@@ -97,11 +97,24 @@ and icon (`app/icon.jpg`) are in `app/CMakeLists.txt`. The settings compiled int
 
 ### Profile-guided optimisation
 
+`pgo/` holds the profile the released NRO was built with (one console session of version 1.0.0). To build with it:
+
+```powershell
+powershell -File tools\win\build_switch.ps1 -Pgo use
+```
+
+`-Pgo none` goes back to a build without PGO. The profile matches the code of this repository: a function you change
+loses its part of it, and the rest still applies. [pgo/README.md](../pgo/README.md) explains its file names and what
+applies when you build from another folder.
+
+To record a new profile:
+
 1. `build_switch.ps1 -Pgo generate` builds an instrumented NRO. Play it on the console: it writes
    `pgo/sa2_pgo_<N>.stream` next to the NRO (one file per session, saved every 2 minutes and on the HOME button).
-2. Copy the `pgo` folder to the PC, then run `powershell -File tools\win\pgo_merge.ps1 <folder>`. It merges every
-   session into `.gcda` files next to the objects of `out\nx`. Move earlier `.gcda` files aside first.
-3. `build_switch.ps1 -Pgo use` builds the optimised NRO. `-Pgo none` goes back to a build without PGO.
+2. Move the `.gcda` files of `pgo\` aside, copy the console's `pgo` folder to the PC, and run
+   `powershell -File tools\win\pgo_merge.ps1 <folder>`. It merges every session into `pgo\` and fills in each file's
+   summary. Merge on the PC that built the instrumented NRO: the streams name its profile folder.
+3. `build_switch.ps1 -Pgo use` builds the optimised NRO.
 
 Do not change the game or app code between steps 1 and 3: a changed function loses its profile.
 

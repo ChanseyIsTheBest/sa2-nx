@@ -197,6 +197,7 @@ Switch; Python; and your own copy of the game for the code generator. The whole 
 | `shaders/` | XenosRecomp with this port's changes, and the shader package tools |
 | `tools/` | Code generation steps, build and test scripts, analysis tools |
 | `patches/` | Every change to third-party code (the SDK, FFmpeg, XenosRecomp) as diffs against upstream |
+| `pgo/` | The PGO profile the released NRO was built with |
 | `mesa/` | Which NVK driver build the NRO links (this port does not change the driver) |
 | `docs/` | Documentation |
 

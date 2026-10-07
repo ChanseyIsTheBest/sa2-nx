@@ -270,21 +270,32 @@ if(REXGLUE_PLATFORM_SWITCH)
     #   SA2_PGO=generate  an instrumented NRO that writes its branch counts to pgo/ on the SD card (src/sa2_pgo.cpp;
     #                     registered in a section, not by constructors: libgcov's exit-time files do not fit the
     #                     Switch). Value profiling is off: its shared lists are not safe without atomic updates.
-    #   SA2_PGO=use       the counts merged on the PC (tools/win/pgo_merge.ps1 writes the .gcda files next to the
-    #                     objects). Code the sessions did not run is compiled as without a profile
-    #                     (-fprofile-partial-training), and functions changed since the instrumented build keep no
-    #                     profile (-Wno-coverage-mismatch).
+    #   SA2_PGO=use       the counts merged on the PC (tools/win/pgo_merge.ps1). Code the sessions did not run is
+    #                     compiled as without a profile (-fprofile-partial-training), and functions changed since the
+    #                     instrumented build keep no profile (-Wno-coverage-mismatch).
+    # The profile is pgo/ at the root of the repository (SA2_PGO_DIR): one .gcda per object, named by the object's
+    # path in the build folder with # for each folder separator. -fprofile-prefix-path makes GCC use those relative
+    # names, so the profile works from any checkout; it must be the build folder written the Windows way, as GCC
+    # sees it. pgo/ holds the profile of the released NRO.
     set(SA2_PGO "" CACHE STRING "Profile-guided optimisation of the Switch build: empty, generate or use")
     set_property(CACHE SA2_PGO PROPERTY STRINGS "" generate use)
+    set(SA2_PGO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../pgo" CACHE PATH "Folder of the PGO profile (.gcda files)")
+    get_filename_component(_sa2_pgo_dir "${SA2_PGO_DIR}" ABSOLUTE)
+    file(TO_NATIVE_PATH "${_sa2_pgo_dir}" _sa2_pgo_dir)
+    file(TO_NATIVE_PATH "${CMAKE_BINARY_DIR}" _sa2_pgo_prefix)
     if(SA2_PGO STREQUAL "generate")
-        set(_sa2_pgo -fprofile-generate -fno-profile-values -fprofile-update=single -fprofile-info-section=gcov_info)
+        set(_sa2_pgo "-fprofile-generate=${_sa2_pgo_dir}" "-fprofile-prefix-path=${_sa2_pgo_prefix}"
+                     -fno-profile-values -fprofile-update=single -fprofile-info-section=gcov_info)
         target_compile_definitions(sa2 PRIVATE SA2_PGO_GENERATE=1)
     elseif(SA2_PGO STREQUAL "use")
+        if(NOT EXISTS "${SA2_PGO_DIR}")
+            message(FATAL_ERROR "SA2_PGO=use: no profile in ${SA2_PGO_DIR}")
+        endif()
         # -fprofile-correction: the counts were taken without atomic updates (-fprofile-update=single) while several
         # game threads ran the same code, so a few increments were lost and some blocks' counts do not add up ("not
         # flow-consistent"); GCC smooths them instead of stopping.
-        set(_sa2_pgo -fprofile-use -fprofile-correction -fno-profile-values -fprofile-partial-training
-                     -Wno-missing-profile -Wno-coverage-mismatch)
+        set(_sa2_pgo "-fprofile-use=${_sa2_pgo_dir}" "-fprofile-prefix-path=${_sa2_pgo_prefix}" -fprofile-correction
+                     -fno-profile-values -fprofile-partial-training -Wno-missing-profile -Wno-coverage-mismatch)
     elseif(SA2_PGO)
         message(FATAL_ERROR "SA2_PGO must be empty, generate or use (got ${SA2_PGO})")
     endif()

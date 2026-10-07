@@ -29,6 +29,8 @@
 *.a
 *.gcda
 *.stream
+# ...except the PGO profile of the released NRO (counts of which code ran, no game code or data)
+!/pgo/*.gcda
 
 # --- SDK third-party sources: tools/fetch_thirdparty.py fetches them; only the files this port changed are tracked --
 /sdk/thirdparty/*

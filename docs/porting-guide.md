@@ -381,6 +381,9 @@ verify mode and the pixel tests (section 12) before keeping it.
      compiles code the session did not reach as without a profile, instead of optimising it for size.
 
   Change no game or app code between the instrumented build and the use build: a changed function loses its profile.
+  Ship the profile with the source (SA2's is in `pgo/`): built with `-fprofile-use=<folder>
+  -fprofile-prefix-path=<build folder>`, GCC names each `.gcda` by the object's path inside the build folder, so
+  anyone building the same code gets the released NRO's optimisation.
 
 ### 9.3 The game's hottest functions as native code
 
