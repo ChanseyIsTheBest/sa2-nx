@@ -111,9 +111,12 @@ hitch while its render targets are made again). The image in handheld mode is ex
 
 ## Performance
 
-The CPU is what limits it: the game runs on three cores at 1020 MHz. Most of the time it holds 60 FPS; the heaviest
-scenes, above all the two-player race, still drop below it. With relaxed vsync a missed frame costs a few FPS instead
-of halving the frame rate.
+The CPU is what limits it: the game runs on three cores at 1020 MHz. In single player it holds 60 FPS with barely any
+dips. The two-player race is the heaviest part of the game: it often runs around 50 FPS. With relaxed vsync a missed
+frame costs a few FPS instead of halving the frame rate.
+
+The released NRO is built with PGO from a console session, which made it about 15 % faster than the same build
+without it.
 
 What was done to get there, round by round and with the measurements, is in
 [docs/enhancements.md](docs/enhancements.md).

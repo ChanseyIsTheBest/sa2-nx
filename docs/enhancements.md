@@ -1538,6 +1538,11 @@ These changes concern the release itself, not performance.
   - `__gcov_info_to_gcda` writes every object summary as zero (runs 0, sum_max 0), and GCC's hot and never-executed
     thresholds come from it. `tools/pgo_summary.py` (run by `pgo_merge.ps1`) writes runs = sessions and sum_max =
     the largest arc count, as libgcov's own dump would. The first session: 171 objects, largest count 2,515,567,889.
+  - **Console result** (the player's test of the released build, 2026-10-08): about 15 % faster than without PGO.
+    Single player barely dips below 60 FPS any more; the two-player race does better but often runs around 50.
+  - Since then the profile is in the repository (`pgo/`), named by each object's path in the build folder
+    (`-fprofile-use=<pgo> -fprofile-prefix-path=<build folder>`), and `pgo_merge.ps1` merges new sessions there. An
+    NRO built from `pgo/` is identical to the released one except its build stamps.
 - **Logging off, completely:** with `log_to_file = false` nothing is created under `logs/`.
   - stderr goes to `logs/rex/rex_stderr.log` only once the configuration says so (`RexSwitchRedirectStderr`, after
     the config is read; it used to be opened by a startup constructor).
