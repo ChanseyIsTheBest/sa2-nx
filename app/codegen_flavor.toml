@@ -1,0 +1,80 @@
+# optimised codegen: written by tools\codegen.ps1 -Flavor optimised from perf_overrides.toml.
+# Code generation options for speed: the "optimised codegen" flavour (tools\codegen.ps1 -Flavor optimised copies this
+# file to codegen_flavor.toml, which sa2_manifest.toml includes; -Flavor classic writes an empty one). Root keys: they
+# must stay outside any table. Build-time, so they come as an A/B NRO pair (docs/enhancements.md, "Build-time").
+#
+# The options only change how the C++ is written, so the compiler can keep guest state in host registers and drop dead
+# stores; the guest-visible result is the same. The set is the part of masseffect-nx's measured perf_overrides.toml
+# that needs no per-function marks in a game with SA2's setjmp/longjmp (the libjpeg error path):
+#   - cr0-cr7, ctr, xer and the lwarx reservation as C++ locals (UnleashedRecomp-NX and MarathonRecomp-NX ship the same);
+#   - skip_msr: no mfmsr/mtmsrd fences, ctx.msr stores or global lock around the guest atomic sequences (a stwcx. is
+#     already a compare-and-swap);
+#   - dform_disp_split: D-form loads/stores as base + zext(reg) + disp (differs only when reg + disp crosses 2^32, a
+#     guest fault either way);
+#   - fctiwz_inline: fctiwz as fcvtzs + NaN select.
+# Masseffect-nx measured skip_msr + reserved_as_local at -3.4 % total CPU and the "diet" (with elide_lr_stores, not used
+# here: SA2's hooks have not been audited for ctx.lr) at -10 % main thread.
+# Round 7 (2026-10-07): non_volatile_as_local and elide_lr_stores too (the other ports' measured "diet": SASRT went from
+# 669,839 ctx.r14-r31 uses to 1,586, 29,172 save/restore helper calls to 0 and 158,515 ctx.lr stores to 0;
+# masseffect-nx -10 % main thread). r14-r31, f14-f31 and v14-v31/v64-v127 become C++ locals, so the __savegprlr /
+# __restgprlr helpers (5.9 % of SA2's console main thread in round 4) and the guest-stack traffic for those registers
+# disappear, and `ctx.lr = <return address>` is no longer stored before every call.
+#   - tools\read_before_write.py on the generated code (--noreturn=827F2E48, the C++ throw: the code after it is a catch
+#     funclet the discovery merged in): one real case, sub_82546D74 (a fragment of sub_82546560 reached through a
+#     pointer table; it reads the parent's r31 frame pointer), marked share_registers in overrides.toml (not
+#     here: this file is also included by the stage DLL's module, where a [functions] entry makes a stub). The rest are the tool's
+#     known false alarms (xor rX,rX,rX in sub_8280A620/sub_8280A9B0, subfe rX,rX,rX in sub_828AC628), the guest setjmp
+#     (sub_82908F10, as before) and, in the stage DLL, sub_88014440 (a loop body registered as a function that nothing
+#     calls; its parent runs the loop inline).
+#   - ctx.lr readers audited: only the d3d-trace diagnostic (sa2_d3d_trace, off) and the console profiler's caller
+#     attribution (switch_perf.cpp) read it; with the stores elided they see an older return address. A PIC `bl` to a
+#     local label keeps its store (the generator's rule).
+#   - setjmp/longjmp (the libjpeg error path, corrupt JPEG data only): after a longjmp, ReXGlue restores ctx; the setjmp
+#     caller's r14-r31 locals keep their values from the time of the failing call instead of setjmp's, the same class
+#     of risk as the CR locals above.
+# Round 7 too: fp_moves_modeless (sa2-nx's own generator option). On the A57 every host flush-mode switch is an
+# `msr fpcr` that costs as much as dozens of instructions, and the generator switched for every scalar float move:
+# lfd/stfd forms, stfiwx, fmr, fabs, fnabs and fneg only move bits and now switch nothing; in VMX code (flush on) the
+# lfs/stfs forms convert through rex::ppc::SingleToDoubleAnyMode / DoubleToSingleAnyMode (sdk/include/rex/ppc/
+# diet_ops.h), which give the flush-off result in either mode (denormal inputs and tiny results take a cold path that
+# clears the mode for that one conversion), instead of switching off and on again. Console profile (round 5): the
+# VMX-heavy game thread XThreadF43C2C0 spent 20-26 % of its samples right after an `msr fpcr`, its hottest function
+# 65 %; that function now keeps one conditional switch at its entry.
+# 2026-10-07 (after round 8): non_argument_as_local too: r0, r2, r11, r12, f0 and v32-v63 become C++ locals (MSVC
+# uses r11, r12 and f0 as scratch everywhere: 632,469 ctx.r11 uses, 87,592 ctx.f0, 65,368 ctx.r12, 9,708 ctx.v32-v63
+# before). tools\non_argument_audit.py (code generated without it) lists every value that crosses a call in those
+# registers (docs/enhancements.md, "non_argument_as_local", names the functions; this file does not, because
+# tools\direct_calls.py takes every address it mentions for a hooked function):
+#   - arguments in r12, read on entry: the SDK's __save*/__rest* helpers (their calls are elided; their bodies keep the
+#     registers in ctx), the MSVC EH/SEH funclets (535 in the game, 8 in the stage DLL; share_registers, marked by the
+#     generator from the EH tables: their owners hand r12 over with the other registers around the inline `bl`), the
+#     stack probe (frame size in r12) and the C++ EH dispatch: _CallSettingFrame (r12 = frame, then blrl to the
+#     funclet) and the continuation jumps of both modules (`mr r12,r5; bctr`). These four keep the registers in ctx
+#     (non_argument_as_local_keep below, in that order: SA2's own generator option), and a caller hands its localized
+#     ones over around a call to them and takes back what they leave.
+#   - one value returned in r11, by a __finally funclet that reloads r11 for its owner: the owner's copy-back after the
+#     funclet call takes it (share_registers). Every other read of r0/r11/r12/f0 after a call is a value the callee
+#     never writes (MSVC's interprocedural register allocation: 46 functions keep f0 across a call, 3 keep r12 across
+#     the stack probe), and a C++ local survives the call the same way.
+#   - three audio resamplers read v57-v63 before writing them: the unaligned-load shift registers of a
+#     software-pipelined loop, shifted out before any use (tools\vec_shiftout.py proves no entry byte reaches a store),
+#     so zero-initialized locals give the same results.
+#   - no hook, native or SDK runtime code reads or writes ctx.r0/r2/r11/r12/f0/v32-v63; the localized copies are made
+#     from the generated code and keep the same locals; guest exceptions are never dispatched (RtlUnwind and
+#     __C_specific_handler are stubs).
+#
+# Post-codegen steps of the flavour (tools\codegen.ps1): tools\pch_no_volatile.py (guest memory without volatile;
+# masseffect-nx: +15-20 % fps) and tools\direct_calls.py (calls between unhooked functions become direct, so GCC can
+# inline them).
+cr_as_local = true
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+skip_msr = true
+dform_disp_split = true
+fctiwz_inline = true
+non_volatile_as_local = true
+elide_lr_stores = true
+fp_moves_modeless = true
+non_argument_as_local = true
+non_argument_as_local_keep = [0x827F5144, 0x82801D90, 0x827EFE34, 0x88010BE4]
