@@ -7,18 +7,23 @@
 // itself first sees them on the console. So each start runs every one of them on a fixed set of edge inputs
 // against a reference written in plain C++ (no helper, no intrinsic) and logs one line:
 //     [enh] instruction forms self-check: N of N results as expected
-// or, per failure, a DIFFERENCE line with the helper, the input and both results. On the PC the same table runs the
-// x86 forms, which proves the expected values; on the console it proves the AArch64 forms. A few microseconds, once.
+// or, per failure, a DIFFERENCE line with the helper, the input and both results (and, because the released
+// configuration logs nothing, the same lines in sa2_selfcheck_failed.txt next to the program). On the PC the same
+// table runs the x86 forms, which proves the expected values; on the console it proves the AArch64 forms. A few
+// microseconds, once.
 #include "sa2_enhancements.h"
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <string>
 
 #include <fmt/format.h>
 
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/ppc/diet_ops.h>
 #include <rex/ppc/intrinsics.h>
@@ -35,12 +40,14 @@ T Opaque(T v) {
 struct Tally {
   int checks = 0;
   int wrong = 0;
+  std::string report;  // the first failures, for the file a failed check leaves next to the program
   void Expect(const char* what, const std::string& input, uint64_t got, uint64_t want) {
     ++checks;
     if (got == want) return;
     if (wrong++ < 8) {
       REXLOG_ERROR("[enh] DIFFERENCE: instruction forms self-check: {}({}) gave {:016X}, expected {:016X}", what,
                    input, got, want);
+      report += fmt::format("{}({}) gave {:016X}, expected {:016X}\n", what, input, got, want);
     }
   }
 };
@@ -263,6 +270,14 @@ void FormsSelfCheck() {
     REXLOG_ERROR("[enh] DIFFERENCE: instruction forms self-check: {} of {} results are NOT as expected (see the lines "
                  "above); this build's helpers do not match their reference on this processor",
                  t.wrong, t.checks);
+    // The released configuration logs nothing, and a wrong form must not go unseen on the console: the failures
+    // also go to a file next to the program. Nothing is written when every result is as expected.
+    const std::filesystem::path path = rex::filesystem::GetExecutableFolder() / "sa2_selfcheck_failed.txt";
+    if (std::FILE* f = std::fopen(path.string().c_str(), "w")) {
+      std::fprintf(f, "sa2-nx instruction forms self-check: %d of %d results are not as expected\n%s", t.wrong,
+                   t.checks, t.report.c_str());
+      std::fclose(f);
+    }
   } else {
     REXLOG_INFO("[enh] instruction forms self-check: {} of {} results as expected ({})", t.checks, t.checks,
 #if defined(__aarch64__)
