@@ -236,6 +236,56 @@ index 0000000000000000000000000000000000000000..9e5b57e56279cd6043a9bd1b0fbffd5b
 +- [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) - For pioneering the modern static recompilation approach for Xbox 360. A lot of the codegen analysis logic and instruction translations are based on their work. Thank you!
 +- [rexdex's recompiler](https://github.com/rexdex/recompiler) - The OG static recompiler for Xbox 360. 
 +- Many others in the Xbox 360 homebrew and modding communities whose work and research have contributed to the collective knowledge that makes projects like this possible.
+diff --git a/cmake/rex_version.cmake b/cmake/rex_version.cmake
+index 2c14df18afd9bd3bb92fcf46e8830f927b342470..6407babf2a0af7931aae592698c02dc69f9e6812 100644
+--- a/cmake/rex_version.cmake
++++ b/cmake/rex_version.cmake
+@@ -104,6 +104,12 @@ endfunction()
+ #     [SOURCE_DIR <path>])    # defaults to CMAKE_SOURCE_DIR
+ #
+ # Runs git in the working tree, then delegates to rex_compute_version.
++#
++# The tags are the SDK's own, so git is asked only when the SDK is the root of its
++# repository. As a folder of another repository (a port that carries the SDK, like
++# sa2-nx) the tags found would be that port's: its v1.0.0 is "ahead" of the SDK's
++# floor and stopped the configure. There the version is the floor, as in a tree
++# without git: MAJOR.MINOR.0.0-dev.unknown.
+ #==========================================================
+ function(rex_resolve_version out_var)
+     set(one_value FLOOR_MAJOR FLOOR_MINOR SOURCE_DIR)
+@@ -114,6 +120,32 @@ function(rex_resolve_version out_var)
+     endif()
+ 
+     find_program(GIT_EXECUTABLE git)
++    set(sdk_is_repository_root FALSE)
++    if(GIT_EXECUTABLE)
++        get_filename_component(sdk_root "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/.." REALPATH)
++        execute_process(
++            COMMAND ${GIT_EXECUTABLE} rev-parse --show-toplevel
++            WORKING_DIRECTORY "${sdk_root}"
++            OUTPUT_VARIABLE git_toplevel
++            ERROR_QUIET
++            OUTPUT_STRIP_TRAILING_WHITESPACE
++            RESULT_VARIABLE git_toplevel_rc)
++        if(git_toplevel_rc EQUAL 0 AND NOT "${git_toplevel}" STREQUAL "")
++            get_filename_component(git_toplevel "${git_toplevel}" REALPATH)
++            string(TOLOWER "${git_toplevel}" git_toplevel_key)
++            string(TOLOWER "${sdk_root}" sdk_root_key)
++            if(git_toplevel_key STREQUAL sdk_root_key)
++                set(sdk_is_repository_root TRUE)
++            endif()
++        endif()
++    endif()
++    if(GIT_EXECUTABLE AND NOT sdk_is_repository_root)
++        message(STATUS
++            "rex_resolve_version: the SDK is not the root of a git repository; "
++            "version ${ARG_FLOOR_MAJOR}.${ARG_FLOOR_MINOR}.0.0-dev.unknown (the floor)")
++        set(${out_var} "${ARG_FLOOR_MAJOR}.${ARG_FLOOR_MINOR}.0.0-dev.unknown" PARENT_SCOPE)
++        return()
++    endif()
+     if(NOT GIT_EXECUTABLE)
+         rex_compute_version(result
+             FLOOR_MAJOR ${ARG_FLOOR_MAJOR}
 diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
 index 41e6dce3254bae528ac80e52a6c799eb6c300373..19f2ed0c5d67887002853ebe1ca02a11184da9b3 100644
 --- a/cmake/rexglue_helpers.cmake
