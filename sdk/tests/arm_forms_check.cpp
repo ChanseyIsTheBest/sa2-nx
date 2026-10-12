@@ -57,3 +57,15 @@ CHECK_FN simde__m128i check_sllv_epi16(simde__m128i a, simde__m128i c) { return 
 CHECK_FN simde__m128i check_srlv_epi16(simde__m128i a, simde__m128i c) { return rex::ppc::simde_mm_srlv_epi16(a, c); }
 CHECK_FN simde__m128i check_srav_epi16(simde__m128i a, simde__m128i c) { return rex::ppc::simde_mm_srav_epi16(a, c); }
 CHECK_FN simde__m128i check_sllv_epi8(simde__m128i a, simde__m128i c) { return rex::ppc::simde_mm_sllv_epi8(a, c); }
+
+// The third CPU round (codegen option div_inline): the divisions as the instruction, without a branch, next to the
+// guarded C expressions they replace.
+CHECK_FN uint32_t check_divwu(uint32_t n, uint32_t d) { return rex::ppc::divwu(n, d); }
+CHECK_FN uint32_t check_divw(int32_t n, int32_t d) { return rex::ppc::divw(n, d); }
+CHECK_FN uint64_t check_divdu(uint64_t n, uint64_t d) { return rex::ppc::divdu(n, d); }
+CHECK_FN int64_t check_divd(int64_t n, int64_t d) { return rex::ppc::divd(n, d); }
+CHECK_FN uint32_t check_old_divwu(uint32_t n, uint32_t d) { return d ? n / d : 0; }
+CHECK_FN uint32_t check_old_divw(int32_t n, int32_t d) {
+  return uint32_t((d && !(n == INT32_MIN && d == -1)) ? n / d : 0);
+}
+CHECK_FN uint32_t check_divw_by_10(int32_t n) { return rex::ppc::divw(n, 10); }

@@ -103,6 +103,14 @@
 # switch saved). The cost of one switch on the A57 is the number that would decide it (the profiler's report now
 # measures it, "FPCR on this CPU").
 # dcbt_prefetch (dcbt / dcbtst as the host's prefetch) is NOT set: 217 sites, no measurement on the console yet.
+#
+# The third CPU round of 2026-10-12:
+# div_inline: divw / divwu / divd / divdu (1,934 sites) through rex::ppc helpers. The C expression needs guards
+# against a zero divisor and INT_MIN / -1 (undefined in C) and the compiler keeps them as a branch; AArch64's
+# sdiv / udiv define both cases, so there the helper is the instruction and, for the signed ones, one select.
+# Its post-codegen steps: tools\loop_locals.py (the ctx registers of call-free loops as locals for the length of
+# the loop), vector loads from read-only data as constants (tools\ro_constants.py) and the two- and three-target
+# sites of tools\indirect_calls.py.
 # Its post-codegen steps (tools\post_codegen.py): tools\indirect_calls.py, tools\ro_constants.py,
 # tools\float_loads.py, tools\leaf_locals.py, tools\pch_cold_traps.py and the entry modes of
 # tools\flush_mode_flow.py. tools\frame_traffic.py only marks its statements: its elisions are opt-in and OFF
@@ -123,4 +131,5 @@ fp_mode_lookahead = true
 fp_mode_lookahead_past_branch = false
 fcti_inline = true
 fp_copy_pairs = true
+div_inline = true
 non_argument_as_local_keep = [0x827F5144, 0x82801D90, 0x827EFE34, 0x88010BE4]

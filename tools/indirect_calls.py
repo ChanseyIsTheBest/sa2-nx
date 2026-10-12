@@ -24,6 +24,9 @@ through. One in six call sites of SA2 is one (20,624).
    RexPromotedMismatch when the table's entry for the target is not that function: the one assumption, tested on
    every promoted call a PC run makes. A target that is not a function of this tree, or a site the list names but
    the code no longer has, is an error: make the list again.
+   A line of the list may name up to three targets (`<function> <n> <target> <target2> [<target3>]`, the most
+   frequent first): the site then tests them in that order, each with its own guarded direct call, before the
+   indirect one (third round of 2026-10-12: sites that go to two or three functions).
 
   python tools/indirect_calls.py --gen app/generated/default [--promote app/indirect_promotions.txt] [--check]
 Idempotent; a changed list is applied by a new run (sites leave and enter the promoted form).
@@ -90,7 +93,7 @@ def main():
         for line in open(a.promote, encoding='utf-8'):
             line = line.split('#')[0].split()
             if len(line) >= 3:
-                promote[(line[0].upper(), int(line[1]))] = line[2].upper()
+                promote[(line[0].upper(), int(line[1]))] = [t.upper() for t in line[2:5]]
     texts = {}
     defined = set()
     for f in files:
@@ -99,7 +102,7 @@ def main():
             m = FUNC.match(line)
             if m:
                 defined.add(m.group(2))
-    tagged = promoted = already = changed = 0
+    tagged = promoted = chained = already = changed = 0
     used = set()
     for f in files:
         lines = texts[f]
@@ -123,15 +126,20 @@ def main():
             ordinal += 1
             expr = m.group(1)
             tag = 'REX_CALL_INDIRECT_FUNC_AT(0x%s, %d, %s);' % (function, site, expr)
-            target = promote.get((function, site))
-            if target:
-                if target not in defined:
-                    sys.exit('ERROR (post-codegen patch): indirect_calls: %s names target %s for %s site %d, which '
-                             'is not a function of %s' % (a.promote, target, function, site, a.gen))
-                new = ('\tif (REX_PROMOTED_IS(%s, 0x%su)) [[likely]] { REX_PROMOTED_CALL(0x%s, sub_%s); '
-                       'sub_%s(ctx, base); } else { %s }' % (expr, target, target, target, target, tag))
-                targets.add(target)
+            wanted = promote.get((function, site))
+            if wanted:
+                for target in wanted:
+                    if target not in defined:
+                        sys.exit('ERROR (post-codegen patch): indirect_calls: %s names target %s for %s site %d, '
+                                 'which is not a function of %s' % (a.promote, target, function, site, a.gen))
+                new = '\t'
+                for n, target in enumerate(wanted):
+                    new += ('if (REX_PROMOTED_IS(%s, 0x%su)) %s{ REX_PROMOTED_CALL(0x%s, sub_%s); sub_%s(ctx, base); } '
+                            'else ' % (expr, target, '[[likely]] ' if n == 0 else '', target, target, target))
+                new += '{ %s }' % tag
+                targets.update(wanted)
                 promoted += 1
+                chained += len(wanted) > 1
                 used.add((function, site))
                 # An earlier run (and tools/direct_calls.py after it) may have written the same line with __imp__.
                 if line.replace('__imp__sub_', 'sub_') == new:
@@ -170,9 +178,9 @@ def main():
                      'changed' % pch)
         if not a.check:
             open(pch, 'w', encoding='utf-8', newline='\n').write(text.replace(anchor, MACROS + '\n' + anchor, 1))
-    print('indirect_calls%s: %d bctrl sites written (%d promoted to a guarded direct call, %d in the list), %d already '
-          'as wanted; %d files changed' %
-          (' (check only)' if a.check else '', tagged, promoted, len(promote), already, changed))
+    print('indirect_calls%s: %d bctrl sites written (%d promoted to a guarded direct call, %d of them with two or '
+          'three targets; %d in the list), %d already as wanted; %d files changed' %
+          (' (check only)' if a.check else '', tagged, promoted, chained, len(promote), already, changed))
 
 
 if __name__ == '__main__':

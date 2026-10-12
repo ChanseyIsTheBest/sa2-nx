@@ -6,6 +6,8 @@ of older code says nothing here), and the precompiled header is included as a pl
 header change would be stale). Nothing in out/nx is touched.
 
   python tools/switch_compile_check.py [--add FLAG ...] [--warnings] <source path, or the end of one> [...]
+  python tools/switch_compile_check.py --like app/src/cpu/sa2_enhancements.cpp app/src/cpu/new_file.cpp
+      a source the configured tree does not know yet, compiled with the flags of one it does
   python tools/switch_compile_check.py sdk/src/core/threading_posix.cpp app/src/cpu/sa2_hot_guest.cpp
 
 Use: to check that code only the Switch build compiles (POSIX threading, `#if defined(__aarch64__)` paths) still
@@ -33,6 +35,11 @@ def main():
         i = args.index('--add')
         extra.append(args[i + 1])
         del args[i:i + 2]
+    like = None
+    if '--like' in args:
+        i = args.index('--like')
+        like = args[i + 1].replace('\\', '/')
+        del args[i:i + 2]
     tally = '--warnings' in args
     args = [a for a in args if a != '--warnings']
     if not args:
@@ -49,6 +56,10 @@ def main():
     for want in args:
         want_n = want.replace('\\', '/')
         found = [s for s in statements if s[0].endswith(want_n)]
+        if not found and like and os.path.exists(os.path.join(ROOT, want_n)):
+            # Not in the configured tree: the build statement of the --like source, with this file in its place.
+            found = [(os.path.join(ROOT, want_n).replace('\\', '/'), s[1], s[2]) for s in statements
+                     if s[0].endswith(like)][:1]
         if not found:
             print('%s: no build statement in out/nx/build.ninja' % want)
             failed += 1

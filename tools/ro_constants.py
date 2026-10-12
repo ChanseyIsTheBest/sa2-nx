@@ -21,6 +21,11 @@ replaces the load by REX_RO_U32(address, value) / REX_RO_U64 / ... with the byte
 Float (`lfs`), double (`lfd`) and, with --ints (the default), integer loads (`lwz` / `lhz` / `lbz` / `ld`) are
 folded; an integer folded into a register is itself a known constant for what follows.
 
+Third round (2026-10-12): vector loads too. `lvx vN, rA, rB` with both registers known reads 16 bytes at a known
+address; when they lie in the read-only data the load and its byte reversal become REX_RO_V128(address, high, low):
+the reversed bytes as a constant on the Switch (one load from the literal pool instead of a guest load, REV64 and
+EXT), the load compared with it in the PC build. Vector code keeps its masks and float constants this way.
+
   python tools/ro_constants.py --gen app/generated/default --image out/default_image.bin [--check] [--no-ints]
 The image is the dump the code generator writes with REXGLUE_DUMP_IMAGE=out/default_image.bin (tools/codegen.ps1 sets
 it); its size must be the pch's REX_IMAGE_SIZE. Idempotent (a folded load no longer matches). Run it before
@@ -42,6 +47,10 @@ FLOAT = re.compile(r'^\t((?:ctx\.)?temp)\.u32 = REX_LOAD_D_U32\((' + REGNAME + r
 FLOAT_USE = re.compile(r'\.f64 = (?:double\((?:ctx\.)?temp\.f32\)|rex::ppc::SingleToDoubleAnyMode\((?:ctx\.)?temp\.u32\));$')
 DOUBLE = re.compile(r'^\t((?:ctx\.)?f\d+)\.u64 = REX_LOAD_D_U64\((' + REGNAME + r')\.u32, (-?\d+)\);$')
 INT = re.compile(r'^\t(' + REGNAME + r')\.u64 = REX_LOAD_D_(U8|U16|U32|U64)\((' + REGNAME + r')\.u32, (-?\d+)\);$')
+# lvx: the aligned effective address, then the load with its byte reversal.
+EA_SUM = re.compile(r'^\tea = \((' + REGNAME + r')\.u32 \+ (' + REGNAME + r')\.u32\) & ~0xF;$')
+EA_ONE = re.compile(r'^\tea = \((' + REGNAME + r')\.u32\) & ~0xF;$')
+VECTOR = 'REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(ea)))'
 # Every mention of a general register, with what follows it: a field and maybe an assignment operator.
 MENTION = re.compile(r'(?<![\w.])(' + REGNAME + r')(?!\d)(\.\w+)?(\s*(?:[-+*/|&^%]|<<|>>)?=(?!=))?')
 CALL = re.compile(r'\(ctx, base[,)]|REX_CALL_INDIRECT_|ppc_trap\(')
@@ -73,6 +82,26 @@ template <typename T>
 #define REX_RO_U16(a, v) RexRoCheck<u16>(REX_LOAD_U16(a), (u16)(v), (a))
 #define REX_RO_U32(a, v) RexRoCheck<u32>(REX_LOAD_U32(a), (u32)(v), (a))
 #define REX_RO_U64(a, v) RexRoCheck<u64>(REX_LOAD_U64(a), (u64)(v), (a))
+#endif
+#endif
+'''
+MARKER_V = '// rexglue ports: vector constants of the read-only data folded (tools/ro_constants.py)'
+MACROS_V = MARKER_V + '''
+#ifndef REX_RO_V128
+#if defined(REX_RO_CONSTANTS_OFF)
+#define REX_RO_V128(a, hi, lo) REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(a)))
+#elif defined(__SWITCH__)
+#define REX_RO_V128(a, hi, lo) simde_mm_set_epi64x((int64_t)(hi), (int64_t)(lo))
+#else
+[[gnu::always_inline]] static inline simde__m128i RexRoCheckV128(simde__m128i memory, simde__m128i constant,
+                                                                 unsigned address) noexcept {
+  g_rex_ro_checked = g_rex_ro_checked + 1;
+  if (simde_mm_movemask_epi8(simde_mm_cmpeq_epi8(memory, constant)) != 0xFFFF) [[unlikely]] RexRoMismatch(address);
+  return memory;
+}
+#define REX_RO_V128(a, hi, lo)                                                        \\
+  RexRoCheckV128(REX_BSWAP128(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(a))),   \\
+                 simde_mm_set_epi64x((int64_t)(hi), (int64_t)(lo)), (a))
 #endif
 #endif
 '''
@@ -126,20 +155,38 @@ def main():
                 return address, int.from_bytes(image[address - base:address - base + size], 'big')
         return None
 
-    stats = dict(floats=0, doubles=0, ints=0, already=0, changed=0)
+    stats = dict(floats=0, doubles=0, ints=0, vectors=0, already=0, changed=0)
     for f in files:
         path = os.path.join(a.gen, f)
         lines = open(path, encoding='utf-8').read().split('\n')
         known = {}
+        ea = None  # the address `ea` holds, when both registers of an lvx were known
         dirty = False
         for i, line in enumerate(lines):
             if not line.startswith('\t'):
                 known.clear()  # a label, a function's first or last line
+                ea = None
                 continue
             if line.startswith('\t//'):
                 continue
-            if 'REX_RO_U' in line:
+            if 'REX_RO_U' in line or 'REX_RO_V128' in line:
                 stats['already'] += 1
+            if line.startswith('\tea = '):
+                m = EA_SUM.match(line)
+                if m and m.group(1) in known and m.group(2) in known:
+                    ea = (known[m.group(1)] + known[m.group(2)]) & 0xFFFFFFF0
+                else:
+                    m = EA_ONE.match(line)
+                    ea = known[m.group(1)] & 0xFFFFFFF0 if m and m.group(1) in known else None
+                continue
+            if ea is not None and VECTOR in line:
+                c = constant(ea, 16)
+                if c:
+                    lines[i] = line.replace(VECTOR, 'REX_RO_V128(0x%08X, 0x%016Xull, 0x%016Xull)' %
+                                            (c[0], c[1] >> 64, c[1] & 0xFFFFFFFFFFFFFFFF))
+                    stats['vectors'] += 1
+                    dirty = True
+                    line = lines[i]
             m = CONST.match(line)
             if m:
                 known[m.group(1)] = int(m.group(2))
@@ -154,6 +201,7 @@ def main():
                 continue
             if STRUCTURED.search(line):
                 known.clear()
+                ea = None
                 continue
             m = FLOAT.match(line)
             if m and m.group(2) in known and i + 1 < len(lines) and FLOAT_USE.search(lines[i + 1]):
@@ -196,16 +244,22 @@ def main():
             stats['changed'] += 1
             if not a.check:
                 open(path, 'w', encoding='utf-8', newline='\n').write('\n'.join(lines))
-    if MARKER not in pch:
-        anchor = '#define REX_MEMORY_SIZE'
+    anchor = '#define REX_MEMORY_SIZE'
+    if MARKER not in pch or MARKER_V not in pch:
         if anchor not in pch:
             sys.exit('ERROR (post-codegen patch): ro_constants: no REX_MEMORY_SIZE in %s: the generated pch changed'
                      % pch_path)
+        new = pch
+        # Each block goes right in front of the anchor, so the scalar one first: the vector block uses its names.
+        if MARKER not in new:
+            new = new.replace(anchor, MACROS + anchor, 1)
+        if MARKER_V not in new:
+            new = new.replace(anchor, MACROS_V + anchor, 1)
         if not a.check:
-            open(pch_path, 'w', encoding='utf-8', newline='\n').write(pch.replace(anchor, MACROS + anchor, 1))
-    print('ro_constants%s: %d float, %d double and %d integer loads from read-only data folded (%s; %d already '
-          'folded), %d files changed' %
-          (' (check only)' if a.check else '', stats['floats'], stats['doubles'], stats['ints'],
+            open(pch_path, 'w', encoding='utf-8', newline='\n').write(new)
+    print('ro_constants%s: %d float, %d double, %d integer and %d vector loads from read-only data folded (%s; %d '
+          'already folded), %d files changed' %
+          (' (check only)' if a.check else '', stats['floats'], stats['doubles'], stats['ints'], stats['vectors'],
            ', '.join('%08X-%08X' % r for r in ranges), stats['already'], stats['changed']))
 
 

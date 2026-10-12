@@ -29,6 +29,7 @@
 #include <fmt/format.h>
 
 #include "me/me_native_system.h"
+#include "profiler/sa2_thread_cycles_pc.h"
 
 #define XXH_INLINE_ALL
 #include <xxhash.h>
@@ -183,6 +184,8 @@ void Record(std::function<rex::ui::Presenter*()> get_presenter, int start_s, int
     g_lockstep.store(true, std::memory_order_release);
     me::native::SetPresentHook(&OnPresent);
   }
+  // What each thread costs over the recorded frames (PC; the same frames in every lockstep run).
+  const std::vector<sa2::profile::ThreadCycles> cycles_before = sa2::profile::SnapshotThreadCycles();
   REXLOG_INFO("[capture] recording {} frames from {} s, game frame {}{}", frame_count, start_s, last,
               lockstep ? fmt::format(" (lockstep: the ring waits for every frame; labels are presented swaps, from {})",
                                      last_swap)
@@ -292,6 +295,28 @@ void Record(std::function<rex::ui::Presenter*()> get_presenter, int start_s, int
                 wait_timeouts);
   }
   raw.close();
+  if (lockstep && !cycles_before.empty()) {
+    std::vector<sa2::profile::ThreadCycles> spent = sa2::profile::SnapshotThreadCycles();
+    uint64_t total = 0;
+    for (sa2::profile::ThreadCycles& t : spent) {
+      for (const sa2::profile::ThreadCycles& b : cycles_before) {
+        if (b.id == t.id) {
+          t.cycles -= std::min(t.cycles, b.cycles);
+          break;
+        }
+      }
+      total += t.cycles;
+    }
+    std::sort(spent.begin(), spent.end(),
+              [](const sa2::profile::ThreadCycles& a, const sa2::profile::ThreadCycles& b) { return a.cycles > b.cycles; });
+    std::string list;
+    for (size_t i = 0; i < spent.size() && i < 8; ++i) {
+      list += fmt::format(" \"{}\" {:.0f}", spent[i].name.empty() ? std::to_string(spent[i].id) : spent[i].name,
+                          double(spent[i].cycles) / 1e6);
+    }
+    REXLOG_INFO("[capture] CPU over the {} recorded frames, million cycles by thread:{}; all threads {:.0f}", written,
+                list, double(total) / 1e6);
+  }
   if (!written) {
     REXLOG_WARN("[capture] no frame recorded (no presenter or no guest output)");
     return;

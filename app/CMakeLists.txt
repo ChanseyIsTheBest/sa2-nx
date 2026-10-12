@@ -40,6 +40,8 @@ set(SA2_SOURCES
     src/sa2_d3d_trace.cpp
     # Video recordings of the game image for testing (cvar sa2_video_s; tools/make_video.sh makes the MP4).
     src/sa2_capture.cpp
+    # CPU cycles per thread over a lockstep capture (PC; an empty function elsewhere).
+    src/profiler/sa2_thread_cycles_pc.cpp
     # DLC: installs the content packages in dlc/ next to the executable (cvar sa2_dlc_dir).
     src/sa2_dlc.cpp
     # The game's language (cvar language: auto = the system language).
@@ -76,6 +78,8 @@ set(SA2_SOURCES
     src/cpu/sa2_enhancements.cpp
     # The PC side of the post-codegen self-checks and the indirect call census (second CPU round; empty on the Switch).
     src/cpu/sa2_codegen_checks.cpp
+    # Every start: the helpers that have a form for one processor only, against plain C++ references (one log line).
+    src/cpu/sa2_forms_selfcheck.cpp
     src/cpu/sa2_gpu_wait.cpp
     src/cpu/sa2_gpu_boost.cpp
     # Native replacements of hot guest functions (src/cpu/hot), each with a self-check guard and its own key.
@@ -223,6 +227,7 @@ option(SA2_GEN_LR_MOVES_ELIDE "No moves of the guest link register in prologues 
 option(SA2_GEN_NV_SAVES_ELIDE "No prologue saves of non-volatile registers that are locals (NOT exact: tint)" OFF)
 option(SA2_GEN_BACK_CHAIN_ELIDE "No back-chain stores of the stack frames (NOT exact for a guest stack walk)" OFF)
 option(SA2_GEN_LEAF_LOCALS "ctx registers of leaf functions with loops as locals" ON)
+option(SA2_GEN_LOOP_LOCALS "ctx registers of call-free loops as locals for the length of the loop" ON)
 option(SA2_GEN_COLD_TRAPS "The trap helper out of line and cold" ON)
 option(SA2_GEN_PROMOTED_CALLS "Guarded direct calls at the promoted indirect call sites" ON)
 set(_sa2_round2_definitions "")
@@ -240,6 +245,9 @@ if(SA2_GEN_NV_SAVES_ELIDE)
 endif()
 if(SA2_GEN_BACK_CHAIN_ELIDE)
     list(APPEND _sa2_round2_definitions REX_BACK_CHAIN_ELIDE)
+endif()
+if(NOT SA2_GEN_LOOP_LOCALS)
+    list(APPEND _sa2_round2_definitions REX_LOOP_LOCALS_OFF)
 endif()
 if(NOT SA2_GEN_LEAF_LOCALS)
     list(APPEND _sa2_round2_definitions REX_LEAF_LOCALS_OFF)

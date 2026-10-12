@@ -26,7 +26,8 @@ EXE = '.exe' if os.name == 'nt' else ''
 FUNC = re.compile(r'^[0-9a-f]+ <(\w+)>:$')
 INS = re.compile(r'^\s+[0-9a-f]+:\s+(\S+)\s*(.*)$')
 INTERESTING = ('ldaxr', 'stlxr', 'ldxr', 'stxr', 'dmb', 'tbl', 'fcvtzs', 'fcvtzu', 'msr', 'mrs', 'bl', 'frinti', 'uqadd',
-               'srhadd', 'urhadd', 'ucvtf', 'cmhi', 'ushl', 'sshl', 'clz')
+               'srhadd', 'urhadd', 'ucvtf', 'cmhi', 'ushl', 'sshl', 'clz', 'sdiv', 'udiv', 'cbz', 'cbnz', 'smull',
+               'csel')
 
 
 def switch_flags():
@@ -172,6 +173,18 @@ def main():
         if len(x86[name]) < len(neon[name]):
             problems.append('%s: the x86 form (%d) is shorter than the NEON form (%d)' %
                             (name, len(x86[name]), len(neon[name])))
+    # The third CPU round: the divisions are the instruction, with no branch; a constant divisor is no division.
+    for name, wanted in (('check_divwu', 'udiv'), ('check_divdu', 'udiv'), ('check_divw', 'sdiv'),
+                         ('check_divd', 'sdiv')):
+        o = ops(name)
+        if wanted not in o or any(op in ('cbz', 'cbnz', 'bl') or op.startswith('b.') for op in o):
+            problems.append('%s: not a branch-free %s' % (name, wanted))
+    for name, old in (('check_divwu', 'check_old_divwu'), ('check_divw', 'check_old_divw')):
+        if len(neon[name]) > len(neon[old]):
+            problems.append('%s (%d instructions) is longer than the guarded C form (%d)' %
+                            (name, len(neon[name]), len(neon[old])))
+    if 'sdiv' in ops('check_divw_by_10'):
+        problems.append('check_divw_by_10: a division by a constant kept its sdiv')
     if problems:
         print('PROBLEMS:')
         for p in problems:

@@ -55,10 +55,12 @@ constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
 // be using to stash their variables.
 KernelState* shared_kernel_state_ = nullptr;
 
+#if defined(_WIN32)
 KernelState* kernel_state() {
   REX_SYS_CENSUS(rex::syscount::kCensusKernelState, 1);
   return shared_kernel_state_;
 }
+#endif
 
 KernelState::KernelState(Runtime* emulator)
     : emulator_(emulator),

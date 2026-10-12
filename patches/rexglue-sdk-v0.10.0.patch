@@ -742,10 +742,10 @@ index 8426798741687cc8201871bc16dabd0732b6f479..9d00a7f345d4421da6bbdd006437b5ef
  
  }  // namespace rex::audio
 diff --git a/include/rex/codegen/config.h b/include/rex/codegen/config.h
-index 8200139a62d727f28389cfd0566d5fccfb57d8df..3ebdca2976c0214f4e6342f1454f2eee04fa051b 100644
+index 8200139a62d727f28389cfd0566d5fccfb57d8df..7546f810e84a18240d133b417d458aadfdc76e15 100644
 --- a/include/rex/codegen/config.h
 +++ b/include/rex/codegen/config.h
-@@ -89,15 +89,95 @@ struct RecompilerConfig {
+@@ -89,15 +89,101 @@ struct RecompilerConfig {
  
    // === Code generation options (optional) ===
    bool skipLr = false;
@@ -812,6 +812,12 @@ index 8200139a62d727f28389cfd0566d5fccfb57d8df..3ebdca2976c0214f4e6342f1454f2eee
 +  // sa2-nx (second CPU round): dcbt / dcbtst as REX_PREFETCH (the host's prefetch of the same address) instead
 +  // of nothing. A hint: no effect on any value.
 +  bool dcbtPrefetch = false;
++  // sa2-nx (third CPU round, 2026-10-12): divw / divwu / divd / divdu through rex::ppc::divw ... (rex/ppc/diet_ops.h)
++  // instead of the guarded C division. The guards exist because dividing by zero (and INT_MIN / -1) is undefined in
++  // C; AArch64's sdiv / udiv define both (0 for a zero divisor), so there the helper is the instruction, plus one
++  // select for the signed overflow case, without a branch. Same results on every platform. A divisor the compiler
++  // knows keeps the C expression (it turns that into a multiplication).
++  bool divInline = false;
 +  std::unordered_set<uint32_t> lrKeepReturns;
    bool ctrAsLocalVariable = false;
    bool xerAsLocalVariable = false;
@@ -1293,6 +1299,41 @@ index 294573164d73d0b234838f33ef4e4dbdd6765dff..651063cf27ad2392f4ed9b65b9d99e39
    // The conversion is performed while the lock is released since it may take a
    // long time.
    // If during the conversion the region currently being converted is
+diff --git a/include/rex/hook.h b/include/rex/hook.h
+index 4ce4f9b9f8627702f2435e4bfc6b5c2242c830ef..3e980d4c03e3cc18bf88246bfb82304ec667c8a9 100644
+--- a/include/rex/hook.h
++++ b/include/rex/hook.h
+@@ -21,9 +21,22 @@
+ #include <rex/ppc/context.h>
+ #include <rex/ppc/function.h>
+ #include <rex/system/kernel_state.h>
++#include <rex/sys_counters.h>
+ #include <rex/system/thread_state.h>
+ #include <rex/types.h>
+ 
++// PC builds count the calls of every export (rex/sys_counters.h, ExportCensus: which host functions a game calls
++// most). Nothing on the Switch.
++#if defined(__SWITCH__)
++#define REX_EXPORT_CENSUS(name) ((void)0)
++#else
++#define REX_EXPORT_CENSUS(name)                                                                     \
++  do {                                                                                              \
++    static std::atomic<uint64_t>* const rex_export_count_ = ::rex::syscount::ExportCounter(name);   \
++    rex_export_count_->fetch_add(1, std::memory_order_relaxed);                                     \
++  } while (0)
++#endif
++
+ //=============================================================================
+ // Hook Macros
+ //=============================================================================
+@@ -41,6 +54,7 @@
+ #else
+ #define REX_HOOK(subroutine, function)                  \
+   extern "C" REX_FUNC(subroutine) {                     \
++    REX_EXPORT_CENSUS(#subroutine);                     \
+     rex::ppc::HostToGuestFunction<function>(ctx, base); \
+   }
+ #endif
 diff --git a/include/rex/input/input_driver.h b/include/rex/input/input_driver.h
 index 52116f13108b8e39904f5627a8ca44f1c8701978..5e06914f38301386827ec01b9cace105716326eb 100644
 --- a/include/rex/input/input_driver.h
@@ -1655,10 +1696,10 @@ index 0ede54262059bff41c8c1f5047602fe406d68e03..741856184d62a9685256c88a96ea3d3a
    //       | cr2-cr4 (12) | fpscr (4).  Total: 1616 bytes.
 diff --git a/include/rex/ppc/diet_ops.h b/include/rex/ppc/diet_ops.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..480341de1dcd773621e7707f0b73aa3b35ac995b
+index 0000000000000000000000000000000000000000..c4c8032625319a96927ef1146980ac583e6b3978
 --- /dev/null
 +++ b/include/rex/ppc/diet_ops.h
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,358 @@
 +/**
 + * @file        ppc/diet_ops.h
 + * @brief       Codegen "diet" helpers: cheaper but bit-identical lowerings of single PPC instructions.
@@ -1771,6 +1812,54 @@ index 0000000000000000000000000000000000000000..480341de1dcd773621e7707f0b73aa3b
 +    return INT32_MAX;
 +  return int64_t(simde_mm_cvtsd_si32(simde_mm_set_sd(v)));
 +#endif
++}
++
++/// sa2-nx, third CPU round (codegen option div_inline): the integer divisions with the results the generated
++/// expressions gave: 0 for a zero divisor, 0 for the signed overflow (INT_MIN / -1), the C quotient otherwise.
++/// On AArch64 `udiv` / `sdiv` are defined for a zero divisor (they answer 0) and never trap, so the unsigned ones
++/// are the instruction alone and the signed ones add a select for the overflow, which `sdiv` answers with INT_MIN.
++/// The C expression needs its guards (division by zero is undefined there) and the compiler keeps them as a branch.
++/// A divisor known at compile time keeps the C expression: the compiler makes a multiplication of it.
++inline uint32_t divwu(uint32_t n, uint32_t d) noexcept {
++#if defined(__aarch64__)
++  if (!__builtin_constant_p(d)) {
++    uint32_t q;
++    asm("udiv %w0, %w1, %w2" : "=r"(q) : "r"(n), "r"(d));
++    return q;
++  }
++#endif
++  return d ? n / d : 0;
++}
++inline uint64_t divdu(uint64_t n, uint64_t d) noexcept {
++#if defined(__aarch64__)
++  if (!__builtin_constant_p(d)) {
++    uint64_t q;
++    asm("udiv %x0, %x1, %x2" : "=r"(q) : "r"(n), "r"(d));
++    return q;
++  }
++#endif
++  return d ? n / d : 0;
++}
++/// The result as the zero-extended word the old expression assigned to the 64-bit register.
++inline uint32_t divw(int32_t n, int32_t d) noexcept {
++#if defined(__aarch64__)
++  if (!__builtin_constant_p(d)) {
++    int32_t q;
++    asm("sdiv %w0, %w1, %w2" : "=r"(q) : "r"(n), "r"(d));
++    return uint32_t((n == INT32_MIN && d == -1) ? 0 : q);
++  }
++#endif
++  return uint32_t((d && !(n == INT32_MIN && d == -1)) ? n / d : 0);
++}
++inline int64_t divd(int64_t n, int64_t d) noexcept {
++#if defined(__aarch64__)
++  if (!__builtin_constant_p(d)) {
++    int64_t q;
++    asm("sdiv %x0, %x1, %x2" : "=r"(q) : "r"(n), "r"(d));
++    return (n == INT64_MIN && d == -1) ? 0 : q;
++  }
++#endif
++  return (d && !(n == INT64_MIN && d == -1)) ? n / d : 0;
 +}
 +
 +/// Codegen option fp_copy_pairs: lfs directly followed by stfs of the same register.
@@ -2212,10 +2301,10 @@ index 1f524802ee642116261f190563b6246a3b6ede27..9d7901deb21aea13c32dfd8839527903
    /// Use this for data patches and recomp-specific achievement registration.
 diff --git a/include/rex/sys_counters.h b/include/rex/sys_counters.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..73e7b2f31c24908b399b170e2b2399ce11f7f799
+index 0000000000000000000000000000000000000000..e1d7ec8ba17fa672eb7a8302c7f6b26a12bc23fc
 --- /dev/null
 +++ b/include/rex/sys_counters.h
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,91 @@
 +#pragma once
 +/**
 + * @file        sys_counters.h
@@ -2288,6 +2377,11 @@ index 0000000000000000000000000000000000000000..73e7b2f31c24908b399b170e2b2399ce
 +void CensusSite(unsigned id);
 +void CensusSitesEnable(bool on);
 +size_t CensusSites(uint64_t* addresses, uint64_t* counts, size_t capacity);
++// Calls per kernel export (third survey, 2026-10-12): every REX_HOOK / REX_EXPORT counts itself here in PC builds,
++// so a run shows which host functions the game calls most. ExportCounter returns the export's counter (created
++// on first use; call it once per export and keep the pointer); ExportCensus copies the `capacity` most called.
++std::atomic<uint64_t>* ExportCounter(const char* name);
++size_t ExportCensus(const char** names, uint64_t* counts, size_t capacity);
 +#endif
 +
 +}  // namespace rex::syscount
@@ -2302,6 +2396,28 @@ index 0000000000000000000000000000000000000000..73e7b2f31c24908b399b170e2b2399ce
 +#define REX_SYS_COUNT(id, n) ::rex::syscount::Census((id), static_cast<uint64_t>(n))
 +#define REX_SYS_CENSUS(id, n) ::rex::syscount::Census((id), static_cast<uint64_t>(n))
 +#endif
+diff --git a/include/rex/system/kernel_state.h b/include/rex/system/kernel_state.h
+index 9b9cf9eb98537111d3a1034b47f4f18ecffaa2f8..5d07d4704d21492f82cf108d1646bbc22b4900f4 100644
+--- a/include/rex/system/kernel_state.h
++++ b/include/rex/system/kernel_state.h
+@@ -400,7 +400,17 @@ class KernelState {
+ };
+ 
+ // Global kernel state accessor (defined in kernel_state.cpp)
++#if defined(_WIN32)
+ KernelState* kernel_state();
++#else
++// sa2-nx (third CPU round, 2026-10-12): one load, inline. It was an out-of-line call (378 call sites in the
++// runtime's Switch objects, 12,000 calls a second in SA2). On Windows it stays a function: the pointer lives in the
++// runtime DLL.
++extern KernelState* shared_kernel_state_;
++inline KernelState* kernel_state() {
++  return shared_kernel_state_;
++}
++#endif
+ 
+ // Convenience accessor for kernel memory
+ inline memory::Memory* kernel_memory() {
 diff --git a/include/rex/system/static_modules.h b/include/rex/system/static_modules.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..697566740ece97253c8142268af85a3fb082c1ab
@@ -6988,6 +7104,68 @@ index 0000000000000000000000000000000000000000..61107ebd8b01952282ffcf0f44ba327a
 +                          const ArgsInRegistersOptions& options, ArgsInRegistersStats* stats = nullptr);
 +
 +}  // namespace rex::codegen
+diff --git a/src/codegen/builders/arithmetic.cpp b/src/codegen/builders/arithmetic.cpp
+index 3908bdf9e6c6ed0f6251279b11044cb42e81d7b6..4713a215e22bcf9b17820e74522b901962812d92 100644
+--- a/src/codegen/builders/arithmetic.cpp
++++ b/src/codegen/builders/arithmetic.cpp
+@@ -103,9 +103,12 @@ bool build_divd(BuilderContext& ctx) {
+   auto rD = ctx.r(ctx.insn.operands[0]);
+   auto rA = ctx.r(ctx.insn.operands[1]);
+   auto rB = ctx.r(ctx.insn.operands[2]);
+-  ctx.println(
+-      "\t{}.s64 = ({}.s64 && !({}.s64 == INT64_MIN && {}.s64 == -1)) ? {}.s64 / {}.s64 : 0;", rD,
+-      rB, rA, rB, rA, rB);
++  if (ctx.config().divInline)
++    ctx.println("\t{}.s64 = rex::ppc::divd({}.s64, {}.s64);", rD, rA, rB);
++  else
++    ctx.println(
++        "\t{}.s64 = ({}.s64 && !({}.s64 == INT64_MIN && {}.s64 == -1)) ? {}.s64 / {}.s64 : 0;", rD,
++        rB, rA, rB, rA, rB);
+   emitRecordFormCompare(ctx);
+   return true;
+ }
+@@ -116,7 +119,10 @@ bool build_divdu(BuilderContext& ctx) {
+   auto rD = ctx.r(ctx.insn.operands[0]);
+   auto rA = ctx.r(ctx.insn.operands[1]);
+   auto rB = ctx.r(ctx.insn.operands[2]);
+-  ctx.println("\t{}.u64 = {}.u64 ? {}.u64 / {}.u64 : 0;", rD, rB, rA, rB);
++  if (ctx.config().divInline)
++    ctx.println("\t{}.u64 = rex::ppc::divdu({}.u64, {}.u64);", rD, rA, rB);
++  else
++    ctx.println("\t{}.u64 = {}.u64 ? {}.u64 / {}.u64 : 0;", rD, rB, rA, rB);
+   emitRecordFormCompare(ctx);
+   return true;
+ }
+@@ -127,10 +133,13 @@ bool build_divw(BuilderContext& ctx) {
+   auto rD = ctx.r(ctx.insn.operands[0]);
+   auto rA = ctx.r(ctx.insn.operands[1]);
+   auto rB = ctx.r(ctx.insn.operands[2]);
+-  ctx.println(
+-      "\t{}.u64 = uint32_t(({}.s32 && !({}.s32 == INT32_MIN && {}.s32 == -1)) ? {}.s32 / {}.s32 : "
+-      "0);",
+-      rD, rB, rA, rB, rA, rB);
++  if (ctx.config().divInline)
++    ctx.println("\t{}.u64 = rex::ppc::divw({}.s32, {}.s32);", rD, rA, rB);
++  else
++    ctx.println(
++        "\t{}.u64 = uint32_t(({}.s32 && !({}.s32 == INT32_MIN && {}.s32 == -1)) ? {}.s32 / {}.s32 : "
++        "0);",
++        rD, rB, rA, rB, rA, rB);
+   emitRecordFormCompare(ctx);
+   return true;
+ }
+@@ -141,7 +150,10 @@ bool build_divwu(BuilderContext& ctx) {
+   auto rD = ctx.r(ctx.insn.operands[0]);
+   auto rA = ctx.r(ctx.insn.operands[1]);
+   auto rB = ctx.r(ctx.insn.operands[2]);
+-  ctx.println("\t{}.u64 = uint32_t({}.u32 ? {}.u32 / {}.u32 : 0);", rD, rB, rA, rB);
++  if (ctx.config().divInline)
++    ctx.println("\t{}.u64 = rex::ppc::divwu({}.u32, {}.u32);", rD, rA, rB);
++  else
++    ctx.println("\t{}.u64 = uint32_t({}.u32 ? {}.u32 / {}.u32 : 0);", rD, rB, rA, rB);
+   emitRecordFormCompare(ctx);
+   return true;
+ }
 diff --git a/src/codegen/builders/builder_context.h b/src/codegen/builders/builder_context.h
 index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..4f6e071c9688b0f60dbd3af72f23770109eac317 100644
 --- a/src/codegen/builders/builder_context.h
@@ -8728,10 +8906,10 @@ index a0484fb45e39a0ee0644db75c185b80a71338b87..5d068ea94147ce533f24e4c8d0986f67
  
      println("#include \"{}_funcs.{}.h\"\n", projectName, index);
 diff --git a/src/codegen/config.cpp b/src/codegen/config.cpp
-index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..18becbcb1d1800c60e7f9a106ffe79508d6c8dc4 100644
+index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..e038c15a1cfe6654ec91f2f889ddd0d2f8d72e8c 100644
 --- a/src/codegen/config.cpp
 +++ b/src/codegen/config.cpp
-@@ -101,6 +101,27 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -101,6 +101,28 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
    // Bool scalars
    auto hasBool = [&](const char* key) -> bool { return toml[key].is_boolean(); };
    MergeBool(cfg.skipLr, toml["skip_lr"].value_or(false), hasBool("skip_lr"), "skip_lr");
@@ -8756,10 +8934,11 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..18becbcb1d1800c60e7f9a106ffe7950
 +  MergeBool(cfg.fpCopyOnlyFunctions, toml["fp_copy_only_functions"].value_or(false),
 +            hasBool("fp_copy_only_functions"), "fp_copy_only_functions");
 +  MergeBool(cfg.dcbtPrefetch, toml["dcbt_prefetch"].value_or(false), hasBool("dcbt_prefetch"), "dcbt_prefetch");
++  MergeBool(cfg.divInline, toml["div_inline"].value_or(false), hasBool("div_inline"), "div_inline");
    MergeBool(cfg.skipMsr, toml["skip_msr"].value_or(false), hasBool("skip_msr"), "skip_msr");
    MergeBool(cfg.ctrAsLocalVariable, toml["ctr_as_local"].value_or(false), hasBool("ctr_as_local"),
              "ctr_as_local");
-@@ -116,6 +137,19 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -116,6 +138,19 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
              hasBool("non_volatile_as_local"), "non_volatile_as_local");
    MergeBool(cfg.generateExceptionHandlers, toml["generate_exception_handlers"].value_or(false),
              hasBool("generate_exception_handlers"), "generate_exception_handlers");
@@ -8779,7 +8958,7 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..18becbcb1d1800c60e7f9a106ffe7950
    if (hasBool("is_dll")) {
      cfg.isDll = toml["is_dll"].value_or(false);
    }
-@@ -278,6 +312,16 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -278,6 +313,16 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
          REXCODEGEN_ERROR("Missing 'labels' in [[switch_tables]] entry");
          continue;
        }
@@ -8796,7 +8975,7 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..18becbcb1d1800c60e7f9a106ffe7950
  
        JumpTable jt;
        jt.bctrAddress = *address_opt;
-@@ -372,6 +416,24 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -372,6 +417,24 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
  
    // --- Sets: additive ---
  
@@ -8821,7 +9000,7 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..18becbcb1d1800c60e7f9a106ffe7950
    // indirect_calls -> knownIndirectCallHints (set)
    if (auto indirectCallArray = toml["indirect_calls"].as_array()) {
      for (auto& entry : *indirectCallArray) {
-@@ -531,6 +593,9 @@ RecompilerConfig::ValidationResult RecompilerConfig::Validate() const {
+@@ -531,6 +594,9 @@ RecompilerConfig::ValidationResult RecompilerConfig::Validate() const {
      }
    }
  
@@ -9572,16 +9751,19 @@ index 378aa4b33cb54edb836921caf0d359bb22659ea1..47a2d7cf9e11264a47796fe399fac2de
 -
 -}  // namespace rex::thread
 diff --git a/src/core/clock.cpp b/src/core/clock.cpp
-index ae72b7ae9cd99c1366a28eb362854e2579bb7aa8..fd91052d6846383cd3cc76be8ecf47f696c04841 100644
+index ae72b7ae9cd99c1366a28eb362854e2579bb7aa8..429e7af09babaee93a882d777dd993bf2da932bd 100644
 --- a/src/core/clock.cpp
 +++ b/src/core/clock.cpp
-@@ -10,18 +10,96 @@
+@@ -10,18 +10,136 @@
   */
  
  #include <algorithm>
 +#include <atomic>
++#include <deque>
  #include <limits>
  #include <mutex>
++#include <utility>
++#include <vector>
  
  #include <rex/chrono/clock.h>
  #include <rex/cvar.h>
@@ -9592,6 +9774,43 @@ index ae72b7ae9cd99c1366a28eb362854e2579bb7aa8..fd91052d6846383cd3cc76be8ecf47f6
 +// The runtime census (sys_counters.h): off the Switch, what REX_SYS_COUNT / REX_SYS_CENSUS count into.
 +namespace rex::syscount {
 +static std::atomic<uint64_t> g_census[kCensusCount]{};
++
++namespace {
++struct ExportEntry {
++  const char* name;
++  std::atomic<uint64_t> count{0};
++};
++std::mutex g_export_mutex;
++std::deque<ExportEntry>& ExportEntries() {
++  static std::deque<ExportEntry> entries;  // a deque: the counters never move
++  return entries;
++}
++}  // namespace
++
++std::atomic<uint64_t>* ExportCounter(const char* name) {
++  std::lock_guard<std::mutex> lock(g_export_mutex);
++  ExportEntry& entry = ExportEntries().emplace_back();
++  entry.name = name;
++  return &entry.count;
++}
++
++size_t ExportCensus(const char** names, uint64_t* counts, size_t capacity) {
++  std::vector<std::pair<uint64_t, const char*>> all;
++  {
++    std::lock_guard<std::mutex> lock(g_export_mutex);
++    for (const ExportEntry& entry : ExportEntries()) {
++      const uint64_t n = entry.count.load(std::memory_order_relaxed);
++      if (n) all.emplace_back(n, entry.name);
++    }
++  }
++  std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
++  const size_t n = std::min(capacity, all.size());
++  for (size_t i = 0; i < n; ++i) {
++    names[i] = all[i].second;
++    counts[i] = all[i].first;
++  }
++  return n;
++}
 +void Census(unsigned id, uint64_t n) {
 +  if (id < kCensusCount)
 +    g_census[id].store(g_census[id].load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
@@ -9672,7 +9891,7 @@ index ae72b7ae9cd99c1366a28eb362854e2579bb7aa8..fd91052d6846383cd3cc76be8ecf47f6
  namespace rex::chrono {
  
  // Time scalar applied to all time operations.
-@@ -35,8 +113,8 @@ uint64_t guest_system_time_base_ = Clock::QueryHostSystemTime();
+@@ -35,8 +153,8 @@ uint64_t guest_system_time_base_ = Clock::QueryHostSystemTime();
  // Computed by RecomputeGuestTickScalar.
  std::pair<uint64_t, uint64_t> guest_tick_ratio_ = std::make_pair(1, 1);
  
@@ -9683,7 +9902,7 @@ index ae72b7ae9cd99c1366a28eb362854e2579bb7aa8..fd91052d6846383cd3cc76be8ecf47f6
  // Last sampled host tick count.
  uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
  // Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
-@@ -71,6 +149,7 @@ uint64_t UpdateGuestClock() {
+@@ -71,6 +189,7 @@ uint64_t UpdateGuestClock() {
      return host_tick_count * guest_tick_ratio_.first / guest_tick_ratio_.second;
    }
  
@@ -9691,7 +9910,7 @@ index ae72b7ae9cd99c1366a28eb362854e2579bb7aa8..fd91052d6846383cd3cc76be8ecf47f6
    std::unique_lock<std::mutex> lock(tick_mutex_, std::defer_lock);
    if (lock.try_lock()) {
      // Translate host tick count to guest tick count.
-@@ -79,12 +158,20 @@ uint64_t UpdateGuestClock() {
+@@ -79,12 +198,20 @@ uint64_t UpdateGuestClock() {
      last_host_tick_count_ = host_tick_count;
      uint64_t guest_tick_delta =
          host_tick_delta * guest_tick_ratio_.first / guest_tick_ratio_.second;
@@ -23557,7 +23776,7 @@ index 754fa13832016ae37164d2bd72f334f7d4e3c046..708d41b2040011607228ca95f05c16b1
 +
  }  // namespace rex::system
 diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
-index 697399cdd4207c779610127c01e5285e580767de..bdab1a6e6dacbdbbc5896c04508da6bd44f5f9af 100644
+index 697399cdd4207c779610127c01e5285e580767de..1acbebfdb73f564f9298eaa75e15d7805e8f235b 100644
 --- a/src/system/kernel_state.cpp
 +++ b/src/system/kernel_state.cpp
 @@ -12,6 +12,7 @@
@@ -23584,15 +23803,20 @@ index 697399cdd4207c779610127c01e5285e580767de..bdab1a6e6dacbdbbc5896c04508da6bd
  
  namespace rex::system {
  
-@@ -53,6 +56,7 @@ constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
+@@ -52,9 +55,12 @@ constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
+ // be using to stash their variables.
  KernelState* shared_kernel_state_ = nullptr;
  
++#if defined(_WIN32)
  KernelState* kernel_state() {
 +  REX_SYS_CENSUS(rex::syscount::kCensusKernelState, 1);
    return shared_kernel_state_;
  }
++#endif
  
-@@ -759,15 +763,19 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
+ KernelState::KernelState(Runtime* emulator)
+     : emulator_(emulator),
+@@ -759,15 +765,19 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
      }
  
      rex::platform::DynamicLibrary library_local;
@@ -23618,7 +23842,7 @@ index 697399cdd4207c779610127c01e5285e580767de..bdab1a6e6dacbdbbc5896c04508da6bd
        if (!register_func) {
          REXSYS_ERROR("ReXModule_Register not found in '{}'", recomp->shared_lib_name);
        } else if (!get_image_info) {
-@@ -1400,3 +1408,23 @@ const char* KernelState::GetOrCreateFiberName(uint32_t guest_addr, const char* t
+@@ -1400,3 +1410,23 @@ const char* KernelState::GetOrCreateFiberName(uint32_t guest_addr, const char* t
  }
  
  }  // namespace rex::system
@@ -30665,10 +30889,10 @@ index 0000000000000000000000000000000000000000..7797c07368013b1ea98318e162503e8b
 +#include <netinet/in.h>
 diff --git a/tests/arm_forms_check.cpp b/tests/arm_forms_check.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..ae5095fec214e799bb35397b8097cada288da69a
+index 0000000000000000000000000000000000000000..89639f0c427b31b5f9a575367438b297ef10716b
 --- /dev/null
 +++ b/tests/arm_forms_check.cpp
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,71 @@
 +// Compile-only check for the Switch compiler (it cannot run on the PC): the AArch64-only forms of the CPU round of
 +// 2026-10-12, one small function each, so tools/arm_forms_check.py can read the instructions GCC makes of them.
 +//   - rex/thread/atomic.h: the inline __atomic lock words (exclusive pair with acquire/release, no trailing `dmb`
@@ -30728,6 +30952,18 @@ index 0000000000000000000000000000000000000000..ae5095fec214e799bb35397b8097cada
 +CHECK_FN simde__m128i check_srlv_epi16(simde__m128i a, simde__m128i c) { return rex::ppc::simde_mm_srlv_epi16(a, c); }
 +CHECK_FN simde__m128i check_srav_epi16(simde__m128i a, simde__m128i c) { return rex::ppc::simde_mm_srav_epi16(a, c); }
 +CHECK_FN simde__m128i check_sllv_epi8(simde__m128i a, simde__m128i c) { return rex::ppc::simde_mm_sllv_epi8(a, c); }
++
++// The third CPU round (codegen option div_inline): the divisions as the instruction, without a branch, next to the
++// guarded C expressions they replace.
++CHECK_FN uint32_t check_divwu(uint32_t n, uint32_t d) { return rex::ppc::divwu(n, d); }
++CHECK_FN uint32_t check_divw(int32_t n, int32_t d) { return rex::ppc::divw(n, d); }
++CHECK_FN uint64_t check_divdu(uint64_t n, uint64_t d) { return rex::ppc::divdu(n, d); }
++CHECK_FN int64_t check_divd(int64_t n, int64_t d) { return rex::ppc::divd(n, d); }
++CHECK_FN uint32_t check_old_divwu(uint32_t n, uint32_t d) { return d ? n / d : 0; }
++CHECK_FN uint32_t check_old_divw(int32_t n, int32_t d) {
++  return uint32_t((d && !(n == INT32_MIN && d == -1)) ? n / d : 0);
++}
++CHECK_FN uint32_t check_divw_by_10(int32_t n) { return rex::ppc::divw(n, 10); }
 diff --git a/tests/fcti_copy_test.cpp b/tests/fcti_copy_test.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..a923797a50862af3aa7f7ac6f307cd68c9ef535f

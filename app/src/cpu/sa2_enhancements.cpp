@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <string>
 #include <thread>
 #include <vector>
@@ -212,6 +213,7 @@ void Resolve() {
               "configuration, turned on);{}",
               __DATE__, __TIME__, SA2_BUILD_FLAVOR, g_cpu_master ? "on" : "off", g_noncpu_master ? "on" : "off",
               defaulted_on, line);
+  FormsSelfCheck();
 }
 
 bool GuestCodeMatches(const uint8_t* base, uint32_t address, uint32_t bytes, uint64_t fnv, const char* what) {
@@ -332,6 +334,25 @@ void StartReport() {
                       "heap lookups for a pointer translation, {:.0f} object retains and releases, {:.0f} kernel "
                       "state reads; {:.0f} critical section owners from the PCR",
                       logs, heaps, refs, states, pcr_owner);
+        }
+        {
+          // The kernel exports the game calls most (rex/hook.h counts every REX_EXPORT in PC builds).
+          static uint64_t last_exports = 0;
+          const char* names[16];
+          uint64_t counts[16];
+          const size_t n = ExportCensus(names, counts, 16);
+          uint64_t shown = 0;
+          std::string list;
+          for (size_t i = 0; i < n; ++i) {
+            list += fmt::format(" {}:{}", names[i] + (std::strncmp(names[i], "__imp__", 7) == 0 ? 7 : 0), counts[i]);
+            shown += counts[i];
+          }
+          if (n) {
+            REXLOG_INFO("[census] kernel exports by calls (cumulative, the 16 most called; {:.0f} a second of "
+                        "them):{}",
+                        double(shown - last_exports) / double(seconds), list);
+          }
+          last_exports = shown;
         }
         REXLOG_INFO("[census] runtime calls per second: guest clock {:.0f} ({:.0f} found its mutex taken); critical "
                     "sections entered {:.0f} ({:.0f} already owned, {:.0f} tried, {:.0f} waited); events set {:.0f}, "

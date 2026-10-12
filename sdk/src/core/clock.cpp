@@ -11,8 +11,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <deque>
 #include <limits>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
@@ -23,6 +26,43 @@
 // The runtime census (sys_counters.h): off the Switch, what REX_SYS_COUNT / REX_SYS_CENSUS count into.
 namespace rex::syscount {
 static std::atomic<uint64_t> g_census[kCensusCount]{};
+
+namespace {
+struct ExportEntry {
+  const char* name;
+  std::atomic<uint64_t> count{0};
+};
+std::mutex g_export_mutex;
+std::deque<ExportEntry>& ExportEntries() {
+  static std::deque<ExportEntry> entries;  // a deque: the counters never move
+  return entries;
+}
+}  // namespace
+
+std::atomic<uint64_t>* ExportCounter(const char* name) {
+  std::lock_guard<std::mutex> lock(g_export_mutex);
+  ExportEntry& entry = ExportEntries().emplace_back();
+  entry.name = name;
+  return &entry.count;
+}
+
+size_t ExportCensus(const char** names, uint64_t* counts, size_t capacity) {
+  std::vector<std::pair<uint64_t, const char*>> all;
+  {
+    std::lock_guard<std::mutex> lock(g_export_mutex);
+    for (const ExportEntry& entry : ExportEntries()) {
+      const uint64_t n = entry.count.load(std::memory_order_relaxed);
+      if (n) all.emplace_back(n, entry.name);
+    }
+  }
+  std::sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+  const size_t n = std::min(capacity, all.size());
+  for (size_t i = 0; i < n; ++i) {
+    names[i] = all[i].second;
+    counts[i] = all[i].first;
+  }
+  return n;
+}
 void Census(unsigned id, uint64_t n) {
   if (id < kCensusCount)
     g_census[id].store(g_census[id].load(std::memory_order_relaxed) + n, std::memory_order_relaxed);

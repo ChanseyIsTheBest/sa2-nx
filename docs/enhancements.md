@@ -1888,6 +1888,76 @@ critical sections a second, three times SA2).
 | 14 | A host call into guest code zero-fills a whole `PPCContext` first (its 128 vector registers alone are 2 KB) | - | 117 | not built |
 | 15 | Each log statement expands to a formatted call inside a try / catch in the function that logs | 2,271 handler sites | - | not built (code layout) |
 
+### The third CPU round of 2026-10-12: searched, built and audited; six items kept, three dropped
+
+The user's request: search, build and audit another fifteen improvements that fit any ReXGlue port. Fifteen that hold
+up were not there to find in one pass. What follows is everything that was tried: six items kept, three measuring
+tools, three experiments dropped with their numbers, and the audit. PC-verified only, like the rounds above.
+
+#### Kept
+
+| Item | Where | What was measured |
+|---|---|---|
+| Guest registers as C++ locals for the length of a call-free loop | `tools/loop_locals.py` (`SA2_GEN_LOOP_LOCALS`) | 5,767 loop regions in 3,044 functions, 25,967 registers (5,283 only read). In `sub_8286ADC8`'s loop the seven loads and stores of ctx per iteration are gone and the body is 33 instructions instead of about 45. The barrier stays. Whole files: instructions unchanged, 0.8 to 1.6 % fewer loads |
+| Promoted calls with two or three targets | `tools/indirect_calls.py`, `tools/indirect_promotions.py` | 243 sites (21 with several targets): the guards catch 84.9 % of the census's indirect calls, up from 80.6 %. 74.3 million promoted calls checked in one run, 0 wrong |
+| The integer divisions as the instruction | generator option `div_inline`, `rex::ppc::divw` ... | 1,978 sites. With the Switch compiler: `divwu` 2 instructions instead of 4, `divw` 6 instead of 9, no branch; a constant divisor still becomes a multiplication |
+| Vector loads from read-only data as constants | `tools/ro_constants.py` (`REX_RO_V128`) | 94 `lvx` sites; they ran 22 million times in one PC run (about 1,300 a frame). A literal instead of a guest load, REV64 and EXT |
+| `kernel_state()` inline off Windows | `rex/system/kernel_state.h` | 378 call sites in the runtime, 12,000 calls a second in SA2. The PC build keeps the function (the pointer is in the runtime DLL), so this one is compile-checked only |
+| Every start checks the forms only one processor has | `app/src/cpu/sa2_forms_selfcheck.cpp` | 248 results (the conversions to integer, the divisions, the float copies, twelve vector helpers, the two saturating conversions) against plain C++ references; one `[enh] instruction forms self-check` line. On the PC it proves the expected values; on the console it is the first time the AArch64 forms run. Not a speed item: the idea is banjo-nx's |
+
+#### Measuring tools that came out of it
+
+- `tools/loop_body_census.py`: instructions, loads and stores inside loops of an AArch64 object (a file's size cannot
+  judge a change inside loops).
+- A census of calls per kernel export (`rex/hook.h` counts every `REX_EXPORT` in PC builds; `[census] kernel exports
+  by calls`). SA2's attract demo: `RtlLeaveCriticalSection` 28,000 a second, then nothing above 900 a second
+  (`NtWaitForSingleObjectEx`, `NtSetEvent`, `KeSetEvent`, `KeTlsGetValue` ...). Beyond the critical sections the
+  kernel side has nothing left to win in this game.
+- CPU cycles per thread over a lockstep capture (`[capture] CPU over the N recorded frames`). Two identical runs
+  differed by 13 % on the game thread, so it shows proportions (the renderer's command thread costs about three times
+  the game thread on the PC), not a step's gain.
+
+#### Tried and dropped
+
+All three wanted the same thing as the first item: a loop barrier that does not force every ctx register through
+memory on each iteration.
+
+| Experiment | Result with the Switch compiler | Why it was dropped |
+|---|---|---|
+| The loop's own loads as volatile reads instead of a barrier | +1.2 / +2.3 / +3.0 % instructions, +2.0 to +5.9 % loads | A volatile load cannot take its value from a store of the same iteration, and the game stores an integer to the stack and loads it back as a float all the time |
+| The guest-memory base pointer made opaque at the loop header | +3.4 / +4.5 / +3.3 % instructions, +5.8 to +7.9 % loads | The compiler then no longer believes that guest stores leave ctx alone and reloads ctx after every one of them |
+| An opaque zero added to the base pointer at the loop header | +1.3 / +3.5 / +1.1 % instructions; in one loop 7 loads and stores of ctx per iteration became 1 | It works as intended in the loop looked at, but the files grow, the gain cannot be shown without the console, and it changes the one mechanism that keeps waiting loops from hanging. The first item reaches the same loops and leaves that mechanism alone |
+
+#### The audit
+
+1. **Loop locals load every register the loop mentions on the way in.** A loop that usually runs once loads a few
+   registers it then does not use. Half of the regions carry at most 4 registers, 90 % at most 8, none more than
+   22, so that cost is small and bounded; from the second iteration on the step only saves. Every `goto` keeps its
+   plain shape (jumps across a region's border go through stubs), which the other tools depend on: without that a
+   second run of the post-codegen sequence lost flush-mode proofs and added barriers.
+2. **The divisions use inline assembly**, which hides them from the compiler: it cannot merge two equal divisions
+   any more. A divisor known at compile time keeps the C expression for that reason.
+3. **`kernel_state()` inline has not run anywhere yet**: the PC keeps the old form. It reads the same pointer.
+4. **A second or third guard** costs one compare more on the calls that match none (under 0.5 % of a promoted
+   site's calls by the rule that selects them).
+5. **Vector constants** rest on the same assumption as the scalar ones (nothing writes the image's `.rdata`); the PC
+   build compares each one with memory every time it runs.
+6. **The forms self-check** can only raise a false alarm, never hide a fault; its expected values are proven by
+   the PC run of the same table.
+
+#### Verification (PC, the round's final build)
+
+- Lockstep capture against `r2f_crcensus0`: 2,926 of 2,979 frames identical in place, the other 53 the known
+  loading frames; the same in verify mode (1,943 of 1,996) and with the run-time keys off (2,930 of 2,983).
+- Verify mode: 208.8 million native checks, 0 differences. Self-checks of one run: 81.6 million folded constants,
+  74.3 million promoted calls, 7.8 million critical section owners, 0 wrong. Forms self-check: 248 of 248.
+- The post-codegen sequence run twice leaves the tree unchanged (compared by hash).
+- Switch compiler: the changed and new sources and four generated files compile; `tools/arm_forms_check.py` holds
+  (now also the divisions); no `fcvtas` in the generated objects (the old rounding, as banjo-nx checks it).
+
+Of the SDK list above, this round built items 4 (`kernel_state()`), 12 (several targets per site) and 13 (the
+divisions).
+
 ## Build-time: the codegen flavour (A/B NRO pair)
 
 These options cannot be switched at run time:

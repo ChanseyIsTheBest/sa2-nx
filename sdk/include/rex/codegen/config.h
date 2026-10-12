@@ -152,6 +152,12 @@ struct RecompilerConfig {
   // sa2-nx (second CPU round): dcbt / dcbtst as REX_PREFETCH (the host's prefetch of the same address) instead
   // of nothing. A hint: no effect on any value.
   bool dcbtPrefetch = false;
+  // sa2-nx (third CPU round, 2026-10-12): divw / divwu / divd / divdu through rex::ppc::divw ... (rex/ppc/diet_ops.h)
+  // instead of the guarded C division. The guards exist because dividing by zero (and INT_MIN / -1) is undefined in
+  // C; AArch64's sdiv / udiv define both (0 for a zero divisor), so there the helper is the instruction, plus one
+  // select for the signed overflow case, without a branch. Same results on every platform. A divisor the compiler
+  // knows keeps the C expression (it turns that into a multiplication).
+  bool divInline = false;
   std::unordered_set<uint32_t> lrKeepReturns;
   bool ctrAsLocalVariable = false;
   bool xerAsLocalVariable = false;

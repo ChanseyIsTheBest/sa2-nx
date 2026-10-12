@@ -70,6 +70,11 @@ uint64_t CensusRead(unsigned id);
 void CensusSite(unsigned id);
 void CensusSitesEnable(bool on);
 size_t CensusSites(uint64_t* addresses, uint64_t* counts, size_t capacity);
+// Calls per kernel export (third survey, 2026-10-12): every REX_HOOK / REX_EXPORT counts itself here in PC builds,
+// so a run shows which host functions the game calls most. ExportCounter returns the export's counter (created
+// on first use; call it once per export and keep the pointer); ExportCensus copies the `capacity` most called.
+std::atomic<uint64_t>* ExportCounter(const char* name);
+size_t ExportCensus(const char** names, uint64_t* counts, size_t capacity);
 #endif
 
 }  // namespace rex::syscount

@@ -22,6 +22,10 @@ manifest, a toml, the xex, the generator binary) and that would otherwise drop t
       tools/frame_traffic.py    the link register and the non-volatile saves of the function prologues
       tools/leaf_locals.py      the ctx registers of leaf functions with loops as locals. Last: it renames registers.
       tools/pch_cold_traps.py   the pch's trap helper (before every division) out of line and cold
+  - optimised, the third CPU round of 2026-10-12:
+      tools/loop_locals.py      the ctx registers a call-free loop uses as locals for the length of the loop (the
+                                barrier stays). After loop_barriers.py, before the localized copies and
+                                leaf_locals.py (which takes the leaf functions).
     ro_constants.py and the entry modes of flush_mode_flow.py need the generator's image dump (out/default_image.bin,
     written by tools/codegen.ps1 through REXGLUE_DUMP_IMAGE); the steps whose PC form calls into the app
     (indirect_calls, ro_constants) run on the game's tree only, not on the stage module (a DLL of its own on the PC);
@@ -101,6 +105,11 @@ def main():
         for tree in trees:
             run(tool('float_loads.py'), '--gen', os.path.join(gen, tree))
             run(tool('frame_traffic.py'), '--gen', os.path.join(gen, tree))
+    if optimised:
+        for tree in trees:
+            # Third round: the ctx registers of call-free loops as locals for the length of the loop. Before the
+            # localized copies, which are made from this text and rename its ctx registers once more.
+            run(tool('loop_locals.py'), '--gen', os.path.join(gen, tree))
     if not scratch:
         # Before leaf_locals.py in a fresh tree; after it when this script runs again (the tool reads both forms).
         run(tool('localize_native.py'), '--list', os.path.join(APP, 'src', 'cpu', 'hot', 'localized.txt'))

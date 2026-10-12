@@ -112,6 +112,54 @@ inline int64_t fctiw(double v) noexcept {
 #endif
 }
 
+/// sa2-nx, third CPU round (codegen option div_inline): the integer divisions with the results the generated
+/// expressions gave: 0 for a zero divisor, 0 for the signed overflow (INT_MIN / -1), the C quotient otherwise.
+/// On AArch64 `udiv` / `sdiv` are defined for a zero divisor (they answer 0) and never trap, so the unsigned ones
+/// are the instruction alone and the signed ones add a select for the overflow, which `sdiv` answers with INT_MIN.
+/// The C expression needs its guards (division by zero is undefined there) and the compiler keeps them as a branch.
+/// A divisor known at compile time keeps the C expression: the compiler makes a multiplication of it.
+inline uint32_t divwu(uint32_t n, uint32_t d) noexcept {
+#if defined(__aarch64__)
+  if (!__builtin_constant_p(d)) {
+    uint32_t q;
+    asm("udiv %w0, %w1, %w2" : "=r"(q) : "r"(n), "r"(d));
+    return q;
+  }
+#endif
+  return d ? n / d : 0;
+}
+inline uint64_t divdu(uint64_t n, uint64_t d) noexcept {
+#if defined(__aarch64__)
+  if (!__builtin_constant_p(d)) {
+    uint64_t q;
+    asm("udiv %x0, %x1, %x2" : "=r"(q) : "r"(n), "r"(d));
+    return q;
+  }
+#endif
+  return d ? n / d : 0;
+}
+/// The result as the zero-extended word the old expression assigned to the 64-bit register.
+inline uint32_t divw(int32_t n, int32_t d) noexcept {
+#if defined(__aarch64__)
+  if (!__builtin_constant_p(d)) {
+    int32_t q;
+    asm("sdiv %w0, %w1, %w2" : "=r"(q) : "r"(n), "r"(d));
+    return uint32_t((n == INT32_MIN && d == -1) ? 0 : q);
+  }
+#endif
+  return uint32_t((d && !(n == INT32_MIN && d == -1)) ? n / d : 0);
+}
+inline int64_t divd(int64_t n, int64_t d) noexcept {
+#if defined(__aarch64__)
+  if (!__builtin_constant_p(d)) {
+    int64_t q;
+    asm("sdiv %x0, %x1, %x2" : "=r"(q) : "r"(n), "r"(d));
+    return (n == INT64_MIN && d == -1) ? 0 : q;
+  }
+#endif
+  return (d && !(n == INT64_MIN && d == -1)) ? n / d : 0;
+}
+
 /// Codegen option fp_copy_pairs: lfs directly followed by stfs of the same register.
 ///
 /// lfs without a mode: the value `double(float)` gives with the flush mode off, in either mode and without touching

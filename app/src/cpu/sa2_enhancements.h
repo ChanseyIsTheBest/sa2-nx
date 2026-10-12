@@ -75,6 +75,11 @@ bool VerifyMode();
 void CodegenChecksInit();
 void CodegenChecksReport(int seconds);
 
+// Runs every helper that has a form for one processor only (the conversions to integer, the divisions, the float
+// copies, the small VMX helpers) on fixed edge inputs against plain C++ references and logs the result
+// (sa2_forms_selfcheck.cpp). Once, from Resolve: on the console it is the first time the AArch64 forms run.
+void FormsSelfCheck();
+
 // Non-CPU: the handheld GPU profile (sa2_gpu_boost; sa2_gpu_boost.cpp). Called once by the app before setup.
 void ApplyGpuBoost();
 
