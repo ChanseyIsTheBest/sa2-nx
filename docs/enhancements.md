@@ -1144,6 +1144,52 @@ per-category GPU timestamps and the resolve log (`sa2_diag_resolves_from`, `sa2_
   what the hardware shows too. Of the 60 distinct textures the agent traced, all 56 linear ones were CPU textures and
   all 4 tiled ones were resolves.
 
+### `sa2_native_partial_resolve_inside`: a whole texture is not a rectangle of a freed one (Chao garden fix, 2026-10-13)
+
+- **The bug:** two photos of version 1.0.0 on the console, playing as Rouge. The Chao garden's grass near the camera
+  and the floor, one roof and some blocks of the kindergarten's classroom were covered in black speckles and
+  comb-shaped blocks. It happened in one session. The player could not make it happen again, and no PC session showed
+  it by itself: Rouge or Sonic straight into the garden, the classroom, a simulated docking, the garden twice, City
+  Escape and Wild Canyon first.
+- **What the picture is:** both scenes draw their ground with a pixel shader that samples a 512x512 shadow map the
+  game renders and resolves every frame (the garden's second one on sampler 6, the classroom's on sampler 5). As
+  Rouge after a fresh start, the game allocates it at 1CB62000 in both scenes. When that sampler reads guest memory
+  instead of the resolved texture, the PC shows the photos' pattern mark for mark. Nothing is ever resolved into
+  guest memory, so it still holds the Chao lobby's freed textures, read as a tiled 8888 texture.
+- **How a resolve loses its texture:** `SearchResolvedPartial` (from banjo-nx: Nuts & Bolts resolves one texture in
+  several rectangles, each with the destination address advanced to its tile) takes a resolve whose destination is a
+  tile offset of an existing resolved texture for a rectangle of that texture and writes it there.
+  - It checked that the rectangle fits below that offset, but not beside it, nor that the resolve declares that
+    texture's size.
+  - `resolved_` keeps every resolved texture for the session, also after the game frees its memory. One PC session
+    through City Escape and Wild Canyon left 8 such 512x512 textures, and the attract demo's first 9,000 frames
+    leave 5.
+  - A whole 512x512 texture that the game allocates 1 to 15 pages (4 KB each: one 32-texel tile column) above one
+    of them was therefore written into the old texture, 32 texels to the right per page, and got none of its own.
+    The draws that sample the new address then read guest memory.
+- **The fix:** a resolve is a later rectangle of an existing texture only when it declares that texture's size and
+  its rectangle lies inside it. Otherwise it gets its own texture, as any new destination does. The depth resolve
+  uses the same rule.
+- **Why it leaves everything else as it was:** the rule only refuses resolves the old one took for a rectangle. SA2
+  itself never resolves in parts: none of 50 PC runs (menus, two stages, the Chao lobby, garden and kindergarten,
+  the attract demo) logged a `partial resolve` line. Only the forced runs below did.
+- **Tests (PC):** `sa2_diag_stale_resolved = "BASE:PAGES[:HEIGHT]"` creates the stale texture a played stage would
+  leave, PAGES pages below the first resolve to BASE, through the same `GetResolved` a real resolve uses.
+  - `1CB62000:4`, garden and classroom as Rouge. Fix off: the log says `partial resolve: advanced base 1CB62000
+    belongs to 1CB5E000; local destination 128,0` and both scenes show the photos' corruption. Fix on: `resolve to
+    1CB62000 ... is not a rectangle of it: it gets its own texture`, and both scenes are drawn right.
+  - `1CB62000:16:1024` (a taller texture one tile row below; the declared-size half of the rule): the same.
+  - Lockstep capture of the attract demo, 3,000 frames from game frame 6000: every frame the fixed build shares
+    with the unchanged build is identical (2,974 with the fix on, 2,999 with it off), and so are the 2,973 the two
+    settings share. The other frames of each run fall outside the other run's 3,000.
+- **Not verified:** that the console session had such a stale texture below the shadow map. Version 1.0.0 writes no
+  log. What the photos establish is that the sampler read guest memory. The other ways `ResolvedTexture` can fail
+  for an address that is resolved every frame (a resolve that is rejected, or an image left unprepared by a render
+  scale change until its next resolve) were not seen in any run.
+- **Log:** `[native] targets: resolve to X ... is not a rectangle of it: it gets its own texture` once per pair of
+  addresses, and `sa2_native_partial_resolve_inside N` in the `[enh] uses` line.
+- **Off:** `sa2_native_partial_resolve_inside = false`.
+
 ### GPU round 2 (2026-10-07): per-draw constant traffic and per-vertex/pixel tests, from round 8's console log
 
 Six keys (all `kNonCpu`, default on; `REX_SA2_GPU_<KEY>=false` turns one off). Four need the shader package of this

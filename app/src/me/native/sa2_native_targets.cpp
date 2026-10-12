@@ -131,6 +131,25 @@ SA2_ENHANCEMENT(g_resolve_alias, sa2_gpu_resolve_alias, sa2::enh::kNonCpu, true,
                 "between) into another texture is not copied; that texture takes the bytes of the first one when "
                 "something reads it or before the first one changes (a copy, or an exchange of the two images when "
                 "the first one is overwritten whole). SA2's 1E8A0000 and 1F6F8000 are never read");
+// Chao garden / kindergarten fix (2026-10-13; the user's console photos of black speckles on the garden's grass and
+// the classroom's floor). SearchResolvedPartial takes a resolve whose destination is a tile offset of an existing
+// resolved texture for a later rectangle of that texture (predicated tiling) and writes it there. It checked that the
+// rectangle fits below that offset but not beside it, so a WHOLE 512x512 shadow map that the game allocated 1 to 15
+// pages (4 KB each: one 32-texel tile column) above an older 512x512 one, still in resolved_ after the game freed it,
+// was written into the old texture and got none of its own. The draws that sample the new address then read guest
+// memory, where nothing was ever resolved (the leftovers of other textures, read as a tiled 8888 texture).
+// docs/enhancements.md has the evidence and what is not verified (the console's own trigger).
+SA2_ENHANCEMENT(g_partial_inside, sa2_native_partial_resolve_inside, sa2::enh::kNonCpu, true,
+                "Renderer: a resolve is a later rectangle of an existing resolved texture only when it declares that "
+                "texture's size and its rectangle lies inside it; a whole texture allocated a few pages above a "
+                "freed one of the same size gets its own texture instead of being written into the old one (the "
+                "Chao garden's and kindergarten's shadow maps)");
+// Test of sa2_native_partial_resolve_inside: leaves the stale texture that triggers it (no stage has to be played).
+REXCVAR_DEFINE_STRING(sa2_diag_stale_resolved, "", "SA2",
+                      "Diagnostic: 'BASE:PAGES[:HEIGHT]' (BASE in hex, as in the log's 'resolved texture at' "
+                      "line). Before the first color resolve to guest address BASE, a resolved texture of the same "
+                      "width and format (and HEIGHT, default the same) is created PAGES 4 KB pages below it, as an "
+                      "earlier resolve to memory the game has since freed leaves it. Empty = off");
 SA2_ENHANCEMENT(g_edram_memo, sa2_cpu_ring_edram_memo, sa2::enh::kCpu, true,
                 "Ring thread: a draw with the same render-target state as the previous draw reuses its EDRAM preparation "
                 "(only when the full path would do no work: same images, tiles owned in the same epoch, nothing pending; "
@@ -1634,10 +1653,13 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
         // banjo-nx: the rows really copied, not the destination height: Nuts & Bolts resolves its second predicated
         // tile (rows 384..719) with the base advanced by 384 rows and the full 1280x720 destination size, which
         // overran the 1280x720 texture of the first tile and became a texture of its own (bottom half missing).
+        DiagStaleResolved(base_resolved, pitch_target, target_height, target_format, (info_target >> 24) & 0x1,
+                          host_format_target);  // sa2_diag_stale_resolved (off by default)
         resolved = SearchResolvedPartial(base_resolved, pitch_target,
                                          std::min(target_height, uint32_t(std::max(y1 - y0, 0))),
                                          target_format, (info_target >> 24) & 0x1,
-                                         host_format_target, log2_texel, base_resolved, dx, dy);
+                                         host_format_target, log2_texel, base_resolved, dx, dy,
+                                         std::min(pitch_target, uint32_t(std::max(x1 - x0, 0))), target_height);
         if (!resolved) {
           resolved = GetResolved(base_resolved, pitch_target, target_height, target_format,
                                      (info_target >> 24) & 0x1, host_format_target);
@@ -2137,7 +2159,9 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
     Resolved* resolved = SearchResolvedPartial(base_resolved, resolved_width,
                                                std::min(resolved_height, uint32_t(std::max(y1 - y0, 0))),
                                                texture_format, false, resolved_host_format, 2,
-                                               base_resolved, dx, dy);
+                                               base_resolved, dx, dy,
+                                               std::min(resolved_width, uint32_t(std::max(x1 - x0, 0))),
+                                               resolved_height);
     if (!resolved) {
       resolved = GetResolved(base_resolved, resolved_width, resolved_height,
                                  texture_format, false, resolved_host_format);
@@ -8335,10 +8359,15 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
   // D3D9 advances RB_COPY_DEST_BASE by the tiled byte offset and sends local (0,0)-based vertices again.
   // Such a base is not a new texture: locate the already-created parent image and turn the physical base
   // delta back into a destination x/y. This is format/geometry based and applies equally to color and depth.
+  // sa2_native_partial_resolve_inside: such a rectangle belongs to the texture its command declares (`segment_width` x
+  // `declared_height`, the destination's own size) and lies inside it: `rect_width` columns from its x offset, as its
+  // rows from its y offset. A resolve that fails either is a texture of its own whose memory merely starts inside a
+  // resolved texture's (the game freed that one and allocated this one a few pages higher): it gets its own image.
   Resolved* SearchResolvedPartial(uint32_t base_segment, uint32_t segment_width,
                                   uint32_t segment_height, uint32_t guest_format,
                                   bool swap_rb, VkFormat host_format, uint32_t log2_texel,
-                                  uint32_t& base_resolved, uint32_t& dx, uint32_t& dy) {
+                                  uint32_t& base_resolved, uint32_t& dx, uint32_t& dy,
+                                  uint32_t rect_width, uint32_t declared_height) {
     if (resolved_.count(base_segment)) {
       return nullptr;  // An exact texture at this address takes precedence.
     }
@@ -8359,6 +8388,19 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
               y + dy + segment_height > candidate.image.height) {
             continue;
           }
+          if (g_partial_inside.active && (candidate.image.height != declared_height ||
+                                          x + dx + rect_width > candidate.image.width)) {
+            g_partial_inside.Use();
+            const uint64_t key = (uint64_t(base_candidate) << 32) | base_segment;
+            if (partial_refused_.insert(key).second) {
+              REXLOG_INFO("[native] targets: resolve to {:08X} ({}x{}, rectangle {}x{}) starts inside the resolved "
+                          "texture at {:08X} ({}x{}), at {},{}, but is not a rectangle of it: it gets its own texture "
+                          "(sa2_native_partial_resolve_inside)",
+                          base_segment, segment_width, declared_height, rect_width, segment_height, base_candidate,
+                          candidate.image.width, candidate.image.height, x + dx, y + dy);
+            }
+            continue;
+          }
           base_resolved = base_candidate;
           dx += x;
           dy += y;
@@ -8374,6 +8416,37 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
       }
     }
     return nullptr;
+  }
+
+  // sa2_diag_stale_resolved = "BASE:PAGES[:HEIGHT]". Called with every color resolve's destination before it is looked
+  // up: ahead of the first resolve to BASE, the resolved texture an earlier resolve PAGES pages below it would have
+  // left is created, through the same GetResolved a real one goes through. Nothing else is touched.
+  void DiagStaleResolved(uint32_t base, uint32_t width, uint32_t height, uint32_t guest_format, bool swap_rb,
+                         VkFormat host_format) {
+    struct Request {
+      uint32_t base = 0, pages = 0, height = 0;
+    };
+    static const Request request = [] {
+      Request r;
+      const std::string text = REXCVAR_GET(sa2_diag_stale_resolved);
+      unsigned int b = 0, p = 0, h = 0;
+      if (std::sscanf(text.c_str(), "%x:%u:%u", &b, &p, &h) >= 2) {
+        r.base = b & 0x1FFFFFFFu;
+        r.pages = p;
+        r.height = h;
+      }
+      return r;
+    }();
+    if (!request.pages || base != request.base || diag_stale_done_ || resolved_.count(base)) return;
+    diag_stale_done_ = true;
+    const uint32_t stale = (base - request.pages * 4096u) & 0x1FFFFFFFu;
+    const uint32_t stale_height = request.height ? request.height : height;
+    const bool made = !resolved_.count(stale) &&
+                      GetResolved(stale, width, stale_height, guest_format, swap_rb, host_format) != nullptr;
+    REXLOG_INFO("[native] targets: sa2_diag_stale_resolved: {} a {}x{} format {} resolved texture at {:08X}, {} pages "
+                "below the new destination {:08X} ({}x{})",
+                made ? "left" : "could NOT leave", width, stale_height, guest_format, stale, request.pages, base, width,
+                height);
   }
 
   void ResolvedReportPool(bool detail = false) {
@@ -10484,6 +10557,8 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
   uint64_t resolved_pool_allocations_ = 0, resolved_pool_ineligible_ = 0, resolved_pool_busy_ = 0;
   std::chrono::steady_clock::time_point resolved_pool_report_{};
   std::unordered_set<uint64_t> partial_recorded_;
+  std::unordered_set<uint64_t> partial_refused_;  // sa2_native_partial_resolve_inside: pairs already logged
+  bool diag_stale_done_ = false;                  // sa2_diag_stale_resolved: made its texture
   VkRect2D area_edram_{};
   uint32_t msaa_edram_actual_ = 0;
   // sa2-nx render resolution: the scale (quarters of the guest size, me_resolution_scale.h) new images are created at;
