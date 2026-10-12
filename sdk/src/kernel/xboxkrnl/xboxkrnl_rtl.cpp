@@ -384,6 +384,7 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
 }
 
 void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+  REX_SYS_CENSUS(rex::syscount::kCensusCritSecEnter, 1);
   uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
   uint32_t spin_count = cs->header.absolute * 256;
   if (spin_count == 0) {
@@ -394,6 +395,7 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 
   if (cs->owning_thread == cur_thread) {
     // We already own the lock.
+    REX_SYS_CENSUS(rex::syscount::kCensusCritSecRecursive, 1);
     rex::thread::atomic_inc(&cs->lock_count);
     cs->recursion_count++;
     return;
@@ -425,6 +427,7 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
 }
 
 u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+  REX_SYS_CENSUS(rex::syscount::kCensusTryEnter, 1);
   uint32_t thread = XThread::GetCurrentThread()->guest_object();
 
   if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {

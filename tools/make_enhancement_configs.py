@@ -30,6 +30,8 @@ in what its name says (docs/enhancements.md):
   sa2_test_vsync_relaxed_off.toml the old fixed vsync (a frame that misses 60 waits for the next vblank), profiler on
   sa2_test_round13_off.toml       round 13's hand-written vertex loaders, njCalcPoint and njMultiMatrix off, profiler on
   sa2_test_vs_fetch_reorder_off.toml  vertex shaders Direct3D reordered dropped again unless the package has them, profiler on
+  sa2_test_cpu_round12_off.toml   the run-time keys of the CPU round of 2026-10-12 off (the dmb back after every
+                                  compare-and-swap, shared hook counters, a notify on every signal), profiler on (A/B)
 
 The profiler is on in sa2.toml itself and in every configuration except sa2_cpu_verify.toml (2026-10-06, the user's
 choice: every test run brings its profile; verify is slow anyway): sa2_gpu_marks_categories = true (GPU time per
@@ -121,6 +123,11 @@ VARIANTS = {
     # 2026-10-07: vertex shaders Direct3D loads with their fetches reordered are no longer identified by the run-time
     # proof (the Chao garden's stats window: drawn only if the package has a container repaired for that order).
     'sa2_test_vs_fetch_reorder_off.toml': {'sa2_gpu_vs_fetch_reorder': 'false', **PROFILING},
+    # 2026-10-12 (sasrt-nx's CPU round): what can be switched without a second NRO. The barrier key puts the `dmb ish`
+    # back after every guest and SDK compare-and-swap; the generator options, the flush-mode proofs, the vector forms
+    # and the frame pointer are build-time (app/CMakeLists.txt, SA2_SWITCH_*; app/perf_overrides.toml).
+    'sa2_test_cpu_round12_off.toml': {'sa2_cpu_guest_cas_no_barrier': 'false', 'sa2_cpu_hook_counter_ctx': 'false',
+                                      'thread_signal_skip_idle': 'false', **PROFILING},
     'sa2_test_driver_paths_off.toml': {'sa2_native_set4_differences': 'false',
                                        'sa2_native_nvk_emission': 'false', 'sa2_native_nvk_cbufs': 'false',
                                        'sa2_native_nvk_dynamic': 'false', 'sa2_native_nvk_preload': 'false',

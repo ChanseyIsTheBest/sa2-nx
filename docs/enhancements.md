@@ -1560,6 +1560,188 @@ These changes concern the release itself, not performance.
   - Credits to masseffect-nx and notes about what was found in Mass Effect stay as they were, as do the shader
     translator's own names (its output must not change).
 
+### The CPU round of 2026-10-12 (sasrt-nx's): measured first, ported, checked on the PC
+
+sasrt-nx found 1.4 to 2.1 million host float-mode switches a second in a race (each an `msr fpcr` on the A57) and
+built thirteen changes around that and around the lock words, most of them in the generator, the post-codegen tools
+and the SDK. The user asked for the same in SA2: measure first, port what sasrt-nx had built and verified, try to
+verify what it had not, stop before any NRO. Everything below is on the branch `cpu-round-2026-10-12`; **no NRO was
+built from it and nothing here ran on the console.**
+
+#### Step 0: the census, on SA2
+
+`sa2_diag_runtime_census = true` (PC builds only; the SDK's `rex/sys_counters.h` counts nothing of it on the Switch)
+logs, with every `[enh] uses` report, the real flush-mode writes, the code addresses they come from, and the calls of
+the runtime's lock and wait paths. `tools/census_summary.py <log> --capture` turns the lines into per-Swap figures
+over the span of a lockstep capture (the same game frames in every run); `tools/census_sites.py <log>` names the
+functions.
+
+The released code (the run `sa2_292`, lockstep, 3,000 frames from game frame 6000: title, loading, the City Escape
+2-player demo), against what sasrt-nx measured in a race:
+
+| per second, PC | SA2 | sasrt-nx |
+|---|---|---|
+| flush-mode switches | 80,400 (1,368 per Swap) | 1,400,000-2,100,000 (60,800 per Swap) |
+| critical sections entered | 25,700 (437 per Swap) | 85,000 |
+| events set / semaphores released | 1,850 / 750 | 12,400 / 6,650 |
+| waits | 1,800 | 8,900 |
+| handle lookups under the global lock | 7,400 | 31,000 |
+
+So SA2 switches the mode about 45 times less often per frame, and about 60 % of what it does switch comes from
+five localized copies: a vector matrix multiply (`n_82140A90`) calling scalar matrix copies (`n_82146E48`,
+`n_82146DD8`), and `n_82833568` / `n_82832B78`. SA2's float code is scalar almost everywhere: the generated code
+has 40,146 "switch off" checks against 136 "switch on" ones.
+
+#### What was ported, and how each was checked
+
+| Change (sasrt-nx's status) | In SA2 | Switch | Checked by |
+|---|---|---|---|
+| `fp_compares_modeless` (built) | on | `app/perf_overrides.toml` | unit test, lockstep, verify mode |
+| `fp_mode_lookahead` (built; its "mode-free" refinement PC only) | on, **without** the bet past a branch (below) | `fp_mode_lookahead`, `fp_mode_lookahead_past_branch = false` | unit test, lockstep, verify mode, the any-mode census |
+| `rotate_word_narrow` (PC only) | ported, **left off** | `app/perf_overrides.toml` | exact (unit test, 2.57 million comparisons; lockstep and verify mode passed with it on), but no gain: with the Switch compiler three recompiled files came out 0.07-0.12 % larger (GCC folds the 64-bit form of an `srwi` into one `lsr`, the narrow one into `ror` + `and`) |
+| `tools/guest_cas.py`: `stwcx.` without the trailing `dmb` (built) | 592 sites | `SA2_SWITCH_GUEST_CAS`; run time: `sa2_cpu_guest_cas_no_barrier` | PC runs the rewritten expression; Switch compiler: `ldaxr` / `stlxr`, the `dmb` only behind the key |
+| The SDK's lock words inline, `__atomic` (atomic_posix.cpp built; inline in `atomic.h` not compiled for ARM) | on | the same run-time key | Switch compiler (`tools/arm_forms_check.py`); every use read (critical sections, spin locks, lists, bit map) |
+| `tools/flush_mode_flow.py` (built) | 15,477 of 40,168 checks proven | `SA2_SWITCH_FLUSH_FLOW` | every PC run tests each proof it executes |
+| `thread_signal_skip_idle` (built) | on | the SDK key (`thread_signal_skip_idle`) | protocol test, no lost wake-up; Switch compiler |
+| Hook call counters in the thread's context (built) | on, for the copies' use counters too | `sa2_cpu_hook_counter_ctx` | lockstep, verify mode, a run with the key off |
+| `-fomit-frame-pointer` on the game code (built) | on | `SA2_SWITCH_OMIT_FRAME_POINTER` | Switch compiler (a flag: nothing to run on the PC) |
+| `tools/vec_byteswap.py` (PC only) | 6,357 reversals, 1,293 table shuffles | `SA2_SWITCH_VEC_BYTESWAP` | unit test (4 million vectors); Switch compiler |
+| `tools/pch_neon_shuffles.py` (PC only, no test) | on | `SA2_SWITCH_NEON_SHUFFLES` | **new** unit test, 10.2 million comparisons over all 256 immediates; Switch compiler |
+| NEON forms of vperm, vctsxs, vctuxs (not compiled for ARM) | on | `SA2_SWITCH_NEON_VMX_HELPERS` | unit tests (19 million comparisons; all 2^32 inputs for the small helpers); Switch compiler: one `tbl`, `fcvtzs`, `fcvtzu` |
+| `sasrt_cpu_index_no_fingerprint`, `sasrt_cpu_ring_draw_trims` | **not ported** | - | SA2 made no indexed draw in 5.9 million draws of the census run: neither has anything to act on |
+| `sasrt_api_thread_stats` | **not ported** | - | SA2 has one drawing thread: the shared words it would move are written by that thread alone |
+
+The "Switch" options are CMake options of the Switch build (`app/CMakeLists.txt`), all on; each OFF defines the
+macro that puts the old form back. `configs/sa2_test_cpu_round12_off.toml` (`tools/make_enhancement_configs.py`)
+turns the three run-time keys off.
+
+#### What SA2 does differently: no any-mode conversions on a bet
+
+sasrt-nx's `fp_mode_lookahead` gives an `lfs` / `stfs` / `frsp` / `fcmpu` its any-mode form (a denormal test, about
+four instructions, instead of a mode check per function) in three cases: a vector instruction comes next; VMX mode
+is known to be current; or nothing that needs a mode follows before the next branch, in any function with vector
+float code and in small "mode-free" functions. The third is a bet on a switch that may come later.
+
+Counted on the PC (`REX_DIET_CENSUS_ON`: plain counters in the any-mode helpers of `rex/ppc/diet_ops.h`, compiled
+into PC builds of the game code only), over the capture span:
+
+| generator rule | any-mode sites | executed per Swap | flush-mode switches per Swap |
+|---|---|---|---|
+| the released code (`fp_moves_modeless` only) | 104 | not counted | 1,368 |
+| sasrt-nx's rule as shipped | 8,949 | 93,656 conversions, 404 compares | 1,359 |
+| without the bet (`fp_mode_lookahead_past_branch = false`) | 205 | 29,813 conversions | 1,346 |
+
+With the bet SA2 ran 94,000 tests a frame, each about four instructions, to save nine switches a frame in play
+(about 180 a frame over the whole run, in the menus): a loss by any plausible cost of an `msr fpcr`. Without it the
+any-mode forms stay where they replace a switch for certain. `fp_mode_lookahead_past_branch` is a new generator
+option (default true: sasrt-nx's behaviour; `sdk/include/rex/codegen/config.h`). Over the first 150 s of the run
+(menus included) the switches per Swap are 928 in the released code, 744 with sasrt-nx's rule and 921 without
+the bet.
+
+What is left in SA2 is real alternation: the matrix multiply in vector code calls matrix copies that load and store
+sixteen floats through the float registers. A copy that needs no mode (one test per load / store pair, or none) is
+candidate 3 of the next round's list.
+
+#### Why each is exact
+
+sasrt-nx's arguments, read again against SA2's code:
+
+- **Any-mode helpers:** each returns, in either mode, the bits the plain expression gives with the mode off
+  (`sdk/tests/fp_any_mode_test.cpp`). The generator only chooses between two exact forms, so the lists it decides by
+  cannot produce a wrong result (they were still compared with SA2's builders: they match).
+- **Compare-and-swap without the barrier:** `lwarx` / `stwcx.` order nothing on PowerPC; the game's own `lwsync` /
+  `sync` / `eieio` are translated separately. The SDK's lock words (critical sections, spin locks, interlocked
+  lists, the bit map) are each read and written only through these atomics, and acquire/release exclusives are what
+  every C++ mutex on AArch64 is built from.
+- **Flush-mode proofs:** a forward must-dataflow per function with callee summaries; anything that hands `ctx` to
+  other code resets it. SA2's addition: `--redo`. A proof depends on which callees are called directly, and
+  `tools/direct_calls.py --redo` turns the calls of a newly hooked function back into hooked calls; proofs from
+  before would be stale. `tools/post_codegen.py` therefore undoes and proves again after `direct_calls.py`, writing
+  only files that change.
+- **Skipped notifies:** a waiter is counted under the condition's mutex before the wait releases it, and the
+  signaller reads the count together with its state change. The interrupt path, mutants, timers and thread handles
+  notify as before.
+- **Byte reversal, shuffles, NEON helpers (and the narrow rotates):** identities, each with a test that compares
+  the two forms.
+
+#### Checks
+
+Unit tests (`tools\win\run_sdk_tests.ps1`, PC, clang; `sdk/tests/`):
+
+| test | result |
+|---|---|
+| `fp_any_mode_test` | 600,081,920 comparisons, 0 differences; negative control 448,806 differences |
+| `rotate_word_test` | 2,568,192 comparisons, 0 differences (and the wrapping masks do need the old form) |
+| `signal_skip_idle_test` | 19.7 million signals notified, 3.4 million skipped, no lost wake-up |
+| `vec_byteswap_test` | 4,004,081 vectors, 0 differences |
+| `vmx_helpers_neon_test` | 19,006,688 comparisons, 0 differences |
+| `vmx_small_helpers_test` | all 2^32 inputs of vcfux, 6 million pairs of the others, 0 differences |
+| `neon_shuffles_test` (new) | 10,240,512 comparisons, 0 differences |
+
+PC runs of the final build (lockstep, 3,000 frames from game frame 6000):
+
+- **Frames:** all 2,997 frames in common with the baseline run (`r2f_crcensus0`: the released code with the counters) have a pixel-identical frame there: 2,944 at the same position, and the 53 frames of the loading screen one animation step apart (its ring and its Omochao run on the loading thread's timing). Against the previous build of this branch: 3,000 of 3,000 identical.
+- **Verify mode** (`sa2_301`): 208,122,035 native replacement checks, 0 differences; the native Direct3D layer compared 3,519,467 records with the original, 0 differences; no `DIFFERENCE` or `MISMATCH` line.
+- **Flush-mode proofs:** every PC run tests each proof it executes (`REX_FLUSH_KNOWN_*` keeps its test off the
+  Switch and reports to `RexFlushFlowMismatch`); the `[verify] flush-mode flow` line counts them. 508,240,316 in the census run and 1,077,244,266 in the verify run, none wrong.
+- **Run-time keys off** (`sa2_cpu_hook_counter_ctx`, `sa2_cpu_guest_cas_no_barrier`): 2,999 of 2,999 frames identical to the default run of the same build (the build before the last regeneration); the log shows the old counters in use.
+
+With the Switch compiler, without building the NRO (devkitA64, the Switch build's own flags from `out/nx`):
+
+- `tools/arm_forms_check.py`: the `__atomic` lock words are `ldaxr` / `stlxr` with their only `dmb` behind the
+  key's byte (the legacy forms end in an unconditional `dmb`); vperm is one two-register `tbl` (8 instructions
+  against 12), vctsxs `fcvtzs` (2 against 14), vctuxs `fcvtzu` (2 against 29).
+- `tools/switch_compile_check.py`: every changed file the PC does not build compiles (the POSIX threading, the
+  atomics, the profiler, the kernel's lock paths), and so do the app's hook file with all the regenerated copies,
+  the stage module and game files with `-fomit-frame-pointer`.
+- `tools/one_file_ab.py` (one recompiled file, each switch alone, instructions / loads / stores):
+
+| `sa2_recomp.16.cpp` | instructions | loads | stores | `msr fpcr` sites |
+|---|---|---|---|---|
+| every switch off | 42,138 | 7,617 | 7,738 | 211 |
+| flush-mode proofs | 41,713 | 7,584 | 7,714 | 173 |
+| no frame pointer | 41,654 | 7,483 | 7,574 | 211 |
+| NEON VMX helpers | 41,990 | 7,624 | 7,757 | 211 |
+| vector byte reversal | 42,120 | 7,614 | 7,740 | 211 |
+| compare-and-swap (adds the key's test) | 42,160 | 7,626 | 7,738 | 211 |
+| all on | 41,026 (-2.6 %) | 7,438 (-2.4 %) | 7,549 (-2.4 %) | 173 |
+
+`sa2_recomp.64.cpp`, every switch off against all on: 40,050 -> 38,764 instructions (-3.2 %), loads -4.1 %, stores -3.0 %, `msr fpcr` sites 258 -> 196, `tbl` 81 -> 25.
+
+Static, in the game code: flush-mode checks compiled on the Switch 40,282 -> 24,691 (15,477 proven), sites that
+always switch 57 -> 39, 592 compare-and-swap sites, 7,650 vector reversals and table shuffles in the new form.
+
+#### The profile
+
+The committed profile (`pgo/`) was recorded with the released code. `tools/pgo_fit.py` compiles regenerated files
+against it with the mismatch warnings on: of 2,075 functions in nine files, 267 (12.9 %) no longer match (their control flow changed) and 6 are new. GCC still uses the counts of a function whose lines only
+moved; a function whose control flow changed is compiled without its profile. The flush-mode proofs and the
+generator options account for most of it; `-fomit-frame-pointer` and the SDK changes cost nothing. The PGO build
+gave 15 % on the console, so a build from this branch should have a new instrumented session before it replaces the
+release.
+
+#### Not measurable on the PC
+
+The `dmb` removal (both forms are `lock cmpxchg` on x86), the skipped wake syscalls (the PC does not build that
+file), the frame pointer and the NEON forms (Switch code), and what a mode write costs on the A57. The static
+counts above and the per-frame counts of the census are what the PC can give: 437 critical sections, 44 signals and
+1,368 mode switches a frame are small numbers next to sasrt-nx's, so the expected gain in SA2 is small too: a
+few per cent of the game code's instructions (frame pointer, proven checks), not a new frame rate.
+
+#### A fix found on the way: the SDK read the port's release tag as its own
+
+`sdk/cmake/rex_version.cmake` takes the SDK's version from `git describe` and stops when the tag it finds is ahead
+of the SDK's floor. With the repository's `v1.0.0` tag every configure of a clone failed ("floor version (0.10) is
+behind tag version (1.0)"). The tags are now asked for only when the SDK is the root of its repository; inside a
+port the version is the floor, the string the released build has. Committed on `main` on its own.
+
+#### Tools of this round
+
+`tools/census_summary.py`, `tools/census_sites.py`, `tools/arm_forms_check.py`, `tools/switch_compile_check.py`,
+`tools/one_file_ab.py`, `tools/pgo_fit.py`, `tools/arm_cost_census.py`, `tools/arm_got_census.py`,
+`tools/generated_code_census.py`, `tools/make_sdk_patch.py`, `tools\win\run_sdk_tests.ps1`, and the four
+post-codegen steps (`guest_cas.py`, `flush_mode_flow.py`, `vec_byteswap.py`, `pch_neon_shuffles.py`).
+
 ## Build-time: the codegen flavour (A/B NRO pair)
 
 These options cannot be switched at run time:
@@ -1587,6 +1769,11 @@ It then runs two post-codegen steps:
 These are masseffect-nx's measured options. Since round 7 they also include `non_volatile_as_local`,
 `elide_lr_stores` and sa2-nx's own `fp_moves_modeless` (see Round 7), and since 2026-10-07 `non_argument_as_local` with
 sa2-nx's `non_argument_as_local_keep` list (see "`non_argument_as_local`").
+
+On the branch `cpu-round-2026-10-12` (see "The CPU round of 2026-10-12") the flavour also sets sasrt-nx's
+`fp_compares_modeless` and `fp_mode_lookahead` (with sa2-nx's `fp_mode_lookahead_past_branch = false`), and
+`tools/post_codegen.py` runs four more steps after the direct calls, on both generated trees: `tools/guest_cas.py`,
+`tools/flush_mode_flow.py --redo`, `tools/vec_byteswap.py` and `tools/pch_neon_shuffles.py`.
 
 `tools/read_before_write.py` on the optimised code finds only the guest setjmp (`sub_82908F10`). It reads cr1–cr7 to
 store them in the jmp_buf, as Mass Effect's does. The six setjmp callers (libjpeg, sub_82812A10 and others) are not
@@ -1640,6 +1827,34 @@ The masseffect-nx renderer that Futari also carries has these ring-thread costs.
 On the console the ring thread used only 7 to 15 % of a core in the attract loop. These wait until console logs from
 gameplay show the ring thread is busy.
 | Null vertex shader one-point draws through the 4x depth alias (sasrt-nx: XXH3 fingerprint AFCC8377CE2A398F, a whole shadow map moved to the 4x image and back per memexport draw) | not seen | No SA2 log (PC or console) names that fingerprint; recheck in stages. This changes EDRAM/depth ownership, so it needs a long play test. |
+
+### Fifteen CPU candidates for any ReXGlue port (2026-10-12; found, not built)
+
+The user's request after the round above. Each has what was counted for it in SA2, on the PC or with the Switch
+compiler; none has run on the console. "Sites" are places in the generated code (`tools/generated_code_census.py` counts them for any port), "per
+Swap" comes from the census run. Order: what the numbers promise against the work.
+
+| # | Candidate | Where | What was counted | Exactness / check |
+|---|---|---|---|---|
+| 1 | `-fno-math-errno -fno-trapping-math` on the game code. sasrt-nx and masseffect-nx ship both; sa2-nx and nfsmw-nx do not | build flag | 1,223 `sqrt` calls in 667 game functions of the released ELF (a compare and a branch to the library after every `fsqrt`). Three files with the Switch compiler: -0.3 / -0.6 / -1.4 % instructions, -1.9 % at best with both | Values unchanged: nothing reads `errno` or the host's float flags. Lockstep and verify mode |
+| 2 | Loop barriers only where a guest load could be hoisted | `tools/loop_barriers.py` | 20,249 barriers. 1,653 loops read no guest memory at all, and 4,232 contain a call the compiler cannot see through (redundant where every path back to the loop header passes one): up to 29 % protect nothing. A barrier clobbers all memory, so every register still in `ctx` is stored and reloaded on each iteration | The barrier's own argument, per loop; `tools/find_self_loops.py` on the ELF as today |
+| 3 | Argument registers (r3-r10, f1-f13, v0-v13) as locals in functions with loops | generator | The 9,012 functions with a barrier hold 56 % of the 1,503,601 uses of those registers; 4,881 functions are leaves. The localized copies do this by hand for about 50 functions. masseffect-nx measured full arguments-in-registers as no gain on top of locals, but it has no loop barriers | Exact by construction, like `tools/localize_native.py`; lockstep |
+| 4 | A float load and store of the same register as a copy that needs no mode | generator | 40 % of SA2's remaining mode switches: a vector matrix multiply calling scalar matrix copies (`n_82140A90` 21.7 %, `n_82146E48` 13.2 %, `n_82146DD8` 5.6 %). 2,399 such adjacent pairs in the code | One denormal test per pair gives the released bits; with the test dropped a signalling NaN is copied unchanged, as on the 360. Needs its own unit test |
+| 5 | The cost of one `msr fpcr` on the A57, measured at start and logged | profiler | sasrt-nx's lookahead threshold and candidate 4 both hang on this number, which nobody has | A timing line, no behaviour |
+| 6 | Indirect calls with one usual target called directly | post-codegen, from a census | 21,365 indirect call sites, 16 % of all call sites (range check, table load, null check, `blr`). How often each runs and where to is not counted yet: the flush census's site table can count it. GCC's own value profiles would do the same in the PGO session; they are off there because their updates are not atomic | The guard compares the target; the slow path is today's code |
+| 7 | Flush-mode proofs across calls into a function (its entry mode from its direct callers) | `tools/flush_mode_flow.py` | 24,691 checks left in 7,684 functions; at least one per function is "unknown at entry". 55,097 proven checks run per Swap already; the unproven ones are not counted yet | The PC self-check tests every proof it executes |
+| 8 | NEON forms for the small VMX helpers | `rex/ppc/intrinsics.h` | With the Switch compiler: vcfux 10 instructions (`ucvtf` is one), `simde_mm_sllv_epi8` 40, `simde_mm_cvttps_epi32` 7, `simde_mm_dp_ps` 4-8. SA2 uses them 33, 2, 4 and 34 times; vector-heavy games more | sasrt-nx's `vmx_small_helpers_test.cpp` already reports 0 differences for five of them |
+| 9 | `fctidz` as `fcvtzs` and a NaN select, like `fctiwz_inline` | generator | 843 sites in SA2, each an `isnan` test, a range compare and a select around the conversion | The same argument as `fctiwz_inline`; a unit test over the edge values |
+| 10 | `fctid` / `fctiw` on ARM round halves away from zero (**a difference from the PC build and the 360, not a speed item**) | generator / simde | simde's non-x86 `simde_mm_cvtsd_si64` is C `round()`; x86 and PowerPC round to even. 10 sites in SA2 | `frinti` + `fcvtzs`; a unit test of the ties |
+| 11 | No address loads from the GOT in the libraries outside the LTO link | build (hidden visibility on declarations) | 38,528 loads of an address from the GOT in the released ELF: 3,555 in game functions, 34,973 in the SDK, the renderer and the driver; 5,685 slots | Addressing only |
+| 12 | Critical sections without the thread lookup | SDK | `RtlEnterCriticalSection` calls `XThread::GetCurrentThread()` (out of line, a thread-pointer call) for the owner id that `ctx.r13` already gives, as the spin locks do. 437 enters per Swap in SA2, 85,000 a second in sasrt-nx | The same id from another place; an assert in the PC build |
+| 13 | One signature table of the C runtime and math functions for all ports | tools | Every port finds `memcpy`, `memset`, `sin`... by hand. SA2's `memcpy` hook takes about 400,000 calls a second, `sin` and `cos` 19,000 each | The existing guard (native against original) |
+| 14 | LTO and PGO for the SDK's runtime libraries too | build | A kernel call is `__imp__X` -> `HostToGuestFunction<>` -> `X_entry` -> its helpers, each a real call. 2,140 import call sites, about 1,100 counted runtime calls per Swap in SA2 | No source change |
+| 15 | The four hot words of the shared constant block as push constants (the renderer all masseffect-nx-based ports share) | renderer | The shared block changes on 90 % of draws, mostly in words 0, 48, 90 and 91; 0.92 binds of set 4 per draw at about 1.3 µs each on the console: about 1.3 ms per frame of the ring thread in play | Pixel-identical: lockstep capture |
+
+For SA2 itself the first three and 6 are the ones with weight: its game thread is drawing code in loops, and the
+kernel traffic (12, 14) and the mode switches (4, 5, 7) are small here. For sasrt-nx the order is the other way
+round.
 
 ## Build time
 

@@ -63,9 +63,29 @@
 #     from the generated code and keep the same locals; guest exceptions are never dispatched (RtlUnwind and
 #     __C_specific_handler are stubs).
 #
-# Post-codegen steps of the flavour (tools\codegen.ps1): tools\pch_no_volatile.py (guest memory without volatile;
-# masseffect-nx: +15-20 % fps) and tools\direct_calls.py (calls between unhooked functions become direct, so GCC can
-# inline them).
+# 2026-10-12, sasrt-nx's CPU round (docs/enhancements.md, "The CPU round of 2026-10-12"): fp_compares_modeless (fcfid,
+# fctiwz, fctidz and fsel cannot be changed by the flush mode: no switch; fcmpu / fcmpo / frsp through any-mode helpers
+# while VMX mode is current), fp_mode_lookahead (before a scalar float instruction switches, the generator looks at the
+# next instruction that needs a mode: lfs / stfs / frsp / fcmpu and one or two fadds / fsubs / fmuls / fdivs in front
+# of vector code compute in whatever mode is current, rex::ppc::*AnyMode in sdk/include/rex/ppc/diet_ops.h, each
+# giving the bits the plain expression gives with the mode off: sdk/tests/fp_any_mode_test.cpp). SA2 switches the mode
+# about 1,400 times a frame in play (sasrt-nx: 60,800), most of it in six localized copies, which are made from this
+# code.
+# fp_mode_lookahead_past_branch = false (sa2-nx's addition to the generator): sasrt-nx's rule also gives a conversion
+# its any-mode form when nothing that needs a mode follows before the next branch, in every function with vector float
+# code and in small "mode-free" functions. SA2's float code is mostly scalar, and there that bet loses: with it the
+# PC census (sa2_diag_runtime_census) counted 4.5-8.7 million any-mode conversions a second, each a test of about
+# four instructions, for at most 180 switches saved per frame. Without it the any-mode forms stay where they replace
+# a switch for certain (a vector instruction comes next, or VMX mode is known to be current).
+# rotate_word_narrow (sasrt-nx's third option: rlwinm / rlwnm / rlwimi whose mask does not wrap as a 32-bit rotate and
+# mask; exact, sdk/tests/rotate_word_test.cpp, and SA2's PC build passed lockstep and verify mode with it) is NOT set:
+# the Switch compiler already folds the 64-bit form, and with the narrow one three recompiled files came out 0.07 to
+# 0.12 % larger (GCC turns the 64-bit form of an `srwi` into one `lsr`, the narrow one into `ror` + `and`).
+#
+# Post-codegen steps of the flavour (tools\post_codegen.py): tools\pch_no_volatile.py (guest memory without volatile;
+# masseffect-nx: +15-20 % fps), tools\loop_barriers.py, tools\direct_calls.py (calls between unhooked functions become
+# direct, so GCC can inline them), and sasrt-nx's of 2026-10-12: tools\guest_cas.py, tools\flush_mode_flow.py,
+# tools\vec_byteswap.py and tools\pch_neon_shuffles.py.
 cr_as_local = true
 ctr_as_local = true
 xer_as_local = true
@@ -77,4 +97,7 @@ non_volatile_as_local = true
 elide_lr_stores = true
 fp_moves_modeless = true
 non_argument_as_local = true
+fp_compares_modeless = true
+fp_mode_lookahead = true
+fp_mode_lookahead_past_branch = false
 non_argument_as_local_keep = [0x827F5144, 0x82801D90, 0x827EFE34, 0x88010BE4]

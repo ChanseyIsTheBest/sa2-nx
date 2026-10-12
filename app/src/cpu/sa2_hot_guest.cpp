@@ -148,8 +148,22 @@ SA2_ENHANCEMENT(g_counter_shared, sa2_cpu_hook_counter_shared, sa2::enh::kCpu, t
                 "Native replacements: one relaxed call counter per hook shared by all threads instead of a thread_local "
                 "one (on the Switch every thread_local access is a call to __aarch64_read_tp, on every hooked call)");
 
+SA2_ENHANCEMENT(g_counter_ctx, sa2_cpu_hook_counter_ctx, sa2::enh::kCpu, true,
+                "Native replacements: each hook's call counter lives in the calling thread's own context "
+                "(PPCContext::host_counters) instead of one counter shared by all threads: no store into a cache line "
+                "every calling thread pulls to its core, and still no thread_local (sasrt-nx's, 2026-10-12)");
+
+void TakeCtxSlot(std::atomic<uint8_t>& slot) {
+  if (slot.load(std::memory_order_relaxed) != kNoSlot) return;
+  static std::atomic<uint32_t> next_slot{0};
+  const uint32_t s = next_slot.fetch_add(1, std::memory_order_relaxed);
+  uint8_t none = kNoSlot;
+  slot.compare_exchange_strong(none, s < kCtxSlots ? uint8_t(s) : kSlotsFull, std::memory_order_relaxed);
+}
+
 void InitHook(Hook& h, uint8_t* base) {
   // May run on several threads at once for the first call: every writer stores the same values.
+  TakeCtxSlot(h.slot);
   bool on = h.key->active;
   if (on && !sa2::enh::GuestCodeMatches(base, h.code_address, h.code_bytes, h.code_hash, h.key->key)) on = false;
   const bool verify = REXCVAR_GET(sa2_cpu_verify);

@@ -52,6 +52,10 @@ powershell -File tools\win\run.ps1 out\pc_build.log "cmake --build out/pc"
 powershell -File tools\win\boot_test.ps1               # 45 s, muted and minimized, then the end of the log
 ```
 
+The PC build runs the code generator again by itself when one of its inputs changed (a toml, the xex, the generator).
+That build then stops once with "`sa2_pch.h` has been modified since the precompiled header ... was built" (the
+precompiled header was made before the regeneration finished): run the build command again.
+
 `out\pc\sa2.toml` holds the PC's settings. It starts **muted and minimized** (`audio_mute`, `window_start_minimized`)
 so test runs stay out of the way; set both to `false` to play. `license_mask = 1` runs the full game rather than the
 XBLA trial, and `sa2_renderer_native = true` (or the environment variable `REX_SA2_RENDERER_NATIVE=true`) uses the
@@ -95,6 +99,11 @@ powershell -File tools\win\package_switch.ps1 -IncludeGame   # the same with the
 and icon (`app/icon.jpg`) are in `app/CMakeLists.txt`. The settings compiled into the NRO are
 `app/sa2_switch_defaults.toml`, and the player's `sa2.toml` is `app/sa2_switch.toml`.
 
+The Switch build's own switches for the CPU round of 2026-10-12, all ON (`-DSA2_SWITCH_...=OFF` at the configure puts
+the old form back; `docs/enhancements.md` has what each does): `SA2_SWITCH_OMIT_FRAME_POINTER`,
+`SA2_SWITCH_FLUSH_FLOW`, `SA2_SWITCH_GUEST_CAS`, `SA2_SWITCH_VEC_BYTESWAP`, `SA2_SWITCH_NEON_SHUFFLES`,
+`SA2_SWITCH_NEON_VMX_HELPERS`. A build with them has not run on a console yet.
+
 ### Profile-guided optimisation
 
 `pgo/` holds the profile the released NRO was built with (one console session of version 1.0.0). To build with it:
@@ -127,6 +136,12 @@ Do not change the game or app code between steps 1 and 3: a changed function los
 | `tools\compare_video.py`, `tools\compare_raw.py` | Line up two recordings frame by frame |
 | `shaders\tests\test_vertex_fetch_reorder.cpp` | The run-time proof for reordered vertex fetches (`--orders` for every order) |
 | `tools\check_switch_build.py` | The checks every Switch build must pass |
+| `tools\win\run_sdk_tests.ps1` | Builds and runs the SDK's unit tests (`sdk\tests`): the any-mode float helpers, rotates, the signal protocol, the vector forms |
+| `tools\arm_forms_check.py` | What the Switch compiler makes of the AArch64-only forms (lock words, NEON helpers), with the claims checked. No NRO is built |
+| `tools\switch_compile_check.py <file> ...` | Compiles chosen files with the Switch compiler and the Switch build's flags into a scratch folder: code only the Switch builds, checked on the PC in a minute |
+| `tools\one_file_ab.py <N> name=flags ...` | One recompiled file in several variants with the Switch compiler; instructions, loads and stores counted |
+| `tools\pgo_fit.py <N> ...` | How many functions of a recompiled file still match the committed profile |
+| `tools\census_summary.py <log>`, `tools\census_sites.py <log>` | A run with `sa2_diag_runtime_census = true`: float-mode switches and runtime calls per Swap, and the functions the switches come from |
 
 Lockstep captures (`REX_VBLANK_PER_SWAP=true`, `REX_SA2_VIDEO_FRAME=6000`) pin every frame to a presented swap, and
 `<name>.hash` keeps the XXH3 of each frame at full resolution. Two runs are equal when their hashes are, frame for

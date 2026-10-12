@@ -615,11 +615,13 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
                "WaitMultiple: %.0f parked, %.0f woken by signal, %.0f safety re-polls, %.0f legacy 1 ms polls | "
                "timestamp timer ticks %.0f | UpdateGuestClock %.0f calls, %.0f contended | ObjectTable lookups "
                "%.0f, %.0f contended | VolumeChangeMask %.0f | vblank thread wakes %.0f | native audio DSP calls "
-               "%.0f, %.0f mismatches | critical-section host waits %.0f\n",
+               "%.0f, %.0f mismatches | critical-section host waits %.0f | signals with nobody blocked (no wake "
+               "syscall, thread_signal_skip_idle) %.0f\n",
                delta(40) / seconds, delta(41) / seconds, delta(42) / seconds, delta(43) / seconds,
                delta(44) / seconds, delta(45) / seconds, delta(46) / seconds, delta(47) / seconds,
                delta(48) / seconds, delta(49) / seconds, delta(50) / seconds, delta(51) / seconds,
-               delta(52) / seconds, delta(53) / seconds, delta(54) / seconds, delta(55) / seconds);
+               delta(52) / seconds, delta(53) / seconds, delta(54) / seconds, delta(55) / seconds,
+               delta(56) / seconds);
   if (frames > 0) {
     std::fprintf(f,
                  "     per frame: %.0f draws | scissor %.1f screens | %.1f submits | "

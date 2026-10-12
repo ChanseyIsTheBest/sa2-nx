@@ -109,6 +109,14 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             "fctiwz_inline");
   MergeBool(cfg.fpMovesModeless, toml["fp_moves_modeless"].value_or(false), hasBool("fp_moves_modeless"),
             "fp_moves_modeless");
+  MergeBool(cfg.fpComparesModeless, toml["fp_compares_modeless"].value_or(false),
+            hasBool("fp_compares_modeless"), "fp_compares_modeless");
+  MergeBool(cfg.fpModeLookahead, toml["fp_mode_lookahead"].value_or(false), hasBool("fp_mode_lookahead"),
+            "fp_mode_lookahead");
+  MergeBool(cfg.fpModeLookaheadPastBranch, toml["fp_mode_lookahead_past_branch"].value_or(true),
+            hasBool("fp_mode_lookahead_past_branch"), "fp_mode_lookahead_past_branch");
+  MergeBool(cfg.rotateWordNarrow, toml["rotate_word_narrow"].value_or(false), hasBool("rotate_word_narrow"),
+            "rotate_word_narrow");
   MergeBool(cfg.skipMsr, toml["skip_msr"].value_or(false), hasBool("skip_msr"), "skip_msr");
   MergeBool(cfg.ctrAsLocalVariable, toml["ctr_as_local"].value_or(false), hasBool("ctr_as_local"),
             "ctr_as_local");

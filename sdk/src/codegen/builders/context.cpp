@@ -18,7 +18,11 @@
 #include <rex/logging.h>
 
 #include "../codegen_logging.h"
+#include "../ppc/disasm.h"
 #include <rex/system/export_resolver.h>
+
+#include <dis-asm.h>
+#include <ppc.h>
 
 namespace rex::codegen {
 
@@ -465,8 +469,270 @@ void BuilderContext::emit_flush_mode_for_move() {
 }
 
 bool BuilderContext::single_conversion_any_mode() {
-  if (config().fpMovesModeless && csrState == CSRState::VMX) {
+  if (config().fpMovesModeless) {
+    if (config().fpModeLookahead) {
+      if (conversion_prefers_any_mode()) {
+        return true;
+      }
+    } else if (csrState == CSRState::VMX) {
+      return true;
+    }
+  }
+  emit_set_flush_mode(false);
+  return false;
+}
+
+void BuilderContext::emit_flush_mode_for_modeless() {
+  if (!config().fpComparesModeless) {
+    emit_set_flush_mode(false);
+  }
+}
+
+namespace {
+enum class FloatKind { kOther, kBranch, kVmx, kFpuOnly, kSingleArithmetic };
+
+// What an instruction asks of the flush mode. The lists are the builders that call emit_set_flush_mode(true)
+// (vector.cpp) and emit_set_flush_mode(false) (floating_point.cpp); fsel, fcfid, fctiwz and fctidz need no mode
+// with fp_compares_modeless, which fp_mode_lookahead builds on.
+FloatKind ClassifyFloat(const ppc_insn& insn) {
+  if (insn.opcode == nullptr) {
+    return FloatKind::kOther;
+  }
+  switch (insn.opcode->id) {
+    case PPC_INST_VADDFP:
+    case PPC_INST_VADDFP128:
+    case PPC_INST_VCFPSXWS128:
+    case PPC_INST_VCFPUXWS128:
+    case PPC_INST_VCFSX:
+    case PPC_INST_VCFUX:
+    case PPC_INST_VCMPBFP:
+    case PPC_INST_VCMPBFP128:
+    case PPC_INST_VCMPEQFP:
+    case PPC_INST_VCMPEQFP128:
+    case PPC_INST_VCMPGEFP:
+    case PPC_INST_VCMPGEFP128:
+    case PPC_INST_VCMPGTFP:
+    case PPC_INST_VCMPGTFP128:
+    case PPC_INST_VCSXWFP128:
+    case PPC_INST_VCTSXS:
+    case PPC_INST_VCTUXS:
+    case PPC_INST_VCUXWFP128:
+    case PPC_INST_VEXPTEFP:
+    case PPC_INST_VEXPTEFP128:
+    case PPC_INST_VLOGEFP:
+    case PPC_INST_VLOGEFP128:
+    case PPC_INST_VMADDCFP128:
+    case PPC_INST_VMADDFP:
+    case PPC_INST_VMADDFP128:
+    case PPC_INST_VMAXFP:
+    case PPC_INST_VMAXFP128:
+    case PPC_INST_VMINFP:
+    case PPC_INST_VMINFP128:
+    case PPC_INST_VMSUM3FP128:
+    case PPC_INST_VMSUM4FP128:
+    case PPC_INST_VMULFP128:
+    case PPC_INST_VNMSUBFP:
+    case PPC_INST_VNMSUBFP128:
+    case PPC_INST_VPKD3D128:
+    case PPC_INST_VREFP:
+    case PPC_INST_VREFP128:
+    case PPC_INST_VRFIM:
+    case PPC_INST_VRFIM128:
+    case PPC_INST_VRFIN:
+    case PPC_INST_VRFIN128:
+    case PPC_INST_VRFIP:
+    case PPC_INST_VRFIP128:
+    case PPC_INST_VRFIZ:
+    case PPC_INST_VRFIZ128:
+    case PPC_INST_VRSQRTEFP:
+    case PPC_INST_VRSQRTEFP128:
+    case PPC_INST_VSUBFP:
+    case PPC_INST_VSUBFP128:
+      return FloatKind::kVmx;
+    case PPC_INST_FADD:
+    case PPC_INST_FCTID:
+    case PPC_INST_FCTIW:
+    case PPC_INST_FDIV:
+    case PPC_INST_FMADD:
+    case PPC_INST_FMADDS:
+    case PPC_INST_FMSUB:
+    case PPC_INST_FMSUBS:
+    case PPC_INST_FMUL:
+    case PPC_INST_FNMADD:
+    case PPC_INST_FNMADDS:
+    case PPC_INST_FNMSUB:
+    case PPC_INST_FNMSUBS:
+    case PPC_INST_FRES:
+    case PPC_INST_FRSQRTE:
+    case PPC_INST_FSQRT:
+    case PPC_INST_FSQRTS:
+    case PPC_INST_FSUB:
+      return FloatKind::kFpuOnly;
+    case PPC_INST_FADDS:
+    case PPC_INST_FSUBS:
+    case PPC_INST_FMULS:
+    case PPC_INST_FDIVS:
+      return FloatKind::kSingleArithmetic;
+    default:
+      break;
+  }
+  // Every PowerPC branch mnemonic starts with 'b' (b, bl, bc*, beq..., blr, bctr, bctrl, bdnz...), and nothing else does.
+  return insn.opcode->name != nullptr && insn.opcode->name[0] == 'b' ? FloatKind::kBranch : FloatKind::kOther;
+}
+}  // namespace
+
+BuilderContext::FloatDemand BuilderContext::next_float_demand() const {
+  uint32_t end = 0;
+  for (const auto& block : fn.blocks()) {
+    if (base >= block.base && base < block.end()) {
+      end = block.end();
+      break;
+    }
+  }
+  // The scalar single operations in a row, this instruction included when it is one: the third one makes the run a
+  // switch to FPU mode (two mode writes for the run cost less than three or more operations with their checks).
+  uint32_t run = ClassifyFloat(insn) == FloatKind::kSingleArithmetic ? 1 : 0;
+  const uint32_t* p = data + 1;
+  uint32_t address = base + 4;
+  for (uint32_t n = 0; address < end && n < 24; ++n, ++p, address += 4) {
+    ppc_insn next;
+    rex::codegen::ppc::Disassemble(p, 4, address, next);
+    switch (ClassifyFloat(next)) {
+      case FloatKind::kVmx:
+        return FloatDemand::kVmx;
+      case FloatKind::kFpuOnly:
+        return FloatDemand::kFpu;
+      case FloatKind::kSingleArithmetic:
+        if (++run > 2) {
+          return FloatDemand::kFpu;
+        }
+        break;
+      case FloatKind::kBranch:
+        return FloatDemand::kNone;
+      case FloatKind::kOther:
+        break;
+    }
+  }
+  return FloatDemand::kNone;
+}
+
+namespace {
+// What a function's float instructions ask of the mode, counted once per function (the builders run function by
+// function on one thread).
+struct FloatProfile {
+  uint32_t base = 0xFFFFFFFFu;
+  uint32_t vmx = 0;           // VMX float instructions
+  uint32_t fpu = 0;           // scalar instructions that need FPU mode (arithmetic, with or without any-mode forms)
+  uint32_t convertible = 0;   // lfs / stfs forms, frsp, fcmpu / fcmpo
+};
+
+bool IsConvertible(const ppc_insn& insn) {
+  if (insn.opcode == nullptr) {
+    return false;
+  }
+  switch (insn.opcode->id) {
+    case PPC_INST_LFS:
+    case PPC_INST_LFSU:
+    case PPC_INST_LFSUX:
+    case PPC_INST_LFSX:
+    case PPC_INST_STFS:
+    case PPC_INST_STFSU:
+    case PPC_INST_STFSUX:
+    case PPC_INST_STFSX:
+    case PPC_INST_FRSP:
+    case PPC_INST_FCMPU:
+    case PPC_INST_FCMPO:
+      return true;
+    default:
+      return false;
+  }
+}
+
+const FloatProfile& ProfileOf(const BuilderContext& ctx) {
+  static thread_local FloatProfile profile;
+  if (profile.base == ctx.fn.base()) {
+    return profile;
+  }
+  profile = FloatProfile{};
+  profile.base = ctx.fn.base();
+  for (const auto& block : ctx.fn.blocks()) {
+    const auto* p = reinterpret_cast<const uint32_t*>(ctx.emitCtx.binary.translate(block.base));
+    if (p == nullptr) {
+      continue;
+    }
+    for (uint32_t address = block.base; address < block.end(); address += 4, ++p) {
+      ppc_insn other;
+      rex::codegen::ppc::Disassemble(p, 4, address, other);
+      switch (ClassifyFloat(other)) {
+        case FloatKind::kVmx:
+          ++profile.vmx;
+          break;
+        case FloatKind::kFpuOnly:
+        case FloatKind::kSingleArithmetic:
+          ++profile.fpu;
+          break;
+        default:
+          if (IsConvertible(other)) {
+            ++profile.convertible;
+          }
+          break;
+      }
+    }
+  }
+  return profile;
+}
+}  // namespace
+
+bool BuilderContext::function_has_vmx_float() const {
+  return ProfileOf(*this).vmx != 0;
+}
+
+bool BuilderContext::function_is_mode_free() const {
+  const FloatProfile& profile = ProfileOf(*this);
+  return profile.fpu == 0 && profile.convertible <= 8;
+}
+
+bool BuilderContext::conversion_prefers_any_mode() const {
+  if (csrState == CSRState::FPU) {
+    return false;  // the plain form is free
+  }
+  switch (next_float_demand()) {
+    case FloatDemand::kVmx:
+      return true;
+    case FloatDemand::kFpu:
+      return false;  // the switch or check is needed anyway: taken here, this instruction stays plain
+    case FloatDemand::kNone:
+      break;
+  }
+  // Nothing that needs a mode before the next branch. VMX mode known to be current: the plain form would switch off
+  // here for certain (fp_moves_modeless's own rule). Otherwise the any-mode form is a bet on a switch that may come
+  // later (fp_mode_lookahead_past_branch; see config.h for what it cost in a mostly scalar game).
+  if (csrState == CSRState::VMX) {
     return true;
+  }
+  return config().fpModeLookaheadPastBranch && (function_has_vmx_float() || function_is_mode_free());
+}
+
+bool BuilderContext::compare_any_mode() {
+  if (config().fpComparesModeless) {
+    if (config().fpModeLookahead) {
+      if (conversion_prefers_any_mode()) {
+        return true;
+      }
+    } else if (csrState == CSRState::VMX) {
+      return true;
+    }
+  }
+  emit_set_flush_mode(false);
+  return false;
+}
+
+bool BuilderContext::arithmetic_any_mode() {
+  if (config().fpModeLookahead && csrState != CSRState::FPU) {
+    const FloatDemand next = next_float_demand();
+    if (next == FloatDemand::kVmx || (next == FloatDemand::kNone && csrState == CSRState::VMX)) {
+      return true;
+    }
   }
   emit_set_flush_mode(false);
   return false;

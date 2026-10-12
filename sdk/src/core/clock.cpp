@@ -19,6 +19,77 @@
 #include <rex/math.h>
 #include <rex/sys_counters.h>
 
+#if !defined(__SWITCH__)
+// The runtime census (sys_counters.h): off the Switch, what REX_SYS_COUNT / REX_SYS_CENSUS count into.
+namespace rex::syscount {
+static std::atomic<uint64_t> g_census[kCensusCount]{};
+void Census(unsigned id, uint64_t n) {
+  if (id < kCensusCount)
+    g_census[id].store(g_census[id].load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+}
+uint64_t CensusRead(unsigned id) {
+  return id < kCensusCount ? g_census[id].load(std::memory_order_relaxed) : 0;
+}
+
+namespace {
+struct Site {
+  std::atomic<uint64_t> address{0}, count{0};
+};
+constexpr size_t kSites = size_t(1) << 16;
+Site g_sites[kSites];
+std::atomic<bool> g_sites_on{false};
+}  // namespace
+
+void CensusSitesEnable(bool on) {
+  g_sites_on.store(on, std::memory_order_relaxed);
+}
+
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((noinline))
+#endif
+void CensusSite(unsigned id) {
+  Census(id, 1);
+  if (!g_sites_on.load(std::memory_order_relaxed)) return;
+#if defined(__clang__) || defined(__GNUC__)
+  const uint64_t a = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+#else
+  const uint64_t a = 1;
+#endif
+  size_t i = size_t((a * 0x9E3779B97F4A7C15ull) >> 48);
+  for (size_t probe = 0; probe < 64; ++probe, i = (i + 1) & (kSites - 1)) {
+    uint64_t have = g_sites[i].address.load(std::memory_order_relaxed);
+    if (have == 0 && g_sites[i].address.compare_exchange_strong(have, a, std::memory_order_relaxed)) have = a;
+    if (have == a) {
+      g_sites[i].count.store(g_sites[i].count.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+      return;
+    }
+  }
+}
+
+size_t CensusSites(uint64_t* addresses, uint64_t* counts, size_t capacity) {
+  size_t n = 0;
+  for (size_t i = 0; i < kSites; ++i) {
+    const uint64_t c = g_sites[i].count.load(std::memory_order_relaxed);
+    if (!c) continue;
+    const uint64_t a = g_sites[i].address.load(std::memory_order_relaxed);
+    // Insertion into the list sorted by count, largest first.
+    size_t at = n < capacity ? n : capacity;
+    while (at > 0 && counts[at - 1] < c) --at;
+    if (at >= capacity) continue;
+    const size_t last = n < capacity ? n : capacity - 1;
+    for (size_t k = last; k > at; --k) {
+      addresses[k] = addresses[k - 1];
+      counts[k] = counts[k - 1];
+    }
+    addresses[at] = a;
+    counts[at] = c;
+    if (n < capacity) ++n;
+  }
+  return n;
+}
+}  // namespace rex::syscount
+#endif
+
 REXCVAR_DEFINE_BOOL(clock_no_scaling, false, "Clock",
                     "Disable clock scaling (inverted: false = scaling enabled)");
 

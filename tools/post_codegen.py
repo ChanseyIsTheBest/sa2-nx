@@ -8,7 +8,12 @@ manifest, a toml, the xex, the generator binary) and that would otherwise drop t
   - the flavour is read from app/codegen_flavor.toml (written by tools/codegen.ps1 -Flavor): "optimised" when it sets
     any codegen key, else "classic";
   - optimised: tools/pch_no_volatile.py + tools/loop_barriers.py (required together) and tools/direct_calls.py on both
-    generated trees;
+    generated trees; then sasrt-nx's steps of 2026-10-12, each a rename of calls into macros the generated pch
+    defines: tools/guest_cas.py (compare-and-swap without the legacy builtin's trailing `dmb ish` on AArch64),
+    tools/flush_mode_flow.py (the flush-mode checks the control flow and the callees' summaries fix: nothing on the
+    Switch, still tested in the PC build), tools/vec_byteswap.py (the 16-byte reversal of guest vector loads and
+    stores without a table lookup on AArch64) and tools/pch_neon_shuffles.py (constant word shuffles as one
+    permutation on AArch64);
   - both: the localized native copies (tools/localize_native.py --list app/src/cpu/hot/localized.txt) and
     app/generated/codegen_flavor.txt (the build's name in the first "[enh]" log line).
 
@@ -45,12 +50,21 @@ def main():
             # Undo and redo in one pass: a function hooked since the last run (a new native) must be called through
             # its hook again. --redo writes only the files that change, so the build does not recompile the others.
             run(os.path.join(ROOT, 'tools', 'direct_calls.py'), '--redo', '--gen', os.path.join(GEN, tree))
+        for tree in ('default', 'data_dll'):
+            # sasrt-nx's steps (2026-10-12). After direct_calls.py: the flush-mode proofs depend on which callees are
+            # called directly, and --redo drops proofs from before a function was hooked. They only rename calls to
+            # macros of the generated pch, so the localized copies below are made from the same statements.
+            run(os.path.join(ROOT, 'tools', 'guest_cas.py'), '--gen', os.path.join(GEN, tree))
+            run(os.path.join(ROOT, 'tools', 'flush_mode_flow.py'), '--redo', '--gen', os.path.join(GEN, tree))
+            run(os.path.join(ROOT, 'tools', 'vec_byteswap.py'), '--gen', os.path.join(GEN, tree))
+            run(os.path.join(ROOT, 'tools', 'pch_neon_shuffles.py'), os.path.join(GEN, tree, 'sa2_pch.h'))
     run(os.path.join(ROOT, 'tools', 'localize_native.py'), '--list',
         os.path.join(APP, 'src', 'cpu', 'hot', 'localized.txt'))
     # Round 7: the options added since round 6 are named too, so a console log tells the builds apart.
     extras = [name for key, name in (('non_volatile_as_local', 'non-volatile locals'), ('elide_lr_stores', 'no lr stores'),
                                      ('fp_moves_modeless', 'modeless fp moves'),
-                                     ('non_argument_as_local', 'non-argument locals'))
+                                     ('non_argument_as_local', 'non-argument locals'),
+                                     ('fp_mode_lookahead', 'fp mode lookahead'))
               if re.search(r'^\s*' + key + r'\s*=\s*true', flavor_toml, re.M)]
     # Written only when it changes: the file is a CMake configure dependency (app/CMakeLists.txt), and rewriting it
     # made every build re-run CMake, rebuild the generator and run the codegen again (2026-10-07).

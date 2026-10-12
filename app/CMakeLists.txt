@@ -187,6 +187,18 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     endforeach()
 endif()
 
+# PC diagnostic (2026-10-12): the game code and the app count the executions of the any-mode float helpers
+# (rex/ppc/diet_ops.h, REX_DIET_CENSUS_ON) in counters the app defines (src/cpu/sa2_enhancements.cpp), for the
+# '[census]' lines of sa2_diag_runtime_census. Not the stage module (a DLL of its own on the PC, without any-mode
+# sites) and never the Switch build.
+if(NOT REXGLUE_PLATFORM_SWITCH)
+    foreach(target sa2 sa2_recomp)
+        if(TARGET ${target})
+            target_compile_definitions(${target} PRIVATE REX_DIET_CENSUS_ON)
+        endif()
+    endforeach()
+endif()
+
 # sa2_register.cpp is one generated function of ~30,000 SetFunction calls that runs once at startup; GCC -O3 spent
 # 771-927 s on it alone (the critical path of every Switch build). -O0 compiles it in seconds and changes nothing at
 # run time but a few microseconds of startup. (From sasrt-nx, 2026-10-06.)
@@ -257,6 +269,57 @@ if(REXGLUE_PLATFORM_SWITCH)
         target_link_options(sa2 PRIVATE ${_sa2_lto_link})
         message(STATUS "sa2: Switch LTO on (${SA2_SWITCH_LTO_JOBS} LTRANS jobs, -fipa-pta ${SA2_SWITCH_IPA_PTA})")
     endif()
+    # sasrt-nx's CPU round (2026-10-12; docs/enhancements.md, "The CPU round of 2026-10-12"). Each has its switch:
+    #   - No frame pointer in the game code: AArch64 GCC keeps the x29 frame chain in every non-leaf function by
+    #     default (stp x29, x30 / mov x29, sp), which costs the set-up instruction and one of the callee-saved registers
+    #     the recompiled code is short of. The SDK and the app keep theirs. The console profiler's pc samples are
+    #     unaffected; its caller chains (switch_perf.cpp walks x29, bounds-checked) end where they reach a game function.
+    #   - The flush-mode checks the control flow fixes compile to nothing here (tools/flush_mode_flow.py); OFF defines
+    #     REX_FLUSH_FLOW_OFF, which puts the original checks back.
+    #   - Guest compare-and-swap without the legacy builtin's trailing `dmb ish` (tools/guest_cas.py); OFF defines
+    #     REX_GUEST_CAS_LEGACY (the run-time key sa2_cpu_guest_cas_no_barrier puts the barrier back without a build).
+    #   - Guest vector loads and stores reversed with REV64 + EXT instead of a table lookup (tools/vec_byteswap.py); OFF
+    #     defines REX_BSWAP128_TABLE.
+    #   - Constant word shuffles as one permutation (tools/pch_neon_shuffles.py); OFF defines REX_SIMDE_SHUFFLES.
+    #   - vperm and the float-to-integer conversions as their NEON instruction (rex/ppc/intrinsics.h); OFF defines
+    #     REX_VMX_HELPERS_X86_FORM.
+    option(SA2_SWITCH_OMIT_FRAME_POINTER "Game code without the x29 frame chain (Switch)" ON)
+    option(SA2_SWITCH_FLUSH_FLOW "Flush-mode checks proven by control flow compile to nothing (Switch)" ON)
+    option(SA2_SWITCH_GUEST_CAS "Guest compare-and-swap without the trailing dmb (Switch)" ON)
+    option(SA2_SWITCH_VEC_BYTESWAP "Guest vector byte reversal as REV64 + EXT (Switch)" ON)
+    option(SA2_SWITCH_NEON_SHUFFLES "Constant word shuffles as one permutation (Switch)" ON)
+    option(SA2_SWITCH_NEON_VMX_HELPERS "vperm and float-to-integer conversions as NEON instructions (Switch)" ON)
+    set(_sa2_round12_definitions "")
+    if(NOT SA2_SWITCH_FLUSH_FLOW)
+        list(APPEND _sa2_round12_definitions REX_FLUSH_FLOW_OFF)
+    endif()
+    if(NOT SA2_SWITCH_GUEST_CAS)
+        list(APPEND _sa2_round12_definitions REX_GUEST_CAS_LEGACY)
+    endif()
+    if(NOT SA2_SWITCH_VEC_BYTESWAP)
+        list(APPEND _sa2_round12_definitions REX_BSWAP128_TABLE)
+    endif()
+    if(NOT SA2_SWITCH_NEON_SHUFFLES)
+        list(APPEND _sa2_round12_definitions REX_SIMDE_SHUFFLES)
+    endif()
+    if(NOT SA2_SWITCH_NEON_VMX_HELPERS)
+        list(APPEND _sa2_round12_definitions REX_VMX_HELPERS_X86_FORM)
+    endif()
+    # The game code, the stage module and the app (whose localized copies are the same generated statements).
+    foreach(target sa2_recomp sa2_Data_DLL sa2)
+        if(TARGET ${target})
+            if(_sa2_round12_definitions)
+                target_compile_definitions(${target} PRIVATE ${_sa2_round12_definitions})
+            endif()
+            if(SA2_SWITCH_OMIT_FRAME_POINTER AND NOT target STREQUAL "sa2")
+                target_compile_options(${target} PRIVATE -fomit-frame-pointer)
+            endif()
+        endif()
+    endforeach()
+    message(STATUS "sa2: CPU round 2026-10-12: omit frame pointer ${SA2_SWITCH_OMIT_FRAME_POINTER}, flush flow "
+                   "${SA2_SWITCH_FLUSH_FLOW}, guest CAS ${SA2_SWITCH_GUEST_CAS}, vector byteswap "
+                   "${SA2_SWITCH_VEC_BYTESWAP}, NEON shuffles ${SA2_SWITCH_NEON_SHUFFLES}, NEON VMX helpers "
+                   "${SA2_SWITCH_NEON_VMX_HELPERS}")
     # Line tables for the app's own code (renderer, natives, hooks): console profiles (rex_profile.log PCs) map to
     # source lines with addr2line on the archived ELF. -g1 does not change the generated code (GCC keeps code
     # generation independent of -g); the NRO is made from the stripped ELF. The generated game code stays without.

@@ -1,6 +1,7 @@
 // Sonic Adventure 2: the switchable enhancements (see sa2_enhancements.h).
 #include "sa2_enhancements.h"
 
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -9,6 +10,8 @@
 #include <fmt/format.h>
 
 #include <rex/logging.h>
+#include <rex/platform.h>
+#include <rex/sys_counters.h>
 
 #ifndef SA2_BUILD_FLAVOR
 #define SA2_BUILD_FLAVOR "classic codegen"
@@ -34,6 +37,55 @@ REXCVAR_DEFINE_INT32(sa2_enhancements_report_s, 10, "SA2 enhancements",
                      "Seconds between two '[enh] uses' log lines (0 = no periodic line)")
     .range(0, 3600)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Diagnostic, from sasrt-nx's CPU round of 2026-10-12 (PC builds: the SDK's sys_counters.h counts nothing of this on
+// the Switch): how often the guest switches the host's float flush mode (an `msr fpcr` on the A57) and reaches the
+// runtime's lock-and-syscall paths, per second, with each '[enh] uses' report. It tells what is worth making cheaper
+// on the console, which a PC profile cannot show. tools/census_sites.py turns the sites line into functions.
+REXCVAR_DEFINE_BOOL(sa2_diag_runtime_census, false, "SA2 enhancements",
+                    "Diagnostic (PC): flush-mode switches and calls of the host runtime's clock, critical section, "
+                    "event, semaphore, wait and handle-lookup paths per second, in '[census]' log lines with each "
+                    "'[enh] uses' report")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+#if !REX_PLATFORM_SWITCH && defined(_WIN32)
+extern "C" __declspec(dllimport) void* __stdcall GetModuleHandleW(const wchar_t* name);
+static uint64_t CensusImageBase() { return reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr)); }
+#else
+[[maybe_unused]] static uint64_t CensusImageBase() { return 0; }
+#endif
+
+// sasrt-nx's CPU round (2026-10-12): build-time work with a run-time side (docs/enhancements.md).
+SA2_ENHANCEMENT(g_guest_cas_no_barrier, sa2_cpu_guest_cas_no_barrier, sa2::enh::kCpu, true,
+                "Compare-and-swap (the game's interlocked operations, tools/guest_cas.py, and the SDK's lock words, "
+                "rex/thread/atomic.h) without the legacy builtin's trailing `dmb ish` on the A57; off puts the barrier "
+                "back at run time");
+#if defined(__aarch64__)
+extern "C" unsigned char g_rex_atomic_legacy_barrier;  // sdk/src/core/atomic_posix.cpp
+#endif
+
+#if !REX_PLATFORM_SWITCH
+// tools/flush_mode_flow.py: off the Switch every flush-mode check the control flow proved redundant keeps its test
+// (REX_FLUSH_KNOWN_ON / _OFF in the generated pch), counts itself here and calls RexFlushFlowMismatch when the proof
+// was wrong, before the mode is switched after all. So every PC run checks the proofs it executes; the Switch build
+// has no code at these places.
+extern "C" {
+volatile unsigned long long g_rex_flush_flow_checked = 0;  // a plain lossy count: "at least this many"
+// rex/ppc/diet_ops.h, REX_DIET_CENSUS_ON: executions of the any-mode float helpers in the game code (conversions,
+// compares, arithmetic, cold paths). Plain lossy counts too.
+volatile unsigned long long g_rex_diet_census[4] = {};
+}
+namespace {
+std::atomic<uint64_t> g_flush_flow_mismatches{0};
+}
+extern "C" void RexFlushFlowMismatch(int on) noexcept {
+  sa2::enh::VerifyDifference();
+  if (g_flush_flow_mismatches.fetch_add(1, std::memory_order_relaxed) < 16) {
+    REXLOG_ERROR("[enh] DIFFERENCE: flush-mode flow: a check proven redundant had to switch the mode {} (return "
+                 "address {})",
+                 on ? "on" : "off", static_cast<const void*>(__builtin_return_address(0)));
+  }
+}
+#endif
 
 namespace sa2::enh {
 namespace {
@@ -80,6 +132,12 @@ constexpr External kExternal[] = {
     {"sa2_native_deferred_recording", kCpu, "true", "false"},
     {"sa2_deferred_native_fast", kCpu, "true", "false"},
     {"sa2_deferred_native_update", kCpu, "true", "false"},
+    // sasrt-nx's CPU round (2026-10-12), the SDK's key: no condition-variable notify (a syscall on Horizon) for an
+    // event or semaphore nobody is blocked on. Read once, at the first signal (threading_posix.cpp, which only the
+    // Switch build compiles: the key does not exist on the PC).
+#if REX_PLATFORM_SWITCH
+    {"thread_signal_skip_idle", kCpu, "true", "false"},
+#endif
     // Non-CPU: the renderer's GPU optimisations.
     {"sa2_native_edram4_clear_color0", kNonCpu, "true", "false"},
     {"sa2_native_constants_dedupe", kNonCpu, "true", "false"},
@@ -131,6 +189,10 @@ void Resolve() {
     const bool own = e->own();
     const bool master = e->group == kCpu ? g_cpu_master : g_noncpu_master;
     e->active = own && master;
+#if defined(__aarch64__)
+    // sa2_cpu_guest_cas_no_barrier: off puts the legacy `dmb ish` back after every compare-and-swap.
+    if (e == &g_guest_cas_no_barrier) g_rex_atomic_legacy_barrier = e->active ? 0 : 1;
+#endif
     line += fmt::format(" {}={}", e->key, e->active ? "on" : (own ? "on-but-master-off" : "off"));
   }
   int defaulted_on = 0;
@@ -195,6 +257,76 @@ void StartReport() {
         REXLOG_INFO("[verify] checks done: native replacements {} | differences (native replacements + renderer "
                     "self-checks): {}",
                     checks, differences);
+#if !REX_PLATFORM_SWITCH
+      // tools/flush_mode_flow.py's self-check: the proven checks this run executed, and those that were wrong.
+      if (const uint64_t proven = g_rex_flush_flow_checked) {
+        const uint64_t wrong = g_flush_flow_mismatches.load(std::memory_order_relaxed);
+        if (wrong) {
+          REXLOG_ERROR("[enh] DIFFERENCE: flush-mode flow: {} of {} checks proven redundant had to switch the mode "
+                       "(cumulative)",
+                       wrong, proven);
+        } else {
+          REXLOG_INFO("[verify] flush-mode flow: {} checks proven redundant executed so far, 0 had to switch the mode",
+                      proven);
+        }
+      }
+      if (REXCVAR_GET(sa2_diag_runtime_census)) {
+        // sa2_diag_runtime_census: the SDK's counters (rex/sys_counters.h), as calls per second.
+        using namespace rex::syscount;
+        static uint64_t last[kCensusCount] = {};
+        const auto per_s = [&](unsigned id) {
+          const uint64_t now = CensusRead(id);
+          const uint64_t d = now - last[id];
+          last[id] = now;
+          return double(d) / double(seconds);
+        };
+        const double clock = per_s(kClockCall), clock_blocked = per_s(kClockBlocked);
+        const double enter = per_s(kCensusCritSecEnter), recursive = per_s(kCensusCritSecRecursive);
+        const double try_enter = per_s(kCensusTryEnter), cs_wait = per_s(kCritSecWait);
+        const double set = per_s(kCensusEventSet), sem = per_s(kCensusSemRelease), wait = per_s(kCensusWait);
+        const double lookup = per_s(kObjLookup), lookup_blocked = per_s(kObjBlocked);
+        const double native = per_s(kCensusNativeObject), stamp = per_s(kTimestampTick);
+        const double flush = per_s(kCensusFlushWrite), flush_same = per_s(kCensusFlushSame);
+        REXLOG_INFO("[census] guest code per second: {:.0f} flush-mode switches (each an msr fpcr on the console; "
+                    "{:.0f} of them unconditional writes that left the mode as it was)",
+                    flush, flush_same);
+        {
+          // What the switches saved by the generator's any-mode forms cost: a test in each of these calls.
+          static uint64_t last_diet[4] = {}, last_proven = 0;
+          double diet[4];
+          for (int i = 0; i < 4; ++i) {
+            const uint64_t now = g_rex_diet_census[i];
+            diet[i] = double(now - last_diet[i]) / double(seconds);
+            last_diet[i] = now;
+          }
+          const uint64_t proven_now = g_rex_flush_flow_checked;
+          const double proven_s = double(proven_now - last_proven) / double(seconds);
+          last_proven = proven_now;
+          REXLOG_INFO("[census] any-mode float helpers per second: conversions {:.0f}, compares {:.0f}, arithmetic "
+                      "{:.0f}, cold paths {:.0f}; proven flush checks executed {:.0f}",
+                      diet[0], diet[1], diet[2], diet[3], proven_s);
+        }
+        // Where the mode is switched: the most counted code addresses so far, as offsets into the executable
+        // (tools/census_sites.py turns them into functions and generated source lines).
+        CensusSitesEnable(true);
+        static int site_reports = 0;
+        if ((++site_reports % 3) == 0) {
+          uint64_t addresses[48], counts[48];
+          const size_t n = CensusSites(addresses, counts, 48);
+          std::string list;
+          for (size_t i = 0; i < n; ++i) {
+            list += fmt::format(" +{:X}:{}", addresses[i] - CensusImageBase(), counts[i]);
+          }
+          if (n) REXLOG_INFO("[census] flush-mode switch sites (cumulative, image offset:count):{}", list);
+        }
+        REXLOG_INFO("[census] runtime calls per second: guest clock {:.0f} ({:.0f} found its mutex taken); critical "
+                    "sections entered {:.0f} ({:.0f} already owned, {:.0f} tried, {:.0f} waited); events set {:.0f}, "
+                    "semaphores released {:.0f}, waits {:.0f}; handle lookups {:.0f} ({:.0f} found the global lock "
+                    "taken), dispatcher objects looked up {:.0f}; timestamp ticks {:.0f}",
+                    clock, clock_blocked, enter, recursive, try_enter, cs_wait, set, sem, wait, lookup, lookup_blocked,
+                    native, stamp);
+      }
+#endif
     }
   });
 }

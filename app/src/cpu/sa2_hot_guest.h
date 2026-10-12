@@ -37,9 +37,21 @@ struct Hook {
   uint32_t period_mask = 0;         // ... afterwards every (mask+1)-th call
   std::atomic<bool> failed{false};  // a check found a difference: the original runs from now on
   std::atomic<uint64_t> checks{0};
+  // sa2_cpu_hook_counter_ctx: this hook's counter in every thread's context (PPCContext::host_counters), given at
+  // the first call (InitHook); kNoSlot until then, kSlotsFull when the slots ran out.
+  std::atomic<uint8_t> slot{0xFF};
 };
+// PPCContext::host_counters: the hooks' slots (first called, first served); the last four belong to the native
+// Direct3D layer (kHostCounterTick, me/sa2_api_internal.h).
+inline constexpr uint8_t kCtxSlots = 60;
+inline constexpr uint8_t kNoSlot = 0xFF, kSlotsFull = 0xFE;
 
 extern ::sa2::enh::Enhancement g_counter_shared;  // sa2_cpu_hook_counter_shared (sa2_hot_guest.cpp)
+extern ::sa2::enh::Enhancement g_counter_ctx;     // sa2_cpu_hook_counter_ctx (sa2_hot_guest.cpp)
+
+// A slot of PPCContext::host_counters for one hook (kSlotsFull when none is left). Two threads at a hook's first call
+// each take a number and one of them stays unused. Defined in sa2_hot_guest.cpp.
+void TakeCtxSlot(std::atomic<uint8_t>& slot);
 
 // First call of a hook (any thread): key, code check, guard settings. Defined in sa2_hot_guest.cpp.
 void InitHook(Hook& h, uint8_t* base);
@@ -98,6 +110,31 @@ inline void DispatchShared(Hook& h, std::atomic<uint32_t>& n, PPCContext& ctx, u
   DispatchCount<Native>(h, c, ctx, base);
 }
 
+// sa2_cpu_hook_counter_ctx (sasrt-nx's, 2026-10-12): the call counter of each hook in the calling thread's own
+// context, which the hook is handed anyway: the per-thread counter the guard was designed with (the first N calls of
+// each thread checked, then every period-th), without the thread_local's call to __aarch64_read_tp and without the
+// shared counter's store, whose cache line every thread calling the hook pulls to its core (memcpy and the hot copies
+// are called from the game's main and render threads alike). The counter only decides which calls the guard checks.
+template <auto Native>
+inline void DispatchCtx(Hook& h, uint32_t& n, PPCContext& ctx, uint8_t* base) {
+  if (h.failed.load(std::memory_order_relaxed)) [[unlikely]] {
+    h.orig(ctx, base);
+    return;
+  }
+  const uint32_t c = n++;
+  if ((c & 255) == 0) [[unlikely]] g_counter_ctx.Use(256);
+  DispatchCount<Native>(h, c, ctx, base);
+}
+
+// The use counter of an unguarded copy (the 10 s report only): the thread's own slot with sa2_cpu_hook_counter_ctx,
+// else the lossy shared count the copies had (a relaxed load and store).
+inline uint32_t CountCopyCall(uint8_t slot, std::atomic<uint32_t>& shared, PPCContext& ctx) {
+  if (g_counter_ctx.active && slot < kCtxSlots) [[likely]] return ctx.host_counters[slot]++;
+  const uint32_t c = shared.load(std::memory_order_relaxed);
+  shared.store(c + 1, std::memory_order_relaxed);
+  return c;
+}
+
 
 }  // namespace sa2::hot
 
@@ -115,7 +152,10 @@ inline void DispatchShared(Hook& h, std::atomic<uint32_t>& n, PPCContext& ctx, u
       st = h.state.load(std::memory_order_relaxed);                                                        \
     }                                                                                                      \
     if (st == sa2::hot::kOn) [[likely]] {                                                                  \
-      if (sa2::hot::g_counter_shared.active) [[likely]] {                                                         \
+      const uint8_t slot = h.slot.load(std::memory_order_relaxed);                                         \
+      if (sa2::hot::g_counter_ctx.active && slot < sa2::hot::kCtxSlots) [[likely]] {                       \
+        sa2::hot::DispatchCtx<&NS::Native>(h, ctx.host_counters[slot], ctx, base);                         \
+      } else if (sa2::hot::g_counter_shared.active) [[likely]] {                                           \
         static std::atomic<uint32_t> n_shared;                                                             \
         sa2::hot::DispatchShared<&NS::Native>(h, n_shared, ctx, base);                                     \
       } else {                                                                                             \
@@ -141,16 +181,18 @@ inline void DispatchShared(Hook& h, std::atomic<uint32_t>& n, PPCContext& ctx, u
   REX_HOOK_RAW(sub_##ADDR) {                                                                    \
     static std::atomic<uint8_t> state{sa2::hot::kUninit};                                       \
     static std::atomic<uint32_t> n_calls; /* the use report only: a lossy relaxed count, no TLS */ \
+    static std::atomic<uint8_t> slot{sa2::hot::kNoSlot}; /* sa2_cpu_hook_counter_ctx */         \
     uint8_t st = state.load(std::memory_order_relaxed);                                         \
     if (st == sa2::hot::kUninit) [[unlikely]] {                                                 \
       const bool on = g_enh_##ADDR.active &&                                                    \
                       sa2::enh::GuestCodeMatches(base, 0x##ADDR##u, BYTES, HASH, #KEY);         \
       st = on ? sa2::hot::kOn : sa2::hot::kOff;                                                 \
+      sa2::hot::TakeCtxSlot(slot);                                                              \
       state.store(st, std::memory_order_relaxed);                                               \
     }                                                                                           \
     if (st == sa2::hot::kOn) [[likely]] {                                                       \
-      const uint32_t c = n_calls.load(std::memory_order_relaxed);                               \
-      n_calls.store(c + 1, std::memory_order_relaxed);                                          \
+      const uint32_t c =                                                                        \
+          sa2::hot::CountCopyCall(slot.load(std::memory_order_relaxed), n_calls, ctx);          \
       if ((c & 255) == 0) g_enh_##ADDR.Use(256);                                                \
       NS::Native(ctx, base);                                                                    \
       return;                                                                                   \
@@ -168,16 +210,18 @@ inline void DispatchShared(Hook& h, std::atomic<uint32_t>& n, PPCContext& ctx, u
   void sa2::hot::Copy_##ADDR(PPCContext& ctx, uint8_t* base) {                                  \
     static std::atomic<uint8_t> state{sa2::hot::kUninit};                                       \
     static std::atomic<uint32_t> n_calls; /* the use report only: a lossy relaxed count, no TLS */ \
+    static std::atomic<uint8_t> slot{sa2::hot::kNoSlot}; /* sa2_cpu_hook_counter_ctx */         \
     uint8_t st = state.load(std::memory_order_relaxed);                                         \
     if (st == sa2::hot::kUninit) [[unlikely]] {                                                 \
       const bool on = g_enh_##ADDR.active &&                                                    \
                       sa2::enh::GuestCodeMatches(base, 0x##ADDR##u, BYTES, HASH, #KEY);         \
       st = on ? sa2::hot::kOn : sa2::hot::kOff;                                                 \
+      sa2::hot::TakeCtxSlot(slot);                                                              \
       state.store(st, std::memory_order_relaxed);                                               \
     }                                                                                           \
     if (st == sa2::hot::kOn) [[likely]] {                                                       \
-      const uint32_t c = n_calls.load(std::memory_order_relaxed);                               \
-      n_calls.store(c + 1, std::memory_order_relaxed);                                          \
+      const uint32_t c =                                                                        \
+          sa2::hot::CountCopyCall(slot.load(std::memory_order_relaxed), n_calls, ctx);          \
       if ((c & 255) == 0) g_enh_##ADDR.Use(256);                                                \
       NS::Native(ctx, base);                                                                    \
       return;                                                                                   \

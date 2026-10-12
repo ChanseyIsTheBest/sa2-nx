@@ -296,6 +296,46 @@ struct BuilderContext {
   /// before and returns false (the plain conversion).
   bool single_conversion_any_mode();
 
+  /// fp_compares_modeless (sasrt-nx): an instruction whose result the flush mode cannot change (fcfid: integer
+  /// to double; fctiwz / fctidz: truncation, a denormal gives 0 either way; fsel through its bit test): no switch
+  /// and no check, and the tracked mode stays what it was. Without the option FPU mode as before.
+  void emit_flush_mode_for_modeless();
+
+  /// fcmpu / fcmpo / frsp: true when the any-mode form must be emitted (fp_compares_modeless with VMX mode current:
+  /// no switch); otherwise switches to FPU mode as before and returns false (the plain form).
+  bool compare_any_mode();
+
+  /// fp_mode_lookahead: what the code after this instruction needs, in address order within its block: kVmx when
+  /// the next instruction that needs a particular flush mode is a VMX float instruction, kFpu when it is a scalar
+  /// instruction without an any-mode form or the third scalar single operation in a row (a run that long switches
+  /// once instead), kNone when a branch, a call, the end of the block or 24 instructions come first. Instructions
+  /// with any-mode forms (float loads and stores, frsp, fcmpu) and instructions the mode cannot change do not count.
+  /// The answer only chooses between two exact forms of the current instruction.
+  enum class FloatDemand { kNone, kFpu, kVmx };
+  FloatDemand next_float_demand() const;
+
+  /// fp_mode_lookahead: whether the function has a VMX float instruction at all. A function without one is scalar
+  /// code: its float loads, stores and compares keep the plain forms behind one mode check, as before the option
+  /// (unless it is mode-free, below).
+  bool function_has_vmx_float() const;
+
+  /// fp_mode_lookahead: a function with no instruction that needs FPU mode (no scalar arithmetic at all: getters,
+  /// setters, float copies, compares) and at most 8 float loads / stores / frsp / fcmpu. With their any-mode forms
+  /// such a function never touches the mode, whatever its caller left; with the plain forms it switched to FPU
+  /// mode for nothing when called from vector code, and the caller switched back.
+  bool function_is_mode_free() const;
+
+  /// fp_mode_lookahead: an lfs / stfs / frsp / fcmpu takes its any-mode form: the mode is not known to be FPU, and
+  /// the next instruction that needs a mode is a VMX one, or there is none before the next branch and the function
+  /// mixes scalar and vector float code (where the mode flips; in a scalar function the single check is cheaper
+  /// than a test per conversion).
+  bool conversion_prefers_any_mode() const;
+
+  /// fadds / fsubs / fmuls / fdivs: true when the any-mode form must be emitted (fp_mode_lookahead, the mode is not
+  /// known to be FPU, and vector code follows after at most one more such operation: no switch, the tracked mode
+  /// stays); otherwise switches to FPU mode as before and returns false.
+  bool arithmetic_any_mode();
+
   /// Emit mid-asm hook if configured for current address
   void emit_mid_asm_hook();
 

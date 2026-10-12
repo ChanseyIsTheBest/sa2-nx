@@ -155,12 +155,31 @@ inline simde__m128 simde_mm_cvtepu32_ps_(simde__m128i src1) {
   return simde_mm_blendv_ps(xmm2, simde_mm_castsi128_ps(xmm0), simde_mm_castsi128_ps(src1));
 }
 
+// rexglue ports (sasrt-nx, 2026-10-12): on AArch64 the three helpers below are the one NEON instruction that does
+// what the VMX instruction does, instead of the x86 emulation compiled through simde (vperm: two pshufb, each an AND
+// and a TBL there, a shift and a blend; the conversions: x86's "integer indefinite" result patched up with compares
+// and blends, on top of simde's own emulation of that result). Same results for every input
+// (sdk/tests/vmx_helpers_neon_test.cpp compares each with the x86 form through simde's model of the NEON
+// instruction). REX_VMX_HELPERS_X86_FORM keeps the x86 forms.
+#if (defined(__aarch64__) || defined(_M_ARM64)) && !defined(REX_VMX_HELPERS_X86_FORM)
+#define REX_VMX_HELPERS_NEON 1
+#endif
+
 // Permute bytes from two vectors based on control vector
 inline simde__m128i simde_mm_perm_epi8_(simde__m128i a, simde__m128i b, simde__m128i c) {
+#if defined(REX_VMX_HELPERS_NEON)
+  // Result byte i = (bit 4 of c[i] ? b : a)[15 - (c[i] & 15)]: with a and b as one 32-byte table that is entry
+  // (c[i] & 0x1F) ^ 0x0F (the XOR is the 15 - x of the low four bits and leaves bit 4).
+  const uint8x16x2_t table = {{simde__m128i_to_neon_u8(a), simde__m128i_to_neon_u8(b)}};
+  const uint8x16_t index =
+      veorq_u8(vandq_u8(simde__m128i_to_neon_u8(c), vdupq_n_u8(0x1F)), vdupq_n_u8(0x0F));
+  return simde__m128i_from_neon_u8(vqtbl2q_u8(table, index));
+#else
   simde__m128i d = simde_mm_set1_epi8(0xF);
   simde__m128i e = simde_mm_sub_epi8(d, simde_mm_and_si128(c, d));
   return simde_mm_blendv_epi8(simde_mm_shuffle_epi8(a, e), simde_mm_shuffle_epi8(b, e),
                               simde_mm_slli_epi32(c, 3));
+#endif
 }
 
 // Unsigned 8-bit compare greater than
@@ -177,6 +196,10 @@ inline simde__m128i simde_mm_cmpgt_epu16(simde__m128i a, simde__m128i b) {
 
 // Vector Convert To Signed Fixed-Point Word Saturate
 inline simde__m128i simde_mm_vctsxs(simde__m128 src1) {
+#if defined(REX_VMX_HELPERS_NEON)
+  // FCVTZS: truncation, saturated at both ends, NaN -> 0: what the x86 form below builds.
+  return simde__m128i_from_neon_i32(vcvtq_s32_f32(simde__m128_to_neon_f32(src1)));
+#else
   simde__m128 xmm2 = simde_mm_cmpunord_ps(src1, src1);
   simde__m128i xmm0 = simde_mm_cvttps_epi32(src1);
   simde__m128i xmm1 = simde_mm_cmpeq_epi32(xmm0, simde_mm_set1_epi32(INT_MIN));
@@ -185,12 +208,17 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1) {
                                         simde_mm_castsi128_ps(simde_mm_set1_epi32(INT_MAX)),
                                         simde_mm_castsi128_ps(xmm1));
   return simde_mm_andnot_si128(simde_mm_castps_si128(xmm2), simde_mm_castps_si128(dest));
+#endif
 }
 
 // Vector Convert To Unsigned Fixed-Point Word Saturate
 // Convert float to unsigned int with saturation to [0, UINT_MAX]
 // NaN -> 0, negative -> 0, > UINT_MAX -> UINT_MAX
 inline simde__m128i simde_mm_vctuxs(simde__m128 src1) {
+#if defined(REX_VMX_HELPERS_NEON)
+  // FCVTZU: truncation, negative -> 0, saturated at UINT_MAX, NaN -> 0.
+  return simde__m128i_from_neon_u32(vcvtq_u32_f32(simde__m128_to_neon_f32(src1)));
+#else
   simde__m128 nan_mask = simde_mm_cmpunord_ps(src1, src1);
   simde__m128 neg_mask = simde_mm_cmplt_ps(src1, simde_mm_setzero_ps());
   simde__m128 max_val = simde_mm_set1_ps(4294967295.0f);  // UINT_MAX as float
@@ -220,6 +248,7 @@ inline simde__m128i simde_mm_vctuxs(simde__m128 src1) {
       simde_mm_and_si128(simde_mm_castps_si128(overflow_mask), simde_mm_set1_epi32(-1)));
 
   return result;
+#endif
 }
 
 // Vector Shift Right

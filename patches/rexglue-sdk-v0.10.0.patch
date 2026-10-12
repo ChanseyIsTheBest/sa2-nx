@@ -742,10 +742,10 @@ index 8426798741687cc8201871bc16dabd0732b6f479..9d00a7f345d4421da6bbdd006437b5ef
  
  }  // namespace rex::audio
 diff --git a/include/rex/codegen/config.h b/include/rex/codegen/config.h
-index 8200139a62d727f28389cfd0566d5fccfb57d8df..dd4de39b6725f91b846a2086009c95dc8ffcd816 100644
+index 8200139a62d727f28389cfd0566d5fccfb57d8df..f2f280ae63f7b6f7b334337b4446dafd096470d0 100644
 --- a/include/rex/codegen/config.h
 +++ b/include/rex/codegen/config.h
-@@ -89,15 +89,46 @@ struct RecompilerConfig {
+@@ -89,15 +89,66 @@ struct RecompilerConfig {
  
    // === Code generation options (optional) ===
    bool skipLr = false;
@@ -763,6 +763,26 @@ index 8200139a62d727f28389cfd0566d5fccfb57d8df..dd4de39b6725f91b846a2086009c95dc
 +  /// mode (flush on), lfs/stfs and their forms convert through rex::ppc::SingleToDoubleAnyMode /
 +  /// DoubleToSingleAnyMode, which give the IEEE result in either mode, instead of switching the mode off and on again.
 +  bool fpMovesModeless = false;
++  // sasrt-nx (2026-10-12): the scalar float instructions whose result the flush mode cannot change switch nothing
++  // (fcfid, fctiwz, fctidz, fsel), and fcmpu / fcmpo / frsp go through any-mode helpers while VMX mode is current.
++  bool fpComparesModeless = false;
++  // sasrt-nx (2026-10-12): before a scalar float instruction switches the flush mode, the generator looks at the
++  // next instruction that needs a particular mode (BuilderContext::next_float_demand). The any-mode forms are then
++  // used whenever the mode is not known to be FPU and vector code (or nothing) follows, and one or two scalar single
++  // operations between vector instructions compute in the current mode (rex::ppc::*SingleAnyMode).
++  bool fpModeLookahead = false;
++  // sa2-nx (2026-10-12): with fpModeLookahead, whether a conversion or compare also takes its any-mode form when
++  // nothing that needs a mode follows before the next branch, in a function with vector float code or a "mode-free"
++  // one (sasrt-nx's rule: true). It bets a test in every such conversion against a switch that may come later. In a
++  // game whose float code is mostly scalar the bet loses: SA2 ran 4.5-8.7 million any-mode conversions a second
++  // (PC census, REX_DIET_CENSUS_ON) to save at most 180 switches a frame. false keeps the any-mode forms where they
++  // replace a switch for certain: a vector instruction comes next, or VMX mode is known to be current.
++  bool fpModeLookaheadPastBranch = true;
++  // sasrt-nx (2026-10-12): rlwinm / rlwnm / rlwimi whose mask does not wrap (mb <= me) are written as a 32-bit
++  // rotate and a 32-bit mask instead of a 64-bit rotate of the word duplicated into both halves. Only a wrapping
++  // mask reaches the upper half, so the result is the same; the compiler then sees a plain shift, bit-field
++  // extract or AND (one instruction instead of three on AArch64).
++  bool rotateWordNarrow = false;
 +  std::unordered_set<uint32_t> lrKeepReturns;
    bool ctrAsLocalVariable = false;
    bool xerAsLocalVariable = false;
@@ -1516,18 +1536,20 @@ index e3fc40dc997a643ffe437012616e3093dff43cee..aebb2a5af9f0d22b37ff0b4372b45623
  
  inline constexpr const char* kVulkanLoader = "libvulkan.so";
 diff --git a/include/rex/ppc/context.h b/include/rex/ppc/context.h
-index 0ede54262059bff41c8c1f5047602fe406d68e03..976a1204c4e47a2cea4726a67ceff557ea1ba3bf 100644
+index 0ede54262059bff41c8c1f5047602fe406d68e03..741856184d62a9685256c88a96ea3d3a813c52cd 100644
 --- a/include/rex/ppc/context.h
 +++ b/include/rex/ppc/context.h
-@@ -18,6 +18,7 @@
+@@ -18,7 +18,9 @@
  #include <cstring>
  
  #include <rex/platform/fpscr.h>
 +#include <rex/ppc/diet_ops.h>
  #include <rex/ppc/func.h>
++#include <rex/sys_counters.h>
  #include <rex/types.h>
  
-@@ -94,10 +95,19 @@ struct CRRegister {
+ #include <simde/x86/avx.h>
+@@ -94,10 +96,19 @@ struct CRRegister {
    }
  
    inline void compare(double left, double right) noexcept {
@@ -1547,12 +1569,67 @@ index 0ede54262059bff41c8c1f5047602fe406d68e03..976a1204c4e47a2cea4726a67ceff557
    }
  
    inline void setFromMask(simde__m128 mask, int imm) noexcept {
+@@ -178,17 +189,22 @@ struct FPSCRRegister {
+   }
+ 
+   inline void enableFlushModeUnconditional() noexcept {
++    REX_SYS_CENSUS_SITE(rex::syscount::kCensusFlushWrite);
++    if ((csr & FlushMask) == FlushMask) REX_SYS_CENSUS(rex::syscount::kCensusFlushSame, 1);
+     csr |= FlushMask;
+     setcsr(csr);
+   }
+ 
+   inline void disableFlushModeUnconditional() noexcept {
++    REX_SYS_CENSUS_SITE(rex::syscount::kCensusFlushWrite);
++    if ((csr & FlushMask) == 0) REX_SYS_CENSUS(rex::syscount::kCensusFlushSame, 1);
+     csr &= ~FlushMask;
+     setcsr(csr);
+   }
+ 
+   inline void enableFlushMode() noexcept {
+     if ((csr & FlushMask) != FlushMask) [[unlikely]] {
++      REX_SYS_CENSUS_SITE(rex::syscount::kCensusFlushWrite);
+       csr |= FlushMask;
+       setcsr(csr);
+     }
+@@ -196,11 +212,16 @@ struct FPSCRRegister {
+ 
+   inline void disableFlushMode() noexcept {
+     if ((csr & FlushMask) != 0) [[unlikely]] {
++      REX_SYS_CENSUS_SITE(rex::syscount::kCensusFlushWrite);
+       csr &= ~FlushMask;
+       setcsr(csr);
+     }
+   }
+ 
++  // tools/flush_mode_flow.py: the test of a check the control flow proved redundant (PC builds keep it).
++  inline bool flushModeIsOn() const noexcept { return (csr & FlushMask) == FlushMask; }
++  inline bool flushModeIsOff() const noexcept { return (csr & FlushMask) == 0; }
++
+   inline void InitHost() noexcept {
+     csr = getcsr();
+     Platform::InitHostExceptions(csr);
+@@ -440,6 +461,14 @@ struct alignas(0x40) PPCContext {
+   PPCVRegister v126;
+   PPCVRegister v127;
+ 
++  //--- Host scratch (rexglue ports; sasrt-nx 2026-10-12) --------
++  // Per-thread counters for the host's hooks, reached through the context every hook is handed: no thread_local
++  // (on the Switch each access is a call to __aarch64_read_tp) and no counter shared by all threads (a cache line
++  // bouncing between cores on every hooked call). Not guest state: never saved, restored or compared; a context
++  // copied and copied back only repeats a few counts. Zero in a new thread's context (value-initialised).
++  static constexpr size_t kHostCounters = 64;
++  uint32_t host_counters[kHostCounters];
++
+   //--- Non-volatile register save/restore --------
+   // Layout: r14-r31 (144) | f14-f31 (144) | v14-v31 (288) | v64-v127 (1024)
+   //       | cr2-cr4 (12) | fpscr (4).  Total: 1616 bytes.
 diff --git a/include/rex/ppc/diet_ops.h b/include/rex/ppc/diet_ops.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..344d0b2843c3dbf32143d1d36a9602c37d8e3984
+index 0000000000000000000000000000000000000000..a3777b15c387e73156fd31bff509e1cc2659c7c0
 --- /dev/null
 +++ b/include/rex/ppc/diet_ops.h
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,218 @@
 +/**
 + * @file        ppc/diet_ops.h
 + * @brief       Codegen "diet" helpers: cheaper but bit-identical lowerings of single PPC instructions.
@@ -1567,6 +1644,17 @@ index 0000000000000000000000000000000000000000..344d0b2843c3dbf32143d1d36a9602c3
 +#include <cstdint>
 +
 +#include <rex/platform/fpscr.h>
++
++// PC diagnostic (sa2-nx, 2026-10-12): how often the any-mode helpers below run, and how often they take a cold path.
++// A flush-mode switch saved is paid for with a test in every one of these calls, so the two counts decide whether the
++// generator's fp_mode_lookahead pays in a given game. Counted only when the build defines REX_DIET_CENSUS_ON (a PC
++// app does, for its game code; the Switch build and the unit tests do not): plain lossy counters the app defines.
++#if defined(REX_DIET_CENSUS_ON) && !defined(__SWITCH__)
++extern "C" volatile unsigned long long g_rex_diet_census[4];  // conversions, compares, arithmetic, cold paths
++#define REX_DIET_CENSUS(k) (g_rex_diet_census[k] = g_rex_diet_census[k] + 1)
++#else
++#define REX_DIET_CENSUS(k) ((void)0)
++#endif
 +
 +namespace rex::ppc {
 +
@@ -1628,13 +1716,44 @@ index 0000000000000000000000000000000000000000..344d0b2843c3dbf32143d1d36a9602c3
 +  P::setcsr(saved);
 +  return f;
 +}
++// The plain single-precision operations with the mode cleared (the cold paths of the *SingleAnyMode helpers).
++#define REX_DIET_SINGLE_SLOW(NAME, EXPR)                                        \
++  [[gnu::noinline, gnu::cold]] inline double NAME(double a, double b) noexcept { \
++    using P = rex::platform::FPSCRPlatform;                                     \
++    const auto saved = P::getcsr();                                             \
++    P::setcsr(decltype(saved)(saved & ~decltype(saved)(P::FlushMask)));         \
++    REX_DIET_FP_BARRIER(a);                                                     \
++    REX_DIET_FP_BARRIER(b);                                                     \
++    double r = double(float(EXPR));                                             \
++    REX_DIET_FP_BARRIER(r);                                                     \
++    P::setcsr(saved);                                                           \
++    return r;                                                                   \
++  }
++REX_DIET_SINGLE_SLOW(AddSingleSlow, a + b)
++REX_DIET_SINGLE_SLOW(SubSingleSlow, a - b)
++REX_DIET_SINGLE_SLOW(MulSingleSlow, a * b)
++REX_DIET_SINGLE_SLOW(DivSingleSlow, a / b)
++#undef REX_DIET_SINGLE_SLOW
++
++template <typename CR>
++[[gnu::noinline, gnu::cold]] inline void CompareSlow(CR& cr, double a, double b) noexcept {
++  using P = rex::platform::FPSCRPlatform;
++  const auto saved = P::getcsr();
++  P::setcsr(decltype(saved)(saved & ~decltype(saved)(P::FlushMask)));
++  REX_DIET_FP_BARRIER(a);
++  REX_DIET_FP_BARRIER(b);
++  cr.compare(a, b);
++  P::setcsr(saved);
++}
 +#undef REX_DIET_FP_BARRIER
 +}  // namespace detail
 +
 +/// lfs: the single's bits to the double register value. A denormal single (exponent 0, fraction not 0) takes the
 +/// slow path; zero, normal, infinite and NaN inputs convert the same in either mode.
 +inline double SingleToDoubleAnyMode(uint32_t bits) noexcept {
++  REX_DIET_CENSUS(0);
 +  if (uint32_t((bits & 0x7FFFFFFFu) - 1u) < 0x007FFFFFu) [[unlikely]] {
++    REX_DIET_CENSUS(3);
 +    return detail::SingleToDoubleSlow(bits);
 +  }
 +  return double(std::bit_cast<float>(bits));
@@ -1644,14 +1763,164 @@ index 0000000000000000000000000000000000000000..344d0b2843c3dbf32143d1d36a9602c3
 +/// double) takes the slow path: only there can the result be tiny. From FLT_MIN up, and for zero, infinity and NaN,
 +/// neither an input flush nor an output flush can apply, on AArch64 (tininess before rounding) or x86 (after).
 +inline float DoubleToSingleAnyMode(double d) noexcept {
++  REX_DIET_CENSUS(0);
 +  const uint64_t a = std::bit_cast<uint64_t>(d) & 0x7FFFFFFFFFFFFFFFull;
 +  if (a - 1u < 0x3810000000000000ull - 1u) [[unlikely]] {
++    REX_DIET_CENSUS(3);
 +    return detail::DoubleToSingleSlow(d);
 +  }
 +  return float(d);
 +}
 +
++/// sasrt-nx (codegen option fp_compares_modeless, 2026-10-12): the same idea for the scalar float instructions the
++/// generator still switched the mode for between VMX instructions.
++///
++/// 0 < |d| < 2^-1022: a denormal double, the only kind of operand the flush mode reads differently (as zero).
++inline bool IsDenormalDouble(double d) noexcept {
++  const uint64_t a = std::bit_cast<uint64_t>(d) & 0x7FFFFFFFFFFFFFFFull;
++  return a - 1u < 0x000FFFFFFFFFFFFFull;
++}
++
++/// fcmpu / fcmpo: a compare writes no float result, so the mode can only change it through an operand: unless one is
++/// a denormal double the answer is the same in either mode. Those compare in the cold helper with the mode cleared.
++template <typename CR>
++inline void CompareAnyMode(CR& cr, double a, double b) noexcept {
++  REX_DIET_CENSUS(1);
++  if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] {
++    REX_DIET_CENSUS(3);
++    detail::CompareSlow(cr, a, b);
++    return;
++  }
++  cr.compare(a, b);
++}
++
++/// frsp: the stfs conversion followed by the lfs one, each exact in either mode (above).
++inline double RoundToSingleAnyMode(double d) noexcept {
++  return SingleToDoubleAnyMode(std::bit_cast<uint32_t>(DoubleToSingleAnyMode(d)));
++}
++
++/// sasrt-nx (codegen option fp_mode_lookahead, 2026-10-12): fadds / fsubs / fmuls / fdivs between VMX instructions,
++/// with the result the instruction gives with the flush mode off, whatever the mode is: one or two scalar operations
++/// in the middle of vector code used to cost a switch to FPU mode and one back (two `msr fpcr` on the A57).
++/// The flush mode can change `double(float(a op b))` in three places only, and each is ruled out or sent to the cold
++/// helper (the plain expression with the mode cleared):
++///   - an operand that is a denormal double (the mode reads it as zero): tested first;
++///   - the double result of the operation being tiny: the mode then returns a zero (AArch64 flushes on tininess
++///     before rounding, x86 on a tiny inexact result), so a result that is not zero was not flushed and is the
++///     same in either mode; a zero result is accepted only where it is exact (x + (-x), x - x, a zero factor, a zero
++///     dividend) and recomputed otherwise;
++///   - the rounding to single and the widening back: RoundToSingleAnyMode (above).
++inline double AddSingleAnyMode(double a, double b) noexcept {
++  REX_DIET_CENSUS(2);
++  if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] return detail::AddSingleSlow(a, b);
++  const double d = a + b;
++  if (d == 0.0 && a != -b) [[unlikely]] return detail::AddSingleSlow(a, b);
++  return RoundToSingleAnyMode(d);
++}
++inline double SubSingleAnyMode(double a, double b) noexcept {
++  REX_DIET_CENSUS(2);
++  if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] return detail::SubSingleSlow(a, b);
++  const double d = a - b;
++  if (d == 0.0 && a != b) [[unlikely]] return detail::SubSingleSlow(a, b);
++  return RoundToSingleAnyMode(d);
++}
++inline double MulSingleAnyMode(double a, double b) noexcept {
++  REX_DIET_CENSUS(2);
++  if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] return detail::MulSingleSlow(a, b);
++  const double d = a * b;
++  if (d == 0.0 && a != 0.0 && b != 0.0) [[unlikely]] return detail::MulSingleSlow(a, b);
++  return RoundToSingleAnyMode(d);
++}
++inline double DivSingleAnyMode(double a, double b) noexcept {
++  REX_DIET_CENSUS(2);
++  if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] return detail::DivSingleSlow(a, b);
++  const double d = a / b;
++  if (d == 0.0 && a != 0.0) [[unlikely]] return detail::DivSingleSlow(a, b);
++  return RoundToSingleAnyMode(d);
++}
++
++/// fsel's test, FRA >= 0.0, on the bits: true for both zeros and every positive number and +infinity, false for every
++/// NaN and every negative number, denormals included (which the flush mode would read as -0: true). The same truth
++/// table as the comparison with the flush mode off, in either mode and without a float compare.
++inline bool GeZeroAnyMode(double a) noexcept {
++  const uint64_t b = std::bit_cast<uint64_t>(a);
++  return b <= 0x7FF0000000000000ull || b == 0x8000000000000000ull;
++}
++
 +}  // namespace rex::ppc
+diff --git a/include/rex/ppc/intrinsics.h b/include/rex/ppc/intrinsics.h
+index 3c2fe09065d089f949314425bd08e09ab5082d68..3fb054035deeab4f4747e155cbc3d60dce63b2b6 100644
+--- a/include/rex/ppc/intrinsics.h
++++ b/include/rex/ppc/intrinsics.h
+@@ -155,12 +155,31 @@ inline simde__m128 simde_mm_cvtepu32_ps_(simde__m128i src1) {
+   return simde_mm_blendv_ps(xmm2, simde_mm_castsi128_ps(xmm0), simde_mm_castsi128_ps(src1));
+ }
+ 
++// rexglue ports (sasrt-nx, 2026-10-12): on AArch64 the three helpers below are the one NEON instruction that does
++// what the VMX instruction does, instead of the x86 emulation compiled through simde (vperm: two pshufb, each an AND
++// and a TBL there, a shift and a blend; the conversions: x86's "integer indefinite" result patched up with compares
++// and blends, on top of simde's own emulation of that result). Same results for every input
++// (sdk/tests/vmx_helpers_neon_test.cpp compares each with the x86 form through simde's model of the NEON
++// instruction). REX_VMX_HELPERS_X86_FORM keeps the x86 forms.
++#if (defined(__aarch64__) || defined(_M_ARM64)) && !defined(REX_VMX_HELPERS_X86_FORM)
++#define REX_VMX_HELPERS_NEON 1
++#endif
++
+ // Permute bytes from two vectors based on control vector
+ inline simde__m128i simde_mm_perm_epi8_(simde__m128i a, simde__m128i b, simde__m128i c) {
++#if defined(REX_VMX_HELPERS_NEON)
++  // Result byte i = (bit 4 of c[i] ? b : a)[15 - (c[i] & 15)]: with a and b as one 32-byte table that is entry
++  // (c[i] & 0x1F) ^ 0x0F (the XOR is the 15 - x of the low four bits and leaves bit 4).
++  const uint8x16x2_t table = {{simde__m128i_to_neon_u8(a), simde__m128i_to_neon_u8(b)}};
++  const uint8x16_t index =
++      veorq_u8(vandq_u8(simde__m128i_to_neon_u8(c), vdupq_n_u8(0x1F)), vdupq_n_u8(0x0F));
++  return simde__m128i_from_neon_u8(vqtbl2q_u8(table, index));
++#else
+   simde__m128i d = simde_mm_set1_epi8(0xF);
+   simde__m128i e = simde_mm_sub_epi8(d, simde_mm_and_si128(c, d));
+   return simde_mm_blendv_epi8(simde_mm_shuffle_epi8(a, e), simde_mm_shuffle_epi8(b, e),
+                               simde_mm_slli_epi32(c, 3));
++#endif
+ }
+ 
+ // Unsigned 8-bit compare greater than
+@@ -177,6 +196,10 @@ inline simde__m128i simde_mm_cmpgt_epu16(simde__m128i a, simde__m128i b) {
+ 
+ // Vector Convert To Signed Fixed-Point Word Saturate
+ inline simde__m128i simde_mm_vctsxs(simde__m128 src1) {
++#if defined(REX_VMX_HELPERS_NEON)
++  // FCVTZS: truncation, saturated at both ends, NaN -> 0: what the x86 form below builds.
++  return simde__m128i_from_neon_i32(vcvtq_s32_f32(simde__m128_to_neon_f32(src1)));
++#else
+   simde__m128 xmm2 = simde_mm_cmpunord_ps(src1, src1);
+   simde__m128i xmm0 = simde_mm_cvttps_epi32(src1);
+   simde__m128i xmm1 = simde_mm_cmpeq_epi32(xmm0, simde_mm_set1_epi32(INT_MIN));
+@@ -185,12 +208,17 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1) {
+                                         simde_mm_castsi128_ps(simde_mm_set1_epi32(INT_MAX)),
+                                         simde_mm_castsi128_ps(xmm1));
+   return simde_mm_andnot_si128(simde_mm_castps_si128(xmm2), simde_mm_castps_si128(dest));
++#endif
+ }
+ 
+ // Vector Convert To Unsigned Fixed-Point Word Saturate
+ // Convert float to unsigned int with saturation to [0, UINT_MAX]
+ // NaN -> 0, negative -> 0, > UINT_MAX -> UINT_MAX
+ inline simde__m128i simde_mm_vctuxs(simde__m128 src1) {
++#if defined(REX_VMX_HELPERS_NEON)
++  // FCVTZU: truncation, negative -> 0, saturated at UINT_MAX, NaN -> 0.
++  return simde__m128i_from_neon_u32(vcvtq_u32_f32(simde__m128_to_neon_f32(src1)));
++#else
+   simde__m128 nan_mask = simde_mm_cmpunord_ps(src1, src1);
+   simde__m128 neg_mask = simde_mm_cmplt_ps(src1, simde_mm_setzero_ps());
+   simde__m128 max_val = simde_mm_set1_ps(4294967295.0f);  // UINT_MAX as float
+@@ -220,6 +248,7 @@ inline simde__m128i simde_mm_vctuxs(simde__m128 src1) {
+       simde_mm_and_si128(simde_mm_castps_si128(overflow_mask), simde_mm_set1_epi32(-1)));
+ 
+   return result;
++#endif
+ }
+ 
+ // Vector Shift Right
 diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
 index 1f524802ee642116261f190563b6246a3b6ede27..9d7901deb21aea13c32dfd883952790382abd2e7 100644
 --- a/include/rex/rex_app.h
@@ -1671,10 +1940,10 @@ index 1f524802ee642116261f190563b6246a3b6ede27..9d7901deb21aea13c32dfd8839527903
    /// Use this for data patches and recomp-specific achievement registration.
 diff --git a/include/rex/sys_counters.h b/include/rex/sys_counters.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..151279ac3dfd4090ad1ad238d49fb948fadce0b7
+index 0000000000000000000000000000000000000000..e9f2fc698613a1796b5c42ed0acd7bbaa28ebae8
 --- /dev/null
 +++ b/include/rex/sys_counters.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,78 @@
 +#pragma once
 +/**
 + * @file        sys_counters.h
@@ -1683,8 +1952,16 @@ index 0000000000000000000000000000000000000000..151279ac3dfd4090ad1ad238d49fb948
 + *
 + * The ids index the profiler's counter array (src/ui/switch_perf.cpp, kCounterCount); the report prints
 + * the per-second delta of each. Keep the enum in sync with the report line there.
++ *
++ * sasrt-nx (2026-10-12): off the Switch the same sites, and the REX_SYS_CENSUS ones, count into
++ * rex::syscount::g_census (a plain load and store each: a lost count does not matter), which the app
++ * prints when it wants a census of the runtime's calls (how often the guest reads the clock, enters a
++ * critical section, sets an event, looks a handle up). On the Switch REX_SYS_CENSUS is nothing: a count
++ * per call is the kind of cost the census is there to find.
 + */
 +
++#include <atomic>
++#include <cstddef>
 +#include <cstdint>
 +
 +namespace rex::syscount {
@@ -1706,16 +1983,44 @@ index 0000000000000000000000000000000000000000..151279ac3dfd4090ad1ad238d49fb948
 +  kAudioNative = 53,      // native audio DSP replacements run (app)
 +  kAudioMismatch = 54,    // ... validate mode mismatches (app)
 +  kCritSecWait = 55,      // RtlEnterCriticalSection fell into a full host wait
-+  kCount = 56,
++  kSignalIdle = 56,       // event / semaphore signals that found nobody blocked: no wake syscall (thread_signal_skip_idle)
++  kCount = 57,
++  // Census only (REX_SYS_CENSUS: never counted on the Switch).
++  kCensusCritSecEnter = 57,   // RtlEnterCriticalSection calls
++  kCensusCritSecRecursive = 58,  // ... that already owned the section
++  kCensusEventSet = 59,       // XEvent::Set calls
++  kCensusSemRelease = 60,     // XSemaphore releases
++  kCensusWait = 61,           // XObject waits (single)
++  kCensusNativeObject = 62,   // XObject::GetNativeObject calls (a guest dispatcher object looked up)
++  kCensusTryEnter = 63,       // RtlTryEnterCriticalSection calls
++  kCensusFlushWrite = 64,     // guest code switched the host flush mode (an `msr fpcr` on AArch64)
++  kCensusFlushSame = 65,      // ... of those, unconditional writes that left the mode as it was
++  kCensusNoteShaderLocked = 66,  // NoteShaderObject calls that took the shared mutex (app)
++  kCensusCount = 72,
 +};
++
++#if !defined(__SWITCH__)
++// Out of line: the table lives in the runtime library (a DLL on Windows, whose data is not exported).
++void Census(unsigned id, uint64_t n);
++uint64_t CensusRead(unsigned id);
++// Census by code address: counts id, and (once CensusSitesEnable(true) was called) the address this was called from.
++// CensusSites copies the `capacity` most counted addresses (cumulative) and returns how many it wrote.
++void CensusSite(unsigned id);
++void CensusSitesEnable(bool on);
++size_t CensusSites(uint64_t* addresses, uint64_t* counts, size_t capacity);
++#endif
 +
 +}  // namespace rex::syscount
 +
 +#if defined(__SWITCH__)
 +extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
 +#define REX_SYS_COUNT(id, n) RexSwitchPerfAdd((id), static_cast<uint64_t>(n))
++#define REX_SYS_CENSUS(id, n) ((void)0)
++#define REX_SYS_CENSUS_SITE(id) ((void)0)
 +#else
-+#define REX_SYS_COUNT(id, n) ((void)0)
++#define REX_SYS_CENSUS_SITE(id) ::rex::syscount::CensusSite((id))
++#define REX_SYS_COUNT(id, n) ::rex::syscount::Census((id), static_cast<uint64_t>(n))
++#define REX_SYS_CENSUS(id, n) ::rex::syscount::Census((id), static_cast<uint64_t>(n))
 +#endif
 diff --git a/include/rex/system/static_modules.h b/include/rex/system/static_modules.h
 new file mode 100644
@@ -1767,6 +2072,94 @@ index 6063f3cc5d6c2f3b097a27c719dd34235a6d1cc4..8b164c5083d2c32afdaff966a7d90a7e
    void RegisterIOCompletionPort(uint32_t key, object_ref<XIOCompletion> port);
    void RemoveIOCompletionPort(uint32_t key);
  
+diff --git a/include/rex/thread/atomic.h b/include/rex/thread/atomic.h
+index f7eecf92f6cb5926844f05990aedc5e0455bced7..c941c7d4e79a75cccbc47d2caeff1532c02e3d11 100644
+--- a/include/rex/thread/atomic.h
++++ b/include/rex/thread/atomic.h
+@@ -13,8 +13,15 @@
+ 
+ #include <cstdint>
+ 
++#if !defined(_WIN32)
++// rexglue ports (sasrt-nx, 2026-10-12): 1 puts a `dmb ish` back after every exclusive pair on AArch64 (the legacy
++// __sync builtins' trailing barrier; sdk/src/core/atomic_posix.cpp defines it, the app's key sets it).
++extern "C" unsigned char g_rex_atomic_legacy_barrier;
++#endif
++
+ namespace rex::thread {
+ 
++#if defined(_WIN32)
+ int32_t atomic_inc(volatile int32_t* value);
+ int32_t atomic_dec(volatile int32_t* value);
+ 
+@@ -27,6 +34,67 @@ int64_t atomic_exchange_add(int64_t amount, volatile int64_t* value);
+ bool atomic_cas(int32_t old_value, int32_t new_value, volatile int32_t* value);
+ bool atomic_cas(int64_t old_value, int64_t new_value, volatile int64_t* value);
+ void atomic_store_release(int32_t new_value, volatile int32_t* value);
++#else
++// POSIX builds (the Switch): inline, so a critical-section enter or leave, a spin lock or an interlocked list
++// operation is the exclusive pair itself and not a call into another translation unit (the SDK library is not part
++// of the app's LTO link). The __atomic builtins with sequentially consistent ordering: acquire/release exclusives
++// and no trailing barrier, where the legacy __sync builtins end with `dmb ish` (GCC PR 65697).
++namespace detail {
++[[gnu::always_inline]] inline void LegacyBarrier() {
++#if defined(__aarch64__)
++  if (g_rex_atomic_legacy_barrier) [[unlikely]] {
++    __asm__ __volatile__("dmb ish" ::: "memory");
++  }
++#endif
++}
++}  // namespace detail
++
++inline int32_t atomic_inc(volatile int32_t* value) {
++  const int32_t r = __atomic_add_fetch(value, 1, __ATOMIC_SEQ_CST);
++  detail::LegacyBarrier();
++  return r;
++}
++inline int32_t atomic_dec(volatile int32_t* value) {
++  const int32_t r = __atomic_sub_fetch(value, 1, __ATOMIC_SEQ_CST);
++  detail::LegacyBarrier();
++  return r;
++}
++
++inline int32_t atomic_exchange(int32_t new_value, volatile int32_t* value) {
++  return __atomic_exchange_n(value, new_value, __ATOMIC_SEQ_CST);
++}
++inline int64_t atomic_exchange(int64_t new_value, volatile int64_t* value) {
++  return __atomic_exchange_n(value, new_value, __ATOMIC_SEQ_CST);
++}
++
++inline int32_t atomic_exchange_add(int32_t amount, volatile int32_t* value) {
++  const int32_t r = __atomic_fetch_add(value, amount, __ATOMIC_SEQ_CST);
++  detail::LegacyBarrier();
++  return r;
++}
++inline int64_t atomic_exchange_add(int64_t amount, volatile int64_t* value) {
++  const int64_t r = __atomic_fetch_add(value, amount, __ATOMIC_SEQ_CST);
++  detail::LegacyBarrier();
++  return r;
++}
++
++inline bool atomic_cas(int32_t old_value, int32_t new_value, volatile int32_t* value) {
++  const bool r =
++      __atomic_compare_exchange_n(value, &old_value, new_value, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
++  detail::LegacyBarrier();
++  return r;
++}
++inline bool atomic_cas(int64_t old_value, int64_t new_value, volatile int64_t* value) {
++  const bool r =
++      __atomic_compare_exchange_n(value, &old_value, new_value, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
++  detail::LegacyBarrier();
++  return r;
++}
++
++inline void atomic_store_release(int32_t new_value, volatile int32_t* value) {
++  __atomic_store_n(value, new_value, __ATOMIC_RELEASE);
++}
++#endif
+ 
+ inline uint32_t atomic_inc(volatile uint32_t* value) {
+   return static_cast<uint32_t>(atomic_inc(reinterpret_cast<volatile int32_t*>(value)));
 diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
 index 352af6743089638f7b48ade2b48ea6d26deb1008..bae1eb6818ab709f811771a1d6430981d4f6b1f6 100644
 --- a/include/rex/thread/fiber.h
@@ -6247,7 +6640,7 @@ index 0000000000000000000000000000000000000000..61107ebd8b01952282ffcf0f44ba327a
 +
 +}  // namespace rex::codegen
 diff --git a/src/codegen/builders/builder_context.h b/src/codegen/builders/builder_context.h
-index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..c680d7b8f72c041fd92360909f48a743a4fe472f 100644
+index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..f5e4f12ae051cd5e8d64f66dd319956d858f7a2c 100644
 --- a/src/codegen/builders/builder_context.h
 +++ b/src/codegen/builders/builder_context.h
 @@ -231,6 +231,46 @@ struct BuilderContext {
@@ -6297,7 +6690,7 @@ index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..c680d7b8f72c041fd92360909f48a743
    /**
     * @brief Emit C++ code for a conditional branch.
     * @param not_ If true, invert the condition
-@@ -247,6 +287,15 @@ struct BuilderContext {
+@@ -247,6 +287,55 @@ struct BuilderContext {
     */
    void emit_set_flush_mode(bool enable);
  
@@ -6310,10 +6703,50 @@ index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..c680d7b8f72c041fd92360909f48a743
 +  /// before and returns false (the plain conversion).
 +  bool single_conversion_any_mode();
 +
++  /// fp_compares_modeless (sasrt-nx): an instruction whose result the flush mode cannot change (fcfid: integer
++  /// to double; fctiwz / fctidz: truncation, a denormal gives 0 either way; fsel through its bit test): no switch
++  /// and no check, and the tracked mode stays what it was. Without the option FPU mode as before.
++  void emit_flush_mode_for_modeless();
++
++  /// fcmpu / fcmpo / frsp: true when the any-mode form must be emitted (fp_compares_modeless with VMX mode current:
++  /// no switch); otherwise switches to FPU mode as before and returns false (the plain form).
++  bool compare_any_mode();
++
++  /// fp_mode_lookahead: what the code after this instruction needs, in address order within its block: kVmx when
++  /// the next instruction that needs a particular flush mode is a VMX float instruction, kFpu when it is a scalar
++  /// instruction without an any-mode form or the third scalar single operation in a row (a run that long switches
++  /// once instead), kNone when a branch, a call, the end of the block or 24 instructions come first. Instructions
++  /// with any-mode forms (float loads and stores, frsp, fcmpu) and instructions the mode cannot change do not count.
++  /// The answer only chooses between two exact forms of the current instruction.
++  enum class FloatDemand { kNone, kFpu, kVmx };
++  FloatDemand next_float_demand() const;
++
++  /// fp_mode_lookahead: whether the function has a VMX float instruction at all. A function without one is scalar
++  /// code: its float loads, stores and compares keep the plain forms behind one mode check, as before the option
++  /// (unless it is mode-free, below).
++  bool function_has_vmx_float() const;
++
++  /// fp_mode_lookahead: a function with no instruction that needs FPU mode (no scalar arithmetic at all: getters,
++  /// setters, float copies, compares) and at most 8 float loads / stores / frsp / fcmpu. With their any-mode forms
++  /// such a function never touches the mode, whatever its caller left; with the plain forms it switched to FPU
++  /// mode for nothing when called from vector code, and the caller switched back.
++  bool function_is_mode_free() const;
++
++  /// fp_mode_lookahead: an lfs / stfs / frsp / fcmpu takes its any-mode form: the mode is not known to be FPU, and
++  /// the next instruction that needs a mode is a VMX one, or there is none before the next branch and the function
++  /// mixes scalar and vector float code (where the mode flips; in a scalar function the single check is cheaper
++  /// than a test per conversion).
++  bool conversion_prefers_any_mode() const;
++
++  /// fadds / fsubs / fmuls / fdivs: true when the any-mode form must be emitted (fp_mode_lookahead, the mode is not
++  /// known to be FPU, and vector code follows after at most one more such operation: no switch, the tracked mode
++  /// stays); otherwise switches to FPU mode as before and returns false.
++  bool arithmetic_any_mode();
++
    /// Emit mid-asm hook if configured for current address
    void emit_mid_asm_hook();
  
-@@ -325,6 +374,14 @@ struct BuilderContext {
+@@ -325,6 +414,14 @@ struct BuilderContext {
     */
    void emit_load_d_form(const char* load_macro, const char* dest_type, bool check_mmio = true);
  
@@ -6329,10 +6762,23 @@ index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..c680d7b8f72c041fd92360909f48a743
     * @brief Emit load with X-form addressing: rD = LOAD(rA + rB)
     * @param load_macro The load macro name
 diff --git a/src/codegen/builders/context.cpp b/src/codegen/builders/context.cpp
-index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..12f3fbbec639823b0e078c49305391bc9a2c4ac1 100644
+index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..f62be0c61e6e5fac5256abdd4ad517a75574e99a 100644
 --- a/src/codegen/builders/context.cpp
 +++ b/src/codegen/builders/context.cpp
-@@ -48,10 +48,28 @@ bool BuilderContext::localizeNonVolatiles() const {
+@@ -18,8 +18,12 @@
+ #include <rex/logging.h>
+ 
+ #include "../codegen_logging.h"
++#include "../ppc/disasm.h"
+ #include <rex/system/export_resolver.h>
+ 
++#include <dis-asm.h>
++#include <ppc.h>
++
+ namespace rex::codegen {
+ 
+ /// eieio instruction encoding (big-endian). Used for MMIO detection:
+@@ -48,10 +52,28 @@ bool BuilderContext::localizeNonVolatiles() const {
    return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters();
  }
  
@@ -6364,7 +6810,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..12f3fbbec639823b0e078c49305391bc
        (localizeNonVolatiles() && index >= 14)) {
      locals.r[index] = true;
      return fmt::format("r{}", index);
-@@ -60,9 +78,7 @@ std::string BuilderContext::r(size_t index) {
+@@ -60,9 +82,7 @@ std::string BuilderContext::r(size_t index) {
  }
  
  std::string BuilderContext::f(size_t index) {
@@ -6375,7 +6821,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..12f3fbbec639823b0e078c49305391bc
      locals.f[index] = true;
      return fmt::format("f{}", index);
    }
-@@ -70,8 +86,7 @@ std::string BuilderContext::f(size_t index) {
+@@ -70,8 +90,7 @@ std::string BuilderContext::f(size_t index) {
  }
  
  std::string BuilderContext::v(size_t index) {
@@ -6385,7 +6831,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..12f3fbbec639823b0e078c49305391bc
        (localizeNonVolatiles() && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
      locals.v[index] = true;
      return fmt::format("v{}", index);
-@@ -80,7 +95,7 @@ std::string BuilderContext::v(size_t index) {
+@@ -80,7 +99,7 @@ std::string BuilderContext::v(size_t index) {
  }
  
  std::string BuilderContext::cr(size_t index) {
@@ -6394,7 +6840,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..12f3fbbec639823b0e078c49305391bc
      locals.cr[index] = true;
      return fmt::format("cr{}", index);
    }
-@@ -88,7 +103,7 @@ std::string BuilderContext::cr(size_t index) {
+@@ -88,7 +107,7 @@ std::string BuilderContext::cr(size_t index) {
  }
  
  const char* BuilderContext::ctr() {
@@ -6403,7 +6849,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..12f3fbbec639823b0e078c49305391bc
      locals.ctr = true;
      return "ctr";
    }
-@@ -96,7 +111,7 @@ const char* BuilderContext::ctr() {
+@@ -96,7 +115,7 @@ const char* BuilderContext::ctr() {
  }
  
  const char* BuilderContext::xer() {
@@ -6412,7 +6858,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..12f3fbbec639823b0e078c49305391bc
      locals.xer = true;
      return "xer";
    }
-@@ -212,17 +227,28 @@ void BuilderContext::emit_function_call(uint32_t address) {
+@@ -212,17 +231,28 @@ void BuilderContext::emit_function_call(uint32_t address) {
        // the owner left live, so hand it the localized copies through ctx and take
        // them back afterwards. Only registers already localized here can be live at
        // this point, so that set is the whole live-in the funclet can see.
@@ -6451,7 +6897,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..12f3fbbec639823b0e078c49305391bc
          return;
        }
  
-@@ -276,6 +302,91 @@ void BuilderContext::emit_function_call(uint32_t address) {
+@@ -276,6 +306,91 @@ void BuilderContext::emit_function_call(uint32_t address) {
    println("\tREX_FATAL(\"Unresolved call from 0x{:08X} to 0x{:08X}\");", base, address);
  }
  
@@ -6543,7 +6989,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..12f3fbbec639823b0e078c49305391bc
  void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
    uint32_t target = insn.operands[1];
  
-@@ -298,7 +409,14 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
+@@ -298,7 +413,14 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
            auto* targetFn = callTarget->asFunction();
            emitCtx.reference(targetFn->name());
            println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
@@ -6559,7 +7005,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..12f3fbbec639823b0e078c49305391bc
            println("\t\treturn;");
            println("\t}}");
          } else if (callTarget->isImport()) {
-@@ -340,6 +458,20 @@ void BuilderContext::emit_set_flush_mode(bool enable) {
+@@ -340,6 +462,282 @@ void BuilderContext::emit_set_flush_mode(bool enable) {
    }
  }
  
@@ -6570,8 +7016,270 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..12f3fbbec639823b0e078c49305391bc
 +}
 +
 +bool BuilderContext::single_conversion_any_mode() {
-+  if (config().fpMovesModeless && csrState == CSRState::VMX) {
++  if (config().fpMovesModeless) {
++    if (config().fpModeLookahead) {
++      if (conversion_prefers_any_mode()) {
++        return true;
++      }
++    } else if (csrState == CSRState::VMX) {
++      return true;
++    }
++  }
++  emit_set_flush_mode(false);
++  return false;
++}
++
++void BuilderContext::emit_flush_mode_for_modeless() {
++  if (!config().fpComparesModeless) {
++    emit_set_flush_mode(false);
++  }
++}
++
++namespace {
++enum class FloatKind { kOther, kBranch, kVmx, kFpuOnly, kSingleArithmetic };
++
++// What an instruction asks of the flush mode. The lists are the builders that call emit_set_flush_mode(true)
++// (vector.cpp) and emit_set_flush_mode(false) (floating_point.cpp); fsel, fcfid, fctiwz and fctidz need no mode
++// with fp_compares_modeless, which fp_mode_lookahead builds on.
++FloatKind ClassifyFloat(const ppc_insn& insn) {
++  if (insn.opcode == nullptr) {
++    return FloatKind::kOther;
++  }
++  switch (insn.opcode->id) {
++    case PPC_INST_VADDFP:
++    case PPC_INST_VADDFP128:
++    case PPC_INST_VCFPSXWS128:
++    case PPC_INST_VCFPUXWS128:
++    case PPC_INST_VCFSX:
++    case PPC_INST_VCFUX:
++    case PPC_INST_VCMPBFP:
++    case PPC_INST_VCMPBFP128:
++    case PPC_INST_VCMPEQFP:
++    case PPC_INST_VCMPEQFP128:
++    case PPC_INST_VCMPGEFP:
++    case PPC_INST_VCMPGEFP128:
++    case PPC_INST_VCMPGTFP:
++    case PPC_INST_VCMPGTFP128:
++    case PPC_INST_VCSXWFP128:
++    case PPC_INST_VCTSXS:
++    case PPC_INST_VCTUXS:
++    case PPC_INST_VCUXWFP128:
++    case PPC_INST_VEXPTEFP:
++    case PPC_INST_VEXPTEFP128:
++    case PPC_INST_VLOGEFP:
++    case PPC_INST_VLOGEFP128:
++    case PPC_INST_VMADDCFP128:
++    case PPC_INST_VMADDFP:
++    case PPC_INST_VMADDFP128:
++    case PPC_INST_VMAXFP:
++    case PPC_INST_VMAXFP128:
++    case PPC_INST_VMINFP:
++    case PPC_INST_VMINFP128:
++    case PPC_INST_VMSUM3FP128:
++    case PPC_INST_VMSUM4FP128:
++    case PPC_INST_VMULFP128:
++    case PPC_INST_VNMSUBFP:
++    case PPC_INST_VNMSUBFP128:
++    case PPC_INST_VPKD3D128:
++    case PPC_INST_VREFP:
++    case PPC_INST_VREFP128:
++    case PPC_INST_VRFIM:
++    case PPC_INST_VRFIM128:
++    case PPC_INST_VRFIN:
++    case PPC_INST_VRFIN128:
++    case PPC_INST_VRFIP:
++    case PPC_INST_VRFIP128:
++    case PPC_INST_VRFIZ:
++    case PPC_INST_VRFIZ128:
++    case PPC_INST_VRSQRTEFP:
++    case PPC_INST_VRSQRTEFP128:
++    case PPC_INST_VSUBFP:
++    case PPC_INST_VSUBFP128:
++      return FloatKind::kVmx;
++    case PPC_INST_FADD:
++    case PPC_INST_FCTID:
++    case PPC_INST_FCTIW:
++    case PPC_INST_FDIV:
++    case PPC_INST_FMADD:
++    case PPC_INST_FMADDS:
++    case PPC_INST_FMSUB:
++    case PPC_INST_FMSUBS:
++    case PPC_INST_FMUL:
++    case PPC_INST_FNMADD:
++    case PPC_INST_FNMADDS:
++    case PPC_INST_FNMSUB:
++    case PPC_INST_FNMSUBS:
++    case PPC_INST_FRES:
++    case PPC_INST_FRSQRTE:
++    case PPC_INST_FSQRT:
++    case PPC_INST_FSQRTS:
++    case PPC_INST_FSUB:
++      return FloatKind::kFpuOnly;
++    case PPC_INST_FADDS:
++    case PPC_INST_FSUBS:
++    case PPC_INST_FMULS:
++    case PPC_INST_FDIVS:
++      return FloatKind::kSingleArithmetic;
++    default:
++      break;
++  }
++  // Every PowerPC branch mnemonic starts with 'b' (b, bl, bc*, beq..., blr, bctr, bctrl, bdnz...), and nothing else does.
++  return insn.opcode->name != nullptr && insn.opcode->name[0] == 'b' ? FloatKind::kBranch : FloatKind::kOther;
++}
++}  // namespace
++
++BuilderContext::FloatDemand BuilderContext::next_float_demand() const {
++  uint32_t end = 0;
++  for (const auto& block : fn.blocks()) {
++    if (base >= block.base && base < block.end()) {
++      end = block.end();
++      break;
++    }
++  }
++  // The scalar single operations in a row, this instruction included when it is one: the third one makes the run a
++  // switch to FPU mode (two mode writes for the run cost less than three or more operations with their checks).
++  uint32_t run = ClassifyFloat(insn) == FloatKind::kSingleArithmetic ? 1 : 0;
++  const uint32_t* p = data + 1;
++  uint32_t address = base + 4;
++  for (uint32_t n = 0; address < end && n < 24; ++n, ++p, address += 4) {
++    ppc_insn next;
++    rex::codegen::ppc::Disassemble(p, 4, address, next);
++    switch (ClassifyFloat(next)) {
++      case FloatKind::kVmx:
++        return FloatDemand::kVmx;
++      case FloatKind::kFpuOnly:
++        return FloatDemand::kFpu;
++      case FloatKind::kSingleArithmetic:
++        if (++run > 2) {
++          return FloatDemand::kFpu;
++        }
++        break;
++      case FloatKind::kBranch:
++        return FloatDemand::kNone;
++      case FloatKind::kOther:
++        break;
++    }
++  }
++  return FloatDemand::kNone;
++}
++
++namespace {
++// What a function's float instructions ask of the mode, counted once per function (the builders run function by
++// function on one thread).
++struct FloatProfile {
++  uint32_t base = 0xFFFFFFFFu;
++  uint32_t vmx = 0;           // VMX float instructions
++  uint32_t fpu = 0;           // scalar instructions that need FPU mode (arithmetic, with or without any-mode forms)
++  uint32_t convertible = 0;   // lfs / stfs forms, frsp, fcmpu / fcmpo
++};
++
++bool IsConvertible(const ppc_insn& insn) {
++  if (insn.opcode == nullptr) {
++    return false;
++  }
++  switch (insn.opcode->id) {
++    case PPC_INST_LFS:
++    case PPC_INST_LFSU:
++    case PPC_INST_LFSUX:
++    case PPC_INST_LFSX:
++    case PPC_INST_STFS:
++    case PPC_INST_STFSU:
++    case PPC_INST_STFSUX:
++    case PPC_INST_STFSX:
++    case PPC_INST_FRSP:
++    case PPC_INST_FCMPU:
++    case PPC_INST_FCMPO:
++      return true;
++    default:
++      return false;
++  }
++}
++
++const FloatProfile& ProfileOf(const BuilderContext& ctx) {
++  static thread_local FloatProfile profile;
++  if (profile.base == ctx.fn.base()) {
++    return profile;
++  }
++  profile = FloatProfile{};
++  profile.base = ctx.fn.base();
++  for (const auto& block : ctx.fn.blocks()) {
++    const auto* p = reinterpret_cast<const uint32_t*>(ctx.emitCtx.binary.translate(block.base));
++    if (p == nullptr) {
++      continue;
++    }
++    for (uint32_t address = block.base; address < block.end(); address += 4, ++p) {
++      ppc_insn other;
++      rex::codegen::ppc::Disassemble(p, 4, address, other);
++      switch (ClassifyFloat(other)) {
++        case FloatKind::kVmx:
++          ++profile.vmx;
++          break;
++        case FloatKind::kFpuOnly:
++        case FloatKind::kSingleArithmetic:
++          ++profile.fpu;
++          break;
++        default:
++          if (IsConvertible(other)) {
++            ++profile.convertible;
++          }
++          break;
++      }
++    }
++  }
++  return profile;
++}
++}  // namespace
++
++bool BuilderContext::function_has_vmx_float() const {
++  return ProfileOf(*this).vmx != 0;
++}
++
++bool BuilderContext::function_is_mode_free() const {
++  const FloatProfile& profile = ProfileOf(*this);
++  return profile.fpu == 0 && profile.convertible <= 8;
++}
++
++bool BuilderContext::conversion_prefers_any_mode() const {
++  if (csrState == CSRState::FPU) {
++    return false;  // the plain form is free
++  }
++  switch (next_float_demand()) {
++    case FloatDemand::kVmx:
++      return true;
++    case FloatDemand::kFpu:
++      return false;  // the switch or check is needed anyway: taken here, this instruction stays plain
++    case FloatDemand::kNone:
++      break;
++  }
++  // Nothing that needs a mode before the next branch. VMX mode known to be current: the plain form would switch off
++  // here for certain (fp_moves_modeless's own rule). Otherwise the any-mode form is a bet on a switch that may come
++  // later (fp_mode_lookahead_past_branch; see config.h for what it cost in a mostly scalar game).
++  if (csrState == CSRState::VMX) {
 +    return true;
++  }
++  return config().fpModeLookaheadPastBranch && (function_has_vmx_float() || function_is_mode_free());
++}
++
++bool BuilderContext::compare_any_mode() {
++  if (config().fpComparesModeless) {
++    if (config().fpModeLookahead) {
++      if (conversion_prefers_any_mode()) {
++        return true;
++      }
++    } else if (csrState == CSRState::VMX) {
++      return true;
++    }
++  }
++  emit_set_flush_mode(false);
++  return false;
++}
++
++bool BuilderContext::arithmetic_any_mode() {
++  if (config().fpModeLookahead && csrState != CSRState::FPU) {
++    const FloatDemand next = next_float_demand();
++    if (next == FloatDemand::kVmx || (next == FloatDemand::kNone && csrState == CSRState::VMX)) {
++      return true;
++    }
 +  }
 +  emit_set_flush_mode(false);
 +  return false;
@@ -6580,7 +7288,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..12f3fbbec639823b0e078c49305391bc
  bool BuilderContext::has_mid_asm_hook() const {
    return config().midAsmHooks.find(base) != config().midAsmHooks.end();
  }
-@@ -487,24 +619,33 @@ void BuilderContext::emit_vec_var_shift(const char* shift_dir, const char* eleme
+@@ -487,24 +885,33 @@ void BuilderContext::emit_vec_var_shift(const char* shift_dir, const char* eleme
  // Memory (Load/Store) Code Generation Helpers
  //=============================================================================
  
@@ -6626,7 +7334,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..12f3fbbec639823b0e078c49305391bc
  }
  
  void BuilderContext::emit_load_x_form(const char* load_macro, const char* dest_type,
-@@ -531,20 +672,15 @@ void BuilderContext::emit_store_d_form(const char* store_macro, const char* src_
+@@ -531,20 +938,15 @@ void BuilderContext::emit_store_d_form(const char* store_macro, const char* src_
                                         bool check_mmio) {
    // D-form: STORE(rA + D, rS) where operands[0]=rS, operands[1]=D, operands[2]=rA
    // store_macro should be like "REX_STORE_U8" - we replace REX_STORE with REX_MM_STORE for MMIO
@@ -6749,7 +7457,7 @@ index 26957fc249752341ec54f33f565b8db03ae84f5d..9c85a859f7e58e87bb352128a0b3c862
    ctx.println("\t}}");
    return true;
 diff --git a/src/codegen/builders/floating_point.cpp b/src/codegen/builders/floating_point.cpp
-index 170224164084692e93d674259dbf215c82cd3e21..daa4bb1ddcab8636f9a96a2501049651841887bb 100644
+index 170224164084692e93d674259dbf215c82cd3e21..091d2b7a6ea47ced705eb0d01991be4c09347a4d 100644
 --- a/src/codegen/builders/floating_point.cpp
 +++ b/src/codegen/builders/floating_point.cpp
 @@ -19,21 +19,21 @@ namespace rex::codegen {
@@ -6777,7 +7485,7 @@ index 170224164084692e93d674259dbf215c82cd3e21..daa4bb1ddcab8636f9a96a2501049651
    ctx.println("\t{}.u64 = {}.u64 ^ 0x8000000000000000;", ctx.f(ctx.insn.operands[0]),
                ctx.f(ctx.insn.operands[1]));
    return true;
-@@ -44,7 +44,7 @@ bool build_fneg(BuilderContext& ctx) {
+@@ -44,13 +44,13 @@ bool build_fneg(BuilderContext& ctx) {
  //=============================================================================
  
  bool build_fmr(BuilderContext& ctx) {
@@ -6786,10 +7494,28 @@ index 170224164084692e93d674259dbf215c82cd3e21..daa4bb1ddcab8636f9a96a2501049651
    ctx.println("\t{}.f64 = {}.f64;", ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
    return true;
  }
-@@ -88,6 +88,11 @@ bool build_fctiw(BuilderContext& ctx) {
+ 
+ bool build_fcfid(BuilderContext& ctx) {
+-  ctx.emit_set_flush_mode(false);
++  ctx.emit_flush_mode_for_modeless();
+   ctx.println("\t{}.f64 = double({}.s64);", ctx.f(ctx.insn.operands[0]),
+               ctx.f(ctx.insn.operands[1]));
+   return true;
+@@ -67,7 +67,7 @@ bool build_fctid(BuilderContext& ctx) {
+ }
+ 
+ bool build_fctidz(BuilderContext& ctx) {
+-  ctx.emit_set_flush_mode(false);
++  ctx.emit_flush_mode_for_modeless();
+   ctx.println(
+       "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x8000000000000000ULL) : "
+       "({1}.f64 > double(LLONG_MAX)) ? LLONG_MAX : "
+@@ -87,7 +87,12 @@ bool build_fctiw(BuilderContext& ctx) {
+ }
  
  bool build_fctiwz(BuilderContext& ctx) {
-   ctx.emit_set_flush_mode(false);
+-  ctx.emit_set_flush_mode(false);
++  ctx.emit_flush_mode_for_modeless();
 +  if (ctx.config().fctiwzInline) {
 +    ctx.println("\t{0}.s64 = rex::ppc::fctiwz({1}.f64);", ctx.f(ctx.insn.operands[0]),
 +                ctx.f(ctx.insn.operands[1]));
@@ -6798,6 +7524,98 @@ index 170224164084692e93d674259dbf215c82cd3e21..daa4bb1ddcab8636f9a96a2501049651
    ctx.println(
        "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x80000000U) : "
        "({1}.f64 >= double(INT_MAX)) ? INT_MAX : "
+@@ -97,7 +102,11 @@ bool build_fctiwz(BuilderContext& ctx) {
+ }
+ 
+ bool build_frsp(BuilderContext& ctx) {
+-  ctx.emit_set_flush_mode(false);
++  if (ctx.compare_any_mode()) {
++    ctx.println("\t{}.f64 = rex::ppc::RoundToSingleAnyMode({}.f64);", ctx.f(ctx.insn.operands[0]),
++                ctx.f(ctx.insn.operands[1]));
++    return true;
++  }
+   ctx.println("\t{}.f64 = double(float({}.f64));", ctx.f(ctx.insn.operands[0]),
+               ctx.f(ctx.insn.operands[1]));
+   return true;
+@@ -108,7 +117,11 @@ bool build_frsp(BuilderContext& ctx) {
+ //=============================================================================
+ 
+ bool build_fcmpu(BuilderContext& ctx) {
+-  ctx.emit_set_flush_mode(false);
++  if (ctx.compare_any_mode()) {
++    ctx.println("\trex::ppc::CompareAnyMode({}, {}.f64, {}.f64);", ctx.cr(ctx.insn.operands[0]),
++                ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
++    return true;
++  }
+   ctx.println("\t{}.compare({}.f64, {}.f64);", ctx.cr(ctx.insn.operands[0]),
+               ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
+   return true;
+@@ -133,7 +146,11 @@ bool build_fadd(BuilderContext& ctx) {
+ }
+ 
+ bool build_fadds(BuilderContext& ctx) {
+-  ctx.emit_set_flush_mode(false);
++  if (ctx.arithmetic_any_mode()) {
++    ctx.println("\t{}.f64 = rex::ppc::AddSingleAnyMode({}.f64, {}.f64);", ctx.f(ctx.insn.operands[0]),
++                ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
++    return true;
++  }
+   ctx.println("\t{}.f64 = double(float({}.f64 + {}.f64));", ctx.f(ctx.insn.operands[0]),
+               ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
+   return true;
+@@ -151,7 +168,11 @@ bool build_fsub(BuilderContext& ctx) {
+ }
+ 
+ bool build_fsubs(BuilderContext& ctx) {
+-  ctx.emit_set_flush_mode(false);
++  if (ctx.arithmetic_any_mode()) {
++    ctx.println("\t{}.f64 = rex::ppc::SubSingleAnyMode({}.f64, {}.f64);", ctx.f(ctx.insn.operands[0]),
++                ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
++    return true;
++  }
+   ctx.println("\t{}.f64 = double(float({}.f64 - {}.f64));", ctx.f(ctx.insn.operands[0]),
+               ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
+   return true;
+@@ -169,7 +190,11 @@ bool build_fmul(BuilderContext& ctx) {
+ }
+ 
+ bool build_fmuls(BuilderContext& ctx) {
+-  ctx.emit_set_flush_mode(false);
++  if (ctx.arithmetic_any_mode()) {
++    ctx.println("\t{}.f64 = rex::ppc::MulSingleAnyMode({}.f64, {}.f64);", ctx.f(ctx.insn.operands[0]),
++                ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
++    return true;
++  }
+   ctx.println("\t{}.f64 = double(float({}.f64 * {}.f64));", ctx.f(ctx.insn.operands[0]),
+               ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
+   return true;
+@@ -187,7 +212,11 @@ bool build_fdiv(BuilderContext& ctx) {
+ }
+ 
+ bool build_fdivs(BuilderContext& ctx) {
+-  ctx.emit_set_flush_mode(false);
++  if (ctx.arithmetic_any_mode()) {
++    ctx.println("\t{}.f64 = rex::ppc::DivSingleAnyMode({}.f64, {}.f64);", ctx.f(ctx.insn.operands[0]),
++                ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
++    return true;
++  }
+   ctx.println("\t{}.f64 = double(float({}.f64 / {}.f64));", ctx.f(ctx.insn.operands[0]),
+               ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
+   return true;
+@@ -297,6 +326,13 @@ bool build_fsqrts(BuilderContext& ctx) {
+ //=============================================================================
+ 
+ bool build_fsel(BuilderContext& ctx) {
++  if (ctx.config().fpComparesModeless) {
++    // The test on the bits: the same truth table as `>= 0.0` with the flush mode off, in either mode.
++    ctx.println("\t{}.f64 = rex::ppc::GeZeroAnyMode({}.f64) ? {}.f64 : {}.f64;",
++                ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
++                ctx.f(ctx.insn.operands[3]));
++    return true;
++  }
+   ctx.emit_set_flush_mode(false);
+   ctx.println("\t{}.f64 = {}.f64 >= 0.0 ? {}.f64 : {}.f64;", ctx.f(ctx.insn.operands[0]),
+               ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]),
 diff --git a/src/codegen/builders/helpers.h b/src/codegen/builders/helpers.h
 index dbc8d51538acce81bc33166b4679036736844a21..5f27bda3a64cf0f95c0f61d7c1a32d7ee7d9f764 100644
 --- a/src/codegen/builders/helpers.h
@@ -6816,6 +7634,57 @@ index dbc8d51538acce81bc33166b4679036736844a21..5f27bda3a64cf0f95c0f61d7c1a32d7e
  }
  
  /**
+diff --git a/src/codegen/builders/logical.cpp b/src/codegen/builders/logical.cpp
+index a58f51d06dfd94ec3e806206fe93ff8cbc79f2ff..024ee34dde11a0ac6e9d85bc34b6945b735c047f 100644
+--- a/src/codegen/builders/logical.cpp
++++ b/src/codegen/builders/logical.cpp
+@@ -278,6 +278,15 @@ bool build_rotldi(BuilderContext& ctx) {
+ 
+ bool build_rlwimi(BuilderContext& ctx) {
+   const uint64_t mask = compute_mask(ctx.insn.operands[3] + 32, ctx.insn.operands[4] + 32);
++  if (ctx.config().rotateWordNarrow && ctx.insn.operands[3] <= ctx.insn.operands[4]) {
++    // rotate_word_narrow: the mask lies in the low word, where the 64-bit rotate of the duplicated word equals the
++    // 32-bit rotate. The kept bits of the destination (all of its upper word) are unchanged.
++    ctx.println("\t{}.u64 = (__builtin_rotateleft32({}.u32, {}) & 0x{:X}u) | ({}.u64 & 0x{:X});",
++                ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]), ctx.insn.operands[2],
++                static_cast<uint32_t>(mask), ctx.r(ctx.insn.operands[0]), ~mask);
++    emitRecordFormCompare(ctx);
++    return true;
++  }
+   ctx.println(
+       "\t{}.u64 = (__builtin_rotateleft64({}.u32 | ({}.u64 << 32), {}) & 0x{:X}) | ({}.u64 & "
+       "0x{:X});",
+@@ -288,6 +297,15 @@ bool build_rlwimi(BuilderContext& ctx) {
+ }
+ 
+ bool build_rlwinm(BuilderContext& ctx) {
++  if (ctx.config().rotateWordNarrow && ctx.insn.operands[3] <= ctx.insn.operands[4]) {
++    // rotate_word_narrow: see build_rlwimi. The u32 result is zero-extended, as the masked 64-bit form was.
++    ctx.println("\t{}.u64 = __builtin_rotateleft32({}.u32, {}) & 0x{:X}u;", ctx.r(ctx.insn.operands[0]),
++                ctx.r(ctx.insn.operands[1]), ctx.insn.operands[2],
++                static_cast<uint32_t>(
++                    compute_mask(ctx.insn.operands[3] + 32, ctx.insn.operands[4] + 32)));
++    emitRecordFormCompare(ctx);
++    return true;
++  }
+   ctx.println("\t{}.u64 = __builtin_rotateleft64({}.u32 | ({}.u64 << 32), {}) & 0x{:X};",
+               ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]), ctx.r(ctx.insn.operands[1]),
+               ctx.insn.operands[2],
+@@ -298,6 +316,14 @@ bool build_rlwinm(BuilderContext& ctx) {
+ 
+ bool build_rlwnm(BuilderContext& ctx) {
+   // Like rlwinm but shift amount comes from register, not immediate
++  if (ctx.config().rotateWordNarrow && ctx.insn.operands[3] <= ctx.insn.operands[4]) {
++    ctx.println("\t{}.u64 = __builtin_rotateleft32({}.u32, {}.u8 & 0x1F) & 0x{:X}u;",
++                ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]), ctx.r(ctx.insn.operands[2]),
++                static_cast<uint32_t>(
++                    compute_mask(ctx.insn.operands[3] + 32, ctx.insn.operands[4] + 32)));
++    emitRecordFormCompare(ctx);
++    return true;
++  }
+   ctx.println("\t{}.u64 = __builtin_rotateleft64({}.u32 | ({}.u64 << 32), {}.u8 & 0x1F) & 0x{:X};",
+               ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]), ctx.r(ctx.insn.operands[1]),
+               ctx.r(ctx.insn.operands[2]),  // Register, not immediate
 diff --git a/src/codegen/builders/memory.cpp b/src/codegen/builders/memory.cpp
 index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e6436921153 100644
 --- a/src/codegen/builders/memory.cpp
@@ -7265,10 +8134,10 @@ index a0484fb45e39a0ee0644db75c185b80a71338b87..5d068ea94147ce533f24e4c8d0986f67
  
      println("#include \"{}_funcs.{}.h\"\n", projectName, index);
 diff --git a/src/codegen/config.cpp b/src/codegen/config.cpp
-index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..ca88ce5130c9814a4a83f992f70aca1f5b65c1e7 100644
+index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..f73c4c3bd2f72491bf4980dccdf06302c9d442f0 100644
 --- a/src/codegen/config.cpp
 +++ b/src/codegen/config.cpp
-@@ -101,6 +101,14 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -101,6 +101,22 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
    // Bool scalars
    auto hasBool = [&](const char* key) -> bool { return toml[key].is_boolean(); };
    MergeBool(cfg.skipLr, toml["skip_lr"].value_or(false), hasBool("skip_lr"), "skip_lr");
@@ -7280,10 +8149,18 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..ca88ce5130c9814a4a83f992f70aca1f
 +            "fctiwz_inline");
 +  MergeBool(cfg.fpMovesModeless, toml["fp_moves_modeless"].value_or(false), hasBool("fp_moves_modeless"),
 +            "fp_moves_modeless");
++  MergeBool(cfg.fpComparesModeless, toml["fp_compares_modeless"].value_or(false),
++            hasBool("fp_compares_modeless"), "fp_compares_modeless");
++  MergeBool(cfg.fpModeLookahead, toml["fp_mode_lookahead"].value_or(false), hasBool("fp_mode_lookahead"),
++            "fp_mode_lookahead");
++  MergeBool(cfg.fpModeLookaheadPastBranch, toml["fp_mode_lookahead_past_branch"].value_or(true),
++            hasBool("fp_mode_lookahead_past_branch"), "fp_mode_lookahead_past_branch");
++  MergeBool(cfg.rotateWordNarrow, toml["rotate_word_narrow"].value_or(false), hasBool("rotate_word_narrow"),
++            "rotate_word_narrow");
    MergeBool(cfg.skipMsr, toml["skip_msr"].value_or(false), hasBool("skip_msr"), "skip_msr");
    MergeBool(cfg.ctrAsLocalVariable, toml["ctr_as_local"].value_or(false), hasBool("ctr_as_local"),
              "ctr_as_local");
-@@ -116,6 +124,19 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -116,6 +132,19 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
              hasBool("non_volatile_as_local"), "non_volatile_as_local");
    MergeBool(cfg.generateExceptionHandlers, toml["generate_exception_handlers"].value_or(false),
              hasBool("generate_exception_handlers"), "generate_exception_handlers");
@@ -7303,7 +8180,7 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..ca88ce5130c9814a4a83f992f70aca1f
    if (hasBool("is_dll")) {
      cfg.isDll = toml["is_dll"].value_or(false);
    }
-@@ -278,6 +299,16 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -278,6 +307,16 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
          REXCODEGEN_ERROR("Missing 'labels' in [[switch_tables]] entry");
          continue;
        }
@@ -7320,7 +8197,7 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..ca88ce5130c9814a4a83f992f70aca1f
  
        JumpTable jt;
        jt.bctrAddress = *address_opt;
-@@ -372,6 +403,24 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -372,6 +411,24 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
  
    // --- Sets: additive ---
  
@@ -7345,7 +8222,7 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..ca88ce5130c9814a4a83f992f70aca1f
    // indirect_calls -> knownIndirectCallHints (set)
    if (auto indirectCallArray = toml["indirect_calls"].as_array()) {
      for (auto& entry : *indirectCallArray) {
-@@ -531,6 +580,9 @@ RecompilerConfig::ValidationResult RecompilerConfig::Validate() const {
+@@ -531,6 +588,9 @@ RecompilerConfig::ValidationResult RecompilerConfig::Validate() const {
      }
    }
  
@@ -8019,11 +8896,64 @@ index 1ddafd0885a317710b271f7bbb71b883cb1545db..05fa64282bfb4aa13c019658cae3b762
  elseif(UNIX)
      # Linux and macOS/Darwin share the POSIX sources; Darwin-specific behavior
      # is selected inside them with #if defined(__APPLE__).
+diff --git a/src/core/atomic_posix.cpp b/src/core/atomic_posix.cpp
+index 378aa4b33cb54edb836921caf0d359bb22659ea1..47a2d7cf9e11264a47796fe399fac2de666c6b2a 100644
+--- a/src/core/atomic_posix.cpp
++++ b/src/core/atomic_posix.cpp
+@@ -3,40 +3,12 @@
+ 
+ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
+ 
+-namespace rex::thread {
+-
+-int32_t atomic_inc(volatile int32_t* value) {
+-  return __sync_add_and_fetch(value, 1);
+-}
+-int32_t atomic_dec(volatile int32_t* value) {
+-  return __sync_sub_and_fetch(value, 1);
+-}
+-
+-int32_t atomic_exchange(int32_t new_value, volatile int32_t* value) {
+-  return __atomic_exchange_n(value, new_value, __ATOMIC_SEQ_CST);
+-}
+-int64_t atomic_exchange(int64_t new_value, volatile int64_t* value) {
+-  return __atomic_exchange_n(value, new_value, __ATOMIC_SEQ_CST);
+-}
+-
+-int32_t atomic_exchange_add(int32_t amount, volatile int32_t* value) {
+-  return __sync_fetch_and_add(value, amount);
++// rexglue ports (sasrt-nx, 2026-10-12): the atomics themselves are inline in rex/thread/atomic.h on POSIX builds.
++// They use the __atomic builtins with sequentially consistent ordering: the legacy __sync builtins promise a full
++// barrier, so on AArch64 without LSE (the Switch's Cortex-A57) GCC ends each of them with `dmb ish` after the
++// exclusive loop (GCC PR 65697): tens of cycles on every critical-section enter and leave, spin lock and
++// interlocked list operation. This byte puts the barrier back at run time (the app's key decides; also read by the
++// generated code's REX_GUEST_CAS, tools/guest_cas.py).
++extern "C" {
++unsigned char g_rex_atomic_legacy_barrier = 0;
+ }
+-int64_t atomic_exchange_add(int64_t amount, volatile int64_t* value) {
+-  return __sync_fetch_and_add(value, amount);
+-}
+-
+-bool atomic_cas(int32_t old_value, int32_t new_value, volatile int32_t* value) {
+-  return __sync_bool_compare_and_swap(reinterpret_cast<volatile int32_t*>(value), old_value,
+-                                      new_value);
+-}
+-bool atomic_cas(int64_t old_value, int64_t new_value, volatile int64_t* value) {
+-  return __sync_bool_compare_and_swap(reinterpret_cast<volatile int64_t*>(value), old_value,
+-                                      new_value);
+-}
+-
+-void atomic_store_release(int32_t new_value, volatile int32_t* value) {
+-  __atomic_store_n(value, new_value, __ATOMIC_RELEASE);
+-}
+-
+-}  // namespace rex::thread
 diff --git a/src/core/clock.cpp b/src/core/clock.cpp
-index ae72b7ae9cd99c1366a28eb362854e2579bb7aa8..bd125f8fbbcb37c6a661d73a1c9a9fefc0081037 100644
+index ae72b7ae9cd99c1366a28eb362854e2579bb7aa8..fd91052d6846383cd3cc76be8ecf47f696c04841 100644
 --- a/src/core/clock.cpp
 +++ b/src/core/clock.cpp
-@@ -10,18 +10,25 @@
+@@ -10,18 +10,96 @@
   */
  
  #include <algorithm>
@@ -8035,6 +8965,77 @@ index ae72b7ae9cd99c1366a28eb362854e2579bb7aa8..bd125f8fbbcb37c6a661d73a1c9a9fef
  #include <rex/cvar.h>
  #include <rex/math.h>
 +#include <rex/sys_counters.h>
++
++#if !defined(__SWITCH__)
++// The runtime census (sys_counters.h): off the Switch, what REX_SYS_COUNT / REX_SYS_CENSUS count into.
++namespace rex::syscount {
++static std::atomic<uint64_t> g_census[kCensusCount]{};
++void Census(unsigned id, uint64_t n) {
++  if (id < kCensusCount)
++    g_census[id].store(g_census[id].load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
++}
++uint64_t CensusRead(unsigned id) {
++  return id < kCensusCount ? g_census[id].load(std::memory_order_relaxed) : 0;
++}
++
++namespace {
++struct Site {
++  std::atomic<uint64_t> address{0}, count{0};
++};
++constexpr size_t kSites = size_t(1) << 16;
++Site g_sites[kSites];
++std::atomic<bool> g_sites_on{false};
++}  // namespace
++
++void CensusSitesEnable(bool on) {
++  g_sites_on.store(on, std::memory_order_relaxed);
++}
++
++#if defined(__clang__) || defined(__GNUC__)
++__attribute__((noinline))
++#endif
++void CensusSite(unsigned id) {
++  Census(id, 1);
++  if (!g_sites_on.load(std::memory_order_relaxed)) return;
++#if defined(__clang__) || defined(__GNUC__)
++  const uint64_t a = reinterpret_cast<uint64_t>(__builtin_return_address(0));
++#else
++  const uint64_t a = 1;
++#endif
++  size_t i = size_t((a * 0x9E3779B97F4A7C15ull) >> 48);
++  for (size_t probe = 0; probe < 64; ++probe, i = (i + 1) & (kSites - 1)) {
++    uint64_t have = g_sites[i].address.load(std::memory_order_relaxed);
++    if (have == 0 && g_sites[i].address.compare_exchange_strong(have, a, std::memory_order_relaxed)) have = a;
++    if (have == a) {
++      g_sites[i].count.store(g_sites[i].count.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
++      return;
++    }
++  }
++}
++
++size_t CensusSites(uint64_t* addresses, uint64_t* counts, size_t capacity) {
++  size_t n = 0;
++  for (size_t i = 0; i < kSites; ++i) {
++    const uint64_t c = g_sites[i].count.load(std::memory_order_relaxed);
++    if (!c) continue;
++    const uint64_t a = g_sites[i].address.load(std::memory_order_relaxed);
++    // Insertion into the list sorted by count, largest first.
++    size_t at = n < capacity ? n : capacity;
++    while (at > 0 && counts[at - 1] < c) --at;
++    if (at >= capacity) continue;
++    const size_t last = n < capacity ? n : capacity - 1;
++    for (size_t k = last; k > at; --k) {
++      addresses[k] = addresses[k - 1];
++      counts[k] = counts[k - 1];
++    }
++    addresses[at] = a;
++    counts[at] = c;
++    if (n < capacity) ++n;
++  }
++  return n;
++}
++}  // namespace rex::syscount
++#endif
  
  REXCVAR_DEFINE_BOOL(clock_no_scaling, false, "Clock",
                      "Disable clock scaling (inverted: false = scaling enabled)");
@@ -8049,7 +9050,7 @@ index ae72b7ae9cd99c1366a28eb362854e2579bb7aa8..bd125f8fbbcb37c6a661d73a1c9a9fef
  namespace rex::chrono {
  
  // Time scalar applied to all time operations.
-@@ -35,8 +42,8 @@ uint64_t guest_system_time_base_ = Clock::QueryHostSystemTime();
+@@ -35,8 +113,8 @@ uint64_t guest_system_time_base_ = Clock::QueryHostSystemTime();
  // Computed by RecomputeGuestTickScalar.
  std::pair<uint64_t, uint64_t> guest_tick_ratio_ = std::make_pair(1, 1);
  
@@ -8060,7 +9061,7 @@ index ae72b7ae9cd99c1366a28eb362854e2579bb7aa8..bd125f8fbbcb37c6a661d73a1c9a9fef
  // Last sampled host tick count.
  uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
  // Mutex to ensure last_host_tick_count_ and last_guest_tick_count_ are in sync
-@@ -71,6 +78,7 @@ uint64_t UpdateGuestClock() {
+@@ -71,6 +149,7 @@ uint64_t UpdateGuestClock() {
      return host_tick_count * guest_tick_ratio_.first / guest_tick_ratio_.second;
    }
  
@@ -8068,7 +9069,7 @@ index ae72b7ae9cd99c1366a28eb362854e2579bb7aa8..bd125f8fbbcb37c6a661d73a1c9a9fef
    std::unique_lock<std::mutex> lock(tick_mutex_, std::defer_lock);
    if (lock.try_lock()) {
      // Translate host tick count to guest tick count.
-@@ -79,12 +87,20 @@ uint64_t UpdateGuestClock() {
+@@ -79,12 +158,20 @@ uint64_t UpdateGuestClock() {
      last_host_tick_count_ = host_tick_count;
      uint64_t guest_tick_delta =
          host_tick_delta * guest_tick_ratio_.first / guest_tick_ratio_.second;
@@ -12489,7 +13490,7 @@ index 0000000000000000000000000000000000000000..225ec8214d9ddcf2a69be4110606dbc6
 +    diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_ShouldNotHappen));
 +}
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c96a0b0e3 100644
+index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e348c21d22 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -14,13 +14,18 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
@@ -12538,7 +13539,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  #include <rex/thread/timer_queue.h>
  
  #include <sched.h>
-@@ -62,6 +79,18 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+@@ -62,6 +79,24 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
  #define REX_HAS_SIGEV_THREAD_ID 0
  #endif
  
@@ -12546,6 +13547,12 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
 +                    "Event-driven waits: WaitMultiple parks on a wake point instead of polling every 1 ms, "
 +                    "and alertable waits are woken by the queued APC hint instead of a 1 ms poll slice. "
 +                    "false = the original 1 ms polling (A/B; also the fallback if a hang is suspected)");
++REXCVAR_DEFINE_BOOL(thread_signal_skip_idle, true, "Threading",
++                    "Setting an event or releasing a semaphore that no thread is blocked on does not call the "
++                    "condition variable's notify (on Horizon always a syscall, svcSignalProcessWideKey, even with "
++                    "nobody waiting): the waiters of each condition are counted under its own mutex. false = notify "
++                    "on every signal, as before");
++
 +REXCVAR_DEFINE_INT32(thread_alertable_slice_ms, 8, "Threading",
 +                     "With thread_wait_blocking: longest an alertable wait sleeps before it re-checks the "
 +                     "APC queue (safety net; the wake-up normally arrives through the queued callback). "
@@ -12557,7 +13564,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  namespace rex::thread {
  
  #if REX_PLATFORM_ANDROID
-@@ -115,7 +144,7 @@ enum class SignalType {
+@@ -115,7 +150,7 @@ enum class SignalType {
  };
  
  int GetSystemSignal(SignalType num) {
@@ -12566,7 +13573,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
    // macOS has no realtime signals (SIGRTMIN..SIGRTMAX); map the runtime's
    // signals onto the two user-defined signals.
    switch (num) {
-@@ -135,7 +164,7 @@ int GetSystemSignal(SignalType num) {
+@@ -135,7 +170,7 @@ int GetSystemSignal(SignalType num) {
  }
  
  SignalType GetSystemSignalType(int num) {
@@ -12575,7 +13582,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
    switch (num) {
      case SIGUSR1:
        return SignalType::kThreadSuspend;
-@@ -156,6 +185,15 @@ std::array<std::atomic<bool>, static_cast<size_t>(SignalType::k_Count)> signal_h
+@@ -156,6 +191,15 @@ std::array<std::atomic<bool>, static_cast<size_t>(SignalType::k_Count)> signal_h
  static void signal_handler(int signal, siginfo_t* info, void* context);
  
  void install_signal_handler(SignalType type) {
@@ -12591,7 +13598,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
    bool expected = false;
    if (!signal_handler_installed[static_cast<size_t>(type)].compare_exchange_strong(expected,
                                                                                     true)) {
-@@ -168,6 +206,7 @@ void install_signal_handler(SignalType type) {
+@@ -168,6 +212,7 @@ void install_signal_handler(SignalType type) {
    if (sigaction(GetSystemSignal(type), &action, nullptr) != 0) {
      signal_handler_installed[static_cast<size_t>(type)] = false;
    }
@@ -12599,7 +13606,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  }
  
  // TODO(dougvj)
-@@ -178,6 +217,8 @@ void EnableAffinityConfiguration() {}
+@@ -178,6 +223,8 @@ void EnableAffinityConfiguration() {}
  uint32_t current_thread_system_id() {
  #if defined(__APPLE__)
    return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
@@ -12608,7 +13615,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  #else
    return static_cast<uint32_t>(syscall(SYS_gettid));
  #endif
-@@ -206,26 +247,9 @@ void Sleep(std::chrono::microseconds duration) {
+@@ -206,26 +253,9 @@ void Sleep(std::chrono::microseconds duration) {
    } while (ret == -1 && errno == EINTR);
  }
  
@@ -12636,7 +13643,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  
  TlsHandle AllocateTlsHandle() {
    auto key = static_cast<pthread_key_t>(-1);
-@@ -267,6 +291,22 @@ static sem_t* RexCreateAnonymousSemaphore() {
+@@ -267,6 +297,22 @@ static sem_t* RexCreateAnonymousSemaphore() {
  }
  #endif  // __APPLE__
  
@@ -12659,7 +13666,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  class PosixConditionBase {
   public:
    PosixConditionBase() {
-@@ -287,10 +327,69 @@ class PosixConditionBase {
+@@ -287,10 +333,69 @@ class PosixConditionBase {
    virtual ~PosixConditionBase() = default;
    virtual bool Signal() = 0;
  
@@ -12732,7 +13739,15 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
      auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
      int lock_result = pthread_mutex_lock(native_mutex);
      if (lock_result == EOWNERDEAD) {
-@@ -309,10 +408,18 @@ class PosixConditionBase {
+@@ -305,14 +410,27 @@ class PosixConditionBase {
+     if (predicate()) {
+       executed = true;
+     } else {
++      // thread_signal_skip_idle: counted while blocked (under mutex_, which the wait releases only once this thread
++      // is queued on the condition), so a signaller that changes the state under the same mutex sees every thread
++      // its notify could wake. A thread that arrives later finds the state already changed and does not block.
++      ++cond_waiters_;
+       if (timeout == std::chrono::milliseconds::max()) {
          cond_.wait(lock, predicate);
          executed = true;  // Did not time out;
        } else {
@@ -12743,6 +13758,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
          executed = cond_.wait_for(lock, timeout, predicate);
 +#endif
        }
++      --cond_waiters_;
      }
      if (executed) {
 +      if (interrupt && !signaled()) {
@@ -12751,7 +13767,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
        post_execution();
        return WaitResult::kSuccess;
      } else {
-@@ -320,13 +427,18 @@ class PosixConditionBase {
+@@ -320,13 +438,18 @@ class PosixConditionBase {
      }
    }
  
@@ -12772,7 +13788,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
        return std::make_pair(result, 0);
      }
  
-@@ -335,14 +447,34 @@ class PosixConditionBase {
+@@ -335,14 +458,34 @@ class PosixConditionBase {
                          ? std::chrono::steady_clock::time_point::max()
                          : start_time + timeout;
  
@@ -12810,7 +13826,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
        for (size_t i = 0; i < handles.size(); ++i) {
  #if REX_PLATFORM_LINUX
          auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
-@@ -367,7 +499,25 @@ class PosixConditionBase {
+@@ -367,7 +510,25 @@ class PosixConditionBase {
  
        if (!all_locked) {
          locks.clear();
@@ -12836,7 +13852,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
          continue;
        }
  
-@@ -411,11 +561,43 @@ class PosixConditionBase {
+@@ -411,11 +572,43 @@ class PosixConditionBase {
          return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
        }
  
@@ -12882,10 +13898,23 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
          std::this_thread::sleep_for(sleep_time);
        }
      }
-@@ -430,6 +612,11 @@ class PosixConditionBase {
+@@ -428,8 +621,24 @@ class PosixConditionBase {
+  protected:
+   inline virtual bool signaled() const = 0;
    inline virtual void post_execution() = 0;
++  // thread_signal_skip_idle: the notify of a state change, given the waiter count read under mutex_ together with
++  // that change. Without a waiter there is nothing to wake and the syscall is skipped (counted for the profiler).
++  void WakeWaiters(uint32_t waiters) {
++    static const bool skip_idle = REXCVAR_GET(thread_signal_skip_idle);
++    if (waiters != 0 || !skip_idle) {
++      cond_.notify_all();
++    } else {
++      REX_SYS_COUNT(rex::syscount::kSignalIdle, 1);
++    }
++  }
    std::condition_variable cond_;
    std::mutex mutex_;
++  uint32_t cond_waiters_ = 0;  // threads blocked in Wait() on cond_; guarded by mutex_
 +
 + private:
 +  std::mutex multi_mutex_;
@@ -12894,34 +13923,49 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  };
  
  // There really is no native POSIX handle for a single wait/signal construct
-@@ -447,9 +634,14 @@ class PosixCondition<Event> : public PosixConditionBase {
+@@ -447,9 +656,16 @@ class PosixCondition<Event> : public PosixConditionBase {
    virtual ~PosixCondition() = default;
  
    bool Signal() override {
 -    auto lock = std::unique_lock<std::mutex>(mutex_);
 -    signal_ = true;
+-    cond_.notify_all();
++    uint32_t waiters;
 +    {
 +      auto lock = std::unique_lock<std::mutex>(mutex_);
 +      signal_ = true;
++      waiters = cond_waiters_;
 +    }
 +    // Notified after the lock is released: a woken waiter (on Horizon the XMA decoder runs above the guest
 +    // threads) would otherwise run straight into the mutex its signaller still holds and go back to sleep.
-     cond_.notify_all();
++    WakeWaiters(waiters);
 +    NotifyMulti();
      return true;
    }
  
-@@ -486,7 +678,9 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+@@ -486,7 +702,10 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
        *out_previous_count = count_;
      }
      count_ += release_count;
+-    cond_.notify_all();
++    const uint32_t waiters = cond_waiters_;
 +    lock.unlock();
-     cond_.notify_all();
++    WakeWaiters(waiters);
 +    NotifyMulti();
      return true;
    }
  
-@@ -514,11 +708,16 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+@@ -494,7 +713,8 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+   inline bool signaled() const override { return count_ > 0; }
+   inline void post_execution() override {
+     count_--;
+-    cond_.notify_all();
++    // Called by the waiter under mutex_ (it has left the count already): other waiters re-check the count.
++    WakeWaiters(cond_waiters_);
+   }
+   uint32_t count_;
+   const uint32_t maximum_count_;
+@@ -514,11 +734,16 @@ class PosixCondition<Mutant> : public PosixConditionBase {
  
    bool Release() {
      if (owner_ == std::this_thread::get_id() && count_ > 0) {
@@ -12942,7 +13986,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
        }
        return true;
      }
-@@ -548,9 +747,12 @@ class PosixCondition<Timer> : public PosixConditionBase {
+@@ -548,9 +773,12 @@ class PosixCondition<Timer> : public PosixConditionBase {
    virtual ~PosixCondition() { Cancel(); }
  
    bool Signal() override {
@@ -12957,7 +14001,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
      return true;
    }
  
-@@ -621,6 +823,240 @@ struct ThreadStartData {
+@@ -621,6 +849,240 @@ struct ThreadStartData {
    Thread* thread_obj;
  };
  
@@ -13198,7 +14242,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  template <>
  class PosixCondition<Thread> : public PosixConditionBase {
    enum class State {
-@@ -667,7 +1103,90 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -667,7 +1129,90 @@ class PosixCondition<Thread> : public PosixConditionBase {
          return false;
        }
      }
@@ -13290,7 +14334,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
        pthread_attr_destroy(&attr);
        return false;
      }
-@@ -758,12 +1277,29 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -758,12 +1303,29 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
  #if defined(__APPLE__)
    uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
@@ -13320,7 +14364,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  #if defined(__APPLE__)
      // macOS doesn't expose Linux-style pthread affinity masks; report every
      // logical processor as available.
-@@ -795,6 +1331,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -795,6 +1357,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
    void set_affinity_mask(uint64_t mask) {
      WaitStarted();
@@ -13328,7 +14372,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  #if defined(__APPLE__)
      // macOS doesn't expose Linux-style pthread affinity masks; keep this a
      // no-op so higher layers can build and run.
-@@ -821,6 +1358,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -821,6 +1384,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
    int priority() {
      WaitStarted();
@@ -13336,7 +14380,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
      int policy;
      sched_param param{};
      int ret = pthread_getschedparam(thread_, &policy, &param);
-@@ -833,6 +1371,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -833,6 +1397,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
    void set_priority(int new_priority) {
      WaitStarted();
@@ -13344,7 +14388,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
      sched_param param{};
      param.sched_priority = new_priority;
      int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
-@@ -868,7 +1407,21 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -868,7 +1433,21 @@ class PosixCondition<Thread> : public PosixConditionBase {
        return;
      }
  
@@ -13367,7 +14411,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
      // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
      // without the sigval payload.
      int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
-@@ -887,6 +1440,27 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -887,6 +1466,27 @@ class PosixCondition<Thread> : public PosixConditionBase {
      }
    }
  
@@ -13395,7 +14439,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
    bool DispatchQueuedUserCallbacks() {
      if (!has_pending_user_callbacks_.load(std::memory_order_acquire)) {
        return false;
-@@ -924,6 +1498,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -924,6 +1524,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
      --suspend_count_;
      if (suspend_count_ == 0 && state_ == State::kSuspended) {
        state_ = State::kRunning;
@@ -13411,7 +14455,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
        // Async-signal-safe wakeup for WaitSuspended() from signal handler path.
        sem_post(suspend_sem_ptr());
      }
-@@ -951,8 +1534,21 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -951,8 +1560,21 @@ class PosixCondition<Thread> : public PosixConditionBase {
        return true;
      }
  
@@ -13433,7 +14477,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
    }
  
    void Terminate(int exit_code) {
-@@ -972,6 +1568,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -972,6 +1594,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
        }
        state_ = State::kFinished;
      }
@@ -13443,7 +14487,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  
      {
        std::lock_guard<std::mutex> lock(mutex_);
-@@ -980,6 +1579,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -980,6 +1605,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
        signaled_ = true;
        cond_.notify_all();
      }
@@ -13451,7 +14495,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
      if (is_current_thread) {
        pthread_exit(reinterpret_cast<void*>(exit_code));
      } else {
-@@ -1014,8 +1614,12 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1014,8 +1640,12 @@ class PosixCondition<Thread> : public PosixConditionBase {
    static void* ThreadStartRoutine(void* parameter);
    inline bool signaled() const override { return signaled_; }
    inline void post_execution() override {
@@ -13465,7 +14509,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
      }
  #if defined(__APPLE__)
      if (suspend_sem_ != SEM_FAILED) {
-@@ -1027,6 +1631,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1027,6 +1657,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
  #endif
    }
    pthread_t thread_;
@@ -13477,7 +14521,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
    bool signaled_;
    int exit_code_;
    State state_;             // Protected by state_mutex_
-@@ -1043,6 +1652,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1043,6 +1678,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
    mutable std::condition_variable state_signal_;
    std::deque<std::function<void()>> user_callbacks_;
    std::atomic<bool> has_pending_user_callbacks_{false};
@@ -13487,7 +14531,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  #if REX_PLATFORM_ANDROID
    // Name accessible via name() on Android before API 26 which added
    // pthread_getname_np.
-@@ -1070,7 +1682,44 @@ bool DispatchCurrentThreadUserCallback() {
+@@ -1070,7 +1708,44 @@ bool DispatchCurrentThreadUserCallback() {
  
  namespace {
  
@@ -13533,7 +14577,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  
  class ScopedAlertableState {
   public:
-@@ -1104,14 +1753,16 @@ bool HasAlertableTimeoutElapsed(std::chrono::steady_clock::time_point deadline)
+@@ -1104,14 +1779,16 @@ bool HasAlertableTimeoutElapsed(std::chrono::steady_clock::time_point deadline)
  std::chrono::milliseconds ComputeAlertableWaitTimeout(
      std::chrono::steady_clock::time_point deadline) {
    if (deadline == std::chrono::steady_clock::time_point::max()) {
@@ -13553,7 +14597,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  }
  
  }  // namespace
-@@ -1165,18 +1816,26 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
+@@ -1165,18 +1842,26 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
  
    ScopedAlertableState alertable_state_guard(true);
    auto deadline = ComputeAlertableDeadline(timeout);
@@ -13584,7 +14628,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
    }
  }
  
-@@ -1198,17 +1857,20 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
+@@ -1198,17 +1883,20 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
  
    ScopedAlertableState alertable_state_guard(true);
    auto deadline = ComputeAlertableDeadline(timeout);
@@ -13609,7 +14653,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
    }
  }
  
-@@ -1224,24 +1886,71 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
+@@ -1224,24 +1912,71 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
      }
      conditions.push_back(&handle->condition());
    }
@@ -13686,7 +14730,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
    }
  }
  
-@@ -1443,6 +2152,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1443,6 +2178,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
      std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
      thread->handle_.state_ = State::kFinished;
    }
@@ -13696,7 +14740,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..f9f3da03233e858c718f1af708cd565c
  
    {
      std::unique_lock<std::mutex> lock(thread->handle_.mutex_);
-@@ -1450,6 +2162,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1450,6 +2188,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
      thread->handle_.signaled_ = true;
      thread->handle_.cond_.notify_all();
    }
@@ -21453,7 +22497,7 @@ index dcb3af63b53139c731001405f6b68cd6453e1fbc..736b0f5988f1b494ebf7b8ab87a1ae1c
                                           chrono::Clock::QueryGuestUptimeMillis());
        });
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
-index 8b862fc7a0487b5aaa1d4c3a27aa5ae7a7526fd8..7bdaac5e7d8b1f32568266bee8744caef5589216 100644
+index 8b862fc7a0487b5aaa1d4c3a27aa5ae7a7526fd8..3b8457c6cb94731191ddfe8c194ca23c5ed9e200 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
 @@ -16,6 +16,7 @@
@@ -21484,8 +22528,11 @@ index 8b862fc7a0487b5aaa1d4c3a27aa5ae7a7526fd8..7bdaac5e7d8b1f32568266bee8744cae
  void xeRtlInitializeCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t cs_ptr) {
    cs->header.type = 1;      // EventSynchronizationObject (auto reset)
    cs->header.absolute = 0;  // spin count div 256
-@@ -379,6 +386,11 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
+@@ -377,28 +384,40 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
+ }
+ 
  void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
++  REX_SYS_CENSUS(rex::syscount::kCensusCritSecEnter, 1);
    uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
    uint32_t spin_count = cs->header.absolute * 256;
 +  if (spin_count == 0) {
@@ -21496,7 +22543,9 @@ index 8b862fc7a0487b5aaa1d4c3a27aa5ae7a7526fd8..7bdaac5e7d8b1f32568266bee8744cae
  
    if (cs->owning_thread == cur_thread) {
      // We already own the lock.
-@@ -387,18 +399,23 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
++    REX_SYS_CENSUS(rex::syscount::kCensusCritSecRecursive, 1);
+     rex::thread::atomic_inc(&cs->lock_count);
+     cs->recursion_count++;
      return;
    }
  
@@ -21522,6 +22571,14 @@ index 8b862fc7a0487b5aaa1d4c3a27aa5ae7a7526fd8..7bdaac5e7d8b1f32568266bee8744cae
      xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, nullptr);
    }
  
+@@ -408,6 +427,7 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+ }
+ 
+ u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
++  REX_SYS_CENSUS(rex::syscount::kCensusTryEnter, 1);
+   uint32_t thread = XThread::GetCurrentThread()->guest_object();
+ 
+   if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 index 1254710a1c427c384bebc0a8e89bc0406cfe88ea..0c90aa71ab79b509c20e1f282a9b00190d75fe56 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
@@ -22296,6 +23353,26 @@ index bd6c7973a155710b8a6f7d8503a39b19123fafa1..d312f1d6aa55dd90dcd460c2857b9103
    return X_ERROR_SUCCESS;
  }
  
+diff --git a/src/system/xevent.cpp b/src/system/xevent.cpp
+index c24fbd13e119282028453920069e6b7a43d044c1..627f145008c6e88ff9377fbd869d9c7ce7c12534 100644
+--- a/src/system/xevent.cpp
++++ b/src/system/xevent.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/logging.h>
+ #include <rex/stream.h>
++#include <rex/sys_counters.h>
+ #include <rex/system/xevent.h>
+ 
+ namespace rex::system {
+@@ -74,6 +75,7 @@ void XEvent::Query(uint32_t* out_type, uint32_t* out_state) {
+ }
+ 
+ int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
++  REX_SYS_CENSUS(rex::syscount::kCensusEventSet, 1);
+   event_->Set();
+   return 1;
+ }
 diff --git a/src/system/xfile.cpp b/src/system/xfile.cpp
 index 4179e8b279d0f17f00e5b289a4daf383d3e82401..49e374a0fe060e8b26ce86171c594354a73afb91 100644
 --- a/src/system/xfile.cpp
@@ -22585,7 +23662,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..c6f6f2c95d85777d99859d34c63f639f
    } else {
      if (old_protect) {
 diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
-index d358f399d84f196be91eafc620a7e6d4242d2f5d..71d9286877aaf879694f81c328968ff74f995acf 100644
+index d358f399d84f196be91eafc620a7e6d4242d2f5d..ee9a11fa45cf6761e08bff0ebbfa3f4ad23ac316 100644
 --- a/src/system/xobject.cpp
 +++ b/src/system/xobject.cpp
 @@ -27,6 +27,8 @@
@@ -22597,7 +23674,23 @@ index d358f399d84f196be91eafc620a7e6d4242d2f5d..71d9286877aaf879694f81c328968ff7
  namespace rex::system {
  
  XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
-@@ -380,7 +382,7 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
+@@ -202,6 +204,7 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
+ 
+ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
+                        uint64_t* opt_timeout) {
++  REX_SYS_CENSUS(rex::syscount::kCensusWait, 1);
+   auto wait_handle = GetWaitHandle();
+   if (!wait_handle) {
+     // Object doesn't support waiting.
+@@ -370,6 +373,7 @@ void XObject::SetNativePointer(uint32_t native_ptr, bool uninitialized) {
+ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* native_ptr,
+                                              int32_t as_type) {
+   assert_not_null(native_ptr);
++  REX_SYS_CENSUS(rex::syscount::kCensusNativeObject, 1);
+ 
+   // Unfortunately the XDK seems to inline some KeInitialize calls, meaning
+   // we never see it and just randomly start getting passed events/timers/etc.
+@@ -380,7 +384,7 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
    // We identify this by setting wait_list_flink to a magic value. When set,
    // wait_list_blink will hold a handle to our object.
  
@@ -22606,6 +23699,26 @@ index d358f399d84f196be91eafc620a7e6d4242d2f5d..71d9286877aaf879694f81c328968ff7
  
    auto header = reinterpret_cast<X_DISPATCH_HEADER*>(native_ptr);
  
+diff --git a/src/system/xsemaphore.cpp b/src/system/xsemaphore.cpp
+index db830e48ebf7053eff3dd500cf65d41eb83ea850..8884e1dc06de58eb5437c1532ca54c58fa1d4cfc 100644
+--- a/src/system/xsemaphore.cpp
++++ b/src/system/xsemaphore.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/logging.h>
+ #include <rex/stream.h>
++#include <rex/sys_counters.h>
+ #include <rex/system/xsemaphore.h>
+ 
+ namespace rex::system {
+@@ -39,6 +40,7 @@ bool XSemaphore::InitializeNative(void* native_ptr, X_DISPATCH_HEADER* header) {
+ }
+ 
+ bool XSemaphore::ReleaseSemaphore(int32_t release_count, int32_t* out_previous_count) {
++  REX_SYS_CENSUS(rex::syscount::kCensusSemRelease, 1);
+   int32_t previous_count = 0;
+   bool success = semaphore_->Release(release_count, &previous_count);
+   if (out_previous_count) {
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
 index 77bce2561bfd97d229f9348bb91b17d1154cf0b9..c2903c030359fe3c55386d1b2a78b71a4bbb92c4 100644
 --- a/src/system/xthread.cpp
@@ -24419,10 +25532,10 @@ index 0000000000000000000000000000000000000000..087e736b8df58944caaff2578fb425e0
 +const char *elf_errmsg(int err) { (void)err; return "libelf is not available on Switch"; }
 diff --git a/src/ui/switch_perf.cpp b/src/ui/switch_perf.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..0f8ee8cb6f2693b6055cd4906fc39d9ac2f16265
+index 0000000000000000000000000000000000000000..7cb6098b902eeb62103bce1ab32f0e8613f3bbb6
 --- /dev/null
 +++ b/src/ui/switch_perf.cpp
-@@ -0,0 +1,1262 @@
+@@ -0,0 +1,1264 @@
 +/**
 + * @file        switch_perf.cpp
 + * @brief       Performance measurement on the console, without a debugger
@@ -25040,11 +26153,13 @@ index 0000000000000000000000000000000000000000..0f8ee8cb6f2693b6055cd4906fc39d9a
 +               "WaitMultiple: %.0f parked, %.0f woken by signal, %.0f safety re-polls, %.0f legacy 1 ms polls | "
 +               "timestamp timer ticks %.0f | UpdateGuestClock %.0f calls, %.0f contended | ObjectTable lookups "
 +               "%.0f, %.0f contended | VolumeChangeMask %.0f | vblank thread wakes %.0f | native audio DSP calls "
-+               "%.0f, %.0f mismatches | critical-section host waits %.0f\n",
++               "%.0f, %.0f mismatches | critical-section host waits %.0f | signals with nobody blocked (no wake "
++               "syscall, thread_signal_skip_idle) %.0f\n",
 +               delta(40) / seconds, delta(41) / seconds, delta(42) / seconds, delta(43) / seconds,
 +               delta(44) / seconds, delta(45) / seconds, delta(46) / seconds, delta(47) / seconds,
 +               delta(48) / seconds, delta(49) / seconds, delta(50) / seconds, delta(51) / seconds,
-+               delta(52) / seconds, delta(53) / seconds, delta(54) / seconds, delta(55) / seconds);
++               delta(52) / seconds, delta(53) / seconds, delta(54) / seconds, delta(55) / seconds,
++               delta(56) / seconds);
 +  if (frames > 0) {
 +    std::fprintf(f,
 +                 "     per frame: %.0f draws | scissor %.1f screens | %.1f submits | "
@@ -28711,6 +29826,1137 @@ index 0000000000000000000000000000000000000000..7797c07368013b1ea98318e162503e8b
 +#pragma once
 +/* Horizon has no netinet/ip.h; the SDK only needs what netinet/in.h already declares. */
 +#include <netinet/in.h>
+diff --git a/tests/arm_forms_check.cpp b/tests/arm_forms_check.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e5b5eb26f8070cee452ce8bad54cd32dee3160d
+--- /dev/null
++++ b/tests/arm_forms_check.cpp
+@@ -0,0 +1,38 @@
++// Compile-only check for the Switch compiler (it cannot run on the PC): the AArch64-only forms of the CPU round of
++// 2026-10-12, one small function each, so tools/arm_forms_check.py can read the instructions GCC makes of them.
++//   - rex/thread/atomic.h: the inline __atomic lock words (exclusive pair with acquire/release, no trailing `dmb`
++//     outside the branch on g_rex_atomic_legacy_barrier), next to the legacy __sync forms they replace;
++//   - rex/ppc/intrinsics.h: vperm and the two float-to-integer conversions as their NEON instruction, with
++//     REX_VMX_HELPERS_X86_FORM the x86 emulation through simde;
++//   - rex/ppc/diet_ops.h: the any-mode float helpers compile (their PC test is sdk/tests/fp_any_mode_test.cpp).
++//
++//   python tools/arm_forms_check.py
++#include <cstdint>
++
++#include <rex/ppc/diet_ops.h>
++#include <rex/ppc/intrinsics.h>
++#include <rex/thread/atomic.h>
++
++#define CHECK_FN extern "C" __attribute__((noinline))
++
++CHECK_FN int32_t check_atomic_inc(volatile int32_t* p) { return rex::thread::atomic_inc(p); }
++CHECK_FN int32_t check_atomic_dec(volatile int32_t* p) { return rex::thread::atomic_dec(p); }
++CHECK_FN bool check_atomic_cas32(volatile int32_t* p) { return rex::thread::atomic_cas(int32_t(-1), int32_t(0), p); }
++CHECK_FN bool check_atomic_cas64(volatile int64_t* p, int64_t a, int64_t b) { return rex::thread::atomic_cas(a, b, p); }
++CHECK_FN int32_t check_atomic_exchange_add(volatile int32_t* p, int32_t n) {
++  return rex::thread::atomic_exchange_add(n, p);
++}
++
++// The legacy forms (what atomic_posix.cpp compiled before, and what the generator's stwcx. was).
++CHECK_FN int32_t check_legacy_inc(volatile int32_t* p) { return __sync_add_and_fetch(p, 1); }
++CHECK_FN bool check_legacy_cas32(volatile int32_t* p) { return __sync_bool_compare_and_swap(p, -1, 0); }
++
++CHECK_FN simde__m128i check_vperm(simde__m128i a, simde__m128i b, simde__m128i c) {
++  return rex::ppc::simde_mm_perm_epi8_(a, b, c);
++}
++CHECK_FN simde__m128i check_vctsxs(simde__m128 a) { return rex::ppc::simde_mm_vctsxs(a); }
++CHECK_FN simde__m128i check_vctuxs(simde__m128 a) { return rex::ppc::simde_mm_vctuxs(a); }
++
++CHECK_FN double check_add_single(double a, double b) { return rex::ppc::AddSingleAnyMode(a, b); }
++CHECK_FN double check_round_single(double a) { return rex::ppc::RoundToSingleAnyMode(a); }
++CHECK_FN bool check_ge_zero(double a) { return rex::ppc::GeZeroAnyMode(a); }
+diff --git a/tests/fp_any_mode_test.cpp b/tests/fp_any_mode_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..17def57025403108bd06bc614b2caadb12cf9334
+--- /dev/null
++++ b/tests/fp_any_mode_test.cpp
+@@ -0,0 +1,274 @@
++// The any-mode helpers of the codegen option fp_compares_modeless (rex/ppc/diet_ops.h) against the plain operation:
++// for every input, the reference is the plain expression evaluated with the host flush mode OFF (what the generated
++// code did after switching to FPU mode), and the helper must give the same bits with the mode off AND with it on,
++// and leave the mode as it found it. Also the three conversions the option stops switching for at all (fcfid,
++// fctiwz, fctidz): their plain expressions must give the same bits in both modes.
++//
++// Inputs: every pair of a list of edge values (zeros, the smallest and largest denormal doubles, DBL_MIN, the single
++// denormal range and FLT_MIN seen as doubles, ones, huge values, infinities, quiet and signalling NaNs), then random
++// bit patterns with the exponent drawn from the edges half of the time.
++//
++//   clang++ -O2 -std=c++23 -ffp-contract=off -Isdk/include -Isdk/thirdparty/simde -Isdk/thirdparty/simde/simde
++//           sdk/tests/fp_any_mode_test.cpp -o out/tools/fp_any_mode_test.exe      (also builds for AArch64)
++//   fp_any_mode_test [random pairs = 20000000] [control]
++// "control" puts the plain operations in the helpers' place: the run must then report differences (it shows that the
++// inputs reach the cases where the mode matters).
++#include <bit>
++#include <climits>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++#include <rex/ppc/diet_ops.h>
++#include <simde/x86/sse2.h>
++
++namespace {
++
++using P = rex::platform::FPSCRPlatform;
++
++// The flags of a CR field, as rex::ppc::CRRegister::compare(double, double) writes them.
++struct Cr {
++  bool lt, gt, eq, un;
++  void compare(double left, double right) noexcept {
++    un = __builtin_isunordered(left, right);
++    lt = __builtin_isless(left, right);
++    gt = __builtin_isgreater(left, right);
++    eq = left == right;
++  }
++  uint32_t bits() const { return uint32_t(lt) | uint32_t(gt) << 1 | uint32_t(eq) << 2 | uint32_t(un) << 3; }
++};
++
++#if defined(__aarch64__)
++#define OPAQUE(x) __asm__ __volatile__("" : "+w"(x))
++#else
++#define OPAQUE(x) __asm__ __volatile__("" : "+x"(x))
++#endif
++
++void SetFlush(bool on) {
++  auto csr = P::getcsr();
++  csr = on ? decltype(csr)(csr | decltype(csr)(P::FlushMask)) : decltype(csr)(csr & ~decltype(csr)(P::FlushMask));
++  P::setcsr(csr);
++}
++
++[[gnu::noinline]] uint32_t PlainCompare(double a, double b) {
++  OPAQUE(a);
++  OPAQUE(b);
++  Cr cr;
++  cr.compare(a, b);
++  return cr.bits();
++}
++[[gnu::noinline]] uint32_t AnyCompare(double a, double b) {
++  OPAQUE(a);
++  OPAQUE(b);
++  Cr cr;
++  rex::ppc::CompareAnyMode(cr, a, b);
++  return cr.bits();
++}
++[[gnu::noinline]] uint64_t PlainFrsp(double a) {
++  OPAQUE(a);
++  float f = float(a);
++  OPAQUE(f);
++  double d = double(f);
++  OPAQUE(d);
++  return std::bit_cast<uint64_t>(d);
++}
++[[gnu::noinline]] uint64_t AnyFrsp(double a) {
++  OPAQUE(a);
++  double d = rex::ppc::RoundToSingleAnyMode(a);
++  OPAQUE(d);
++  return std::bit_cast<uint64_t>(d);
++}
++[[gnu::noinline]] bool PlainGeZero(double a) {
++  OPAQUE(a);
++  return a >= 0.0;
++}
++[[gnu::noinline]] bool AnyGeZero(double a) {
++  OPAQUE(a);
++  return rex::ppc::GeZeroAnyMode(a);
++}
++// fadds / fsubs / fmuls / fdivs: the generator's plain expression and the any-mode helper (fp_mode_lookahead).
++#define ARITHMETIC(NAME, OP, HELPER)                         \
++  [[gnu::noinline]] uint64_t Plain##NAME(double a, double b) { \
++    OPAQUE(a);                                               \
++    OPAQUE(b);                                               \
++    double d = a OP b;                                       \
++    OPAQUE(d);                                               \
++    float f = float(d);                                      \
++    OPAQUE(f);                                               \
++    double r = double(f);                                    \
++    OPAQUE(r);                                               \
++    return std::bit_cast<uint64_t>(r);                       \
++  }                                                          \
++  [[gnu::noinline]] uint64_t Any##NAME(double a, double b) {   \
++    OPAQUE(a);                                               \
++    OPAQUE(b);                                               \
++    double r = rex::ppc::HELPER(a, b);                       \
++    OPAQUE(r);                                               \
++    return std::bit_cast<uint64_t>(r);                       \
++  }
++ARITHMETIC(Add, +, AddSingleAnyMode)
++ARITHMETIC(Sub, -, SubSingleAnyMode)
++ARITHMETIC(Mul, *, MulSingleAnyMode)
++ARITHMETIC(Div, /, DivSingleAnyMode)
++#undef ARITHMETIC
++
++// The generator's expressions for the conversions that no longer switch.
++[[gnu::noinline]] int64_t Fctiwz(double a) {
++  OPAQUE(a);
++  return rex::ppc::fctiwz(a);
++}
++[[gnu::noinline]] int64_t Fctidz(double a) {
++  OPAQUE(a);
++  return std::isnan(a) ? int64_t(0x8000000000000000ULL)
++                       : (a > double(LLONG_MAX)) ? LLONG_MAX : simde_mm_cvttsd_si64(simde_mm_load_sd(&a));
++}
++[[gnu::noinline]] uint64_t Fcfid(int64_t v) {
++  __asm__ __volatile__("" : "+r"(v));
++  double d = double(v);
++  OPAQUE(d);
++  return std::bit_cast<uint64_t>(d);
++}
++
++uint64_t g_state = 0x9E3779B97F4A7C15ull;
++uint64_t Next() {
++  g_state ^= g_state << 13;
++  g_state ^= g_state >> 7;
++  g_state ^= g_state << 17;
++  return g_state;
++}
++double RandomDouble() {
++  // Edges of the double and single ranges, and exponents whose products and quotients land on them (2^-511 squared
++  // is near DBL_MIN, 2^-63 squared near FLT_MIN, 2^-74 squared near the smallest single denormal).
++  static const uint64_t exponents[] = {0,     0,     1,     2,     3,     0x369, 0x36A, 0x380, 0x381, 0x382,
++                                       0x3FF, 0x47E, 0x47F, 0x7FE, 0x7FF, 0x1FF, 0x200, 0x201, 0x3BF, 0x3C0,
++                                       0x3C1, 0x3B4, 0x3B5, 0x43E, 0x43F, 0x5FE, 0x5FF};
++  uint64_t r = Next();
++  uint64_t e = (r >> 52) & 0x7FF;
++  if (Next() & 1) e = exponents[Next() % (sizeof(exponents) / sizeof(exponents[0]))];
++  uint64_t m = r & 0x000FFFFFFFFFFFFFull;
++  switch (Next() & 7) {  // mantissas at the rounding edges too
++    case 0: m = 0; break;
++    case 1: m = 0x000FFFFFFFFFFFFFull; break;
++    case 2: m &= 0x000FFFFFE0000000ull; break;  // exactly a single's mantissa
++    case 3: m = (m & 0x000FFFFFE0000000ull) | 0x10000000ull; break;  // a tie when rounded to single
++    default: break;
++  }
++  return std::bit_cast<double>((r & 0x8000000000000000ull) | (e << 52) | m);
++}
++
++uint64_t g_failures = 0, g_checks = 0, g_cold = 0;
++uint64_t g_mode_matters[4] = {};  // per arithmetic operation: inputs whose plain result differs between the modes
++bool g_control = false;  // negative control: the plain operations in the helpers' place must differ with the mode on
++void Fail(const char* what, bool mode, double a, double b, uint64_t got, uint64_t want) {
++  if (g_failures++ < 20) {
++    std::printf("FAILED %s (flush mode %s): a %016llX b %016llX got %llX want %llX\n", what, mode ? "on" : "off",
++                static_cast<unsigned long long>(std::bit_cast<uint64_t>(a)),
++                static_cast<unsigned long long>(std::bit_cast<uint64_t>(b)), static_cast<unsigned long long>(got),
++                static_cast<unsigned long long>(want));
++  }
++}
++
++void CheckPair(double a, double b) {
++  SetFlush(false);
++  const uint32_t want_cmp = PlainCompare(a, b);
++  const uint64_t want_frsp = PlainFrsp(a);
++  const bool want_ge = PlainGeZero(a);
++  const int64_t want_fctiwz = Fctiwz(a), want_fctidz = Fctidz(a);
++  const int64_t integer = std::bit_cast<int64_t>(a);
++  const uint64_t want_fcfid = Fcfid(integer);
++  if (rex::ppc::IsDenormalDouble(a) || rex::ppc::IsDenormalDouble(b)) ++g_cold;
++  const uint64_t want_arith[4] = {PlainAdd(a, b), PlainSub(a, b), PlainMul(a, b), PlainDiv(a, b)};
++  // NaN payloads: the operations return one of the operands' payloads either way; compared as "is a NaN".
++  const auto same = [](uint64_t x, uint64_t y) {
++    const bool nx = (x & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull;
++    const bool ny = (y & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull;
++    return nx || ny ? nx == ny : x == y;
++  };
++  for (const bool mode : {false, true}) {
++    SetFlush(mode);
++    const auto before = P::getcsr();
++    const uint32_t cmp = g_control ? PlainCompare(a, b) : AnyCompare(a, b);
++    const uint64_t frsp = g_control ? PlainFrsp(a) : AnyFrsp(a);
++    const bool ge = g_control ? PlainGeZero(a) : AnyGeZero(a);
++    const int64_t fctiwz = Fctiwz(a), fctidz = Fctidz(a);
++    const uint64_t fcfid = Fcfid(integer);
++    const uint64_t arith[4] = {g_control ? PlainAdd(a, b) : AnyAdd(a, b), g_control ? PlainSub(a, b) : AnySub(a, b),
++                               g_control ? PlainMul(a, b) : AnyMul(a, b), g_control ? PlainDiv(a, b) : AnyDiv(a, b)};
++    const auto after = P::getcsr();
++    static const char* const names[4] = {"AddSingleAnyMode", "SubSingleAnyMode", "MulSingleAnyMode",
++                                         "DivSingleAnyMode"};
++    for (int k = 0; k < 4; ++k) {
++      if (!same(arith[k], want_arith[k])) Fail(names[k], mode, a, b, arith[k], want_arith[k]);
++    }
++    if (mode) {
++      const uint64_t plain_on[4] = {PlainAdd(a, b), PlainSub(a, b), PlainMul(a, b), PlainDiv(a, b)};
++      for (int k = 0; k < 4; ++k) g_mode_matters[k] += !same(plain_on[k], want_arith[k]);
++    }
++    g_checks += 10;
++    if (cmp != want_cmp) Fail("CompareAnyMode", mode, a, b, cmp, want_cmp);
++    if (frsp != want_frsp) Fail("RoundToSingleAnyMode", mode, a, b, frsp, want_frsp);
++    if (ge != want_ge) Fail("GeZeroAnyMode", mode, a, b, ge, want_ge);
++    if (fctiwz != want_fctiwz) Fail("fctiwz", mode, a, b, uint64_t(fctiwz), uint64_t(want_fctiwz));
++    if (fctidz != want_fctidz) Fail("fctidz", mode, a, b, uint64_t(fctidz), uint64_t(want_fctidz));
++    if (fcfid != want_fcfid) Fail("fcfid", mode, a, b, fcfid, want_fcfid);
++    if ((before ^ after) & decltype(before)(P::FlushMask)) Fail("the mode was left changed", mode, a, b, after, before);
++  }
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++  const uint64_t random_pairs = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 20000000ull;
++  g_control = argc > 2 && argv[2][0] == 'c';
++  const auto saved = P::getcsr();
++  std::vector<double> edges;
++  const uint64_t magnitudes[] = {
++      0x0000000000000000ull, 0x0000000000000001ull, 0x0000000000000002ull, 0x0008000000000000ull,
++      0x000FFFFFFFFFFFFFull, 0x0010000000000000ull, 0x0010000000000001ull,  // around DBL_MIN
++      0x36A0000000000000ull, 0x369FFFFFFFFFFFFFull, 0x36A0000000000001ull,  // around the smallest single denormal
++      0x3690000000000000ull, 0x3680000000000000ull,                          // half of it and below: rounds to 0 or it
++      0x380FFFFFFFFFFFFFull, 0x3810000000000000ull, 0x3810000000000001ull,  // around FLT_MIN
++      0x380FFFFFF0000000ull, 0x380FFFFFE0000000ull, 0x3800000000000000ull,  // single denormals as doubles
++      0x3FF0000000000000ull, 0x3FF0000010000000ull, 0x3FEFFFFFFFFFFFFFull,  // around 1, a rounding tie
++      0x41DFFFFFFFC00000ull, 0x41E0000000000000ull, 0x43E0000000000000ull,  // INT32_MAX, 2^31, 2^63
++      0x47EFFFFFE0000000ull, 0x47EFFFFFF0000000ull, 0x47F0000000000000ull,  // FLT_MAX and past it
++      0x7FEFFFFFFFFFFFFFull, 0x7FF0000000000000ull, 0x7FF8000000000000ull, 0x7FF0000000000001ull,
++      0x7FFFFFFFFFFFFFFFull};
++  for (const uint64_t m : magnitudes) {
++    edges.push_back(std::bit_cast<double>(m));
++    edges.push_back(std::bit_cast<double>(m | 0x8000000000000000ull));
++  }
++  for (const double a : edges)
++    for (const double b : edges) CheckPair(a, b);
++  for (uint64_t i = 0; i < random_pairs; ++i) {
++    const double a = RandomDouble();
++    double b = (i & 7) == 0 ? edges[Next() % edges.size()] : RandomDouble();
++    if ((i & 7) == 1) {
++      // A near-equal partner: sums and differences that cancel down to a tiny result.
++      const uint64_t bits = std::bit_cast<uint64_t>(a) ^ (Next() & 0xFFFF) ^ ((Next() & 1) << 63);
++      b = std::bit_cast<double>(bits);
++    }
++    CheckPair(a, b);
++  }
++  P::setcsr(saved);
++  std::printf("%llu edge pairs and %llu random pairs, %llu comparisons of a helper with the plain operation "
++              "(%llu pairs with a denormal operand: the cold paths)\n",
++              static_cast<unsigned long long>(edges.size() * edges.size()),
++              static_cast<unsigned long long>(random_pairs), static_cast<unsigned long long>(g_checks),
++              static_cast<unsigned long long>(g_cold));
++  std::printf("pairs whose plain single-precision result differs between the modes: add %llu, sub %llu, mul %llu, "
++              "div %llu\n",
++              static_cast<unsigned long long>(g_mode_matters[0]), static_cast<unsigned long long>(g_mode_matters[1]),
++              static_cast<unsigned long long>(g_mode_matters[2]), static_cast<unsigned long long>(g_mode_matters[3]));
++  if (g_control) {
++    std::printf("NEGATIVE CONTROL (plain operations with the mode on): %llu differences; the test can see the "
++                "mode: %s\n",
++                static_cast<unsigned long long>(g_failures), g_failures ? "yes" : "NO");
++    return g_failures ? 0 : 1;
++  }
++  std::printf(g_failures ? "RESULT: FAILED (%llu differences)\n" : "RESULT: ok (0 differences)\n",
++              static_cast<unsigned long long>(g_failures));
++  return g_failures ? 1 : 0;
++}
+diff --git a/tests/neon_shuffles_test.cpp b/tests/neon_shuffles_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b2a264a2e6add9883e739589ce488f098e05e739
+--- /dev/null
++++ b/tests/neon_shuffles_test.cpp
+@@ -0,0 +1,111 @@
++// tools/pch_neon_shuffles.py redefines, on AArch64, simde_mm_shuffle_epi32(v, imm) and simde_mm_permute_ps(v, imm)
++// as SIMDE_SHUFFLE_VECTOR_ with the indices (imm & 3, (imm >> 2) & 3, (imm >> 4) & 3, (imm >> 6) & 3). sasrt-nx left
++// this one without a test (the index formula is simde's own for targets without a native shuffle); sa2-nx checks it
++// anyway: this compares that exact expression (the macro bodies below are the tool's, under other names) with the
++// real pshufd / shufps of the PC for every one of the 256 immediates, on position-marking and random vectors.
++//
++//   clang++ -O2 -std=c++23 -march=x86-64-v2 -Isdk/include -Isdk/thirdparty/simde -Isdk/thirdparty/simde/simde
++//           sdk/tests/neon_shuffles_test.cpp -o out/tools/neon_shuffles_test.exe
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++
++#include <emmintrin.h>
++#include <simde/x86/avx.h>
++
++#if !defined(SIMDE_SHUFFLE_VECTOR_)
++#error "SIMDE_SHUFFLE_VECTOR_ is not available with this compiler: the tool's block would not apply either"
++#endif
++
++// The tool's two definitions (tools/pch_neon_shuffles.py, BLOCK), renamed.
++#define rex_test_shuffle_epi32(a, imm8)                                                        \
++  (__extension__({                                                                             \
++    const simde__m128i_private rex_shuffle_a_ = simde__m128i_to_private(a);                    \
++    simde__m128i_from_private((simde__m128i_private){                                          \
++        .i32 = SIMDE_SHUFFLE_VECTOR_(32, 16, (rex_shuffle_a_).i32, (rex_shuffle_a_).i32,       \
++                                     ((imm8)) & 3, ((imm8) >> 2) & 3, ((imm8) >> 4) & 3,       \
++                                     ((imm8) >> 6) & 3)});                                     \
++  }))
++#define rex_test_permute_ps(a, imm8)                                                           \
++  (__extension__({                                                                             \
++    const simde__m128_private rex_permute_a_ = simde__m128_to_private(a);                      \
++    simde__m128_from_private((simde__m128_private){                                            \
++        .f32 = SIMDE_SHUFFLE_VECTOR_(32, 16, (rex_permute_a_).f32, (rex_permute_a_).f32,       \
++                                     ((imm8)) & 3, ((imm8) >> 2) & 3, ((imm8) >> 4) & 3,       \
++                                     ((imm8) >> 6) & 3)});                                     \
++  }))
++
++namespace {
++
++uint64_t g_state = 0x9E3779B97F4A7C15ull;
++uint64_t Next() {
++  g_state ^= g_state << 13;
++  g_state ^= g_state >> 7;
++  g_state ^= g_state << 17;
++  return g_state;
++}
++
++uint64_t g_comparisons = 0, g_differences = 0;
++
++void Compare(const __m128i& want, const simde__m128i& got, const char* what, int imm) {
++  ++g_comparisons;
++  if (std::memcmp(&want, &got, 16) != 0) {
++    if (g_differences++ < 8) std::printf("DIFFERENCE %s imm %d\n", what, imm);
++  }
++}
++
++// The immediate must be a constant expression: one instantiation per value.
++template <int Imm>
++void One(const uint32_t* words) {
++  const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(words));
++  simde__m128i sv;
++  std::memcpy(&sv, &v, 16);
++  Compare(_mm_shuffle_epi32(v, Imm), rex_test_shuffle_epi32(sv, Imm), "shuffle_epi32", Imm);
++  const __m128 f = _mm_castsi128_ps(v);
++  simde__m128 sf;
++  std::memcpy(&sf, &f, 16);
++  // vpermilps with an immediate is shufps of the vector with itself.
++  const __m128 want = _mm_shuffle_ps(f, f, Imm);
++  const simde__m128 got = rex_test_permute_ps(sf, Imm);
++  __m128i want_i;
++  simde__m128i got_i;
++  std::memcpy(&want_i, &want, 16);
++  std::memcpy(&got_i, &got, 16);
++  Compare(want_i, got_i, "permute_ps", Imm);
++}
++
++template <int... Imm>
++void Row(const uint32_t* words, int base) {
++  (void)base;
++  (One<Imm>(words), ...);
++}
++
++#define R4(n) n, n + 1, n + 2, n + 3
++#define R16(n) R4(n), R4(n + 4), R4(n + 8), R4(n + 12)
++#define R64(n) R16(n), R16(n + 16), R16(n + 32), R16(n + 48)
++
++void All(const uint32_t* words) {
++  Row<R64(0)>(words, 0);
++  Row<R64(64)>(words, 64);
++  Row<R64(128)>(words, 128);
++  Row<R64(192)>(words, 192);
++}
++
++}  // namespace
++
++int main() {
++  const uint32_t marks[4] = {0x03020100u, 0x13121110u, 0x23222120u, 0x33323130u};
++  All(marks);
++  for (int i = 0; i < 20000; ++i) {
++    uint32_t words[4];
++    for (uint32_t& w : words) w = uint32_t(Next() >> 16);
++    if ((i & 7) == 0) words[i & 3] = 0x7FC00001u;  // a NaN payload must travel as bits
++    if ((i & 7) == 1) words[i & 3] = 0x00000001u;  // and a denormal
++    All(words);
++  }
++  std::printf("%llu comparisons of the constant-permutation forms with pshufd / shufps (256 immediates)\n",
++              static_cast<unsigned long long>(g_comparisons));
++  std::printf("RESULT: %s (%llu differences)\n", g_differences ? "FAILED" : "ok",
++              static_cast<unsigned long long>(g_differences));
++  return g_differences ? 1 : 0;
++}
+diff --git a/tests/rotate_word_test.cpp b/tests/rotate_word_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b4b97f04ca1deb2c7cb599f0b5c039ce133ae8b
+--- /dev/null
++++ b/tests/rotate_word_test.cpp
+@@ -0,0 +1,84 @@
++// The generator option rotate_word_narrow: rlwinm / rlwnm / rlwimi with a mask that does not wrap (mb <= me) written
++// as a 32-bit rotate and a 32-bit mask. This compares that form with the form the generator wrote before (a 64-bit
++// rotate of the word duplicated into both halves, masked with the 64-bit mask), bit for bit on the whole 64-bit
++// register, for every shift 0..31 and every mask mb <= me, on edge values and random ones, with random upper halves
++// in the source register (the old form reads `rS.u32 | (rS.u64 << 32)`, which drops them) and, for rlwimi, in the
++// destination (whose upper half must be kept). The wrapping masks (mb > me) keep the old form in the generator; the
++// test also shows that they need it (the narrow form differs there).
++//
++//   clang++ -O2 -std=c++20 sdk/tests/rotate_word_test.cpp -o out/tools/rotate_word_test.exe
++#include <cstdint>
++#include <cstdio>
++
++namespace {
++
++// sdk/src/codegen/builders/helpers.h, compute_mask (PowerPC bit numbering: bit 0 is the most significant).
++uint64_t ComputeMask(uint32_t mstart, uint32_t mstop) {
++  mstart &= 0x3F;
++  mstop &= 0x3F;
++  const uint64_t value = (UINT64_MAX >> mstart) ^ ((mstop >= 63) ? 0 : UINT64_MAX >> (mstop + 1));
++  return mstart <= mstop ? value : ~value;
++}
++
++uint64_t g_state = 0x13198A2E03707344ull;
++uint64_t Next() {
++  g_state ^= g_state << 13;
++  g_state ^= g_state >> 7;
++  g_state ^= g_state << 17;
++  return g_state;
++}
++
++uint64_t Rotl64(uint64_t x, unsigned n) { return n ? (x << n) | (x >> (64 - n)) : x; }
++uint32_t Rotl32(uint32_t x, unsigned n) { return n ? (x << n) | (x >> (32 - n)) : x; }
++
++// The old forms.
++uint64_t OldRlwinm(uint64_t rs, unsigned sh, uint64_t mask) {
++  return Rotl64(uint32_t(rs) | (rs << 32), sh) & mask;
++}
++uint64_t OldRlwimi(uint64_t ra, uint64_t rs, unsigned sh, uint64_t mask) {
++  return (Rotl64(uint32_t(rs) | (rs << 32), sh) & mask) | (ra & ~mask);
++}
++// The narrow forms (what the generator writes with the option).
++uint64_t NewRlwinm(uint64_t rs, unsigned sh, uint64_t mask) {
++  return Rotl32(uint32_t(rs), sh) & uint32_t(mask);
++}
++uint64_t NewRlwimi(uint64_t ra, uint64_t rs, unsigned sh, uint64_t mask) {
++  return (Rotl32(uint32_t(rs), sh) & uint32_t(mask)) | (ra & ~mask);
++}
++
++}  // namespace
++
++int main() {
++  const uint64_t edges[] = {0, 1, 0x80000000ull, 0xFFFFFFFFull, 0x7FFFFFFFull, 0x55555555ull, 0xAAAAAAAAull,
++                            0x00010000ull, 0xFFFF0000ull, 0x0000FFFFull, 0x12345678ull, 0x80000001ull};
++  uint64_t checked = 0, failures = 0, wrapping_differ = 0, wrapping = 0;
++  for (unsigned sh = 0; sh < 32; ++sh) {
++    for (unsigned mb = 0; mb < 32; ++mb) {
++      for (unsigned me = 0; me < 32; ++me) {
++        const uint64_t mask = ComputeMask(mb + 32, me + 32);
++        for (int k = 0; k < 12 + 64; ++k) {
++          const uint64_t upper = Next() << 32;
++          const uint64_t rs = (k < 12 ? edges[k] : (Next() & 0xFFFFFFFFull)) | upper;
++          const uint64_t ra = Next();
++          if (mb <= me) {
++            if ((mask >> 32) != 0) ++failures;  // the premise: a mask that does not wrap lies in the low word
++            failures += OldRlwinm(rs, sh, mask) != NewRlwinm(rs, sh, mask);
++            failures += OldRlwimi(ra, rs, sh, mask) != NewRlwimi(ra, rs, sh, mask);
++            checked += 2;
++          } else {
++            ++wrapping;
++            wrapping_differ += OldRlwinm(rs, sh, mask) != NewRlwinm(rs, sh, mask);
++          }
++        }
++      }
++    }
++  }
++  std::printf("%llu comparisons of the narrow forms with the 64-bit forms (every shift, every mask mb <= me)\n",
++              static_cast<unsigned long long>(checked));
++  std::printf("wrapping masks (kept in the 64-bit form by the generator): the narrow form would differ in %llu of "
++              "%llu cases\n",
++              static_cast<unsigned long long>(wrapping_differ), static_cast<unsigned long long>(wrapping));
++  std::printf(failures ? "RESULT: FAILED (%llu differences)\n" : "RESULT: ok (0 differences)\n",
++              static_cast<unsigned long long>(failures));
++  return failures ? 1 : 0;
++}
+diff --git a/tests/signal_skip_idle_test.cpp b/tests/signal_skip_idle_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..15dde6c3a7588d2c012a1f506106f6380a37d344
+--- /dev/null
++++ b/tests/signal_skip_idle_test.cpp
+@@ -0,0 +1,222 @@
++// Stress test of the protocol behind thread_signal_skip_idle (sdk/src/core/threading_posix.cpp, PosixConditionBase):
++// a signal whose condition has no blocked waiter skips the notify. The classes below repeat that file's Event and
++// Semaphore logic line for line (state under the mutex, waiters counted under the same mutex around the wait, the
++// waiter count read together with the state change, the notify after the unlock) so the protocol itself can be run
++// on a PC, where threading_posix.cpp is not built.
++//
++// Each test is a strict handshake: a lost wake-up leaves a thread blocked for ever, which the watchdog reports.
++//   clang++ -O2 -std=c++20 sdk/tests/signal_skip_idle_test.cpp -o out/tools/signal_skip_idle_test.exe
++//   signal_skip_idle_test [seconds=5]
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++namespace {
++
++std::atomic<uint64_t> g_notified{0}, g_skipped{0};
++
++class ConditionBase {
++ public:
++  virtual ~ConditionBase() = default;
++  bool Wait(std::chrono::milliseconds timeout) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    bool executed;
++    if (signaled()) {
++      executed = true;
++    } else {
++      ++cond_waiters_;
++      executed = cond_.wait_for(lock, timeout, [this] { return signaled(); });
++      --cond_waiters_;
++    }
++    if (executed) post_execution();
++    return executed;
++  }
++
++ protected:
++  virtual bool signaled() const = 0;
++  virtual void post_execution() = 0;
++  void WakeWaiters(uint32_t waiters) {
++    if (waiters != 0) {
++      cond_.notify_all();
++      g_notified.fetch_add(1, std::memory_order_relaxed);
++    } else {
++      g_skipped.fetch_add(1, std::memory_order_relaxed);
++    }
++  }
++  std::condition_variable cond_;
++  std::mutex mutex_;
++  uint32_t cond_waiters_ = 0;
++};
++
++class Event : public ConditionBase {
++ public:
++  explicit Event(bool manual_reset) : manual_reset_(manual_reset) {}
++  void Signal() {
++    uint32_t waiters;
++    {
++      std::unique_lock<std::mutex> lock(mutex_);
++      signal_ = true;
++      waiters = cond_waiters_;
++    }
++    WakeWaiters(waiters);
++  }
++  void Reset() {
++    std::unique_lock<std::mutex> lock(mutex_);
++    signal_ = false;
++  }
++
++ private:
++  bool signaled() const override { return signal_; }
++  void post_execution() override {
++    if (!manual_reset_) signal_ = false;
++  }
++  bool signal_ = false;
++  const bool manual_reset_;
++};
++
++class Semaphore : public ConditionBase {
++ public:
++  void Release(uint32_t n) {
++    std::unique_lock<std::mutex> lock(mutex_);
++    count_ += n;
++    const uint32_t waiters = cond_waiters_;
++    lock.unlock();
++    WakeWaiters(waiters);
++  }
++
++ private:
++  bool signaled() const override { return count_ > 0; }
++  void post_execution() override {
++    count_--;
++    WakeWaiters(cond_waiters_);
++  }
++  uint32_t count_ = 0;
++};
++
++constexpr auto kStuck = std::chrono::milliseconds(4000);
++std::atomic<bool> g_failed{false};
++
++void Fail(const char* what) {
++  if (!g_failed.exchange(true)) std::printf("FAILED: %s\n", what);
++}
++
++// Ping-pong on two auto-reset events: every Signal must wake exactly one Wait. Returns the round trips.
++uint64_t PingPong(std::chrono::steady_clock::time_point end, int spin) {
++  Event ping(false), pong(false);
++  std::atomic<bool> stop{false};
++  std::atomic<uint64_t> trips{0};
++  std::thread echo([&] {
++    while (!stop.load(std::memory_order_relaxed)) {
++      if (!ping.Wait(kStuck)) {
++        if (!stop.load()) Fail("auto-reset event: a signal woke nobody (echo side)");
++        return;
++      }
++      for (volatile int i = 0; i < spin; ++i) {}
++      pong.Signal();
++    }
++  });
++  while (std::chrono::steady_clock::now() < end && !g_failed.load()) {
++    ping.Signal();
++    if (!pong.Wait(kStuck)) {
++      Fail("auto-reset event: a signal woke nobody (caller side)");
++      break;
++    }
++    trips.fetch_add(1, std::memory_order_relaxed);
++  }
++  stop.store(true);
++  ping.Signal();
++  echo.join();
++  return trips.load();
++}
++
++// Producers release a semaphore, consumers take it: every unit released is consumed.
++uint64_t SemaphoreFlow(std::chrono::steady_clock::time_point end, int producers, int consumers) {
++  Semaphore sem;
++  std::atomic<uint64_t> produced{0}, consumed{0};
++  std::atomic<bool> stop{false};
++  std::vector<std::thread> threads;
++  for (int i = 0; i < consumers; ++i) {
++    threads.emplace_back([&] {
++      for (;;) {
++        if (sem.Wait(std::chrono::milliseconds(50))) {
++          consumed.fetch_add(1, std::memory_order_relaxed);
++        } else if (stop.load() && consumed.load() >= produced.load()) {
++          return;
++        }
++      }
++    });
++  }
++  for (int i = 0; i < producers; ++i) {
++    threads.emplace_back([&, i] {
++      uint32_t n = 0;
++      while (std::chrono::steady_clock::now() < end) {
++        produced.fetch_add(1, std::memory_order_relaxed);
++        sem.Release(1);
++        if ((++n & (i ? 63 : 7)) == 0) std::this_thread::yield();
++        // Never far ahead of the consumers: the test is about wake-ups, not about a queue growing.
++        while (produced.load(std::memory_order_relaxed) - consumed.load(std::memory_order_relaxed) > 64 &&
++               std::chrono::steady_clock::now() < end + kStuck) {
++          std::this_thread::yield();
++        }
++      }
++    });
++  }
++  for (int i = consumers; i < int(threads.size()); ++i) threads[size_t(i)].join();
++  stop.store(true);
++  const auto deadline = std::chrono::steady_clock::now() + kStuck;
++  while (consumed.load() < produced.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
++  if (consumed.load() != produced.load()) Fail("semaphore: released units were never consumed (a lost wake-up)");
++  for (int i = 0; i < consumers; ++i) threads[size_t(i)].join();
++  return consumed.load();
++}
++
++// A manual-reset event set once wakes every waiter, whether it blocked before or arrives after.
++uint64_t ManualBroadcast(std::chrono::steady_clock::time_point end) {
++  uint64_t rounds = 0;
++  while (std::chrono::steady_clock::now() < end && !g_failed.load()) {
++    Event gate(true);
++    std::atomic<int> through{0};
++    std::vector<std::thread> threads;
++    for (int i = 0; i < 4; ++i) {
++      threads.emplace_back([&, i] {
++        if (i & 1) std::this_thread::yield();
++        if (gate.Wait(kStuck)) through.fetch_add(1);
++      });
++    }
++    if (rounds & 1) std::this_thread::yield();
++    gate.Signal();
++    for (auto& t : threads) t.join();
++    if (through.load() != 4) Fail("manual-reset event: a waiter stayed blocked after the event was set");
++    ++rounds;
++  }
++  return rounds;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++  const int seconds = argc > 1 ? std::atoi(argv[1]) : 5;
++  const auto slice = std::chrono::milliseconds(seconds * 1000 / 4);
++  auto end = std::chrono::steady_clock::now() + slice;
++  const uint64_t trips_tight = PingPong(end, 0);
++  end = std::chrono::steady_clock::now() + slice;
++  const uint64_t trips_spin = PingPong(end, 2000);
++  end = std::chrono::steady_clock::now() + slice;
++  const uint64_t units = SemaphoreFlow(end, 2, 3);
++  end = std::chrono::steady_clock::now() + slice;
++  const uint64_t rounds = ManualBroadcast(end);
++  std::printf("auto-reset ping-pong: %llu + %llu round trips; semaphore: %llu units through 2 producers and 3 "
++              "consumers; manual-reset broadcast: %llu rounds of 4 waiters\n",
++              static_cast<unsigned long long>(trips_tight), static_cast<unsigned long long>(trips_spin),
++              static_cast<unsigned long long>(units), static_cast<unsigned long long>(rounds));
++  std::printf("signals: %llu notified, %llu found nobody blocked and skipped the notify\n",
++              static_cast<unsigned long long>(g_notified.load()), static_cast<unsigned long long>(g_skipped.load()));
++  std::printf(g_failed.load() ? "RESULT: FAILED\n" : "RESULT: ok (no lost wake-up)\n");
++  return g_failed.load() ? 1 : 0;
++}
+diff --git a/tests/vec_byteswap_test.cpp b/tests/vec_byteswap_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd023085749b8da7d17dc201ff54ce6be0ae5ce8
+--- /dev/null
++++ b/tests/vec_byteswap_test.cpp
+@@ -0,0 +1,81 @@
++// tools/vec_byteswap.py replaces, on AArch64, the 16-byte reversal the generator writes as
++//     simde_mm_shuffle_epi8(v, simde_mm_load_si128((simde__m128i*)VectorMaskL))
++// with vextq_u8(r, r, 8), r = vrev64q_u8(v). This checks that the two are the same permutation, on a PC: the left
++// side with the real pshufb and the SDK's own mask table, the right side with simde's implementation of the two NEON
++// instructions (its model of their definition). Position-marking vectors (each byte its own index), single-byte
++// vectors and random ones.
++//
++//   clang++ -O2 -std=c++23 -march=x86-64-v2 -Isdk/include -Isdk/thirdparty/simde -Isdk/thirdparty/simde/simde
++//           -Iout/pc/rexglue-sdk/include sdk/tests/vec_byteswap_test.cpp -o out/tools/vec_byteswap_test.exe
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++
++#include <simde/arm/neon.h>
++#include <simde/x86/ssse3.h>
++
++#include <rex/ppc/intrinsics.h>
++
++namespace {
++
++uint64_t g_state = 0x243F6A8885A308D3ull;
++uint64_t Next() {
++  g_state ^= g_state << 13;
++  g_state ^= g_state >> 7;
++  g_state ^= g_state << 17;
++  return g_state;
++}
++
++bool Same(const uint8_t* bytes) {
++  simde__m128i v;
++  std::memcpy(&v, bytes, 16);
++  const simde__m128i table =
++      simde_mm_shuffle_epi8(v, simde_mm_load_si128(reinterpret_cast<const simde__m128i*>(rex::ppc::VectorMaskL)));
++  simde_uint8x16_t n = simde_vld1q_u8(bytes);
++  const simde_uint8x16_t r = simde_vrev64q_u8(n);
++  n = simde_vextq_u8(r, r, 8);
++  uint8_t a[16], b[16];
++  std::memcpy(a, &table, 16);
++  simde_vst1q_u8(b, n);
++  return std::memcmp(a, b, 16) == 0;
++}
++
++}  // namespace
++
++int main() {
++  uint64_t checked = 0, failures = 0;
++  uint8_t bytes[16];
++  for (int i = 0; i < 16; ++i) bytes[i] = uint8_t(i);
++  failures += !Same(bytes);
++  ++checked;
++  // The expected permutation itself, spelled out once: byte i of the result is byte 15 - i of the input.
++  {
++    simde__m128i v;
++    std::memcpy(&v, bytes, 16);
++    const simde__m128i table =
++        simde_mm_shuffle_epi8(v, simde_mm_load_si128(reinterpret_cast<const simde__m128i*>(rex::ppc::VectorMaskL)));
++    uint8_t out[16];
++    std::memcpy(out, &table, 16);
++    for (int i = 0; i < 16; ++i) failures += out[i] != uint8_t(15 - i);
++  }
++  for (int i = 0; i < 16; ++i) {
++    for (int value = 1; value < 256; ++value) {
++      std::memset(bytes, 0, 16);
++      bytes[i] = uint8_t(value);
++      failures += !Same(bytes);
++      ++checked;
++    }
++  }
++  for (int k = 0; k < 4000000; ++k) {
++    const uint64_t lo = Next(), hi = Next();
++    std::memcpy(bytes, &lo, 8);
++    std::memcpy(bytes + 8, &hi, 8);
++    failures += !Same(bytes);
++    ++checked;
++  }
++  std::printf("%llu vectors: REV64 + EXT #8 against pshufb with VectorMaskL's first row\n",
++              static_cast<unsigned long long>(checked));
++  std::printf(failures ? "RESULT: FAILED (%llu differences)\n" : "RESULT: ok (0 differences)\n",
++              static_cast<unsigned long long>(failures));
++  return failures ? 1 : 0;
++}
+diff --git a/tests/vmx_helpers_neon_test.cpp b/tests/vmx_helpers_neon_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..4bb6491d62e6adbcbab1499e523224f4ed2cdc89
+--- /dev/null
++++ b/tests/vmx_helpers_neon_test.cpp
+@@ -0,0 +1,147 @@
++// rex/ppc/intrinsics.h gives three VMX helper operations a NEON-native form on AArch64:
++//   simde_mm_perm_epi8_ (vperm)   -> vqtbl2q_u8({a, b}, (c & 0x1F) ^ 0x0F)
++//   simde_mm_vctsxs               -> vcvtq_s32_f32   (FCVTZS)
++//   simde_mm_vctuxs               -> vcvtq_u32_f32   (FCVTZU)
++// This runs on a PC: the left side is the header's x86 form (what the PC build executes), the right side the same
++// expression as the NEON path written with simde's implementation of the NEON instruction (its model of the
++// instruction's definition) for vperm, and for the two conversions a scalar statement of the Arm definition of
++// FCVTZS / FCVTZU. Every result must be equal.
++//
++//   clang++ -O2 -std=c++23 -march=x86-64-v2 -Isdk/include -Isdk/thirdparty/simde -Isdk/thirdparty/simde/simde
++//           -Iout/pc/rexglue-sdk/include sdk/tests/vmx_helpers_neon_test.cpp -o out/tools/vmx_helpers_neon_test.exe
++#include <bit>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++
++#include <simde/arm/neon.h>
++
++#include <rex/ppc/intrinsics.h>
++
++namespace {
++
++uint64_t g_state = 0xA4093822299F31D0ull;
++uint64_t Next() {
++  g_state ^= g_state << 13;
++  g_state ^= g_state >> 7;
++  g_state ^= g_state << 17;
++  return g_state;
++}
++
++uint64_t g_checked = 0, g_failures = 0;
++
++// FCVTZS / FCVTZU of a single, as the Arm ARM defines them (FPToFixed with round-toward-zero: a NaN gives 0, a value
++// beyond the destination's range saturates). simde's x86 implementation of vcvtq_u32_f32 is not used: it goes through
++// the signed conversion and returns 0x80000000 for values from 2^31 up, which the instruction does not.
++int32_t Fcvtzs(float x) {
++  if (std::isnan(x)) return 0;
++  if (x >= 2147483648.0f) return INT32_MAX;
++  if (x <= -2147483648.0f) return INT32_MIN;
++  return int32_t(x);
++}
++uint32_t Fcvtzu(float x) {
++  if (std::isnan(x)) return 0;
++  if (x >= 4294967296.0f) return UINT32_MAX;
++  if (x <= 0.0f) return 0;
++  return uint32_t(x);
++}
++
++void Report(const char* what, const void* in, const void* got, const void* want) {
++  if (g_failures++ < 12) {
++    uint32_t i[4], g[4], w[4];
++    std::memcpy(i, in, 16);
++    std::memcpy(g, got, 16);
++    std::memcpy(w, want, 16);
++    std::printf("FAILED %s: in %08X %08X %08X %08X  neon form %08X %08X %08X %08X  x86 form %08X %08X %08X %08X\n",
++                what, i[0], i[1], i[2], i[3], g[0], g[1], g[2], g[3], w[0], w[1], w[2], w[3]);
++  }
++}
++
++void CheckPerm(const uint8_t* a, const uint8_t* b, const uint8_t* c) {
++  simde__m128i va, vb, vc;
++  std::memcpy(&va, a, 16);
++  std::memcpy(&vb, b, 16);
++  std::memcpy(&vc, c, 16);
++  const simde__m128i x86 = rex::ppc::simde_mm_perm_epi8_(va, vb, vc);
++  const simde_uint8x16x2_t table = {{simde_vld1q_u8(a), simde_vld1q_u8(b)}};
++  const simde_uint8x16_t index =
++      simde_veorq_u8(simde_vandq_u8(simde_vld1q_u8(c), simde_vdupq_n_u8(0x1F)), simde_vdupq_n_u8(0x0F));
++  uint8_t neon[16], want[16];
++  simde_vst1q_u8(neon, simde_vqtbl2q_u8(table, index));
++  std::memcpy(want, &x86, 16);
++  ++g_checked;
++  if (std::memcmp(neon, want, 16) != 0) Report("vperm", c, neon, want);
++}
++
++void CheckConversions(const float* f) {
++  simde__m128 v;
++  std::memcpy(&v, f, 16);
++  const simde__m128i s86 = rex::ppc::simde_mm_vctsxs(v);
++  const simde__m128i u86 = rex::ppc::simde_mm_vctuxs(v);
++  int32_t sn[4];
++  uint32_t un[4];
++  for (int i = 0; i < 4; ++i) {
++    sn[i] = Fcvtzs(f[i]);
++    un[i] = Fcvtzu(f[i]);
++  }
++  g_checked += 2;
++  if (std::memcmp(sn, &s86, 16) != 0) Report("vctsxs", f, sn, &s86);
++  if (std::memcmp(un, &u86, 16) != 0) Report("vctuxs", f, un, &u86);
++}
++
++}  // namespace
++
++int main() {
++  uint8_t a[16], b[16], c[16];
++  // vperm: marker tables (a holds 0..15, b holds 16..31), every control byte value in every position, then random.
++  for (int i = 0; i < 16; ++i) {
++    a[i] = uint8_t(i);
++    b[i] = uint8_t(16 + i);
++  }
++  for (int position = 0; position < 16; ++position) {
++    for (int value = 0; value < 256; ++value) {
++      for (int i = 0; i < 16; ++i) c[i] = uint8_t(Next());
++      c[position] = uint8_t(value);
++      CheckPerm(a, b, c);
++    }
++  }
++  for (int k = 0; k < 3000000; ++k) {
++    uint64_t r[6];
++    for (auto& x : r) x = Next();
++    std::memcpy(a, &r[0], 16);
++    std::memcpy(b, &r[2], 16);
++    std::memcpy(c, &r[4], 16);
++    CheckPerm(a, b, c);
++  }
++  // The conversions: edge values in every lane position, then random bit patterns (exponents near 2^31 and 2^32 half
++  // of the time).
++  const uint32_t edges[] = {
++      0x00000000, 0x80000000, 0x00000001, 0x80000001, 0x007FFFFF, 0x00800000, 0x3F000000, 0xBF000000,  // 0, denormals, 0.5
++      0x3F7FFFFF, 0x3F800000, 0xBF800000, 0x3FFFFFFF, 0x40000000, 0x4EFFFFFF, 0x4F000000, 0x4F000001,  // around 2^31
++      0xCEFFFFFF, 0xCF000000, 0xCF000001, 0x4F7FFFFF, 0x4F800000, 0x4F800001, 0xCF800000, 0x5F000000,  // around 2^32
++      0x7F7FFFFF, 0xFF7FFFFF, 0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00000, 0x7F800001, 0xFFBFFFFF,  // max, inf, NaNs
++      0x4B000000, 0x4B000001, 0xCB000001, 0x4A7FFFFE};                                                 // integers with halves
++  float f[4];
++  for (const uint32_t e0 : edges) {
++    for (const uint32_t e1 : edges) {
++      const uint32_t bits[4] = {e0, e1, uint32_t(Next()), e0 ^ 0x80000000u};
++      std::memcpy(f, bits, 16);
++      CheckConversions(f);
++    }
++  }
++  for (int k = 0; k < 8000000; ++k) {
++    uint32_t bits[4];
++    for (auto& x : bits) {
++      x = uint32_t(Next());
++      if (Next() & 1) x = (x & 0x807FFFFFu) | (uint32_t(0x9C + Next() % 8) << 23);  // exponents 2^29 .. 2^36
++    }
++    std::memcpy(f, bits, 16);
++    CheckConversions(f);
++  }
++  std::printf("%llu comparisons of the NEON forms with the x86 forms (vperm, vctsxs, vctuxs)\n",
++              static_cast<unsigned long long>(g_checked));
++  std::printf(g_failures ? "RESULT: FAILED (%llu differences)\n" : "RESULT: ok (0 differences)\n",
++              static_cast<unsigned long long>(g_failures));
++  return g_failures ? 1 : 0;
++}
+diff --git a/tests/vmx_small_helpers_test.cpp b/tests/vmx_small_helpers_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..16abe9faa5c4b16ebcf79c07060cc062cdfbe64d
+--- /dev/null
++++ b/tests/vmx_small_helpers_test.cpp
+@@ -0,0 +1,126 @@
++// The small VMX helper operations of rex/ppc/intrinsics.h against the NEON instruction each one stands for, on a PC:
++// the header's x86 form on one side, a scalar statement of the NEON instruction's definition on the other.
++//   simde_mm_cvtepu32_ps_  (vcfux)    UCVTF: unsigned 32-bit integer to single, round to nearest even
++//                                     -> ALL 2^32 inputs
++//   simde_mm_adds_epu32    (vadduws)  UQADD: unsigned saturating add
++//   simde_mm_cmpgt_epu8/16 (vcmpgtub/uh) CMHI: unsigned greater-than
++//   simde_mm_avg_epi8/16   (vavgsb/sh)   SRHADD: signed (a + b + 1) >> 1
++//   VectorMaskL / VectorMaskR: every byte is 0..15 or has bit 7 set (then pshufb and TBL agree on it)
++// A helper is only given a NEON form in the header if this reports 0 differences for it.
++//
++//   clang++ -O2 -std=c++23 -march=x86-64-v2 -Isdk/include -Isdk/thirdparty/simde -Isdk/thirdparty/simde/simde
++//           -Iout/pc/rexglue-sdk/include sdk/tests/vmx_small_helpers_test.cpp -o out/tools/vmx_small_helpers_test.exe
++#include <bit>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++
++#include <rex/ppc/intrinsics.h>
++
++namespace {
++
++uint64_t g_state = 0x452821E638D01377ull;
++uint64_t Next() {
++  g_state ^= g_state << 13;
++  g_state ^= g_state >> 7;
++  g_state ^= g_state << 17;
++  return g_state;
++}
++
++}  // namespace
++
++int main() {
++  // UCVTF, every input. The C conversion of a uint32_t to float is correctly rounded in the current mode (round to
++  // nearest even here): cvtsi2ss from the zero-extended 64-bit value.
++  uint64_t ucvtf_differences = 0;
++  uint32_t first_bad = 0;
++  for (uint64_t base = 0; base < 0x100000000ull; base += 4) {
++    const uint32_t in[4] = {uint32_t(base), uint32_t(base + 1), uint32_t(base + 2), uint32_t(base + 3)};
++    simde__m128i v;
++    std::memcpy(&v, in, 16);
++    const simde__m128 r = rex::ppc::simde_mm_cvtepu32_ps_(v);
++    float out[4];
++    std::memcpy(out, &r, 16);
++    for (int i = 0; i < 4; ++i) {
++      volatile uint32_t x = in[i];
++      const float want = float(uint32_t(x));
++      if (std::bit_cast<uint32_t>(out[i]) != std::bit_cast<uint32_t>(want)) {
++        if (!ucvtf_differences) first_bad = in[i];
++        ++ucvtf_differences;
++      }
++    }
++  }
++  std::printf("vcfux / UCVTF: all 4294967296 inputs, %llu differences%s\n",
++              static_cast<unsigned long long>(ucvtf_differences), ucvtf_differences ? " (first below)" : "");
++  if (ucvtf_differences) std::printf("  first differing input %08X\n", first_bad);
++
++  uint64_t add = 0, gt8 = 0, gt16 = 0, avg8 = 0, avg16 = 0, checked = 0;
++  for (int k = 0; k < 6000000; ++k) {
++    uint8_t a[16], b[16];
++    uint64_t r[4] = {Next(), Next(), Next(), Next()};
++    std::memcpy(a, &r[0], 16);
++    std::memcpy(b, &r[2], 16);
++    if ((k & 7) == 0) std::memset(a, (k & 8) ? 0xFF : 0x80, 16);
++    if ((k & 15) == 1) std::memcpy(b, a, 16);
++    simde__m128i va, vb;
++    std::memcpy(&va, a, 16);
++    std::memcpy(&vb, b, 16);
++    uint8_t out[16];
++    simde__m128i x = rex::ppc::simde_mm_adds_epu32(va, vb);
++    std::memcpy(out, &x, 16);
++    for (int i = 0; i < 4; ++i) {
++      uint32_t p, q, got;
++      std::memcpy(&p, a + 4 * i, 4);
++      std::memcpy(&q, b + 4 * i, 4);
++      std::memcpy(&got, out + 4 * i, 4);
++      const uint64_t sum = uint64_t(p) + q;
++      add += got != (sum > 0xFFFFFFFFull ? 0xFFFFFFFFu : uint32_t(sum));
++    }
++    x = rex::ppc::simde_mm_cmpgt_epu8(va, vb);
++    std::memcpy(out, &x, 16);
++    for (int i = 0; i < 16; ++i) gt8 += out[i] != (a[i] > b[i] ? 0xFF : 0x00);
++    x = rex::ppc::simde_mm_cmpgt_epu16(va, vb);
++    std::memcpy(out, &x, 16);
++    for (int i = 0; i < 8; ++i) {
++      uint16_t p, q, got;
++      std::memcpy(&p, a + 2 * i, 2);
++      std::memcpy(&q, b + 2 * i, 2);
++      std::memcpy(&got, out + 2 * i, 2);
++      gt16 += got != (p > q ? 0xFFFF : 0x0000);
++    }
++    x = rex::ppc::simde_mm_avg_epi8(va, vb);
++    std::memcpy(out, &x, 16);
++    for (int i = 0; i < 16; ++i) avg8 += int8_t(out[i]) != int8_t((int(int8_t(a[i])) + int(int8_t(b[i])) + 1) >> 1);
++    x = rex::ppc::simde_mm_avg_epi16(va, vb);
++    std::memcpy(out, &x, 16);
++    for (int i = 0; i < 8; ++i) {
++      int16_t p, q, got;
++      std::memcpy(&p, a + 2 * i, 2);
++      std::memcpy(&q, b + 2 * i, 2);
++      std::memcpy(&got, out + 2 * i, 2);
++      avg16 += got != int16_t((int(p) + int(q) + 1) >> 1);
++    }
++    ++checked;
++  }
++  std::printf("%llu random vector pairs: UQADD (vadduws) %llu differences, CMHI bytes %llu, CMHI halfwords %llu, "
++              "SRHADD bytes %llu, SRHADD halfwords %llu\n",
++              static_cast<unsigned long long>(checked), static_cast<unsigned long long>(add),
++              static_cast<unsigned long long>(gt8), static_cast<unsigned long long>(gt16),
++              static_cast<unsigned long long>(avg8), static_cast<unsigned long long>(avg16));
++
++  uint64_t mask_bytes = 0, mask_bad = 0;
++  for (const uint8_t byte : rex::ppc::VectorMaskL) {
++    ++mask_bytes;
++    mask_bad += !(byte <= 15 || (byte & 0x80));
++  }
++  for (const uint8_t byte : rex::ppc::VectorMaskR) {
++    ++mask_bytes;
++    mask_bad += !(byte <= 15 || (byte & 0x80));
++  }
++  std::printf("VectorMaskL / VectorMaskR: %llu bytes, %llu outside {0..15, bit 7 set}\n",
++              static_cast<unsigned long long>(mask_bytes), static_cast<unsigned long long>(mask_bad));
++  const bool ok = !ucvtf_differences && !add && !gt8 && !gt16 && !avg8 && !avg16 && !mask_bad;
++  std::printf(ok ? "RESULT: ok (0 differences)\n" : "RESULT: differences found (see above)\n");
++  return ok ? 0 : 1;
++}
 diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
 index f102b56a18ad266586d0ea65cd0f376112db27e1..075130745cc63506fc66487057836b59ae2acbbe 100644
 --- a/thirdparty/CMakeLists.txt

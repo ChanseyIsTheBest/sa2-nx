@@ -204,6 +204,7 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
 
 X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                        uint64_t* opt_timeout) {
+  REX_SYS_CENSUS(rex::syscount::kCensusWait, 1);
   auto wait_handle = GetWaitHandle();
   if (!wait_handle) {
     // Object doesn't support waiting.
@@ -372,6 +373,7 @@ void XObject::SetNativePointer(uint32_t native_ptr, bool uninitialized) {
 object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* native_ptr,
                                              int32_t as_type) {
   assert_not_null(native_ptr);
+  REX_SYS_CENSUS(rex::syscount::kCensusNativeObject, 1);
 
   // Unfortunately the XDK seems to inline some KeInitialize calls, meaning
   // we never see it and just randomly start getting passed events/timers/etc.
