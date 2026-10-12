@@ -151,6 +151,8 @@ Do not change the game or app code between steps 1 and 3: a changed function los
 | `tools\indirect_promotions.py --census <file> --gen app\generated\default` | Makes `app\indirect_promotions.txt` from a PC run with `sa2_diag_indirect_census = "<file>"`: the indirect call sites that go to one target |
 | `tools\loop_body_census.py --compare before.o after.o` | Instructions, loads and stores inside loops of two AArch64 objects: for a step that changes loops, where a file's size says nothing |
 | `tools\switch_compile_check.py --like <known source> <new source>` | A source the configured Switch tree does not list yet, compiled with a sibling's flags |
+| `tools\lto_census.py <elf>` | What the LTO link left in a Switch ELF: the calls between game functions that were not inlined (by the callee's size), functions with one call site left, calls out of the LTO unit, the clones and cold parts the optimiser made |
+| `tools\address_taken_census.py` | An estimate of the game functions nobody takes the address of, and how many of them are called from one place (the code LTO cannot treat as it would in an ordinary program) |
 | `tools\crt_signatures.py make / scan` | Signatures of the C runtime functions one port found (`tools\crt_signatures.json`), looked for in any game's image dump |
 | `tools\census_summary.py <log>`, `tools\census_sites.py <log>` | A run with `sa2_diag_runtime_census = true`: float-mode switches and runtime calls per Swap, and the functions the switches come from |
 

@@ -1958,6 +1958,56 @@ memory on each iteration.
 Of the SDK list above, this round built items 4 (`kernel_state()`), 12 (several targets per site) and 13 (the
 divisions).
 
+### Link-time optimisation of a recompiled program: what the release's link did and did not do (2026-10-12)
+
+The user's question: can LTO be improved for ReXGlue ports in general? Measured on the released v1.0.0 ELF (LTO and
+PGO, `out/nx/elf/sa2_v1.0.0_pgo_use_20261008_0105.elf`) and with the Switch compiler (GCC 16.1). Nothing here has
+changed a build yet; the last part says why that is the right order.
+
+The LTO unit is the game code and the app: 177 of the Switch build's 1,253 compile commands. The SDK, the
+third-party libraries, the stage module (127 functions, 55 KB) and the driver stay outside.
+
+| Question | Measured | Conclusion |
+|---|---|---|
+| Does the inliner take the small functions? | 110,826 direct call sites are left between game functions. 2.0 % of them call a function of 32 instructions or fewer, 14.1 % one of 64 or fewer, 46 % one of 128 or fewer | Yes. What stays out of line is medium and large |
+| What about functions called from one place? | 8,579 of the 30,766 game functions have one direct call statement in the generated code and no address anywhere in the image (`tools/address_taken_census.py`). In the ELF, 7,326 functions with one call site left hold 28.5 % of the game code's instructions | In an ordinary program GCC inlines a function that is called once and drops its body (`-finline-functions-called-once`). It needs the function to be unreachable otherwise, and the function table takes the address of every function, so the rule never applies. These functions meet the limit for any other function instead (`max-inline-insns-auto` = 30) |
+| Are functions split into a hot and a cold part? | No: 0 `.cold` parts in the release. `-freorder-blocks-and-partition` is off by default on AArch64. Tried on two game files: without a profile 2 cold parts (248 bytes); with the committed profile 4 parts in file 16 (328 bytes of 179 KB), and file 64 does not assemble (`invalid operands (.text.unlikely.X and .text.X sections) for '-'`: a jump table whose targets were split off) | Dropped: it breaks with this compiler and moves next to nothing |
+| Do the interprocedural passes specialise functions? | 437 `.constprop`, 1,083 `.isra` and 218 `.part` clones in the program, 24 of them of game functions | Not in the game code: every game function has the same two parameters and all of its state in memory, so there is nothing to specialise |
+| What crosses the border of the LTO unit? | From game code: the critical sections (2,220 call sites into one-instruction thunks), the cold fallback of an indirect call (22,866 sites), and in the release the logging inside every trap site (round 2 moved that out of line) | In SA2 the kernel is rarely called (the third round's census: only the critical sections are frequent), so putting the SDK into the unit would win little here. A port with more kernel traffic should measure it before deciding |
+| How is the link partitioned? | 512 LTRANS partitions (GCC 16's default). `-fipa-ra` only helps a call whose callee was compiled earlier in the same partition, and `-fipa-pta` runs per partition | A link-time experiment (fewer, larger partitions); game functions push 2.99 callee-saved registers on average |
+
+#### The order of work
+
+GCC inserts the profile's counters before its interprocedural inliner runs, and matches a function with its profile
+by the function's own control flow. So:
+
+- what is decided at the link can still change after a profile is recorded, without losing it: the inliner's
+  limits, the partitions, which functions the table lists;
+- what must be final before the console session is the source (every round above) and the set of instrumented
+  objects.
+
+The instrumented build of this branch therefore keeps the release's LTO settings, and the items below wait for the
+new profile, whose counts can then judge them (`-fdump-ipa-inline` at the link lists every decision with the
+call site's count).
+
+#### Candidates for the build that uses the new profile
+
+1. **A higher `max-inline-insns-auto` for the game code** (a compile option of the game files: GCC keeps its
+   parameters per function). With a profile the inliner takes the hottest call sites first and leaves cold ones
+   alone, so this reaches the hot medium-sized functions the limit of 30 keeps out, including the hot ones that are
+   called once. Semantics cannot change; the cost is code size, bounded by `inline-unit-growth`.
+2. **Fewer, larger partitions**, for `-fipa-ra`.
+3. **A function table without the functions nobody takes the address of.** The largest lever (the called-once rule
+   and smaller code), and the only one that can break the game: a function reached by an address the analysis
+   missed ends in the invalid-function trap. The loaded image has no relocation table to make the list exact (its
+   `.reloc` range holds other data), so this needs a conservative address scan and a PC census proving that every
+   indirect target of long runs is on the list. Not started.
+
+GCC 16.1 also has `-flto-incremental=<folder>` (with `-flto-partition=cache`): unchanged partitions are reused
+from one link to the next, which would shorten the A/B builds. Not for a release build.
+
+Tools: `tools/lto_census.py` (what a link left in an ELF) and `tools/address_taken_census.py`.
+
 ## Build-time: the codegen flavour (A/B NRO pair)
 
 These options cannot be switched at run time:
