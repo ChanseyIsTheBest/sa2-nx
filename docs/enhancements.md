@@ -2054,6 +2054,70 @@ from one link to the next, which would shorten the A/B builds. Not for a release
 
 Tools: `tools/lto_census.py` (what a link left in an ELF) and `tools/address_taken_census.py`.
 
+#### The link with the new profile (2026-10-13): the inline limit of the game code raised to 64
+
+The user played the instrumented build of this branch and sent its profile (one session; 6,862 of the game's 33,303
+functions ran, the release's session ran 6,506). The first build from it kept the release's link settings and wrote
+the inliner's dump (`SA2_SWITCH_LTO_DUMP`), which ends with the reason every remaining call site was refused and how
+often those calls ran in the session:
+
+| Reason | Call sites | Calls in the session |
+|---|---|---|
+| inlined | | 22.5 billion |
+| `max-inline-insns-auto` limit reached | 105,317 | 3.88 billion |
+| `max-inline-insns-single` limit reached (functions declared inline: the app's) | 466 | 0.32 billion |
+| `large-function-growth` limit reached | 563 | 0.24 billion |
+| optimization level attribute mismatch | 25 | 0.05 billion |
+| the others together | | 0.06 billion |
+
+So one limit refuses 86 % of the executed calls that are still calls: the size limit for functions not declared
+`inline` (30). In hand-written code that keyword carries the author's judgement; in recompiled code no function has
+it, so the limit is the default nobody chose. With a profile the inliner only grows hot call sites (a cold one is
+refused as "call is unlikely and code size would grow"), so raising it adds code where the session ran.
+
+Five builds from the same profile (`tools/lto_inline_report.py`; the time estimate is GCC's own, weighted by the
+profile, and knows nothing about caches; the hot functions are the ones GCC placed in `.text.hot`):
+
+| Build | Limit / unit growth | Executed calls left | Time estimate | Hot functions | `.text` | NRO |
+|---|---|---|---|---|---|---|
+| A: the release's settings | 30 / 40 % | 4.54 billion | baseline | 1.72 MB | 37.8 MB | 53.8 MB |
+| A2: A and the two fixes below | 30 / 40 % | 4.51 billion | -0.04 % | 1.76 MB | 37.8 MB | 53.8 MB |
+| B | 200 / 40 % | 2.03 billion | -2.1 % | 2.46 MB | 45.6 MB | 61.7 MB |
+| C: with the fixes | 200 / 12 % | 1.89 billion | -2.2 % | 2.51 MB | 38.9 MB | 54.9 MB |
+| **D: with the fixes (kept)** | **64 / 12 %** | **2.65 billion** | **-1.5 %** | **2.06 MB** | **38.9 MB** | **55.0 MB** |
+
+- **B** shows the gain and two costs. The whole unit grew to the 40 per cent the compiler allows, most of it in code
+  the session never ran (with `-fprofile-partial-training` that code is optimised as without a profile, and the
+  higher limit applies to it too). And the hot functions grew by 46 %.
+- **C** caps the unit's growth at 12 % (`SA2_SWITCH_INLINE_UNIT_GROWTH`). The inliner takes the best call sites
+  first (the most calls for the least growth), so the cap only cut the cold growth: the NRO is 2 % larger than A,
+  the hot functions as large as in B. What they grew by, against A2: 30 % of the added size is callees that now
+  have one copy (the function moved into its only hot caller: nothing is executed twice), half is callees with
+  four or more copies, among them `sub_82544128` (about 2.3 KB) in 35 places and `sub_82546268` in 34. A function
+  that ran from one address and stayed in the instruction cache then runs from 35.
+- **D** keeps the call sites where the call itself is a large part of the work: 41 % fewer executed calls than A2
+  for 17 % more hot code. The step from D to C buys another 0.7 % of the estimate with 0.45 MB of hot code, most of
+  it the large multi-copy callees, which is the part a 48 KB instruction cache and a 2 MB second-level cache
+  shared by four cores cannot be assumed to take. 64 and 12 are the defaults of a build that uses a profile.
+
+Two fixes for the localized copies and native replacements (`app/src/cpu/sa2_hot_guest.cpp`, the hottest game code,
+compiled as part of the app), found on the way:
+
+- **The errno rule.** GCC does not inline between two functions that both compute with floats and differ in
+  `-fmath-errno`. The game code has `-fno-math-errno` since the second round and this file did not, so the native
+  replacements and the game functions that call them stayed apart at the link: the "attribute mismatch" row above.
+  The file gets the flag (it calls no function that sets errno, so its own code is unchanged).
+- **The frame pointer.** The first round's `-fomit-frame-pointer` covered the generated files only; this file gets
+  it too.
+
+Verified: the profile fits with and without the parameters (`tools/pgo_fit.py`: 0 of 443 functions lose it), every
+build passes `tools/check_switch_build.py` (which now follows a known guest halt through a chain of inlined calls:
+with the higher limit `sub_828C5D60` inlines `sub_828D71E8`, which inlines the halt of `sub_828DB988`). Not
+measured: the console. The session's length is not recorded, so the counts above cannot be turned into calls per
+frame; at 20,000 to 70,000 frames, D removes roughly 27,000 to 93,000 executed calls a frame over all threads.
+
+Not tried: fewer partitions (`SA2_SWITCH_LTO_PARTITIONS`) and the pruned function table.
+
 ## Build-time: the codegen flavour (A/B NRO pair)
 
 These options cannot be switched at run time:

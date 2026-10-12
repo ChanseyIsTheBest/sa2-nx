@@ -131,7 +131,11 @@ To record a new profile:
    summary. Merge on the PC that built the instrumented NRO: the streams name its profile folder.
 3. `build_switch.ps1 -Pgo use` builds the optimised NRO.
 
-Do not change the game or app code between steps 1 and 3: a changed function loses its profile.
+Do not change the game or app code between steps 1 and 3: a changed function loses its profile. What the link
+decides can still change, because GCC adds the counters before its interprocedural inliner runs: a build that uses a
+profile gives the game code `--param=max-inline-insns-auto=64` and `--param=inline-unit-growth=12`
+(`SA2_SWITCH_INLINE_AUTO`, `SA2_SWITCH_INLINE_UNIT_GROWTH`; empty for the compiler's 30 and 40).
+`docs/enhancements.md`, "Link-time optimisation of a recompiled program", has the measurements.
 
 ## Tests on the PC
 
@@ -152,6 +156,7 @@ Do not change the game or app code between steps 1 and 3: a changed function los
 | `tools\loop_body_census.py --compare before.o after.o` | Instructions, loads and stores inside loops of two AArch64 objects: for a step that changes loops, where a file's size says nothing |
 | `tools\switch_compile_check.py --like <known source> <new source>` | A source the configured Switch tree does not list yet, compiled with a sibling's flags |
 | `tools\lto_census.py <elf>` | What the LTO link left in a Switch ELF: the calls between game functions that were not inlined (by the callee's size), functions with one call site left, calls out of the LTO unit, the clones and cold parts the optimiser made |
+| `tools\lto_inline_report.py [--save NAME] [--against NAME]` | After a Switch link configured with `-DSA2_SWITCH_LTO_DUMP=ON`: the calls the inliner took and refused (by reason), counted as often as they ran in the profile's session, GCC's profile-weighted time estimate, the size of the hot functions, and against a saved report the copies a setting added |
 | `tools\address_taken_census.py` | An estimate of the game functions nobody takes the address of, and how many of them are called from one place (the code LTO cannot treat as it would in an ordinary program) |
 | `tools\crt_signatures.py make / scan` | Signatures of the C runtime functions one port found (`tools\crt_signatures.json`), looked for in any game's image dump |
 | `tools\census_summary.py <log>`, `tools\census_sites.py <log>` | A run with `sa2_diag_runtime_census = true`: float-mode switches and runtime calls per Swap, and the functions the switches come from |

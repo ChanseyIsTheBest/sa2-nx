@@ -348,8 +348,60 @@ if(REXGLUE_PLATFORM_SWITCH)
                 target_compile_options(${target} PRIVATE ${_sa2_lto_compile})
             endif()
         endforeach()
+        # The inliner's limits at the link (docs/enhancements.md, "Link-time optimisation of a recompiled program").
+        # GCC adds the profile's counters before its interprocedural inliner runs, so none of these touches a
+        # recorded profile: they can change between the instrumented build and the one that uses its counts.
+        #   SA2_SWITCH_INLINE_AUTO     --param=max-inline-insns-auto for the game code and its localized copies, in
+        #                              a build that uses a profile (SA2_PGO=use). The compiler's 30 is its limit
+        #                              for functions not declared inline, which says nothing about recompiled
+        #                              code: in the session of 2026-10-12 it refused call sites that ran 3.9
+        #                              billion times. 64 inlines the small ones among them: 41 % fewer executed
+        #                              calls, GCC's profile-weighted time estimate 1.5 % lower, the hot functions
+        #                              17 % larger. 200 also copies functions of 2 KB into 35 hot places (the hot
+        #                              functions 46 % larger), which a 48 KB instruction cache pays for. A compile
+        #                              option: GCC keeps its parameters per function and the inliner asks the
+        #                              caller's. Empty: the compiler's.
+        #   SA2_SWITCH_INLINE_UNIT_GROWTH  --param=inline-unit-growth for the same code and builds (the compiler's
+        #                              is 40 per cent). The inliner takes the best call sites first (the most calls
+        #                              in the profile for the least growth) and stops at this much growth of the
+        #                              whole unit. Without it the higher limit above fills the 40 per cent with
+        #                              code the session never ran (the NRO came out 8 MB larger). Empty: the
+        #                              compiler's.
+        #   SA2_SWITCH_LTO_PARTITIONS  --param=lto-partitions at the link (empty: the compiler's 512).
+        #   SA2_SWITCH_LTO_DUMP        -fdump-ipa-inline and a link map in the build folder, for
+        #                              tools/lto_inline_report.py. The code is the same with and without.
+        set(SA2_SWITCH_INLINE_AUTO "64" CACHE STRING
+            "max-inline-insns-auto of the game code with a profile (empty: the compiler's)")
+        set(SA2_SWITCH_INLINE_UNIT_GROWTH "12" CACHE STRING
+            "inline-unit-growth of the game code with a profile (empty: the compiler's)")
+        set(SA2_SWITCH_LTO_PARTITIONS "" CACHE STRING "LTRANS partitions of the Switch link (empty: the compiler's)")
+        option(SA2_SWITCH_LTO_DUMP "The inliner's decisions of the Switch LTO link as a dump file" OFF)
+        set(_sa2_inline_options "")
+        if(SA2_PGO STREQUAL "use")
+            if(SA2_SWITCH_INLINE_AUTO)
+                list(APPEND _sa2_inline_options --param=max-inline-insns-auto=${SA2_SWITCH_INLINE_AUTO})
+            endif()
+            if(SA2_SWITCH_INLINE_UNIT_GROWTH)
+                list(APPEND _sa2_inline_options --param=inline-unit-growth=${SA2_SWITCH_INLINE_UNIT_GROWTH})
+            endif()
+        endif()
+        if(_sa2_inline_options)
+            if(TARGET sa2_recomp)
+                target_compile_options(sa2_recomp PRIVATE ${_sa2_inline_options})
+            endif()
+            set_property(SOURCE src/cpu/sa2_hot_guest.cpp APPEND PROPERTY COMPILE_OPTIONS ${_sa2_inline_options})
+        endif()
+        if(SA2_SWITCH_LTO_PARTITIONS)
+            list(APPEND _sa2_lto_link --param=lto-partitions=${SA2_SWITCH_LTO_PARTITIONS})
+        endif()
+        if(SA2_SWITCH_LTO_DUMP)
+            # With the link map (sa2.map): the input sections say how large the hot part of the code is.
+            list(APPEND _sa2_lto_link -fdump-ipa-inline "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/sa2.map")
+        endif()
         target_link_options(sa2 PRIVATE ${_sa2_lto_link})
-        message(STATUS "sa2: Switch LTO on (${SA2_SWITCH_LTO_JOBS} LTRANS jobs, -fipa-pta ${SA2_SWITCH_IPA_PTA})")
+        message(STATUS "sa2: Switch LTO on (${SA2_SWITCH_LTO_JOBS} LTRANS jobs, -fipa-pta ${SA2_SWITCH_IPA_PTA}, "
+                       "game code inliner options '${_sa2_inline_options}', "
+                       "partitions '${SA2_SWITCH_LTO_PARTITIONS}', dump ${SA2_SWITCH_LTO_DUMP})")
     endif()
     # sasrt-nx's CPU round (2026-10-12; docs/enhancements.md, "The CPU round of 2026-10-12"). Each has its switch:
     #   - No frame pointer in the game code: AArch64 GCC keeps the x29 frame chain in every non-leaf function by
@@ -398,6 +450,17 @@ if(REXGLUE_PLATFORM_SWITCH)
             endif()
         endif()
     endforeach()
+    # The localized copies (app/generated/hot, all compiled in one file of the app) are game code too, and the
+    # hottest of it: the same rule for that file. It only frees x29; the profile is not touched.
+    if(SA2_SWITCH_OMIT_FRAME_POINTER)
+        set_property(SOURCE src/cpu/sa2_hot_guest.cpp APPEND PROPERTY COMPILE_OPTIONS -fomit-frame-pointer)
+    endif()
+    # And the game code's errno rule: GCC does not inline between two functions that both compute with floats and
+    # differ in -fmath-errno, which kept the native replacements (this file) and the game functions that call them
+    # apart at the link: 25 call sites with 47 million calls in the profile's session.
+    if(SA2_GAME_NO_MATH_ERRNO)
+        set_property(SOURCE src/cpu/sa2_hot_guest.cpp APPEND PROPERTY COMPILE_OPTIONS -fno-math-errno)
+    endif()
     message(STATUS "sa2: CPU round 2026-10-12: omit frame pointer ${SA2_SWITCH_OMIT_FRAME_POINTER}, flush flow "
                    "${SA2_SWITCH_FLUSH_FLOW}, guest CAS ${SA2_SWITCH_GUEST_CAS}, vector byteswap "
                    "${SA2_SWITCH_VEC_BYTESWAP}, NEON shuffles ${SA2_SWITCH_NEON_SHUFFLES}, NEON VMX helpers "
