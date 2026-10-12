@@ -35,6 +35,7 @@ struct RecompilerLocalVariables {
   bool v[128]{};
   bool env{};
   bool temp{};
+  bool f_bits[32]{};
   bool v_temp{};
   bool ea{};
 
@@ -98,6 +99,9 @@ struct BuilderContext {
   /// Pointer to active jump table for bctr dispatch, or nullptr
   const JumpTable* activeJumpTable = nullptr;
 
+  /// The addresses of the function that get a label (jump targets), or nullptr when the caller did not give them.
+  const std::unordered_set<size_t>* labels = nullptr;
+
   /// Get the recompiler configuration
   const RecompilerConfig& config() const;
 
@@ -156,6 +160,8 @@ struct BuilderContext {
 
   /// Get expression for vector temporary variable (always "vTemp")
   const char* v_temp();
+  /// fp_copy_pairs: the local that carries the bits an lfs loaded into float register `index` to its stores.
+  std::string f_bits(size_t index);
 
   /// Get expression for setjmp environment storage (always "env")
   const char* env();
@@ -290,6 +296,24 @@ struct BuilderContext {
   /// A floating-point move (lfd/stfd forms, stfiwx, fmr, fabs, fnabs, fneg): only bits move, so with
   /// fp_moves_modeless no flush-mode switch is emitted (sa2-nx round 7). Otherwise FPU mode as before.
   void emit_flush_mode_for_move();
+
+  /// fp_copy_pairs: this lfs / lfsx takes the copy form: its bits go to the register's bits local and the register
+  /// gets its value through rex::ppc::SingleToDoublePure, with no mode statement. Every lfs / lfsx does where the
+  /// form pays (float_copy_pair_pays) and no mid-asm hook stands at it.
+  bool float_copy_pair_load() const;
+  /// fp_copy_pairs: where the copy forms are taken. VMX mode known to be current (the plain form would switch off
+  /// and back; certain to pay), and with fp_copy_only_functions also an unknown mode in a copy-only function (a
+  /// bet: see RecompilerConfig::fpCopyOnlyFunctions for what it cost in SA2).
+  bool float_copy_pair_pays() const;
+  /// fp_copy_pairs: a function with no instruction that needs FPU mode whose every lfs / stfs form is an
+  /// lfs / lfsx or a store of loaded bits (a structure or matrix copy). With the copy forms it has no mode
+  /// statement at all.
+  bool function_is_copy_only() const;
+
+  /// fp_copy_pairs: this stfs / stfsx writes loaded bits: its register still holds what an lfs / lfsx of the
+  /// same block put there (see RecompilerConfig::fpCopyPairs), and the form pays. It writes
+  /// rex::ppc::QuietSingleBits of the register's bits local, without a conversion and without a mode statement.
+  bool float_copy_pair_store() const;
 
   /// An lfs/stfs form: true when the conversion must go through rex::ppc::SingleToDoubleAnyMode /
   /// DoubleToSingleAnyMode (fp_moves_modeless with VMX mode current: no switch); otherwise switches to FPU mode as

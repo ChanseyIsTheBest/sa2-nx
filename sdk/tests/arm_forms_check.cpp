@@ -36,3 +36,24 @@ CHECK_FN simde__m128i check_vctuxs(simde__m128 a) { return rex::ppc::simde_mm_vc
 CHECK_FN double check_add_single(double a, double b) { return rex::ppc::AddSingleAnyMode(a, b); }
 CHECK_FN double check_round_single(double a) { return rex::ppc::RoundToSingleAnyMode(a); }
 CHECK_FN bool check_ge_zero(double a) { return rex::ppc::GeZeroAnyMode(a); }
+
+// The second CPU round of 2026-10-12 (sa2-nx).
+//   - rex/ppc/diet_ops.h: fctid / fctiw as `frinti` + `fcvtzs`, fctidz as `fcvtzs` (codegen option fcti_inline; no
+//     call of round()); SingleToDoublePure and QuietSingleBits (fp_copy_pairs) without a call and without `msr`.
+//   - rex/ppc/intrinsics.h: the small VMX helpers as their NEON instruction.
+CHECK_FN int64_t check_fctid(double v) { return rex::ppc::fctid(v); }
+CHECK_FN int64_t check_fctiw(double v) { return rex::ppc::fctiw(v); }
+CHECK_FN int64_t check_fctidz(double v) { return rex::ppc::fctidz(v); }
+CHECK_FN double check_single_pure(uint32_t bits) { return rex::ppc::SingleToDoublePure(bits); }
+CHECK_FN uint32_t check_quiet_single(uint32_t bits) { return rex::ppc::QuietSingleBits(bits); }
+CHECK_FN simde__m128i check_adds_epu32(simde__m128i a, simde__m128i b) { return rex::ppc::simde_mm_adds_epu32(a, b); }
+CHECK_FN simde__m128i check_avg_epi8(simde__m128i a, simde__m128i b) { return rex::ppc::simde_mm_avg_epi8(a, b); }
+CHECK_FN simde__m128i check_avg_epi16(simde__m128i a, simde__m128i b) { return rex::ppc::simde_mm_avg_epi16(a, b); }
+CHECK_FN simde__m128i check_avg_epi32(simde__m128i a, simde__m128i b) { return rex::ppc::simde_mm_avg_epi32(a, b); }
+CHECK_FN simde__m128 check_cvtepu32_ps(simde__m128i a) { return rex::ppc::simde_mm_cvtepu32_ps_(a); }
+CHECK_FN simde__m128i check_cmpgt_epu8(simde__m128i a, simde__m128i b) { return rex::ppc::simde_mm_cmpgt_epu8(a, b); }
+CHECK_FN simde__m128i check_cmpgt_epu16(simde__m128i a, simde__m128i b) { return rex::ppc::simde_mm_cmpgt_epu16(a, b); }
+CHECK_FN simde__m128i check_sllv_epi16(simde__m128i a, simde__m128i c) { return rex::ppc::simde_mm_sllv_epi16(a, c); }
+CHECK_FN simde__m128i check_srlv_epi16(simde__m128i a, simde__m128i c) { return rex::ppc::simde_mm_srlv_epi16(a, c); }
+CHECK_FN simde__m128i check_srav_epi16(simde__m128i a, simde__m128i c) { return rex::ppc::simde_mm_srav_epi16(a, c); }
+CHECK_FN simde__m128i check_sllv_epi8(simde__m128i a, simde__m128i c) { return rex::ppc::simde_mm_sllv_epi8(a, c); }

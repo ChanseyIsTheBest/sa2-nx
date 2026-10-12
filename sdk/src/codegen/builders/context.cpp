@@ -135,6 +135,11 @@ const char* BuilderContext::temp() {
   return "temp";
 }
 
+std::string BuilderContext::f_bits(size_t index) {
+  locals.f_bits[index] = true;
+  return fmt::format("fb{}", index);
+}
+
 const char* BuilderContext::v_temp() {
   locals.v_temp = true;
   return "vTemp";
@@ -482,6 +487,92 @@ bool BuilderContext::single_conversion_any_mode() {
   return false;
 }
 
+namespace {
+bool IsSingleLoad(const ppc_insn& insn) {
+  return insn.opcode != nullptr && (insn.opcode->id == PPC_INST_LFS || insn.opcode->id == PPC_INST_LFSX);
+}
+bool IsSingleStore(const ppc_insn& insn) {
+  return insn.opcode != nullptr && (insn.opcode->id == PPC_INST_STFS || insn.opcode->id == PPC_INST_STFSX);
+}
+}  // namespace
+
+namespace {
+constexpr uint32_t kFloatCopyReach = 64;  // how far back a store looks for its load
+
+// An instruction that touches no float or vector register and no float status, and is no branch, call, system call
+// or trap. By the mnemonic: every PowerPC float instruction starts with f, lf, stf, mff or mtf, every vector one
+// with v, lv, stv, mfv or mtv, every branch with b; sc, tw and td are the system call and the traps. Anything
+// unknown does not qualify.
+bool IsPlainIntegerInstruction(const ppc_insn& insn) {
+  if (insn.opcode == nullptr || insn.opcode->name == nullptr) {
+    return false;
+  }
+  const std::string_view name = insn.opcode->name;
+  for (const std::string_view prefix : {"f", "lf", "stf", "mff", "mtf", "v", "lv", "stv", "mfv", "mtv", "b", "sc",
+                                         "tw", "td"}) {
+    if (name.substr(0, prefix.size()) == prefix) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// fp_copy_pairs: the address of the lfs / lfsx whose bits the stfs / stfsx at `store` (its word at `storeData`)
+// writes, or 0. Going back from the store inside its block: the first instruction that writes the store's register
+// must be an lfs / lfsx of it; before that only other lfs / lfsx / stfs / stfsx (they write their own register or
+// none) and plain integer instructions. No label after the load up to the store (a jump would arrive without the
+// load), no mid-asm hook from the load to the store (it could change the register).
+uint32_t FloatCopyLoadOf(const BuilderContext& ctx, uint32_t store, const uint32_t* storeData) {
+  if (!ctx.config().fpCopyPairs || ctx.labels == nullptr) {
+    return 0;
+  }
+  ppc_insn self;
+  rex::codegen::ppc::Disassemble(storeData, 4, store, self);
+  const auto& hooks = ctx.config().midAsmHooks;
+  if (!IsSingleStore(self) || hooks.find(store) != hooks.end() ||
+      ctx.labels->find(store) != ctx.labels->end()) {
+    return 0;
+  }
+  uint32_t start = 0xFFFFFFFFu;
+  for (const auto& block : ctx.fn.blocks()) {
+    if (store >= block.base && store < block.end()) {
+      start = block.base;
+      break;
+    }
+  }
+  uint32_t address = store - 4;
+  const uint32_t* p = storeData - 1;
+  for (uint32_t n = 0; address >= start && address < store && n < kFloatCopyReach; ++n, --p, address -= 4) {
+    if (hooks.find(address) != hooks.end()) {
+      return 0;
+    }
+    ppc_insn previous;
+    rex::codegen::ppc::Disassemble(p, 4, address, previous);
+    if (IsSingleLoad(previous)) {
+      if (previous.operands[0] == self.operands[0]) {
+        return address;  // a label AT the load is fine: whoever jumps there runs the load
+      }
+    } else if (!IsSingleStore(previous) && !IsPlainIntegerInstruction(previous)) {
+      return 0;
+    }
+    if (ctx.labels->find(address) != ctx.labels->end()) {
+      return 0;
+    }
+  }
+  return 0;
+}
+}  // namespace
+
+bool BuilderContext::float_copy_pair_load() const {
+  return config().fpCopyPairs && IsSingleLoad(insn) && !has_mid_asm_hook() && float_copy_pair_pays();
+}
+
+bool BuilderContext::float_copy_pair_store() const {
+  // Its load took the copy form: the tracked mode can only have become FPU between the two (nothing there sets
+  // VMX mode or forgets the mode), and then this store does not take the form either.
+  return config().fpCopyPairs && float_copy_pair_pays() && FloatCopyLoadOf(*this, base, data) != 0;
+}
+
 void BuilderContext::emit_flush_mode_for_modeless() {
   if (!config().fpComparesModeless) {
     emit_set_flush_mode(false);
@@ -624,6 +715,8 @@ struct FloatProfile {
   uint32_t vmx = 0;           // VMX float instructions
   uint32_t fpu = 0;           // scalar instructions that need FPU mode (arithmetic, with or without any-mode forms)
   uint32_t convertible = 0;   // lfs / stfs forms, frsp, fcmpu / fcmpo
+  uint32_t copies = 0;        // ... of those, lfs / lfsx and stores of loaded bits (fp_copy_pairs)
+  uint32_t copy_stores = 0;   // ... of those, the stores
 };
 
 bool IsConvertible(const ppc_insn& insn) {
@@ -674,6 +767,14 @@ const FloatProfile& ProfileOf(const BuilderContext& ctx) {
         default:
           if (IsConvertible(other)) {
             ++profile.convertible;
+            if (IsSingleLoad(other)) {
+              if (ctx.config().midAsmHooks.find(address) == ctx.config().midAsmHooks.end()) {
+                ++profile.copies;
+              }
+            } else if (FloatCopyLoadOf(ctx, address, p) != 0) {
+              ++profile.copies;
+              ++profile.copy_stores;
+            }
           }
           break;
       }
@@ -685,6 +786,16 @@ const FloatProfile& ProfileOf(const BuilderContext& ctx) {
 
 bool BuilderContext::function_has_vmx_float() const {
   return ProfileOf(*this).vmx != 0;
+}
+
+bool BuilderContext::function_is_copy_only() const {
+  const FloatProfile& profile = ProfileOf(*this);
+  return profile.fpu == 0 && profile.copy_stores != 0 && profile.convertible == profile.copies;
+}
+
+bool BuilderContext::float_copy_pair_pays() const {
+  return csrState == CSRState::VMX ||
+         (config().fpCopyOnlyFunctions && csrState == CSRState::Unknown && function_is_copy_only());
 }
 
 bool BuilderContext::function_is_mode_free() const {

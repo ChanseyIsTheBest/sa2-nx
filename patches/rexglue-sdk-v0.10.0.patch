@@ -742,10 +742,10 @@ index 8426798741687cc8201871bc16dabd0732b6f479..9d00a7f345d4421da6bbdd006437b5ef
  
  }  // namespace rex::audio
 diff --git a/include/rex/codegen/config.h b/include/rex/codegen/config.h
-index 8200139a62d727f28389cfd0566d5fccfb57d8df..f2f280ae63f7b6f7b334337b4446dafd096470d0 100644
+index 8200139a62d727f28389cfd0566d5fccfb57d8df..3ebdca2976c0214f4e6342f1454f2eee04fa051b 100644
 --- a/include/rex/codegen/config.h
 +++ b/include/rex/codegen/config.h
-@@ -89,15 +89,66 @@ struct RecompilerConfig {
+@@ -89,15 +89,95 @@ struct RecompilerConfig {
  
    // === Code generation options (optional) ===
    bool skipLr = false;
@@ -783,6 +783,35 @@ index 8200139a62d727f28389cfd0566d5fccfb57d8df..f2f280ae63f7b6f7b334337b4446dafd
 +  // mask reaches the upper half, so the result is the same; the compiler then sees a plain shift, bit-field
 +  // extract or AND (one instruction instead of three on AArch64).
 +  bool rotateWordNarrow = false;
++  // sa2-nx (second CPU round, 2026-10-12): fctid, fctiw and fctidz as rex::ppc::fctid / fctiw / fctidz
++  // (rex/ppc/diet_ops.h) instead of an isnan test, a range compare and simde's scalar conversion around each. On
++  // AArch64 they are `fcvtzs` (after `frinti` for the two that round) and a NaN select. For fctid and fctiw this
++  // also CORRECTS the AArch64 build: simde's portable conversion rounds with C round() (halves away from zero),
++  // the Xbox 360 and the x86 build round in the current mode (halves to even).
++  bool fctiInline = false;
++  // sa2-nx (second CPU round): a float copied through a register (lfs / lfsx, then stfs / stfsx of the same
++  // register: structure and matrix copies) needs no flush mode. The load keeps its bits in a local of that register
++  // (fb0..fb31) and gives the register its value through rex::ppc::SingleToDoublePure (integer arithmetic for a
++  // denormal: no mode, and the compiler drops it when the register is not read again); a store whose register
++  // still holds what such a load put there writes those bits with a signalling NaN quieted
++  // (rex::ppc::QuietSingleBits), which is what the two conversions gave. "Still holds": going back from the store
++  // in its block, the first instruction that writes the register is that load, and everything between is another
++  // lfs / lfsx / stfs / stfsx or an instruction that touches no float or vector register and is no branch, call or
++  // trap; no label after the load up to the store, no mid-asm hook from the load to the store.
++  // Used where VMX mode is known to be current: there the plain forms would switch the mode off and back, and the
++  // any-mode helpers they otherwise go through cost a test and a conversion each.
++  bool fpCopyPairs = false;
++  // sa2-nx (second CPU round): with fpCopyPairs, also in every copy-only function (no instruction that needs FPU
++  // mode, every lfs / stfs form an lfs / lfsx or a store of loaded bits), whatever the mode: such a function then
++  // has no mode statement at all, and a caller in VMX mode no longer pays a switch into it and one back. A BET, and
++  // off by default: the copy forms cost a test per load and per store on every call, the switches are saved only
++  // on the calls that come from vector code. SA2 (PC census, 2026-10-12): 5.25 million copy forms a second to
++  // save 22,000 switches a second, 235 forms per switch; its matrix copies run 1,500 times a frame, one call in
++  // seven from vector code. Worth it only where copies are mostly called from vector code.
++  bool fpCopyOnlyFunctions = false;
++  // sa2-nx (second CPU round): dcbt / dcbtst as REX_PREFETCH (the host's prefetch of the same address) instead
++  // of nothing. A hint: no effect on any value.
++  bool dcbtPrefetch = false;
 +  std::unordered_set<uint32_t> lrKeepReturns;
    bool ctrAsLocalVariable = false;
    bool xerAsLocalVariable = false;
@@ -1626,10 +1655,10 @@ index 0ede54262059bff41c8c1f5047602fe406d68e03..741856184d62a9685256c88a96ea3d3a
    //       | cr2-cr4 (12) | fpscr (4).  Total: 1616 bytes.
 diff --git a/include/rex/ppc/diet_ops.h b/include/rex/ppc/diet_ops.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..a3777b15c387e73156fd31bff509e1cc2659c7c0
+index 0000000000000000000000000000000000000000..480341de1dcd773621e7707f0b73aa3b35ac995b
 --- /dev/null
 +++ b/include/rex/ppc/diet_ops.h
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,310 @@
 +/**
 + * @file        ppc/diet_ops.h
 + * @brief       Codegen "diet" helpers: cheaper but bit-identical lowerings of single PPC instructions.
@@ -1645,12 +1674,15 @@ index 0000000000000000000000000000000000000000..a3777b15c387e73156fd31bff509e1cc
 +
 +#include <rex/platform/fpscr.h>
 +
++#include <simde/x86/sse2.h>
++
 +// PC diagnostic (sa2-nx, 2026-10-12): how often the any-mode helpers below run, and how often they take a cold path.
 +// A flush-mode switch saved is paid for with a test in every one of these calls, so the two counts decide whether the
 +// generator's fp_mode_lookahead pays in a given game. Counted only when the build defines REX_DIET_CENSUS_ON (a PC
 +// app does, for its game code; the Switch build and the unit tests do not): plain lossy counters the app defines.
 +#if defined(REX_DIET_CENSUS_ON) && !defined(__SWITCH__)
-+extern "C" volatile unsigned long long g_rex_diet_census[4];  // conversions, compares, arithmetic, cold paths
++// conversions, compares, arithmetic, cold paths, float copy loads, float copy stores
++extern "C" volatile unsigned long long g_rex_diet_census[6];
 +#define REX_DIET_CENSUS(k) (g_rex_diet_census[k] = g_rex_diet_census[k] + 1)
 +#else
 +#define REX_DIET_CENSUS(k) ((void)0)
@@ -1675,6 +1707,95 @@ index 0000000000000000000000000000000000000000..a3777b15c387e73156fd31bff509e1cc
 +    return INT32_MAX;
 +  return (v > -2147483648.0) ? int64_t(int32_t(v)) : int64_t(INT32_MIN);
 +#endif
++}
++
++/// sa2-nx, second CPU round (codegen option fcti_inline): the other three conversions to integer the same way.
++///
++/// fctidz: truncate toward zero to int64 with PPC saturation, NaN -> INT64_MIN. The old expression was
++/// `isnan ? INT64_MIN : v > 2^63 ? INT64_MAX : simde_mm_cvttsd_si64(v)`. On AArch64 simde's conversion is a C cast,
++/// which the compiler writes as the saturating `fcvtzs`: with the NaN select that is every value the old expression
++/// gave there. On x86 `cvttsd2si` answers INT64_MIN for everything out of range, so the old expression gave
++/// INT64_MIN for exactly v == 2^63 (its test is `>`); the Xbox 360 and the AArch64 build give INT64_MAX there, and
++/// so does this helper: the one input where it differs from the old x86 code.
++inline int64_t fctidz(double v) noexcept {
++#if defined(__aarch64__)
++  int64_t r;
++  asm("fcvtzs %x0, %d1" : "=r"(r) : "w"(v));
++  return __builtin_isnan(v) ? INT64_MIN : r;
++#else
++  if (__builtin_isnan(v))
++    return INT64_MIN;
++  if (v >= 9223372036854775808.0)
++    return INT64_MAX;
++  return (v >= -9223372036854775808.0) ? int64_t(v) : INT64_MIN;
++#endif
++}
++
++/// fctid: round to int64 in the current rounding mode (the guest's: FPSCR.RN is mirrored into the host's) with PPC
++/// saturation, NaN -> INT64_MIN. The old expression was
++/// `isnan ? INT64_MIN : v > 2^63 ? INT64_MAX : simde_mm_cvtsd_si64(v)`. On x86 that is `cvtsd2si` (current mode,
++/// INT64_MIN out of range) and so is this helper; it differs only, as fctidz, at v == 2^63 (INT64_MAX, as on the
++/// 360). On AArch64 simde's portable version is `(int64_t)round(v)`: halves AWAY from zero (0.5 -> 1, 2.5 -> 3) in
++/// every mode, where the 360 and x86 give 0 and 2. `frinti` (to an integral double in the current mode, no inexact
++/// flag) and the saturating `fcvtzs` round as the 360 does: the helper CORRECTS that build.
++inline int64_t fctid(double v) noexcept {
++  if (__builtin_isnan(v)) [[unlikely]]
++    return INT64_MIN;
++#if defined(__aarch64__)
++  double integral;
++  asm("frinti %d0, %d1" : "=w"(integral) : "w"(v));
++  int64_t r;
++  asm("fcvtzs %x0, %d1" : "=r"(r) : "w"(integral));
++  return r;
++#else
++  if (v >= 9223372036854775808.0)
++    return INT64_MAX;
++  return simde_mm_cvtsd_si64(simde_mm_set_sd(v));
++#endif
++}
++
++/// fctiw: the same to int32, as the s64 register image the old expression produced (NaN -> 0x0000000080000000,
++/// everything else sign extended). Old: `isnan ? 0x80000000U : v >= INT_MAX ? INT_MAX : simde_mm_cvtsd_si32(v)`;
++/// on x86 this is that expression, on AArch64 the halves are corrected as for fctid.
++inline int64_t fctiw(double v) noexcept {
++  if (__builtin_isnan(v)) [[unlikely]]
++    return int64_t(0x80000000U);
++#if defined(__aarch64__)
++  double integral;
++  asm("frinti %d0, %d1" : "=w"(integral) : "w"(v));
++  int32_t r;
++  asm("fcvtzs %w0, %d1" : "=r"(r) : "w"(integral));
++  return int64_t(r);
++#else
++  if (v >= 2147483647.0)
++    return INT32_MAX;
++  return int64_t(simde_mm_cvtsd_si32(simde_mm_set_sd(v)));
++#endif
++}
++
++/// Codegen option fp_copy_pairs: lfs directly followed by stfs of the same register.
++///
++/// lfs without a mode: the value `double(float)` gives with the flush mode off, in either mode and without touching
++/// the mode. Only a denormal single reads differently with the mode on; it is converted with integer arithmetic
++/// (normalise the fraction, rebuild the double), so the function is pure and the compiler removes it when the
++/// register is not read again.
++inline double SingleToDoublePure(uint32_t bits) noexcept {
++  REX_DIET_CENSUS(4);
++  const uint32_t fraction = bits & 0x007FFFFFu;
++  if ((bits & 0x7F800000u) == 0 && fraction != 0) [[unlikely]] {
++    const int shift = __builtin_clz(fraction) - 8;  // 1..23: brings the leading one to bit 23
++    const uint64_t exponent = uint64_t(1023 - 126 - shift);
++    const uint64_t mantissa = uint64_t((fraction << shift) & 0x007FFFFFu) << 29;
++    return std::bit_cast<double>((uint64_t(bits >> 31) << 63) | (exponent << 52) | mantissa);
++  }
++  return double(std::bit_cast<float>(bits));
++}
++
++/// stfs of the value such an lfs loaded: `float(double(single))` with the mode off is the single again, except
++/// that the two conversions quiet a signalling NaN (they set the top fraction bit and keep the rest).
++inline uint32_t QuietSingleBits(uint32_t bits) noexcept {
++  REX_DIET_CENSUS(5);
++  return (bits & 0x7FFFFFFFu) > 0x7F800000u ? (bits | 0x00400000u) : bits;
 +}
 +
 +/// sa2-nx round 7 (codegen option fp_moves_modeless): the lfs/stfs conversions with the IEEE result, i.e. the one
@@ -1849,23 +1970,85 @@ index 0000000000000000000000000000000000000000..a3777b15c387e73156fd31bff509e1cc
 +
 +}  // namespace rex::ppc
 diff --git a/include/rex/ppc/intrinsics.h b/include/rex/ppc/intrinsics.h
-index 3c2fe09065d089f949314425bd08e09ab5082d68..3fb054035deeab4f4747e155cbc3d60dce63b2b6 100644
+index 3c2fe09065d089f949314425bd08e09ab5082d68..265f59971c46f072fb9ffa81975e812be0ebb5b9 100644
 --- a/include/rex/ppc/intrinsics.h
 +++ b/include/rex/ppc/intrinsics.h
-@@ -155,12 +155,31 @@ inline simde__m128 simde_mm_cvtepu32_ps_(simde__m128i src1) {
-   return simde_mm_blendv_ps(xmm2, simde_mm_castsi128_ps(xmm0), simde_mm_castsi128_ps(src1));
- }
+@@ -116,35 +116,68 @@ inline uint8_t VectorShiftTableR[] = {
+ // SIMD Helper Functions
+ //=============================================================================
  
-+// rexglue ports (sasrt-nx, 2026-10-12): on AArch64 the three helpers below are the one NEON instruction that does
-+// what the VMX instruction does, instead of the x86 emulation compiled through simde (vperm: two pshufb, each an AND
-+// and a TBL there, a shift and a blend; the conversions: x86's "integer indefinite" result patched up with compares
-+// and blends, on top of simde's own emulation of that result). Same results for every input
-+// (sdk/tests/vmx_helpers_neon_test.cpp compares each with the x86 form through simde's model of the NEON
-+// instruction). REX_VMX_HELPERS_X86_FORM keeps the x86 forms.
++// rexglue ports (sasrt-nx, 2026-10-12): on AArch64 the helpers below are the one NEON instruction that does what the
++// VMX instruction does, instead of the x86 emulation compiled through simde (vperm: two pshufb, each an AND and a TBL
++// there, a shift and a blend; the float conversions: x86's "integer indefinite" result patched up with compares and
++// blends, on top of simde's own emulation of that result). Same results for every input:
++// sdk/tests/vmx_helpers_neon_test.cpp compares vperm, vctsxs and vctuxs with the x86 form through simde's model of
++// the NEON instruction; sdk/tests/vmx_small_helpers_test.cpp compares the small ones (sa2-nx, 2026-10-12: saturating
++// add, the signed averages, the unsigned compares, vcfux, the per-lane shifts) with a scalar statement of the NEON
++// instruction, and the shifts with simde's model too. REX_VMX_HELPERS_X86_FORM keeps the x86 forms.
++// vcfux as UCVTF rounds in the host's current mode, the x86 form to nearest: the same while the mode is to nearest,
++// which is the only mode the vector unit of the 360 has and the mode vector code runs in.
 +#if (defined(__aarch64__) || defined(_M_ARM64)) && !defined(REX_VMX_HELPERS_X86_FORM)
 +#define REX_VMX_HELPERS_NEON 1
 +#endif
 +
+ // Unsigned 32-bit saturating add
+ inline simde__m128i simde_mm_adds_epu32(simde__m128i a, simde__m128i b) {
++#if defined(REX_VMX_HELPERS_NEON)
++  return simde__m128i_from_neon_u32(vqaddq_u32(simde__m128i_to_neon_u32(a), simde__m128i_to_neon_u32(b)));  // UQADD
++#else
+   return simde_mm_add_epi32(
+       a, simde_mm_min_epu32(simde_mm_xor_si128(a, simde_mm_cmpeq_epi32(a, a)), b));
++#endif
+ }
+ 
+ // Signed 8-bit average (rounds towards zero)
+ inline simde__m128i simde_mm_avg_epi8(simde__m128i a, simde__m128i b) {
++#if defined(REX_VMX_HELPERS_NEON)
++  return simde__m128i_from_neon_i8(vrhaddq_s8(simde__m128i_to_neon_i8(a), simde__m128i_to_neon_i8(b)));  // SRHADD
++#else
+   simde__m128i c = simde_mm_set1_epi8(char(128));
+   return simde_mm_xor_si128(c,
+                             simde_mm_avg_epu8(simde_mm_xor_si128(c, a), simde_mm_xor_si128(c, b)));
++#endif
+ }
+ 
+ // Signed 16-bit average
+ inline simde__m128i simde_mm_avg_epi16(simde__m128i a, simde__m128i b) {
++#if defined(REX_VMX_HELPERS_NEON)
++  return simde__m128i_from_neon_i16(vrhaddq_s16(simde__m128i_to_neon_i16(a), simde__m128i_to_neon_i16(b)));
++#else
+   simde__m128i c = simde_mm_set1_epi16(short(32768));
+   return simde_mm_xor_si128(c,
+                             simde_mm_avg_epu16(simde_mm_xor_si128(c, a), simde_mm_xor_si128(c, b)));
++#endif
+ }
+ 
+ // Signed 32-bit average
+ inline simde__m128i simde_mm_avg_epi32(simde__m128i a, simde__m128i b) {
++#if defined(REX_VMX_HELPERS_NEON)
++  return simde__m128i_from_neon_i32(vrhaddq_s32(simde__m128i_to_neon_i32(a), simde__m128i_to_neon_i32(b)));
++#else
+   simde__m128i sum = simde_mm_add_epi32(simde_mm_srai_epi32(a, 1), simde_mm_srai_epi32(b, 1));
+   return simde_mm_add_epi32(sum,
+                             simde_mm_and_si128(simde_mm_or_si128(a, b), simde_mm_set1_epi32(1)));
++#endif
+ }
+ 
+ // Convert unsigned 32-bit integers to floats
+ inline simde__m128 simde_mm_cvtepu32_ps_(simde__m128i src1) {
++#if defined(REX_VMX_HELPERS_NEON)
++  return simde__m128_from_neon_f32(vcvtq_f32_u32(simde__m128i_to_neon_u32(src1)));  // UCVTF
++#else
+   simde__m128i xmm1 = simde_mm_add_epi32(src1, simde_mm_set1_epi32(127));
+   simde__m128i xmm0 = simde_mm_slli_epi32(src1, 31 - 8);
+   xmm0 = simde_mm_srli_epi32(xmm0, 31);
+@@ -153,30 +186,52 @@ inline simde__m128 simde_mm_cvtepu32_ps_(simde__m128i src1) {
+   xmm0 = simde_mm_add_epi32(xmm0, simde_mm_set1_epi32(0x4F800000));
+   simde__m128 xmm2 = simde_mm_cvtepi32_ps(src1);
+   return simde_mm_blendv_ps(xmm2, simde_mm_castsi128_ps(xmm0), simde_mm_castsi128_ps(src1));
++#endif
+ }
+ 
  // Permute bytes from two vectors based on control vector
  inline simde__m128i simde_mm_perm_epi8_(simde__m128i a, simde__m128i b, simde__m128i c) {
 +#if defined(REX_VMX_HELPERS_NEON)
@@ -1884,7 +2067,24 @@ index 3c2fe09065d089f949314425bd08e09ab5082d68..3fb054035deeab4f4747e155cbc3d60d
  }
  
  // Unsigned 8-bit compare greater than
-@@ -177,6 +196,10 @@ inline simde__m128i simde_mm_cmpgt_epu16(simde__m128i a, simde__m128i b) {
+ inline simde__m128i simde_mm_cmpgt_epu8(simde__m128i a, simde__m128i b) {
++#if defined(REX_VMX_HELPERS_NEON)
++  return simde__m128i_from_neon_u8(vcgtq_u8(simde__m128i_to_neon_u8(a), simde__m128i_to_neon_u8(b)));  // CMHI
++#else
+   simde__m128i c = simde_mm_set1_epi8(char(128));
+   return simde_mm_cmpgt_epi8(simde_mm_xor_si128(a, c), simde_mm_xor_si128(b, c));
++#endif
+ }
+ 
+ // Unsigned 16-bit compare greater than
+ inline simde__m128i simde_mm_cmpgt_epu16(simde__m128i a, simde__m128i b) {
++#if defined(REX_VMX_HELPERS_NEON)
++  return simde__m128i_from_neon_u16(vcgtq_u16(simde__m128i_to_neon_u16(a), simde__m128i_to_neon_u16(b)));
++#else
+   simde__m128i c = simde_mm_set1_epi16(short(32768));
+   return simde_mm_cmpgt_epi16(simde_mm_xor_si128(a, c), simde_mm_xor_si128(b, c));
++#endif
+ }
  
  // Vector Convert To Signed Fixed-Point Word Saturate
  inline simde__m128i simde_mm_vctsxs(simde__m128 src1) {
@@ -1895,7 +2095,7 @@ index 3c2fe09065d089f949314425bd08e09ab5082d68..3fb054035deeab4f4747e155cbc3d60d
    simde__m128 xmm2 = simde_mm_cmpunord_ps(src1, src1);
    simde__m128i xmm0 = simde_mm_cvttps_epi32(src1);
    simde__m128i xmm1 = simde_mm_cmpeq_epi32(xmm0, simde_mm_set1_epi32(INT_MIN));
-@@ -185,12 +208,17 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1) {
+@@ -185,12 +240,17 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1) {
                                          simde_mm_castsi128_ps(simde_mm_set1_epi32(INT_MAX)),
                                          simde_mm_castsi128_ps(xmm1));
    return simde_mm_andnot_si128(simde_mm_castps_si128(xmm2), simde_mm_castps_si128(dest));
@@ -1913,7 +2113,7 @@ index 3c2fe09065d089f949314425bd08e09ab5082d68..3fb054035deeab4f4747e155cbc3d60d
    simde__m128 nan_mask = simde_mm_cmpunord_ps(src1, src1);
    simde__m128 neg_mask = simde_mm_cmplt_ps(src1, simde_mm_setzero_ps());
    simde__m128 max_val = simde_mm_set1_ps(4294967295.0f);  // UINT_MAX as float
-@@ -220,6 +248,7 @@ inline simde__m128i simde_mm_vctuxs(simde__m128 src1) {
+@@ -220,6 +280,7 @@ inline simde__m128i simde_mm_vctuxs(simde__m128 src1) {
        simde_mm_and_si128(simde_mm_castps_si128(overflow_mask), simde_mm_set1_epi32(-1)));
  
    return result;
@@ -1921,6 +2121,78 @@ index 3c2fe09065d089f949314425bd08e09ab5082d68..3fb054035deeab4f4747e155cbc3d60d
  }
  
  // Vector Shift Right
+@@ -340,6 +401,12 @@ inline simde__m128i simde_mm_vsro(simde__m128i a, simde__m128i b) {
+ 
+ // Variable 16-bit shift left: widen to 32-bit, shift, narrow back
+ inline simde__m128i simde_mm_sllv_epi16(simde__m128i a, simde__m128i count) {
++#if defined(REX_VMX_HELPERS_NEON)
++  // USHL reads its count as the lane's low byte, signed: clamped to 16 it gives 0 for every count of 16 or more,
++  // as the widened x86 form does.
++  const uint16x8_t n = vminq_u16(simde__m128i_to_neon_u16(count), vdupq_n_u16(16));
++  return simde__m128i_from_neon_u16(vshlq_u16(simde__m128i_to_neon_u16(a), vreinterpretq_s16_u16(n)));
++#else
+   simde__m128i zero = simde_mm_setzero_si128();
+   simde__m128i a_lo = simde_mm_unpacklo_epi16(a, zero);
+   simde__m128i a_hi = simde_mm_unpackhi_epi16(a, zero);
+@@ -351,10 +418,16 @@ inline simde__m128i simde_mm_sllv_epi16(simde__m128i a, simde__m128i count) {
+   r_lo = simde_mm_and_si128(r_lo, mask16);
+   r_hi = simde_mm_and_si128(r_hi, mask16);
+   return simde_mm_packus_epi32(r_lo, r_hi);
++#endif
+ }
+ 
+ // Variable 16-bit logical right shift: widen to 32-bit, shift, narrow back
+ inline simde__m128i simde_mm_srlv_epi16(simde__m128i a, simde__m128i count) {
++#if defined(REX_VMX_HELPERS_NEON)
++  const uint16x8_t n = vminq_u16(simde__m128i_to_neon_u16(count), vdupq_n_u16(16));
++  return simde__m128i_from_neon_u16(
++      vshlq_u16(simde__m128i_to_neon_u16(a), vnegq_s16(vreinterpretq_s16_u16(n))));  // USHL by -n: a right shift
++#else
+   simde__m128i zero = simde_mm_setzero_si128();
+   simde__m128i a_lo = simde_mm_unpacklo_epi16(a, zero);
+   simde__m128i a_hi = simde_mm_unpackhi_epi16(a, zero);
+@@ -363,10 +436,17 @@ inline simde__m128i simde_mm_srlv_epi16(simde__m128i a, simde__m128i count) {
+   simde__m128i r_lo = simde_mm_srlv_epi32(a_lo, s_lo);
+   simde__m128i r_hi = simde_mm_srlv_epi32(a_hi, s_hi);
+   return simde_mm_packus_epi32(r_lo, r_hi);
++#endif
+ }
+ 
+ // Variable 16-bit arithmetic right shift: sign-extend to 32-bit, shift, narrow back
+ inline simde__m128i simde_mm_srav_epi16(simde__m128i a, simde__m128i count) {
++#if defined(REX_VMX_HELPERS_NEON)
++  // A count of 15 already gives the sign fill, which is what every larger count gives too.
++  const uint16x8_t n = vminq_u16(simde__m128i_to_neon_u16(count), vdupq_n_u16(15));
++  return simde__m128i_from_neon_i16(
++      vshlq_s16(simde__m128i_to_neon_i16(a), vnegq_s16(vreinterpretq_s16_u16(n))));  // SSHL by -n
++#else
+   simde__m128i zero = simde_mm_setzero_si128();
+   // Sign-extend a: duplicate each 16-bit lane, then arithmetic shift right by 16
+   simde__m128i a_lo = simde_mm_srai_epi32(simde_mm_unpacklo_epi16(a, a), 16);
+@@ -376,10 +456,15 @@ inline simde__m128i simde_mm_srav_epi16(simde__m128i a, simde__m128i count) {
+   simde__m128i r_lo = simde_mm_srav_epi32(a_lo, s_lo);
+   simde__m128i r_hi = simde_mm_srav_epi32(a_hi, s_hi);
+   return simde_mm_packs_epi32(r_lo, r_hi);
++#endif
+ }
+ 
+ // Variable 8-bit shift left: widen to 16-bit, shift, narrow back
+ inline simde__m128i simde_mm_sllv_epi8(simde__m128i a, simde__m128i count) {
++#if defined(REX_VMX_HELPERS_NEON)
++  const uint8x16_t n = vminq_u8(simde__m128i_to_neon_u8(count), vdupq_n_u8(8));
++  return simde__m128i_from_neon_u8(vshlq_u8(simde__m128i_to_neon_u8(a), vreinterpretq_s8_u8(n)));
++#else
+   simde__m128i zero = simde_mm_setzero_si128();
+   simde__m128i a_lo = simde_mm_unpacklo_epi8(a, zero);
+   simde__m128i a_hi = simde_mm_unpackhi_epi8(a, zero);
+@@ -391,6 +476,7 @@ inline simde__m128i simde_mm_sllv_epi8(simde__m128i a, simde__m128i count) {
+   r_lo = simde_mm_and_si128(r_lo, mask8);
+   r_hi = simde_mm_and_si128(r_hi, mask8);
+   return simde_mm_packus_epi16(r_lo, r_hi);
++#endif
+ }
+ 
+ }  // namespace rex::ppc
 diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
 index 1f524802ee642116261f190563b6246a3b6ede27..9d7901deb21aea13c32dfd883952790382abd2e7 100644
 --- a/include/rex/rex_app.h
@@ -1940,10 +2212,10 @@ index 1f524802ee642116261f190563b6246a3b6ede27..9d7901deb21aea13c32dfd8839527903
    /// Use this for data patches and recomp-specific achievement registration.
 diff --git a/include/rex/sys_counters.h b/include/rex/sys_counters.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..e9f2fc698613a1796b5c42ed0acd7bbaa28ebae8
+index 0000000000000000000000000000000000000000..73e7b2f31c24908b399b170e2b2399ce11f7f799
 --- /dev/null
 +++ b/include/rex/sys_counters.h
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,86 @@
 +#pragma once
 +/**
 + * @file        sys_counters.h
@@ -1996,7 +2268,15 @@ index 0000000000000000000000000000000000000000..e9f2fc698613a1796b5c42ed0acd7bba
 +  kCensusFlushWrite = 64,     // guest code switched the host flush mode (an `msr fpcr` on AArch64)
 +  kCensusFlushSame = 65,      // ... of those, unconditional writes that left the mode as it was
 +  kCensusNoteShaderLocked = 66,  // NoteShaderObject calls that took the shared mutex (app)
-+  kCensusCount = 72,
++  kCensusCritSecPcrOwner = 67,   // critical section calls that took the owner id from the PCR (no thread lookup)
++  kCensusCritSecOwnerMismatch = 68,  // ... where that id was not the looked-up thread's (PC self-check: must be 0)
++  // The SDK's own overhead (sa2-nx, the third survey of 2026-10-12): how often the runtime makes an out-of-line
++  // call for something that is one load or nothing.
++  kCensusLogCall = 69,        // log statements executed (rex::GetLoggerRaw calls), at any level, written or not
++  kCensusLookupHeap = 70,     // Memory::LookupHeap calls (one inside every Memory::TranslateVirtual)
++  kCensusRetainRelease = 71,  // XObject::Retain and Release calls
++  kCensusKernelState = 72,    // rex::system::kernel_state() calls
++  kCensusCount = 76,
 +};
 +
 +#if !defined(__SWITCH__)
@@ -2072,6 +2352,64 @@ index 6063f3cc5d6c2f3b097a27c719dd34235a6d1cc4..8b164c5083d2c32afdaff966a7d90a7e
    void RegisterIOCompletionPort(uint32_t key, object_ref<XIOCompletion> port);
    void RemoveIOCompletionPort(uint32_t key);
  
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+index 0c39a42009e4e4e8d64c7325196ba5690559f335..baf25b42cc091942bfb9bcb0899d540f4ca934f8 100644
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -385,12 +385,20 @@ class Memory {
+   // Note that the contents at the specified host address are big-endian.
+   template <typename T = uint8_t*>
+   inline T TranslateVirtual(uint32_t guest_address) const {
++#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && defined(__aarch64__))
+     uint8_t* host_address = virtual_membase_ + guest_address;
+     const auto heap = LookupHeap(guest_address);
+     if (heap) {
+       host_address += heap->host_address_offset();
+     }
+     return reinterpret_cast<T>(host_address);
++#else
++    // sa2-nx (2026-10-12): no heap has a host offset on this platform (detail::PhysicalHostOffset, the constant the
++    // recompiled code adds for the same translation, is 0; PhysicalHeap::Initialize checks that every heap agrees
++    // with it). So this is the plain sum, without the out-of-line heap lookup every kernel call that takes a
++    // pointer paid for (318 call sites in the runtime).
++    return reinterpret_cast<T>(virtual_membase_ + guest_address);
++#endif
+   }
+ 
+   // Base address of physical memory in the host address space.
+diff --git a/include/rex/system/xobject.h b/include/rex/system/xobject.h
+index 0a43f07e52e94b957e74ab29dd31c368354fb035..bdead9551e59da3310d3ac388af12f1eabc52ce1 100644
+--- a/include/rex/system/xobject.h
++++ b/include/rex/system/xobject.h
+@@ -19,6 +19,7 @@
+ 
+ #include <fmt/format.h>
+ 
++#include <rex/sys_counters.h>
+ #include <rex/system/xmemory.h>
+ #include <rex/system/xtypes.h>
+ #include <rex/thread.h>
+@@ -173,8 +174,18 @@ class XObject {
+ 
+   void RetainHandle();
+   bool ReleaseHandle();
+-  void Retain();
+-  void Release();
++  // Inline (sa2-nx, 2026-10-12): two atomic operations, called around every handle lookup (577 call sites in the
++  // runtime were out-of-line calls). The PC build counts them (rex/sys_counters.h, kCensusRetainRelease).
++  void Retain() {
++    REX_SYS_CENSUS(rex::syscount::kCensusRetainRelease, 1);
++    ++pointer_ref_count_;
++  }
++  void Release() {
++    REX_SYS_CENSUS(rex::syscount::kCensusRetainRelease, 1);
++    if (--pointer_ref_count_ == 0) {
++      delete this;
++    }
++  }
+   X_STATUS Delete();
+ 
+   virtual bool Save(stream::ByteStream* stream) {
 diff --git a/include/rex/thread/atomic.h b/include/rex/thread/atomic.h
 index f7eecf92f6cb5926844f05990aedc5e0455bced7..c941c7d4e79a75cccbc47d2caeff1532c02e3d11 100644
 --- a/include/rex/thread/atomic.h
@@ -3325,7 +3663,7 @@ index d2fa537f5f599ea939cbef3a7d4985893a0f467a..10188148b232ed830559f35d01f7c744
          CXX_VISIBILITY_PRESET hidden
      )
 diff --git a/resources/templates/codegen/pch_h.inja b/resources/templates/codegen/pch_h.inja
-index 68274d27a31bdfc28f68bef53ca62a5f6dfa4d61..4a95f35d6d133ffd6efe1203fdae386f03412baa 100644
+index 68274d27a31bdfc28f68bef53ca62a5f6dfa4d61..f22e97e6bd701db66bdbe57860aa032d958fb05a 100644
 --- a/resources/templates/codegen/pch_h.inja
 +++ b/resources/templates/codegen/pch_h.inja
 @@ -78,6 +78,16 @@ extern PPCFuncMapping PPCFuncMappings[];
@@ -3345,7 +3683,18 @@ index 68274d27a31bdfc28f68bef53ca62a5f6dfa4d61..4a95f35d6d133ffd6efe1203fdae386f
  #else
  #define DEFINE_REX_FUNC(name)                                       \
    __attribute__((alias("__imp__" #name)))                           \
-@@ -144,6 +154,32 @@ extern PPCFuncMapping PPCFuncMappings[];
+@@ -131,6 +141,10 @@ extern PPCFuncMapping PPCFuncMappings[];
+ #endif
+ 
+ #define REX_RAW_ADDR(x) (base + (u32)(x) + REX_PHYS_HOST_OFFSET(x))
++// dcbt / dcbtst with the generator's dcbt_prefetch option: the host's prefetch of the same address.
++#ifndef REX_PREFETCH
++#define REX_PREFETCH(x, write) __builtin_prefetch((const void*)REX_RAW_ADDR(x), (write))
++#endif
+ 
+ #define REX_LOAD_U8(x) (*(volatile u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+ #define REX_LOAD_U16(x) __builtin_bswap16(*(volatile u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
+@@ -144,6 +158,32 @@ extern PPCFuncMapping PPCFuncMappings[];
  #define REX_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
  #define REX_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
  
@@ -6640,10 +6989,37 @@ index 0000000000000000000000000000000000000000..61107ebd8b01952282ffcf0f44ba327a
 +
 +}  // namespace rex::codegen
 diff --git a/src/codegen/builders/builder_context.h b/src/codegen/builders/builder_context.h
-index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..f5e4f12ae051cd5e8d64f66dd319956d858f7a2c 100644
+index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..4f6e071c9688b0f60dbd3af72f23770109eac317 100644
 --- a/src/codegen/builders/builder_context.h
 +++ b/src/codegen/builders/builder_context.h
-@@ -231,6 +231,46 @@ struct BuilderContext {
+@@ -35,6 +35,7 @@ struct RecompilerLocalVariables {
+   bool v[128]{};
+   bool env{};
+   bool temp{};
++  bool f_bits[32]{};
+   bool v_temp{};
+   bool ea{};
+ 
+@@ -98,6 +99,9 @@ struct BuilderContext {
+   /// Pointer to active jump table for bctr dispatch, or nullptr
+   const JumpTable* activeJumpTable = nullptr;
+ 
++  /// The addresses of the function that get a label (jump targets), or nullptr when the caller did not give them.
++  const std::unordered_set<size_t>* labels = nullptr;
++
+   /// Get the recompiler configuration
+   const RecompilerConfig& config() const;
+ 
+@@ -156,6 +160,8 @@ struct BuilderContext {
+ 
+   /// Get expression for vector temporary variable (always "vTemp")
+   const char* v_temp();
++  /// fp_copy_pairs: the local that carries the bits an lfs loaded into float register `index` to its stores.
++  std::string f_bits(size_t index);
+ 
+   /// Get expression for setjmp environment storage (always "env")
+   const char* env();
+@@ -231,6 +237,46 @@ struct BuilderContext {
     */
    void emit_function_call(uint32_t address);
  
@@ -6690,13 +7066,31 @@ index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..f5e4f12ae051cd5e8d64f66dd319956d
    /**
     * @brief Emit C++ code for a conditional branch.
     * @param not_ If true, invert the condition
-@@ -247,6 +287,55 @@ struct BuilderContext {
+@@ -247,6 +293,73 @@ struct BuilderContext {
     */
    void emit_set_flush_mode(bool enable);
  
 +  /// A floating-point move (lfd/stfd forms, stfiwx, fmr, fabs, fnabs, fneg): only bits move, so with
 +  /// fp_moves_modeless no flush-mode switch is emitted (sa2-nx round 7). Otherwise FPU mode as before.
 +  void emit_flush_mode_for_move();
++
++  /// fp_copy_pairs: this lfs / lfsx takes the copy form: its bits go to the register's bits local and the register
++  /// gets its value through rex::ppc::SingleToDoublePure, with no mode statement. Every lfs / lfsx does where the
++  /// form pays (float_copy_pair_pays) and no mid-asm hook stands at it.
++  bool float_copy_pair_load() const;
++  /// fp_copy_pairs: where the copy forms are taken. VMX mode known to be current (the plain form would switch off
++  /// and back; certain to pay), and with fp_copy_only_functions also an unknown mode in a copy-only function (a
++  /// bet: see RecompilerConfig::fpCopyOnlyFunctions for what it cost in SA2).
++  bool float_copy_pair_pays() const;
++  /// fp_copy_pairs: a function with no instruction that needs FPU mode whose every lfs / stfs form is an
++  /// lfs / lfsx or a store of loaded bits (a structure or matrix copy). With the copy forms it has no mode
++  /// statement at all.
++  bool function_is_copy_only() const;
++
++  /// fp_copy_pairs: this stfs / stfsx writes loaded bits: its register still holds what an lfs / lfsx of the
++  /// same block put there (see RecompilerConfig::fpCopyPairs), and the form pays. It writes
++  /// rex::ppc::QuietSingleBits of the register's bits local, without a conversion and without a mode statement.
++  bool float_copy_pair_store() const;
 +
 +  /// An lfs/stfs form: true when the conversion must go through rex::ppc::SingleToDoubleAnyMode /
 +  /// DoubleToSingleAnyMode (fp_moves_modeless with VMX mode current: no switch); otherwise switches to FPU mode as
@@ -6746,7 +7140,7 @@ index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..f5e4f12ae051cd5e8d64f66dd319956d
    /// Emit mid-asm hook if configured for current address
    void emit_mid_asm_hook();
  
-@@ -325,6 +414,14 @@ struct BuilderContext {
+@@ -325,6 +438,14 @@ struct BuilderContext {
     */
    void emit_load_d_form(const char* load_macro, const char* dest_type, bool check_mmio = true);
  
@@ -6762,7 +7156,7 @@ index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..f5e4f12ae051cd5e8d64f66dd319956d
     * @brief Emit load with X-form addressing: rD = LOAD(rA + rB)
     * @param load_macro The load macro name
 diff --git a/src/codegen/builders/context.cpp b/src/codegen/builders/context.cpp
-index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..f62be0c61e6e5fac5256abdd4ad517a75574e99a 100644
+index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..548d4f82224fa159e2e2ba813dc5c8d9b8a6bc25 100644
 --- a/src/codegen/builders/context.cpp
 +++ b/src/codegen/builders/context.cpp
 @@ -18,8 +18,12 @@
@@ -6858,7 +7252,19 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..f62be0c61e6e5fac5256abdd4ad517a7
      locals.xer = true;
      return "xer";
    }
-@@ -212,17 +231,28 @@ void BuilderContext::emit_function_call(uint32_t address) {
+@@ -116,6 +135,11 @@ const char* BuilderContext::temp() {
+   return "temp";
+ }
+ 
++std::string BuilderContext::f_bits(size_t index) {
++  locals.f_bits[index] = true;
++  return fmt::format("fb{}", index);
++}
++
+ const char* BuilderContext::v_temp() {
+   locals.v_temp = true;
+   return "vTemp";
+@@ -212,17 +236,28 @@ void BuilderContext::emit_function_call(uint32_t address) {
        // the owner left live, so hand it the localized copies through ctx and take
        // them back afterwards. Only registers already localized here can be live at
        // this point, so that set is the whole live-in the funclet can see.
@@ -6897,7 +7303,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..f62be0c61e6e5fac5256abdd4ad517a7
          return;
        }
  
-@@ -276,6 +306,91 @@ void BuilderContext::emit_function_call(uint32_t address) {
+@@ -276,6 +311,91 @@ void BuilderContext::emit_function_call(uint32_t address) {
    println("\tREX_FATAL(\"Unresolved call from 0x{:08X} to 0x{:08X}\");", base, address);
  }
  
@@ -6989,7 +7395,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..f62be0c61e6e5fac5256abdd4ad517a7
  void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
    uint32_t target = insn.operands[1];
  
-@@ -298,7 +413,14 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
+@@ -298,7 +418,14 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
            auto* targetFn = callTarget->asFunction();
            emitCtx.reference(targetFn->name());
            println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
@@ -7005,7 +7411,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..f62be0c61e6e5fac5256abdd4ad517a7
            println("\t\treturn;");
            println("\t}}");
          } else if (callTarget->isImport()) {
-@@ -340,6 +462,282 @@ void BuilderContext::emit_set_flush_mode(bool enable) {
+@@ -340,6 +467,388 @@ void BuilderContext::emit_set_flush_mode(bool enable) {
    }
  }
  
@@ -7027,6 +7433,92 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..f62be0c61e6e5fac5256abdd4ad517a7
 +  }
 +  emit_set_flush_mode(false);
 +  return false;
++}
++
++namespace {
++bool IsSingleLoad(const ppc_insn& insn) {
++  return insn.opcode != nullptr && (insn.opcode->id == PPC_INST_LFS || insn.opcode->id == PPC_INST_LFSX);
++}
++bool IsSingleStore(const ppc_insn& insn) {
++  return insn.opcode != nullptr && (insn.opcode->id == PPC_INST_STFS || insn.opcode->id == PPC_INST_STFSX);
++}
++}  // namespace
++
++namespace {
++constexpr uint32_t kFloatCopyReach = 64;  // how far back a store looks for its load
++
++// An instruction that touches no float or vector register and no float status, and is no branch, call, system call
++// or trap. By the mnemonic: every PowerPC float instruction starts with f, lf, stf, mff or mtf, every vector one
++// with v, lv, stv, mfv or mtv, every branch with b; sc, tw and td are the system call and the traps. Anything
++// unknown does not qualify.
++bool IsPlainIntegerInstruction(const ppc_insn& insn) {
++  if (insn.opcode == nullptr || insn.opcode->name == nullptr) {
++    return false;
++  }
++  const std::string_view name = insn.opcode->name;
++  for (const std::string_view prefix : {"f", "lf", "stf", "mff", "mtf", "v", "lv", "stv", "mfv", "mtv", "b", "sc",
++                                         "tw", "td"}) {
++    if (name.substr(0, prefix.size()) == prefix) {
++      return false;
++    }
++  }
++  return true;
++}
++
++// fp_copy_pairs: the address of the lfs / lfsx whose bits the stfs / stfsx at `store` (its word at `storeData`)
++// writes, or 0. Going back from the store inside its block: the first instruction that writes the store's register
++// must be an lfs / lfsx of it; before that only other lfs / lfsx / stfs / stfsx (they write their own register or
++// none) and plain integer instructions. No label after the load up to the store (a jump would arrive without the
++// load), no mid-asm hook from the load to the store (it could change the register).
++uint32_t FloatCopyLoadOf(const BuilderContext& ctx, uint32_t store, const uint32_t* storeData) {
++  if (!ctx.config().fpCopyPairs || ctx.labels == nullptr) {
++    return 0;
++  }
++  ppc_insn self;
++  rex::codegen::ppc::Disassemble(storeData, 4, store, self);
++  const auto& hooks = ctx.config().midAsmHooks;
++  if (!IsSingleStore(self) || hooks.find(store) != hooks.end() ||
++      ctx.labels->find(store) != ctx.labels->end()) {
++    return 0;
++  }
++  uint32_t start = 0xFFFFFFFFu;
++  for (const auto& block : ctx.fn.blocks()) {
++    if (store >= block.base && store < block.end()) {
++      start = block.base;
++      break;
++    }
++  }
++  uint32_t address = store - 4;
++  const uint32_t* p = storeData - 1;
++  for (uint32_t n = 0; address >= start && address < store && n < kFloatCopyReach; ++n, --p, address -= 4) {
++    if (hooks.find(address) != hooks.end()) {
++      return 0;
++    }
++    ppc_insn previous;
++    rex::codegen::ppc::Disassemble(p, 4, address, previous);
++    if (IsSingleLoad(previous)) {
++      if (previous.operands[0] == self.operands[0]) {
++        return address;  // a label AT the load is fine: whoever jumps there runs the load
++      }
++    } else if (!IsSingleStore(previous) && !IsPlainIntegerInstruction(previous)) {
++      return 0;
++    }
++    if (ctx.labels->find(address) != ctx.labels->end()) {
++      return 0;
++    }
++  }
++  return 0;
++}
++}  // namespace
++
++bool BuilderContext::float_copy_pair_load() const {
++  return config().fpCopyPairs && IsSingleLoad(insn) && !has_mid_asm_hook() && float_copy_pair_pays();
++}
++
++bool BuilderContext::float_copy_pair_store() const {
++  // Its load took the copy form: the tracked mode can only have become FPU between the two (nothing there sets
++  // VMX mode or forgets the mode), and then this store does not take the form either.
++  return config().fpCopyPairs && float_copy_pair_pays() && FloatCopyLoadOf(*this, base, data) != 0;
 +}
 +
 +void BuilderContext::emit_flush_mode_for_modeless() {
@@ -7171,6 +7663,8 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..f62be0c61e6e5fac5256abdd4ad517a7
 +  uint32_t vmx = 0;           // VMX float instructions
 +  uint32_t fpu = 0;           // scalar instructions that need FPU mode (arithmetic, with or without any-mode forms)
 +  uint32_t convertible = 0;   // lfs / stfs forms, frsp, fcmpu / fcmpo
++  uint32_t copies = 0;        // ... of those, lfs / lfsx and stores of loaded bits (fp_copy_pairs)
++  uint32_t copy_stores = 0;   // ... of those, the stores
 +};
 +
 +bool IsConvertible(const ppc_insn& insn) {
@@ -7221,6 +7715,14 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..f62be0c61e6e5fac5256abdd4ad517a7
 +        default:
 +          if (IsConvertible(other)) {
 +            ++profile.convertible;
++            if (IsSingleLoad(other)) {
++              if (ctx.config().midAsmHooks.find(address) == ctx.config().midAsmHooks.end()) {
++                ++profile.copies;
++              }
++            } else if (FloatCopyLoadOf(ctx, address, p) != 0) {
++              ++profile.copies;
++              ++profile.copy_stores;
++            }
 +          }
 +          break;
 +      }
@@ -7232,6 +7734,16 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..f62be0c61e6e5fac5256abdd4ad517a7
 +
 +bool BuilderContext::function_has_vmx_float() const {
 +  return ProfileOf(*this).vmx != 0;
++}
++
++bool BuilderContext::function_is_copy_only() const {
++  const FloatProfile& profile = ProfileOf(*this);
++  return profile.fpu == 0 && profile.copy_stores != 0 && profile.convertible == profile.copies;
++}
++
++bool BuilderContext::float_copy_pair_pays() const {
++  return csrState == CSRState::VMX ||
++         (config().fpCopyOnlyFunctions && csrState == CSRState::Unknown && function_is_copy_only());
 +}
 +
 +bool BuilderContext::function_is_mode_free() const {
@@ -7288,7 +7800,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..f62be0c61e6e5fac5256abdd4ad517a7
  bool BuilderContext::has_mid_asm_hook() const {
    return config().midAsmHooks.find(base) != config().midAsmHooks.end();
  }
-@@ -487,24 +885,33 @@ void BuilderContext::emit_vec_var_shift(const char* shift_dir, const char* eleme
+@@ -487,24 +996,33 @@ void BuilderContext::emit_vec_var_shift(const char* shift_dir, const char* eleme
  // Memory (Load/Store) Code Generation Helpers
  //=============================================================================
  
@@ -7334,7 +7846,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..f62be0c61e6e5fac5256abdd4ad517a7
  }
  
  void BuilderContext::emit_load_x_form(const char* load_macro, const char* dest_type,
-@@ -531,20 +938,15 @@ void BuilderContext::emit_store_d_form(const char* store_macro, const char* src_
+@@ -531,20 +1049,15 @@ void BuilderContext::emit_store_d_form(const char* store_macro, const char* src_
                                         bool check_mmio) {
    // D-form: STORE(rA + D, rS) where operands[0]=rS, operands[1]=D, operands[2]=rA
    // store_macro should be like "REX_STORE_U8" - we replace REX_STORE with REX_MM_STORE for MMIO
@@ -7457,7 +7969,7 @@ index 26957fc249752341ec54f33f565b8db03ae84f5d..9c85a859f7e58e87bb352128a0b3c862
    ctx.println("\t}}");
    return true;
 diff --git a/src/codegen/builders/floating_point.cpp b/src/codegen/builders/floating_point.cpp
-index 170224164084692e93d674259dbf215c82cd3e21..091d2b7a6ea47ced705eb0d01991be4c09347a4d 100644
+index 170224164084692e93d674259dbf215c82cd3e21..e78cf9965205b875ba19fad556e010f70f6c4e83 100644
 --- a/src/codegen/builders/floating_point.cpp
 +++ b/src/codegen/builders/floating_point.cpp
 @@ -19,21 +19,21 @@ namespace rex::codegen {
@@ -7501,16 +8013,45 @@ index 170224164084692e93d674259dbf215c82cd3e21..091d2b7a6ea47ced705eb0d01991be4c
    ctx.println("\t{}.f64 = double({}.s64);", ctx.f(ctx.insn.operands[0]),
                ctx.f(ctx.insn.operands[1]));
    return true;
-@@ -67,7 +67,7 @@ bool build_fctid(BuilderContext& ctx) {
+@@ -58,6 +58,11 @@ bool build_fcfid(BuilderContext& ctx) {
+ 
+ bool build_fctid(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(false);
++  if (ctx.config().fctiInline) {
++    ctx.println("\t{0}.s64 = rex::ppc::fctid({1}.f64);", ctx.f(ctx.insn.operands[0]),
++                ctx.f(ctx.insn.operands[1]));
++    return true;
++  }
+   ctx.println(
+       "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x8000000000000000ULL) : "
+       "({1}.f64 > double(LLONG_MAX)) ? LLONG_MAX : "
+@@ -67,7 +72,12 @@ bool build_fctid(BuilderContext& ctx) {
  }
  
  bool build_fctidz(BuilderContext& ctx) {
 -  ctx.emit_set_flush_mode(false);
 +  ctx.emit_flush_mode_for_modeless();
++  if (ctx.config().fctiInline) {
++    ctx.println("\t{0}.s64 = rex::ppc::fctidz({1}.f64);", ctx.f(ctx.insn.operands[0]),
++                ctx.f(ctx.insn.operands[1]));
++    return true;
++  }
    ctx.println(
        "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x8000000000000000ULL) : "
        "({1}.f64 > double(LLONG_MAX)) ? LLONG_MAX : "
-@@ -87,7 +87,12 @@ bool build_fctiw(BuilderContext& ctx) {
+@@ -78,6 +88,11 @@ bool build_fctidz(BuilderContext& ctx) {
+ 
+ bool build_fctiw(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(false);
++  if (ctx.config().fctiInline) {
++    ctx.println("\t{0}.s64 = rex::ppc::fctiw({1}.f64);", ctx.f(ctx.insn.operands[0]),
++                ctx.f(ctx.insn.operands[1]));
++    return true;
++  }
+   ctx.println(
+       "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x80000000U) : "
+       "({1}.f64 >= double(INT_MAX)) ? INT_MAX : "
+@@ -87,7 +102,12 @@ bool build_fctiw(BuilderContext& ctx) {
  }
  
  bool build_fctiwz(BuilderContext& ctx) {
@@ -7524,7 +8065,7 @@ index 170224164084692e93d674259dbf215c82cd3e21..091d2b7a6ea47ced705eb0d01991be4c
    ctx.println(
        "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x80000000U) : "
        "({1}.f64 >= double(INT_MAX)) ? INT_MAX : "
-@@ -97,7 +102,11 @@ bool build_fctiwz(BuilderContext& ctx) {
+@@ -97,7 +117,11 @@ bool build_fctiwz(BuilderContext& ctx) {
  }
  
  bool build_frsp(BuilderContext& ctx) {
@@ -7537,7 +8078,7 @@ index 170224164084692e93d674259dbf215c82cd3e21..091d2b7a6ea47ced705eb0d01991be4c
    ctx.println("\t{}.f64 = double(float({}.f64));", ctx.f(ctx.insn.operands[0]),
                ctx.f(ctx.insn.operands[1]));
    return true;
-@@ -108,7 +117,11 @@ bool build_frsp(BuilderContext& ctx) {
+@@ -108,7 +132,11 @@ bool build_frsp(BuilderContext& ctx) {
  //=============================================================================
  
  bool build_fcmpu(BuilderContext& ctx) {
@@ -7550,7 +8091,7 @@ index 170224164084692e93d674259dbf215c82cd3e21..091d2b7a6ea47ced705eb0d01991be4c
    ctx.println("\t{}.compare({}.f64, {}.f64);", ctx.cr(ctx.insn.operands[0]),
                ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
    return true;
-@@ -133,7 +146,11 @@ bool build_fadd(BuilderContext& ctx) {
+@@ -133,7 +161,11 @@ bool build_fadd(BuilderContext& ctx) {
  }
  
  bool build_fadds(BuilderContext& ctx) {
@@ -7563,7 +8104,7 @@ index 170224164084692e93d674259dbf215c82cd3e21..091d2b7a6ea47ced705eb0d01991be4c
    ctx.println("\t{}.f64 = double(float({}.f64 + {}.f64));", ctx.f(ctx.insn.operands[0]),
                ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
    return true;
-@@ -151,7 +168,11 @@ bool build_fsub(BuilderContext& ctx) {
+@@ -151,7 +183,11 @@ bool build_fsub(BuilderContext& ctx) {
  }
  
  bool build_fsubs(BuilderContext& ctx) {
@@ -7576,7 +8117,7 @@ index 170224164084692e93d674259dbf215c82cd3e21..091d2b7a6ea47ced705eb0d01991be4c
    ctx.println("\t{}.f64 = double(float({}.f64 - {}.f64));", ctx.f(ctx.insn.operands[0]),
                ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
    return true;
-@@ -169,7 +190,11 @@ bool build_fmul(BuilderContext& ctx) {
+@@ -169,7 +205,11 @@ bool build_fmul(BuilderContext& ctx) {
  }
  
  bool build_fmuls(BuilderContext& ctx) {
@@ -7589,7 +8130,7 @@ index 170224164084692e93d674259dbf215c82cd3e21..091d2b7a6ea47ced705eb0d01991be4c
    ctx.println("\t{}.f64 = double(float({}.f64 * {}.f64));", ctx.f(ctx.insn.operands[0]),
                ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
    return true;
-@@ -187,7 +212,11 @@ bool build_fdiv(BuilderContext& ctx) {
+@@ -187,7 +227,11 @@ bool build_fdiv(BuilderContext& ctx) {
  }
  
  bool build_fdivs(BuilderContext& ctx) {
@@ -7602,7 +8143,7 @@ index 170224164084692e93d674259dbf215c82cd3e21..091d2b7a6ea47ced705eb0d01991be4c
    ctx.println("\t{}.f64 = double(float({}.f64 / {}.f64));", ctx.f(ctx.insn.operands[0]),
                ctx.f(ctx.insn.operands[1]), ctx.f(ctx.insn.operands[2]));
    return true;
-@@ -297,6 +326,13 @@ bool build_fsqrts(BuilderContext& ctx) {
+@@ -297,6 +341,13 @@ bool build_fsqrts(BuilderContext& ctx) {
  //=============================================================================
  
  bool build_fsel(BuilderContext& ctx) {
@@ -7686,7 +8227,7 @@ index a58f51d06dfd94ec3e806206fe93ff8cbc79f2ff..024ee34dde11a0ac6e9d85bc34b6945b
                ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]), ctx.r(ctx.insn.operands[1]),
                ctx.r(ctx.insn.operands[2]),  // Register, not immediate
 diff --git a/src/codegen/builders/memory.cpp b/src/codegen/builders/memory.cpp
-index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e6436921153 100644
+index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..45d4021478528e50fa21f3f5b225f82b64807d0f 100644
 --- a/src/codegen/builders/memory.cpp
 +++ b/src/codegen/builders/memory.cpp
 @@ -220,16 +220,15 @@ bool build_ldarx(BuilderContext& ctx) {
@@ -7711,7 +8252,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
    ctx.print("\t{}.u64 = REX_LOAD_U64(", ctx.f(ctx.insn.operands[0]));
    if (ctx.insn.operands[1] != 0)
      ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
-@@ -238,28 +237,35 @@ bool build_lfdx(BuilderContext& ctx) {
+@@ -238,28 +237,47 @@ bool build_lfdx(BuilderContext& ctx) {
  }
  
  bool build_lfs(BuilderContext& ctx) {
@@ -7721,9 +8262,17 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
 -    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
 -  ctx.println("{});", static_cast<int32_t>(ctx.insn.operands[1]));
 -  ctx.println("\t{}.f64 = double({}.f32);", ctx.f(ctx.insn.operands[0]), ctx.temp());
-+  const bool any_mode = ctx.single_conversion_any_mode();
++  const bool pair = ctx.float_copy_pair_load();
++  const bool any_mode = !pair && ctx.single_conversion_any_mode();
 +  std::string macro = "REX_LOAD_U32";
 +  const std::string args = ctx.d_form_args(macro, false);
++  if (pair) {
++    // The bits in the register's own local: its stores may come after other loads and stores.
++    const std::string bits = ctx.f_bits(ctx.insn.operands[0]);
++    ctx.println("\t{}.u32 = {}({});", bits, macro, args);
++    ctx.println("\t{}.f64 = rex::ppc::SingleToDoublePure({}.u32);", ctx.f(ctx.insn.operands[0]), bits);
++    return true;
++  }
 +  ctx.println("\t{}.u32 = {}({});", ctx.temp(), macro, args);
 +  if (any_mode)
 +    ctx.println("\t{}.f64 = rex::ppc::SingleToDoubleAnyMode({}.u32);", ctx.f(ctx.insn.operands[0]),
@@ -7735,13 +8284,18 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
  
  bool build_lfsx(BuilderContext& ctx) {
 -  ctx.emit_set_flush_mode(false);
-+  const bool any_mode = ctx.single_conversion_any_mode();
-   ctx.print("\t{}.u32 = REX_LOAD_U32(", ctx.temp());
+-  ctx.print("\t{}.u32 = REX_LOAD_U32(", ctx.temp());
++  const bool pair = ctx.float_copy_pair_load();
++  const bool any_mode = !pair && ctx.single_conversion_any_mode();
++  const std::string bits = pair ? ctx.f_bits(ctx.insn.operands[0]) : std::string(ctx.temp());
++  ctx.print("\t{}.u32 = REX_LOAD_U32(", bits);
    if (ctx.insn.operands[1] != 0)
      ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
    ctx.println("{}.u32);", ctx.r(ctx.insn.operands[2]));
 -  ctx.println("\t{}.f64 = double({}.f32);", ctx.f(ctx.insn.operands[0]), ctx.temp());
-+  if (any_mode)
++  if (pair)
++    ctx.println("\t{}.f64 = rex::ppc::SingleToDoublePure({}.u32);", ctx.f(ctx.insn.operands[0]), bits);
++  else if (any_mode)
 +    ctx.println("\t{}.f64 = rex::ppc::SingleToDoubleAnyMode({}.u32);", ctx.f(ctx.insn.operands[0]),
 +                ctx.temp());
 +  else
@@ -7756,7 +8310,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
    ctx.println("\t{} = {} + {}.u32;", ctx.ea(), static_cast<int32_t>(ctx.insn.operands[1]),
                ctx.r(ctx.insn.operands[2]));
    ctx.println("\t{}.u64 = REX_LOAD_U64({});", ctx.f(ctx.insn.operands[0]), ctx.ea());
-@@ -269,7 +275,7 @@ bool build_lfdu(BuilderContext& ctx) {
+@@ -269,7 +287,7 @@ bool build_lfdu(BuilderContext& ctx) {
  
  bool build_lfdux(BuilderContext& ctx) {
    // Load Floating-point Double with Update Indexed
@@ -7765,7 +8319,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
    ctx.println("\t{} = {}.u32 + {}.u32;", ctx.ea(), ctx.r(ctx.insn.operands[1]),
                ctx.r(ctx.insn.operands[2]));
    ctx.println("\t{}.u64 = REX_LOAD_U64({});", ctx.f(ctx.insn.operands[0]), ctx.ea());
-@@ -279,22 +285,30 @@ bool build_lfdux(BuilderContext& ctx) {
+@@ -279,22 +297,30 @@ bool build_lfdux(BuilderContext& ctx) {
  
  bool build_lfsu(BuilderContext& ctx) {
    // Load Floating-point Single with Update (convert to double)
@@ -7800,7 +8354,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
    ctx.println("\t{}.u32 = {};", ctx.r(ctx.insn.operands[1]), ctx.ea());
    return true;
  }
-@@ -447,17 +461,16 @@ bool build_stdux(BuilderContext& ctx) {
+@@ -447,17 +473,16 @@ bool build_stdux(BuilderContext& ctx) {
  //=============================================================================
  
  bool build_stfd(BuilderContext& ctx) {
@@ -7824,7 +8378,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
    ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U64(" : "\tREX_STORE_U64(");
    if (ctx.insn.operands[1] != 0)
      ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
-@@ -467,7 +480,7 @@ bool build_stfdx(BuilderContext& ctx) {
+@@ -467,7 +492,7 @@ bool build_stfdx(BuilderContext& ctx) {
  
  bool build_stfdux(BuilderContext& ctx) {
    // Store Floating-point Double with Update Indexed: EA = rA + rB; MEM(EA) = FRS; rA = EA
@@ -7833,7 +8387,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
    ctx.println("\t{} = {}.u32 + {}.u32;", ctx.ea(), ctx.r(ctx.insn.operands[1]),
                ctx.r(ctx.insn.operands[2]));
    ctx.println("\tREX_STORE_U64({}, {}.u64);", ctx.ea(), ctx.f(ctx.insn.operands[0]));
-@@ -476,7 +489,7 @@ bool build_stfdux(BuilderContext& ctx) {
+@@ -476,7 +501,7 @@ bool build_stfdux(BuilderContext& ctx) {
  }
  
  bool build_stfiwx(BuilderContext& ctx) {
@@ -7842,7 +8396,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
    ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
    if (ctx.insn.operands[1] != 0)
      ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
-@@ -485,18 +498,26 @@ bool build_stfiwx(BuilderContext& ctx) {
+@@ -485,18 +510,35 @@ bool build_stfiwx(BuilderContext& ctx) {
  }
  
  bool build_stfs(BuilderContext& ctx) {
@@ -7852,8 +8406,13 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
 -  if (ctx.insn.operands[2] != 0)
 -    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
 -  ctx.println("{}, {}.u32);", static_cast<int32_t>(ctx.insn.operands[1]), ctx.temp());
-+  const bool any_mode = ctx.single_conversion_any_mode();
-+  if (any_mode)
++  // fp_copy_pairs: the register's bits local still holds what its lfs loaded.
++  const bool pair = ctx.float_copy_pair_store();
++  const bool any_mode = !pair && ctx.single_conversion_any_mode();
++  if (pair)
++    ctx.println("\t{}.u32 = rex::ppc::QuietSingleBits({}.u32);", ctx.temp(),
++                ctx.f_bits(ctx.insn.operands[0]));
++  else if (any_mode)
 +    ctx.println("\t{}.f32 = rex::ppc::DoubleToSingleAnyMode({}.f64);", ctx.temp(),
 +                ctx.f(ctx.insn.operands[0]));
 +  else
@@ -7868,8 +8427,12 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
  bool build_stfsx(BuilderContext& ctx) {
 -  ctx.emit_set_flush_mode(false);
 -  ctx.println("\t{}.f32 = float({}.f64);", ctx.temp(), ctx.f(ctx.insn.operands[0]));
-+  const bool any_mode = ctx.single_conversion_any_mode();
-+  if (any_mode)
++  const bool pair = ctx.float_copy_pair_store();
++  const bool any_mode = !pair && ctx.single_conversion_any_mode();
++  if (pair)
++    ctx.println("\t{}.u32 = rex::ppc::QuietSingleBits({}.u32);", ctx.temp(),
++                ctx.f_bits(ctx.insn.operands[0]));
++  else if (any_mode)
 +    ctx.println("\t{}.f32 = rex::ppc::DoubleToSingleAnyMode({}.f64);", ctx.temp(),
 +                ctx.f(ctx.insn.operands[0]));
 +  else
@@ -7877,7 +8440,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
    ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
    if (ctx.insn.operands[1] != 0)
      ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
-@@ -506,7 +527,7 @@ bool build_stfsx(BuilderContext& ctx) {
+@@ -506,7 +548,7 @@ bool build_stfsx(BuilderContext& ctx) {
  
  bool build_stfdu(BuilderContext& ctx) {
    // Store Floating-point Double with Update
@@ -7886,7 +8449,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
    ctx.println("\t{} = {} + {}.u32;", ctx.ea(), static_cast<int32_t>(ctx.insn.operands[1]),
                ctx.r(ctx.insn.operands[2]));
    ctx.println("\tREX_STORE_U64({}, {}.u64);", ctx.ea(), ctx.f(ctx.insn.operands[0]));
-@@ -516,10 +537,14 @@ bool build_stfdu(BuilderContext& ctx) {
+@@ -516,10 +558,14 @@ bool build_stfdu(BuilderContext& ctx) {
  
  bool build_stfsu(BuilderContext& ctx) {
    // Store Floating-point Single with Update (convert double to float first)
@@ -7903,7 +8466,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
    ctx.println("\tREX_STORE_U32({}, {}.u32);", ctx.ea(), ctx.temp());
    ctx.println("\t{}.u32 = {};", ctx.r(ctx.insn.operands[2]), ctx.ea());
    return true;
-@@ -527,8 +552,12 @@ bool build_stfsu(BuilderContext& ctx) {
+@@ -527,8 +573,12 @@ bool build_stfsu(BuilderContext& ctx) {
  
  bool build_stfsux(BuilderContext& ctx) {
    // Store Floating-point Single with Update Indexed
@@ -7919,7 +8482,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..64b43daab1fde5e9e29f793676562e64
                ctx.r(ctx.insn.operands[2]));
    ctx.println("\t{}({}, {}.u32);", ctx.mmio_check_x_form() ? "REX_MM_STORE_U32" : "REX_STORE_U32",
 diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
-index b2d70f53f8e74ea2be6e0de26efbcc91ea19950f..6de3dc134a4686bf01011fb7b1d41299a9f0f2fb 100644
+index b2d70f53f8e74ea2be6e0de26efbcc91ea19950f..bf65e550b313c5204c88849a3d724df9c13c4ab0 100644
 --- a/src/codegen/builders/system.cpp
 +++ b/src/codegen/builders/system.cpp
 @@ -31,20 +31,24 @@ bool build_attn(BuilderContext& ctx) {
@@ -7950,6 +8513,37 @@ index b2d70f53f8e74ea2be6e0de26efbcc91ea19950f..6de3dc134a4686bf01011fb7b1d41299
 +  // Preserve ordering even when an eieio is not consumed as part of a
 +  // recognized MMIO access sequence.
 +  ctx.println("\tstd::atomic_thread_fence(std::memory_order_seq_cst);");
+   return true;
+ }
+ 
+@@ -135,15 +139,28 @@ bool build_dcbf(BuilderContext& ctx) {
+   return true;
+ }
+ 
++namespace {
++// dcbt_prefetch (sa2-nx): the hint as the host's own prefetch of the same address. No effect on any value.
++void emit_prefetch(BuilderContext& ctx, int write) {
++  if (!ctx.config().dcbtPrefetch) {
++    return;
++  }
++  ctx.print("\tREX_PREFETCH(");
++  if (ctx.insn.operands[0] != 0)
++    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[0]));
++  ctx.println("{}.u32, {});", ctx.r(ctx.insn.operands[1]), write);
++}
++}  // namespace
++
+ bool build_dcbt(BuilderContext& ctx) {
+   // Hint instruction, prefetch has no semantic effect
+-  (void)ctx;
++  emit_prefetch(ctx, 0);
+   return true;
+ }
+ 
+ bool build_dcbtst(BuilderContext& ctx) {
+   // Hint instruction, prefetch-for-store has no semantic effect
+-  (void)ctx;
++  emit_prefetch(ctx, 1);
    return true;
  }
  
@@ -8134,10 +8728,10 @@ index a0484fb45e39a0ee0644db75c185b80a71338b87..5d068ea94147ce533f24e4c8d0986f67
  
      println("#include \"{}_funcs.{}.h\"\n", projectName, index);
 diff --git a/src/codegen/config.cpp b/src/codegen/config.cpp
-index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..f73c4c3bd2f72491bf4980dccdf06302c9d442f0 100644
+index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..18becbcb1d1800c60e7f9a106ffe79508d6c8dc4 100644
 --- a/src/codegen/config.cpp
 +++ b/src/codegen/config.cpp
-@@ -101,6 +101,22 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -101,6 +101,27 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
    // Bool scalars
    auto hasBool = [&](const char* key) -> bool { return toml[key].is_boolean(); };
    MergeBool(cfg.skipLr, toml["skip_lr"].value_or(false), hasBool("skip_lr"), "skip_lr");
@@ -8157,10 +8751,15 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..f73c4c3bd2f72491bf4980dccdf06302
 +            hasBool("fp_mode_lookahead_past_branch"), "fp_mode_lookahead_past_branch");
 +  MergeBool(cfg.rotateWordNarrow, toml["rotate_word_narrow"].value_or(false), hasBool("rotate_word_narrow"),
 +            "rotate_word_narrow");
++  MergeBool(cfg.fctiInline, toml["fcti_inline"].value_or(false), hasBool("fcti_inline"), "fcti_inline");
++  MergeBool(cfg.fpCopyPairs, toml["fp_copy_pairs"].value_or(false), hasBool("fp_copy_pairs"), "fp_copy_pairs");
++  MergeBool(cfg.fpCopyOnlyFunctions, toml["fp_copy_only_functions"].value_or(false),
++            hasBool("fp_copy_only_functions"), "fp_copy_only_functions");
++  MergeBool(cfg.dcbtPrefetch, toml["dcbt_prefetch"].value_or(false), hasBool("dcbt_prefetch"), "dcbt_prefetch");
    MergeBool(cfg.skipMsr, toml["skip_msr"].value_or(false), hasBool("skip_msr"), "skip_msr");
    MergeBool(cfg.ctrAsLocalVariable, toml["ctr_as_local"].value_or(false), hasBool("ctr_as_local"),
              "ctr_as_local");
-@@ -116,6 +132,19 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -116,6 +137,19 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
              hasBool("non_volatile_as_local"), "non_volatile_as_local");
    MergeBool(cfg.generateExceptionHandlers, toml["generate_exception_handlers"].value_or(false),
              hasBool("generate_exception_handlers"), "generate_exception_handlers");
@@ -8180,7 +8779,7 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..f73c4c3bd2f72491bf4980dccdf06302
    if (hasBool("is_dll")) {
      cfg.isDll = toml["is_dll"].value_or(false);
    }
-@@ -278,6 +307,16 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -278,6 +312,16 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
          REXCODEGEN_ERROR("Missing 'labels' in [[switch_tables]] entry");
          continue;
        }
@@ -8197,7 +8796,7 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..f73c4c3bd2f72491bf4980dccdf06302
  
        JumpTable jt;
        jt.bctrAddress = *address_opt;
-@@ -372,6 +411,24 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -372,6 +416,24 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
  
    // --- Sets: additive ---
  
@@ -8222,7 +8821,7 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..f73c4c3bd2f72491bf4980dccdf06302
    // indirect_calls -> knownIndirectCallHints (set)
    if (auto indirectCallArray = toml["indirect_calls"].as_array()) {
      for (auto& entry : *indirectCallArray) {
-@@ -531,6 +588,9 @@ RecompilerConfig::ValidationResult RecompilerConfig::Validate() const {
+@@ -531,6 +593,9 @@ RecompilerConfig::ValidationResult RecompilerConfig::Validate() const {
      }
    }
  
@@ -8232,6 +8831,29 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..f73c4c3bd2f72491bf4980dccdf06302
    // Check function address alignment
    for (const auto& [addr, size] : functions) {
      if (addr & 0x3) {
+diff --git a/src/codegen/function_graph.cpp b/src/codegen/function_graph.cpp
+index fc918bb2d0b170bb338b5f15197664d427e578ac..aaa76f7a011ebf636f7e221c14f8c64ebe310c8f 100644
+--- a/src/codegen/function_graph.cpp
++++ b/src/codegen/function_graph.cpp
+@@ -582,6 +582,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+         int id = insn.opcode->id;
+         BuilderContext builderCtx{body,           ctx,      *this,   insn, blockBase, data,
+                                   localVariables, csrState, activeJt};
++        builderCtx.labels = &labels;
+ 
+         if (hasHookBefore) {
+           builderCtx.emit_mid_asm_hook();
+@@ -669,6 +670,10 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+     emit_println(out, "\tPPCContext env{{}};");
+   if (localVariables.temp)
+     emit_println(out, "\tPPCRegister temp{{}};");
++  for (size_t i = 0; i < 32; i++) {
++    if (localVariables.f_bits[i])
++      emit_println(out, "\tPPCRegister fb{}{{}};", i);
++  }
+   if (localVariables.v_temp)
+     emit_println(out, "\tPPCVRegister vTemp{{}};");
+   if (localVariables.ea)
 diff --git a/src/codegen/function_scanner.cpp b/src/codegen/function_scanner.cpp
 index d7ba51942f9001745122e6c6f2e711c004a63e67..d1843f5e0c8730b7533f5653e6f4f26d01898d94 100644
 --- a/src/codegen/function_scanner.cpp
@@ -11667,7 +12289,7 @@ index 0000000000000000000000000000000000000000..45e8d93d224b82ff0557d5b54fdf4bde
 +
 +#endif /* __SWITCH__ */
 diff --git a/src/core/logging.cpp b/src/core/logging.cpp
-index 1645848c3e14dbfe99db458bc5c8b4d46d041b1b..4c3860a7e811611b7153315a35ace3e0ccec4bc1 100644
+index 1645848c3e14dbfe99db458bc5c8b4d46d041b1b..759b2f67c0fd57f4e5438004ffa9d64bd5caf04a 100644
 --- a/src/core/logging.cpp
 +++ b/src/core/logging.cpp
 @@ -12,11 +12,20 @@
@@ -11691,10 +12313,11 @@ index 1645848c3e14dbfe99db458bc5c8b4d46d041b1b..4c3860a7e811611b7153315a35ace3e0
  #include <spdlog/sinks/rotating_file_sink.h>
  #include <spdlog/sinks/stdout_color_sinks.h>
  
-@@ -26,6 +35,20 @@
+@@ -26,6 +35,21 @@
  #include <rex/logging.h>
  #include <rex/platform.h>
  #include <rex/platform/env.h>
++#include <rex/sys_counters.h>
 +#include <rex/thread.h>
 +
 +#if REX_PLATFORM_SWITCH
@@ -11712,7 +12335,7 @@ index 1645848c3e14dbfe99db458bc5c8b4d46d041b1b..4c3860a7e811611b7153315a35ace3e0
  
  #if REX_PLATFORM_WIN32
  #include <spdlog/sinks/msvc_sink.h>
-@@ -33,18 +56,32 @@
+@@ -33,18 +57,32 @@
  #include <spdlog/sinks/stdout_sinks.h>
  #endif
  
@@ -11746,7 +12369,7 @@ index 1645848c3e14dbfe99db458bc5c8b4d46d041b1b..4c3860a7e811611b7153315a35ace3e0
      .range(0, 60)
      .lifecycle(rex::cvar::Lifecycle::kInitOnly);
  
-@@ -56,6 +93,82 @@ REXCVAR_DEFINE_INT32(log_max_files, 20, "Log", "Max number of rotated log files
+@@ -56,6 +94,82 @@ REXCVAR_DEFINE_INT32(log_max_files, 20, "Log", "Max number of rotated log files
      .range(1, 100)
      .lifecycle(rex::cvar::Lifecycle::kInitOnly);
  
@@ -11829,7 +12452,7 @@ index 1645848c3e14dbfe99db458bc5c8b4d46d041b1b..4c3860a7e811611b7153315a35ace3e0
  namespace rex {
  
  namespace {
-@@ -70,6 +183,187 @@ bool g_initialized = false;
+@@ -70,6 +184,187 @@ bool g_initialized = false;
  std::mutex g_mutex;
  LogConfig g_config;
  
@@ -12017,7 +12640,7 @@ index 1645848c3e14dbfe99db458bc5c8b4d46d041b1b..4c3860a7e811611b7153315a35ace3e0
  std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_dir,
                                              std::string_view app_name) {
    std::filesystem::create_directories(logs_dir);
-@@ -93,6 +387,53 @@ std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_di
+@@ -93,6 +388,53 @@ std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_di
    return logs_dir / fmt::format("{}_{:03d}.log", app_name, max_seq + 1);
  }
  
@@ -12071,7 +12694,7 @@ index 1645848c3e14dbfe99db458bc5c8b4d46d041b1b..4c3860a7e811611b7153315a35ace3e0
  std::vector<spdlog::sink_ptr> BuildDefaultSinks() {
    std::vector<spdlog::sink_ptr> sinks;
    if (g_early_sink)
-@@ -103,6 +444,10 @@ std::vector<spdlog::sink_ptr> BuildDefaultSinks() {
+@@ -103,6 +445,10 @@ std::vector<spdlog::sink_ptr> BuildDefaultSinks() {
      sinks.push_back(g_file_sink);
    for (auto& s : g_extra_sinks)
      sinks.push_back(s);
@@ -12082,7 +12705,7 @@ index 1645848c3e14dbfe99db458bc5c8b4d46d041b1b..4c3860a7e811611b7153315a35ace3e0
    return sinks;
  }
  
-@@ -131,10 +476,21 @@ spdlog::level::level_enum ResolveCategoryLevel(const std::string& name) {
+@@ -131,10 +477,21 @@ spdlog::level::level_enum ResolveCategoryLevel(const std::string& name) {
    return g_config.default_level;
  }
  
@@ -12105,7 +12728,7 @@ index 1645848c3e14dbfe99db458bc5c8b4d46d041b1b..4c3860a7e811611b7153315a35ace3e0
    logger->set_level(ResolveCategoryLevel(name));
    logger->flush_on(g_config.flush_level);
    spdlog::register_logger(logger);
-@@ -226,9 +582,16 @@ void InitLogging(const LogConfig& config) {
+@@ -226,9 +583,16 @@ void InitLogging(const LogConfig& config) {
      resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
    }
    if (!resolved_path.empty()) {
@@ -12125,7 +12748,7 @@ index 1645848c3e14dbfe99db458bc5c8b4d46d041b1b..4c3860a7e811611b7153315a35ace3e0
      sink->set_level(spdlog::level::trace);
      sink->set_pattern(config.file_pattern);
      g_file_sink = sink;
-@@ -236,6 +599,25 @@ void InitLogging(const LogConfig& config) {
+@@ -236,6 +600,25 @@ void InitLogging(const LogConfig& config) {
  
    g_extra_sinks = config.extra_sinks;
  
@@ -12151,7 +12774,7 @@ index 1645848c3e14dbfe99db458bc5c8b4d46d041b1b..4c3860a7e811611b7153315a35ace3e0
    // Rebuild all loggers with new sinks
    for (auto& entry : g_registry) {
      if (entry.name.empty())
-@@ -277,11 +659,15 @@ void ShutdownLogging() {
+@@ -277,11 +660,15 @@ void ShutdownLogging() {
    for (auto& entry : g_registry)
      if (entry.logger)
        entry.logger->flush();
@@ -12168,7 +12791,7 @@ index 1645848c3e14dbfe99db458bc5c8b4d46d041b1b..4c3860a7e811611b7153315a35ace3e0
    g_early_sink.reset();
    g_extra_sinks.clear();
    g_initialized = false;
-@@ -293,6 +679,8 @@ void FlushLogging() {
+@@ -293,6 +680,8 @@ void FlushLogging() {
    for (auto& entry : g_registry)
      if (entry.logger)
        entry.logger->flush();
@@ -12177,7 +12800,15 @@ index 1645848c3e14dbfe99db458bc5c8b4d46d041b1b..4c3860a7e811611b7153315a35ace3e0
  }
  
  LogCategoryId RegisterLogCategory(const char* name) {
-@@ -562,3 +950,10 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
+@@ -357,6 +746,7 @@ std::span<const LogCategoryEntry> GetAllCategories() {
+ }
+ 
+ spdlog::logger* GetLoggerRaw(LogCategoryId category) {
++  REX_SYS_CENSUS(rex::syscount::kCensusLogCall, 1);
+   if (!g_initialized && !g_early_initialized)
+     InitLoggingEarly();
+   if (category.id < g_registry.size()) {
+@@ -562,3 +952,10 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
  }
  
  }  // namespace rex
@@ -22497,7 +23128,7 @@ index dcb3af63b53139c731001405f6b68cd6453e1fbc..736b0f5988f1b494ebf7b8ab87a1ae1c
                                           chrono::Clock::QueryGuestUptimeMillis());
        });
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
-index 8b862fc7a0487b5aaa1d4c3a27aa5ae7a7526fd8..3b8457c6cb94731191ddfe8c194ca23c5ed9e200 100644
+index 8b862fc7a0487b5aaa1d4c3a27aa5ae7a7526fd8..302f1d79c19873dc41d7b24635311b62b3014e15 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
 @@ -16,6 +16,7 @@
@@ -22528,17 +23159,62 @@ index 8b862fc7a0487b5aaa1d4c3a27aa5ae7a7526fd8..3b8457c6cb94731191ddfe8c194ca23c
  void xeRtlInitializeCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t cs_ptr) {
    cs->header.type = 1;      // EventSynchronizationObject (auto reset)
    cs->header.absolute = 0;  // spin count div 256
-@@ -377,28 +384,40 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
+@@ -376,30 +383,84 @@ u32 RtlInitializeCriticalSectionAndSpinCount_entry(ppc_ptr_t<X_RTL_CRITICAL_SECT
+   return xeRtlInitializeCriticalSectionAndSpinCount(cs, cs.guest_address(), spin_count);
  }
  
- void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+-void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+-  uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
++// sa2-nx, second CPU round: the game's own calls of RtlEnterCriticalSection / RtlTryEnterCriticalSection come in
++// through raw exports (below), which have the guest context: r13 points at the thread's KPCR, whose PRCB names the
++// current KTHREAD (XThread writes guest_object() there when it creates the PCR). That is the owner id, without the
++// thread-local lookup of XThread::GetCurrentThread() (an out-of-line call and a thread-pointer call on the Switch),
++// as the spin locks already take theirs. Host callers keep the lookup (the _entry functions).
++REXCVAR_DEFINE_BOOL(kernel_critsec_pcr_owner, true, "Kernel",
++                    "RtlEnterCriticalSection / RtlTryEnterCriticalSection called by the game take the owner "
++                    "thread from the processor control region the guest context points at (r13) instead of "
++                    "looking the host thread up; false = the lookup");
++
++namespace {
++// The two settings, read once at the game's first critical section call (long after the configuration was loaded):
++// a cvar read is an out-of-line call, which is what this path is rid of.
++struct GuestCriticalSectionConfig {
++  bool pcr_owner;
++  uint32_t spin;
++};
++inline const GuestCriticalSectionConfig& GuestCriticalSection() {
++  static const GuestCriticalSectionConfig config{
++      REXCVAR_GET(kernel_critsec_pcr_owner),
++      static_cast<uint32_t>(std::max(REXCVAR_GET(kernel_critsec_spin), 0))};
++  return config;
++}
++
++inline uint32_t CriticalSectionOwner(PPCContext& ctx, uint8_t* base) {
++  if (!GuestCriticalSection().pcr_owner) [[unlikely]] {
++    return XThread::GetCurrentThread()->guest_object();
++  }
++  const auto* pcr = rex::memory::GuestPtr<const X_KPCR*>(base, ctx.r13.u32);
++  const uint32_t thread = static_cast<uint32_t>(pcr->prcb_data.current_thread);
++#if !defined(__SWITCH__)
++  // PC self-check: every call compares the id with the looked-up thread's.
++  REX_SYS_CENSUS(rex::syscount::kCensusCritSecPcrOwner, 1);
++  if (thread != XThread::GetCurrentThread()->guest_object()) [[unlikely]] {
++    REX_SYS_CENSUS(rex::syscount::kCensusCritSecOwnerMismatch, 1);
++    return XThread::GetCurrentThread()->guest_object();
++  }
++#endif
++  return thread;
++}
++}  // namespace
++
++// default_spin: the tries for a section initialised without a spin count (kernel_critsec_spin).
++static void xeEnterCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t cur_thread, uint32_t default_spin) {
 +  REX_SYS_CENSUS(rex::syscount::kCensusCritSecEnter, 1);
-   uint32_t cur_thread = XThread::GetCurrentThread()->guest_object();
    uint32_t spin_count = cs->header.absolute * 256;
 +  if (spin_count == 0) {
 +    // Plain InitializeCriticalSection has no spin count: a contended acquire went straight to the full
 +    // waiter (object lookup, host condition variable, a context switch each way).
-+    spin_count = static_cast<uint32_t>(std::max(REXCVAR_GET(kernel_critsec_spin), 0));
++    spin_count = default_spin;
 +  }
  
    if (cs->owning_thread == cur_thread) {
@@ -22567,18 +23243,73 @@ index 8b862fc7a0487b5aaa1d4c3a27aa5ae7a7526fd8..3b8457c6cb94731191ddfe8c194ca23c
  
    if (rex::thread::atomic_inc(&cs->lock_count) != 0) {
      // Create a full waiter.
+-    xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, nullptr);
 +    REX_SYS_COUNT(rex::syscount::kCritSecWait, 1);
-     xeKeWaitForSingleObject(reinterpret_cast<void*>(cs.host_address()), 8, 0, 0, nullptr);
++    xeKeWaitForSingleObject(reinterpret_cast<void*>(cs), 8, 0, 0, nullptr);
    }
  
-@@ -408,6 +427,7 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+   assert_true(cs->owning_thread == 0);
+@@ -407,8 +468,13 @@ void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+   cs->recursion_count = 1;
  }
  
- u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+-u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+-  uint32_t thread = XThread::GetCurrentThread()->guest_object();
++void RtlEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
++  xeEnterCriticalSection(cs, XThread::GetCurrentThread()->guest_object(),
++                         static_cast<uint32_t>(std::max(REXCVAR_GET(kernel_critsec_spin), 0)));
++}
++
++static uint32_t xeTryEnterCriticalSection(X_RTL_CRITICAL_SECTION* cs, uint32_t thread) {
 +  REX_SYS_CENSUS(rex::syscount::kCensusTryEnter, 1);
-   uint32_t thread = XThread::GetCurrentThread()->guest_object();
  
    if (rex::thread::atomic_cas(-1, 0, &cs->lock_count)) {
+     // Able to steal the lock right away.
+@@ -426,6 +492,23 @@ u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+   return 0;
+ }
+ 
++u32 RtlTryEnterCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
++  return xeTryEnterCriticalSection(cs, XThread::GetCurrentThread()->guest_object());
++}
++
++// The raw exports' bodies: the argument as HostToGuestFunction would translate it, the owner from the context.
++void RtlEnterCriticalSection_raw(PPCContext& ctx, uint8_t* base) {
++  xeEnterCriticalSection(rex::memory::GuestPtr<X_RTL_CRITICAL_SECTION*>(base, ctx.r3.u32),
++                         CriticalSectionOwner(ctx, base), GuestCriticalSection().spin);
++}
++
++void RtlTryEnterCriticalSection_raw(PPCContext& ctx, uint8_t* base) {
++  const uint32_t taken = xeTryEnterCriticalSection(
++      rex::memory::GuestPtr<X_RTL_CRITICAL_SECTION*>(base, ctx.r3.u32), CriticalSectionOwner(ctx, base));
++  asm volatile("" ::: "memory");
++  ctx.r3.u64 = taken;
++}
++
+ void RtlLeaveCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
+   assert_true(cs->owning_thread == XThread::GetCurrentThread()->guest_object());
+ 
+@@ -618,9 +701,17 @@ REX_EXPORT(__imp__RtlInitializeCriticalSection,
+            rex::kernel::xboxkrnl::RtlInitializeCriticalSection_entry)
+ REX_EXPORT(__imp__RtlInitializeCriticalSectionAndSpinCount,
+            rex::kernel::xboxkrnl::RtlInitializeCriticalSectionAndSpinCount_entry)
+-REX_EXPORT(__imp__RtlEnterCriticalSection, rex::kernel::xboxkrnl::RtlEnterCriticalSection_entry)
+-REX_EXPORT(__imp__RtlTryEnterCriticalSection,
+-           rex::kernel::xboxkrnl::RtlTryEnterCriticalSection_entry)
++// Raw (sa2-nx, second CPU round): they need the guest context for the owner id (kernel_critsec_pcr_owner).
++REX_HOOK_RAW(__imp__RtlEnterCriticalSection) {
++  rex::kernel::xboxkrnl::RtlEnterCriticalSection_raw(ctx, base);
++}
++static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__RtlEnterCriticalSection(
++    "__imp__RtlEnterCriticalSection", &__imp__RtlEnterCriticalSection);
++REX_HOOK_RAW(__imp__RtlTryEnterCriticalSection) {
++  rex::kernel::xboxkrnl::RtlTryEnterCriticalSection_raw(ctx, base);
++}
++static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__RtlTryEnterCriticalSection(
++    "__imp__RtlTryEnterCriticalSection", &__imp__RtlTryEnterCriticalSection);
+ REX_EXPORT(__imp__RtlLeaveCriticalSection, rex::kernel::xboxkrnl::RtlLeaveCriticalSection_entry)
+ REX_EXPORT(__imp__RtlTimeToTimeFields, rex::kernel::xboxkrnl::RtlTimeToTimeFields_entry)
+ REX_EXPORT(__imp__RtlTimeFieldsToTime, rex::kernel::xboxkrnl::RtlTimeFieldsToTime_entry)
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 index 1254710a1c427c384bebc0a8e89bc0406cfe88ea..0c90aa71ab79b509c20e1f282a9b00190d75fe56 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
@@ -22826,7 +23557,7 @@ index 754fa13832016ae37164d2bd72f334f7d4e3c046..708d41b2040011607228ca95f05c16b1
 +
  }  // namespace rex::system
 diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
-index 697399cdd4207c779610127c01e5285e580767de..6a556d9e2ee6b3b0b8f12b3e2a1d8e55bebf5a4e 100644
+index 697399cdd4207c779610127c01e5285e580767de..bdab1a6e6dacbdbbc5896c04508da6bd44f5f9af 100644
 --- a/src/system/kernel_state.cpp
 +++ b/src/system/kernel_state.cpp
 @@ -12,6 +12,7 @@
@@ -22845,7 +23576,23 @@ index 697399cdd4207c779610127c01e5285e580767de..6a556d9e2ee6b3b0b8f12b3e2a1d8e55
  #include <rex/system/function_dispatcher.h>
  #include <chrono>
  #include <thread>
-@@ -759,15 +761,19 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
+@@ -42,6 +44,7 @@
+ #include <rex/system/xsemaphore.h>
+ #include <rex/system/xthread.h>
+ #include <rex/system/xtimer.h>
++#include <rex/sys_counters.h>
+ 
+ namespace rex::system {
+ 
+@@ -53,6 +56,7 @@ constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
+ KernelState* shared_kernel_state_ = nullptr;
+ 
+ KernelState* kernel_state() {
++  REX_SYS_CENSUS(rex::syscount::kCensusKernelState, 1);
+   return shared_kernel_state_;
+ }
+ 
+@@ -759,15 +763,19 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
      }
  
      rex::platform::DynamicLibrary library_local;
@@ -22871,7 +23618,7 @@ index 697399cdd4207c779610127c01e5285e580767de..6a556d9e2ee6b3b0b8f12b3e2a1d8e55
        if (!register_func) {
          REXSYS_ERROR("ReXModule_Register not found in '{}'", recomp->shared_lib_name);
        } else if (!get_image_info) {
-@@ -1400,3 +1406,23 @@ const char* KernelState::GetOrCreateFiberName(uint32_t guest_addr, const char* t
+@@ -1400,3 +1408,23 @@ const char* KernelState::GetOrCreateFiberName(uint32_t guest_addr, const char* t
  }
  
  }  // namespace rex::system
@@ -23387,10 +24134,10 @@ index 4179e8b279d0f17f00e5b289a4daf383d3e82401..49e374a0fe060e8b26ce86171c594354
  
  void XFile::RegisterIOCompletionPort(uint32_t key, object_ref<XIOCompletion> port) {
 diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
-index 76cc87766d34672914d99a6ea7644f549b8b3e85..c6f6f2c95d85777d99859d34c63f639ff9c36539 100644
+index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353205c63d5 100644
 --- a/src/system/xmemory.cpp
 +++ b/src/system/xmemory.cpp
-@@ -27,6 +27,7 @@
+@@ -27,11 +27,13 @@
  #include <rex/stream.h>
  #include <rex/system/function_dispatcher.h>
  #include <rex/system/mmio_handler.h>
@@ -23398,7 +24145,13 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..c6f6f2c95d85777d99859d34c63f639f
  #include <rex/system/xmemory.h>
  #include <rex/thread.h>
  
-@@ -131,6 +132,31 @@ Memory::~Memory() {
+ // TODO(benvanik): move xbox.h out
+ #include <rex/system/xtypes.h>
++#include <rex/sys_counters.h>
+ 
+ REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -131,6 +133,31 @@ Memory::~Memory() {
    physical_membase_ = nullptr;
  }
  
@@ -23430,7 +24183,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..c6f6f2c95d85777d99859d34c63f639f
  bool Memory::Initialize() {
    file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
  
-@@ -157,6 +183,19 @@ bool Memory::Initialize() {
+@@ -157,6 +184,19 @@ bool Memory::Initialize() {
      return false;
    }
    mapping_base_ = views_.all_views[0];
@@ -23450,7 +24203,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..c6f6f2c95d85777d99859d34c63f639f
  #else
    // Attempt to create our views. This may fail at the first address
    // we pick, so try a few times.
-@@ -218,9 +257,22 @@ bool Memory::Initialize() {
+@@ -218,9 +258,22 @@ bool Memory::Initialize() {
  
    // Pre-commit the physical memory range so the GPU can access it
    // without page faults. Reference: xenia-canary 5f5be0668.
@@ -23473,7 +24226,15 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..c6f6f2c95d85777d99859d34c63f639f
  
    // Install MMIO handler for physical address translation and MMIO ranges
    mmio_handler_ = runtime::MMIOHandler::Install(
-@@ -531,6 +583,96 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
+@@ -395,6 +448,7 @@ void Memory::Reset() {
+ }
+ 
+ const BaseHeap* Memory::LookupHeap(uint32_t address) const {
++  REX_SYS_CENSUS(rex::syscount::kCensusLookupHeap, 1);
+   if (address < 0x40000000) {
+     return &heaps_.v00000000;
+   } else if (address < 0x7F000000) {
+@@ -531,6 +585,96 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
    return mmio_handler_->LookupRange(virtual_address);
  }
  
@@ -23570,7 +24331,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..c6f6f2c95d85777d99859d34c63f639f
  bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                       void* host_address, bool is_write) {
    // Access via physical_membase_ is special, when need to bypass everything
-@@ -547,6 +689,9 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+@@ -547,6 +691,9 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
          "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
          is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
          rex::thread::current_thread_id());
@@ -23580,7 +24341,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..c6f6f2c95d85777d99859d34c63f639f
      return false;
    }
  
-@@ -882,6 +1027,29 @@ rex::memory::PageAccess ToPageAccess(uint32_t protect) {
+@@ -882,6 +1029,29 @@ rex::memory::PageAccess ToPageAccess(uint32_t protect) {
    }
  }
  
@@ -23610,7 +24371,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..c6f6f2c95d85777d99859d34c63f639f
  uint32_t FromPageAccess(rex::memory::PageAccess protect) {
    switch (protect) {
      case memory::PageAccess::kNoAccess:
-@@ -952,7 +1120,8 @@ bool BaseHeap::SyncHostPageAccess(uint32_t start_page_number, uint32_t end_page_
+@@ -952,7 +1122,8 @@ bool BaseHeap::SyncHostPageAccess(uint32_t start_page_number, uint32_t end_page_
          continue;
        }
        has_committed = true;
@@ -23620,7 +24381,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..c6f6f2c95d85777d99859d34c63f639f
        if (page_access == rex::memory::PageAccess::kReadWrite) {
          has_read = true;
          has_write = true;
-@@ -1349,7 +1518,8 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
+@@ -1349,7 +1520,8 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
                            : rex::memory::AllocationType::kReserve;
      void* result =
          rex::memory::AllocFixed(TranslateRelative(start_page_number << page_size_shift_),
@@ -23630,7 +24391,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..c6f6f2c95d85777d99859d34c63f639f
      if (!result) {
        REXSYS_ERROR("BaseHeap::AllocFixed failed to alloc range from host");
        return false;
-@@ -1512,7 +1682,8 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t
+@@ -1512,7 +1684,8 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t
                            : rex::memory::AllocationType::kReserve;
      void* result =
          rex::memory::AllocFixed(TranslateRelative(start_page_number << page_size_shift_),
@@ -23640,7 +24401,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..c6f6f2c95d85777d99859d34c63f639f
      if (!result) {
        REXSYS_ERROR("BaseHeap::Alloc failed to alloc range from host");
        return false;
-@@ -1704,14 +1875,19 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
+@@ -1704,14 +1877,19 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
      const uint32_t page_count = end_page_number - start_page_number + 1;
      memory::PageAccess old_protect_access;
      if (!rex::memory::Protect(TranslateRelative(start_page_number << page_size_shift_),
@@ -23661,20 +24422,52 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..c6f6f2c95d85777d99859d34c63f639f
      }
    } else {
      if (old_protect) {
+@@ -1878,6 +2056,13 @@ void PhysicalHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType
+   } else {
+     host_address_offset = 0;
+   }
++  // The header's constant is what the recompiled code and (off Windows) Memory::TranslateVirtual add instead of
++  // asking the heap: it must be this heap's offset.
++  if (host_address_offset != detail::PhysicalHostOffset(heap_base)) {
++    REXSYS_ERROR("Physical heap {:08X}: host address offset {:X}, but PhysicalHostOffset says {:X}", heap_base,
++                 host_address_offset, detail::PhysicalHostOffset(heap_base));
++    std::abort();
++  }
+ 
+   BaseHeap::Initialize(memory, membase, heap_type, heap_base, heap_size, page_size,
+                        host_address_offset);
 diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
-index d358f399d84f196be91eafc620a7e6d4242d2f5d..ee9a11fa45cf6761e08bff0ebbfa3f4ad23ac316 100644
+index d358f399d84f196be91eafc620a7e6d4242d2f5d..9ea9354e8eaf8dcdd72177a70ef242757be9d103 100644
 --- a/src/system/xobject.cpp
 +++ b/src/system/xobject.cpp
-@@ -27,6 +27,8 @@
+@@ -26,6 +26,9 @@
+ #include <rex/system/xsemaphore.h>
  #include <rex/system/xsymboliclink.h>
  #include <rex/system/xthread.h>
- 
-+#include "global_lock_spin.h"
++#include <rex/sys_counters.h>
 +
++#include "global_lock_spin.h"
+ 
  namespace rex::system {
  
- XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
-@@ -202,6 +204,7 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
+@@ -88,16 +91,6 @@ bool XObject::ReleaseHandle() {
+   return kernel_state_->object_table()->ReleaseHandle(handles_[0]) == X_STATUS_SUCCESS;
+ }
+ 
+-void XObject::Retain() {
+-  ++pointer_ref_count_;
+-}
+-
+-void XObject::Release() {
+-  if (--pointer_ref_count_ == 0) {
+-    delete this;
+-  }
+-}
+-
+ X_STATUS XObject::Delete() {
+   if (kernel_state_ == nullptr) {
+     // Fake return value for api-scanner
+@@ -202,6 +195,7 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
  
  X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                         uint64_t* opt_timeout) {
@@ -23682,7 +24475,7 @@ index d358f399d84f196be91eafc620a7e6d4242d2f5d..ee9a11fa45cf6761e08bff0ebbfa3f4a
    auto wait_handle = GetWaitHandle();
    if (!wait_handle) {
      // Object doesn't support waiting.
-@@ -370,6 +373,7 @@ void XObject::SetNativePointer(uint32_t native_ptr, bool uninitialized) {
+@@ -370,6 +364,7 @@ void XObject::SetNativePointer(uint32_t native_ptr, bool uninitialized) {
  object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* native_ptr,
                                               int32_t as_type) {
    assert_not_null(native_ptr);
@@ -23690,7 +24483,7 @@ index d358f399d84f196be91eafc620a7e6d4242d2f5d..ee9a11fa45cf6761e08bff0ebbfa3f4a
  
    // Unfortunately the XDK seems to inline some KeInitialize calls, meaning
    // we never see it and just randomly start getting passed events/timers/etc.
-@@ -380,7 +384,7 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
+@@ -380,7 +375,7 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
    // We identify this by setting wait_list_flink to a magic value. When set,
    // wait_list_blink will hold a handle to our object.
  
@@ -25532,10 +26325,10 @@ index 0000000000000000000000000000000000000000..087e736b8df58944caaff2578fb425e0
 +const char *elf_errmsg(int err) { (void)err; return "libelf is not available on Switch"; }
 diff --git a/src/ui/switch_perf.cpp b/src/ui/switch_perf.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..7cb6098b902eeb62103bce1ab32f0e8613f3bbb6
+index 0000000000000000000000000000000000000000..8c719656665b0ebf800ae582381b4b9ee3a8af7e
 --- /dev/null
 +++ b/src/ui/switch_perf.cpp
-@@ -0,0 +1,1264 @@
+@@ -0,0 +1,1308 @@
 +/**
 + * @file        switch_perf.cpp
 + * @brief       Performance measurement on the console, without a debugger
@@ -26453,6 +27246,45 @@ index 0000000000000000000000000000000000000000..7cb6098b902eeb62103bce1ab32f0e86
 +  }
 +};
 +
++// sa2-nx, second CPU round (2026-10-12): what one access of FPCR costs on this CPU. The recompiled code switches the
++// host's float flush mode with `msr fpcr`, and every choice between "a test in each conversion" and "a switch" (the
++// generator's fp_moves_modeless, fp_mode_lookahead and fp_copy_pairs) hangs on that cost, which had never been
++// measured on the A57. Four loops of the same shape, the best of five runs each: empty, a read, a write of the
++// value already there, a write that toggles FZ (what a real switch does). Run once, for the report's header.
++struct FpcrCost {
++  double read_ns, write_same_ns, write_toggle_ns;
++};
++FpcrCost MeasureFpcrCost(u64 tick_freq) {
++  constexpr int kCount = 200000;
++  u64 saved;
++  asm volatile("mrs %0, fpcr" : "=r"(saved));
++  const auto loop = [&](int kind) {
++    u64 best = ~u64(0);
++    for (int run = 0; run < 5; ++run) {
++      u64 v = saved;
++      const u64 t0 = armGetSystemTick();
++      for (int i = 0; i < kCount; ++i) {
++        if (kind == 1) {
++          asm volatile("mrs %0, fpcr" : "=r"(v));
++        } else if (kind == 2) {
++          asm volatile("msr fpcr, %0" : : "r"(v));
++        } else if (kind == 3) {
++          v ^= u64(1) << 24;  // FZ
++          asm volatile("msr fpcr, %0" : : "r"(v));
++        } else {
++          asm volatile("" : "+r"(v));
++        }
++      }
++      const u64 t = armGetSystemTick() - t0;
++      if (t < best) best = t;
++      asm volatile("msr fpcr, %0" : : "r"(saved));
++    }
++    return double(best) * 1e9 / double(tick_freq) / double(kCount);
++  };
++  const double empty = loop(0);
++  return {loop(1) - empty, loop(2) - empty, loop(3) - empty};
++}
++
 +void ProfilerMain(void*) {
 +  const u64 tick_freq = armGetSystemTickFreq();
 +
@@ -26509,6 +27341,11 @@ index 0000000000000000000000000000000000000000..7cb6098b902eeb62103bce1ab32f0e86
 +    std::fprintf(f, "image 0x%016" PRIx64 ", code up to 0x%016" PRIx64 "\n\n", g_base,
 +                 g_text_hi);
 +    std::fprintf(f, "Stack sampling: %s\n", sample_stacks ? "active (1 ms)" : "disabled");
++    const FpcrCost fpcr = MeasureFpcrCost(tick_freq);
++    std::fprintf(f,
++                 "FPCR on this CPU (per access, loop overhead taken off): read %.1f ns, write of the same value "
++                 "%.1f ns, write that toggles the flush mode %.1f ns (one cycle is 0.98 ns at 1020 MHz)\n",
++                 fpcr.read_ns, fpcr.write_same_ns, fpcr.write_toggle_ns);
 +    std::fclose(f);
 +  }
 +
@@ -29828,10 +30665,10 @@ index 0000000000000000000000000000000000000000..7797c07368013b1ea98318e162503e8b
 +#include <netinet/in.h>
 diff --git a/tests/arm_forms_check.cpp b/tests/arm_forms_check.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..3e5b5eb26f8070cee452ce8bad54cd32dee3160d
+index 0000000000000000000000000000000000000000..ae5095fec214e799bb35397b8097cada288da69a
 --- /dev/null
 +++ b/tests/arm_forms_check.cpp
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,59 @@
 +// Compile-only check for the Switch compiler (it cannot run on the PC): the AArch64-only forms of the CPU round of
 +// 2026-10-12, one small function each, so tools/arm_forms_check.py can read the instructions GCC makes of them.
 +//   - rex/thread/atomic.h: the inline __atomic lock words (exclusive pair with acquire/release, no trailing `dmb`
@@ -29870,6 +30707,381 @@ index 0000000000000000000000000000000000000000..3e5b5eb26f8070cee452ce8bad54cd32
 +CHECK_FN double check_add_single(double a, double b) { return rex::ppc::AddSingleAnyMode(a, b); }
 +CHECK_FN double check_round_single(double a) { return rex::ppc::RoundToSingleAnyMode(a); }
 +CHECK_FN bool check_ge_zero(double a) { return rex::ppc::GeZeroAnyMode(a); }
++
++// The second CPU round of 2026-10-12 (sa2-nx).
++//   - rex/ppc/diet_ops.h: fctid / fctiw as `frinti` + `fcvtzs`, fctidz as `fcvtzs` (codegen option fcti_inline; no
++//     call of round()); SingleToDoublePure and QuietSingleBits (fp_copy_pairs) without a call and without `msr`.
++//   - rex/ppc/intrinsics.h: the small VMX helpers as their NEON instruction.
++CHECK_FN int64_t check_fctid(double v) { return rex::ppc::fctid(v); }
++CHECK_FN int64_t check_fctiw(double v) { return rex::ppc::fctiw(v); }
++CHECK_FN int64_t check_fctidz(double v) { return rex::ppc::fctidz(v); }
++CHECK_FN double check_single_pure(uint32_t bits) { return rex::ppc::SingleToDoublePure(bits); }
++CHECK_FN uint32_t check_quiet_single(uint32_t bits) { return rex::ppc::QuietSingleBits(bits); }
++CHECK_FN simde__m128i check_adds_epu32(simde__m128i a, simde__m128i b) { return rex::ppc::simde_mm_adds_epu32(a, b); }
++CHECK_FN simde__m128i check_avg_epi8(simde__m128i a, simde__m128i b) { return rex::ppc::simde_mm_avg_epi8(a, b); }
++CHECK_FN simde__m128i check_avg_epi16(simde__m128i a, simde__m128i b) { return rex::ppc::simde_mm_avg_epi16(a, b); }
++CHECK_FN simde__m128i check_avg_epi32(simde__m128i a, simde__m128i b) { return rex::ppc::simde_mm_avg_epi32(a, b); }
++CHECK_FN simde__m128 check_cvtepu32_ps(simde__m128i a) { return rex::ppc::simde_mm_cvtepu32_ps_(a); }
++CHECK_FN simde__m128i check_cmpgt_epu8(simde__m128i a, simde__m128i b) { return rex::ppc::simde_mm_cmpgt_epu8(a, b); }
++CHECK_FN simde__m128i check_cmpgt_epu16(simde__m128i a, simde__m128i b) { return rex::ppc::simde_mm_cmpgt_epu16(a, b); }
++CHECK_FN simde__m128i check_sllv_epi16(simde__m128i a, simde__m128i c) { return rex::ppc::simde_mm_sllv_epi16(a, c); }
++CHECK_FN simde__m128i check_srlv_epi16(simde__m128i a, simde__m128i c) { return rex::ppc::simde_mm_srlv_epi16(a, c); }
++CHECK_FN simde__m128i check_srav_epi16(simde__m128i a, simde__m128i c) { return rex::ppc::simde_mm_srav_epi16(a, c); }
++CHECK_FN simde__m128i check_sllv_epi8(simde__m128i a, simde__m128i c) { return rex::ppc::simde_mm_sllv_epi8(a, c); }
+diff --git a/tests/fcti_copy_test.cpp b/tests/fcti_copy_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a923797a50862af3aa7f7ac6f307cd68c9ef535f
+--- /dev/null
++++ b/tests/fcti_copy_test.cpp
+@@ -0,0 +1,285 @@
++// The helpers of the codegen options fcti_inline and fp_copy_pairs (rex/ppc/diet_ops.h), sa2-nx's second CPU round.
++//
++// 1. fctid / fctiw / fctidz against a model of the PowerPC instruction written with integer arithmetic only (the
++//    double is taken apart, rounded by the rule of the mode and saturated), in each of the four rounding modes:
++//    edge values (zeros, halves, the int32 and int64 limits and their neighbours, denormals, infinities, NaNs) and
++//    random bit patterns. The model is also the AArch64 form step by step: `frinti` (to an integral double in the
++//    current mode) and the saturating `fcvtzs`, with the NaN select. The old generated expressions are run next to
++//    them: on x86 they must agree everywhere except fctid / fctidz at exactly 2^63 (reported: once per mode).
++// 2. rex::ppc::SingleToDoublePure and QuietSingleBits for ALL 2^32 single bit patterns:
++//      - with the flush mode off: the same bits as `double(float)` and as `float(double(float))`, and as a
++//        conversion written with integer arithmetic only;
++//      - with the flush mode on: SingleToDoublePure still gives the integer conversion's bits (the plain conversion
++//        does not: its differences are counted as the negative control and must not be 0).
++//
++//   clang++ -O2 -std=c++23 -ffp-contract=off -Isdk/include -Isdk/thirdparty/simde -Isdk/thirdparty/simde/simde
++//           sdk/tests/fcti_copy_test.cpp -o out/tools/fcti_copy_test.exe
++//   fcti_copy_test [random values per mode = 20000000]
++#include <bit>
++#include <climits>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++#include <rex/ppc/diet_ops.h>
++#include <simde/x86/sse2.h>
++
++namespace {
++
++using P = rex::platform::FPSCRPlatform;
++
++#if defined(__aarch64__)
++#define OPAQUE(x) __asm__ __volatile__("" : "+w"(x))
++#else
++#define OPAQUE(x) __asm__ __volatile__("" : "+x"(x))
++#endif
++
++void SetFlush(bool on) {
++  auto csr = P::getcsr();
++  csr = on ? decltype(csr)(csr | decltype(csr)(P::FlushMask)) : decltype(csr)(csr & ~decltype(csr)(P::FlushMask));
++  P::setcsr(csr);
++}
++
++// Guest rounding modes (FPSCR.RN): 0 nearest even, 1 toward zero, 2 up, 3 down.
++void SetRounding(unsigned guest) {
++  auto csr = P::getcsr();
++  csr = decltype(csr)((csr & ~decltype(csr)(P::RoundMaskVal)) | decltype(csr)(P::GuestToHost[guest]));
++  P::setcsr(csr);
++}
++
++// The double rounded to an integer in the given mode, saturated to [lo, hi]; integer arithmetic only.
++// `nan` is the answer for a NaN.
++int64_t ModelRound(double v, unsigned mode, int64_t lo, int64_t hi, int64_t nan) {
++  const uint64_t bits = std::bit_cast<uint64_t>(v);
++  const bool negative = bits >> 63;
++  const int exponent = int((bits >> 52) & 0x7FF);
++  uint64_t fraction = bits & 0x000FFFFFFFFFFFFFull;
++  if (exponent == 0x7FF) {
++    if (fraction != 0) return nan;
++    return negative ? lo : hi;
++  }
++  // |v| = magnitude * 2^-shift exactly (as far as it matters), with the bits below the integer in `rest`.
++  unsigned __int128 magnitude;
++  bool half = false, below = false;  // the first bit below the integer, and any bit below that
++  if (exponent == 0) {
++    magnitude = 0;
++    below = fraction != 0;  // a denormal: less than a half
++  } else {
++    fraction |= 0x0010000000000000ull;
++    const int e = exponent - 1023 - 52;  // |v| = fraction * 2^e
++    if (e >= 0) {
++      if (e > 62) return negative ? lo : hi;  // at least 2^115
++      magnitude = (unsigned __int128)fraction << e;
++    } else if (e < -54) {
++      magnitude = 0;
++      below = true;
++    } else {
++      const int s = -e;  // 1..54
++      magnitude = s >= 64 ? 0 : fraction >> s;
++      half = (fraction >> (s - 1)) & 1;
++      below = (fraction & ((1ull << (s - 1)) - 1)) != 0;
++    }
++  }
++  bool up = false;  // away from zero
++  switch (mode) {
++    case 0: up = half && (below || (magnitude & 1)); break;
++    case 1: up = false; break;
++    case 2: up = !negative && (half || below); break;
++    case 3: up = negative && (half || below); break;
++  }
++  if (up) ++magnitude;
++  if (negative) {
++    if (magnitude > (unsigned __int128)(-(__int128)lo)) return lo;
++    return int64_t(-(__int128)magnitude);
++  }
++  if (magnitude > (unsigned __int128)hi) return hi;
++  return int64_t(magnitude);
++}
++
++// The register images the instructions leave.
++int64_t ModelFctid(double v, unsigned mode) { return ModelRound(v, mode, INT64_MIN, INT64_MAX, INT64_MIN); }
++int64_t ModelFctidz(double v) { return ModelRound(v, 1, INT64_MIN, INT64_MAX, INT64_MIN); }
++int64_t ModelFctiw(double v, unsigned mode) {
++  return ModelRound(v, mode, INT32_MIN, INT32_MAX, int64_t(0x80000000u));
++}
++
++[[gnu::noinline]] int64_t NewFctid(double v) { OPAQUE(v); return rex::ppc::fctid(v); }
++[[gnu::noinline]] int64_t NewFctidz(double v) { OPAQUE(v); return rex::ppc::fctidz(v); }
++[[gnu::noinline]] int64_t NewFctiw(double v) { OPAQUE(v); return rex::ppc::fctiw(v); }
++// The generator's expressions without the option (floating_point.cpp).
++[[gnu::noinline]] int64_t OldFctid(double v) {
++  OPAQUE(v);
++  return __builtin_isnan(v) ? int64_t(0x8000000000000000ULL)
++                            : (v > double(LLONG_MAX)) ? LLONG_MAX : simde_mm_cvtsd_si64(simde_mm_load_sd(&v));
++}
++[[gnu::noinline]] int64_t OldFctidz(double v) {
++  OPAQUE(v);
++  return __builtin_isnan(v) ? int64_t(0x8000000000000000ULL)
++                            : (v > double(LLONG_MAX)) ? LLONG_MAX : simde_mm_cvttsd_si64(simde_mm_load_sd(&v));
++}
++[[gnu::noinline]] int64_t OldFctiw(double v) {
++  OPAQUE(v);
++  return __builtin_isnan(v) ? int64_t(0x80000000U)
++                            : (v >= double(INT_MAX)) ? INT_MAX : simde_mm_cvtsd_si32(simde_mm_load_sd(&v));
++}
++
++uint64_t g_seed = 0x9E3779B97F4A7C15ull;
++uint64_t Next() {
++  g_seed ^= g_seed << 13;
++  g_seed ^= g_seed >> 7;
++  g_seed ^= g_seed << 17;
++  return g_seed;
++}
++
++// single -> double with integer arithmetic only, signalling NaNs quieted (what the hardware conversion does).
++uint64_t ModelSingleToDouble(uint32_t bits) {
++  const uint64_t sign = uint64_t(bits >> 31) << 63;
++  const uint32_t exponent = (bits >> 23) & 0xFF;
++  uint32_t fraction = bits & 0x007FFFFFu;
++  if (exponent == 0xFF) {
++    return sign | 0x7FF0000000000000ull | (fraction ? (uint64_t(fraction | 0x00400000u) << 29) : 0);
++  }
++  if (exponent == 0) {
++    if (fraction == 0) return sign;
++    int e = 1;
++    while (!(fraction & 0x00800000u)) {
++      fraction <<= 1;
++      --e;
++    }
++    return sign | (uint64_t(e - 127 + 1023) << 52) | (uint64_t(fraction & 0x007FFFFFu) << 29);
++  }
++  return sign | (uint64_t(exponent - 127 + 1023) << 52) | (uint64_t(fraction) << 29);
++}
++
++[[gnu::noinline]] uint64_t PlainLoad(uint32_t bits) {
++  float f = std::bit_cast<float>(bits);
++  OPAQUE(f);
++  double d = double(f);
++  OPAQUE(d);
++  return std::bit_cast<uint64_t>(d);
++}
++[[gnu::noinline]] uint32_t PlainCopy(uint32_t bits) {
++  float f = std::bit_cast<float>(bits);
++  OPAQUE(f);
++  double d = double(f);
++  OPAQUE(d);
++  float g = float(d);
++  OPAQUE(g);
++  return std::bit_cast<uint32_t>(g);
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++  const uint64_t randoms = argc > 1 ? strtoull(argv[1], nullptr, 10) : 20000000ull;
++  uint64_t differences = 0, checked = 0, old_differs = 0;
++
++  // ---- 1. the conversions to integer ----
++  std::vector<double> edges;
++  const double base_values[] = {0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.5, 1e-310, 4.9406564584124654e-324,
++                                2147483645.5, 2147483646.0, 2147483646.5, 2147483647.0, 2147483647.25,
++                                2147483647.5, 2147483647.75, 2147483648.0, 2147483648.5, 2147483649.0, 4294967295.5,
++                                4294967296.0, 4503599627370495.5, 4503599627370496.0, 4503599627370497.0,
++                                9007199254740991.0, 9007199254740992.0, 9223372036854774784.0,
++                                9223372036854775808.0, 9223372036854777856.0, 1.8446744073709552e19, 1e300};
++  for (double v : base_values) {
++    edges.push_back(v);
++    edges.push_back(-v);
++    // the doubles next to it
++    const uint64_t b = std::bit_cast<uint64_t>(v);
++    edges.push_back(std::bit_cast<double>(b + 1));
++    edges.push_back(-std::bit_cast<double>(b + 1));
++    if (b) {
++      edges.push_back(std::bit_cast<double>(b - 1));
++      edges.push_back(-std::bit_cast<double>(b - 1));
++    }
++  }
++  for (uint64_t nan : {0x7FF0000000000000ull, 0xFFF0000000000000ull, 0x7FF8000000000000ull, 0xFFF8000000000001ull,
++                       0x7FF0000000000001ull, 0xFFF4000000000000ull}) {
++    edges.push_back(std::bit_cast<double>(nan));
++  }
++  SetFlush(false);
++  for (unsigned mode = 0; mode < 4; ++mode) {
++    SetRounding(mode);
++    const auto one = [&](double v) {
++      const int64_t d = NewFctid(v), dz = NewFctidz(v), w = NewFctiw(v);
++      const int64_t md = ModelFctid(v, mode), mdz = ModelFctidz(v), mw = ModelFctiw(v, mode);
++      checked += 3;
++      if (d != md || dz != mdz || w != mw) {
++        if (differences++ < 12) {
++          printf("DIFFERENCE mode %u v=%a: fctid %llx (model %llx) fctidz %llx (model %llx) fctiw %llx (model %llx)\n",
++                 mode, v, (unsigned long long)d, (unsigned long long)md, (unsigned long long)dz,
++                 (unsigned long long)mdz, (unsigned long long)w, (unsigned long long)mw);
++        }
++      }
++#if !defined(__aarch64__)
++      // The old expressions on x86: equal, except fctid / fctidz at exactly 2^63.
++      const bool at_limit = v == 9223372036854775808.0;
++      if (OldFctid(v) != d || OldFctidz(v) != dz || OldFctiw(v) != w) {
++        if (at_limit && OldFctiw(v) == w) {
++          ++old_differs;
++        } else if (differences++ < 12) {
++          printf("DIFFERENCE from the old expression, mode %u v=%a\n", mode, v);
++        }
++      }
++#endif
++    };
++    for (double v : edges) one(v);
++    for (uint64_t i = 0; i < randoms; ++i) {
++      uint64_t bits = Next();
++      switch (i & 3) {
++        case 0: break;                                                             // any double
++        case 1: bits = (bits & 0x800FFFFFFFFFFFFFull) | (uint64_t(1023 + (Next() % 70)) << 52); break;  // 1 .. 2^70
++        case 2: bits = std::bit_cast<uint64_t>(double(int64_t(Next() % 4000000) - 2000000) * 0.5); break;  // halves
++        case 3: bits = std::bit_cast<uint64_t>(2147483648.0 * ((Next() & 1) ? 1 : -1) +
++                                                 double(int64_t(Next() % 4096) - 2048) * 0.25); break;
++      }
++      one(std::bit_cast<double>(bits));
++    }
++  }
++  SetRounding(0);
++  printf("fcti: %llu results against the integer model in 4 rounding modes; old x86 expressions differ at 2^63 only: "
++         "%llu times\n",
++         (unsigned long long)checked, (unsigned long long)old_differs);
++
++  // ---- 2. the float copy pair, all single bit patterns ----
++  uint64_t control = 0;
++  SetFlush(false);
++  for (uint64_t i = 0; i <= 0xFFFFFFFFull; ++i) {
++    const uint32_t bits = uint32_t(i);
++    const uint64_t ref = PlainLoad(bits);
++    const uint64_t pure = std::bit_cast<uint64_t>(rex::ppc::SingleToDoublePure(bits));
++    if (pure != ref || ModelSingleToDouble(bits) != ref || rex::ppc::QuietSingleBits(bits) != PlainCopy(bits)) {
++      if (differences++ < 12) {
++        printf("DIFFERENCE (mode off) single %08x: pure %016llx model %016llx plain %016llx; quiet %08x plain %08x\n",
++               bits, (unsigned long long)pure, (unsigned long long)ModelSingleToDouble(bits),
++               (unsigned long long)ref, rex::ppc::QuietSingleBits(bits), PlainCopy(bits));
++      }
++    }
++  }
++  SetFlush(true);
++  for (uint64_t i = 0; i <= 0xFFFFFFFFull; ++i) {
++    const uint32_t bits = uint32_t(i);
++    const uint64_t model = ModelSingleToDouble(bits);
++    uint32_t opaque = bits;
++    __asm__ __volatile__("" : "+r"(opaque));
++    if (std::bit_cast<uint64_t>(rex::ppc::SingleToDoublePure(opaque)) != model) {
++      if (differences++ < 12) printf("DIFFERENCE (mode on) single %08x\n", bits);
++    }
++    if (PlainLoad(bits) != model) ++control;
++  }
++  const bool still_on = P::getcsr() & P::FlushMask;
++  SetFlush(false);
++  checked += 3 * 0x100000000ull + 0x100000000ull;
++  printf("copy pair: all 2^32 singles, mode off (pure, integer model, quieted bits) and mode on (pure); the plain "
++         "conversion differs with the mode on for %llu singles (negative control, must not be 0); mode left %s\n",
++         (unsigned long long)control, still_on ? "on (as set)" : "CHANGED");
++  if (!still_on) ++differences;
++  if (control == 0) {
++    printf("FAILED: the negative control found nothing\n");
++    return 2;
++  }
++  printf("%llu checks, %llu differences\n", (unsigned long long)checked, (unsigned long long)differences);
++  return differences ? 1 : 0;
++}
+diff --git a/tests/float_loads_test.cpp b/tests/float_loads_test.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2d2beecf8439bfe3505183f10f9cf10811a169c
+--- /dev/null
++++ b/tests/float_loads_test.cpp
+@@ -0,0 +1,57 @@
++// tools/float_loads.py: the AArch64 form of a single-precision guest load (the four big-endian bytes loaded into a
++// vector register and reversed there, `ldr s; rev32`) against the integer form it replaces (the word loaded,
++// byte-swapped and moved to the float register), for ALL 2^32 bit patterns. The NEON expression is the one the
++// generated pch defines (RexFloatFromBigEndian), run here through simde's model of the instructions; both forms only
++// move bytes, so every pattern (signalling NaNs and denormals included) must come out with the same bits.
++//
++//   clang++ -O2 -std=c++23 -march=x86-64-v2 -Isdk/include -Isdk/thirdparty/simde -Isdk/thirdparty/simde/simde
++//           sdk/tests/float_loads_test.cpp -o out/tools/float_loads_test.exe
++#include <bit>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++
++#include <simde/arm/neon.h>
++
++namespace {
++
++// The pch's expression, with simde's names.
++inline float FromBigEndian(const void* p) noexcept {
++  float f;
++  std::memcpy(&f, p, 4);
++  const simde_float32x2_t v = simde_vset_lane_f32(f, simde_vdup_n_f32(0.0f), 0);
++  return simde_vget_lane_f32(simde_vreinterpret_f32_u8(simde_vrev32_u8(simde_vreinterpret_u8_f32(v))), 0);
++}
++
++// The integer form (REX_LOAD_U32 and the union read of the generated code).
++inline float IntegerForm(const void* p) noexcept {
++  uint32_t w;
++  std::memcpy(&w, p, 4);
++  return std::bit_cast<float>(__builtin_bswap32(w));
++}
++
++}  // namespace
++
++int main() {
++  uint64_t differences = 0;
++  alignas(8) unsigned char memory[8] = {};
++  for (uint64_t i = 0; i <= 0xFFFFFFFFull; ++i) {
++    const uint32_t guest = uint32_t(i);
++    // Guest memory holds the value big-endian.
++    memory[0] = uint8_t(guest >> 24);
++    memory[1] = uint8_t(guest >> 16);
++    memory[2] = uint8_t(guest >> 8);
++    memory[3] = uint8_t(guest);
++    void* p = memory;
++    __asm__ __volatile__("" : "+r"(p) : : "memory");
++    const uint32_t a = std::bit_cast<uint32_t>(FromBigEndian(p));
++    const uint32_t b = std::bit_cast<uint32_t>(IntegerForm(p));
++    if (a != b || b != guest) {
++      if (differences++ < 12) printf("DIFFERENCE %08x: vector form %08x integer form %08x\n", guest, a, b);
++    }
++  }
++  printf("float loads: all 2^32 patterns, vector form (simde's model) against the integer form\n");
++  printf("RESULT: %s (%llu differences)\n", differences ? "FAILED" : "ok", (unsigned long long)differences);
++  return differences ? 1 : 0;
++}
 diff --git a/tests/fp_any_mode_test.cpp b/tests/fp_any_mode_test.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..17def57025403108bd06bc614b2caadb12cf9334
@@ -30827,10 +32039,10 @@ index 0000000000000000000000000000000000000000..4bb6491d62e6adbcbab1499e523224f4
 +}
 diff --git a/tests/vmx_small_helpers_test.cpp b/tests/vmx_small_helpers_test.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..16abe9faa5c4b16ebcf79c07060cc062cdfbe64d
+index 0000000000000000000000000000000000000000..ee2b94b7eb001d8f197b77f67859cf8df86d8e1f
 --- /dev/null
 +++ b/tests/vmx_small_helpers_test.cpp
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,230 @@
 +// The small VMX helper operations of rex/ppc/intrinsics.h against the NEON instruction each one stands for, on a PC:
 +// the header's x86 form on one side, a scalar statement of the NEON instruction's definition on the other.
 +//   simde_mm_cvtepu32_ps_  (vcfux)    UCVTF: unsigned 32-bit integer to single, round to nearest even
@@ -30839,6 +32051,12 @@ index 0000000000000000000000000000000000000000..16abe9faa5c4b16ebcf79c07060cc062
 +//   simde_mm_cmpgt_epu8/16 (vcmpgtub/uh) CMHI: unsigned greater-than
 +//   simde_mm_avg_epi8/16   (vavgsb/sh)   SRHADD: signed (a + b + 1) >> 1
 +//   VectorMaskL / VectorMaskR: every byte is 0..15 or has bit 7 set (then pshufb and TBL agree on it)
++// sa2-nx (2026-10-12), with the NEON forms now in the header:
++//   simde_mm_avg_epi32     (vavgsw)   SRHADD on words
++//   simde_mm_sllv_epi16 / srlv_epi16 / srav_epi16 / sllv_epi8: USHL / SSHL with the count clamped. Each is compared
++//                                     with a scalar statement of what the x86 form gives for EVERY count (0 or the
++//                                     sign fill from the lane size on) and with the header's NEON expression run
++//                                     through simde's model of the instruction.
 +// A helper is only given a NEON form in the header if this reports 0 differences for it.
 +//
 +//   clang++ -O2 -std=c++23 -march=x86-64-v2 -Isdk/include -Isdk/thirdparty/simde -Isdk/thirdparty/simde/simde
@@ -30848,6 +32066,8 @@ index 0000000000000000000000000000000000000000..16abe9faa5c4b16ebcf79c07060cc062
 +#include <cstdint>
 +#include <cstdio>
 +#include <cstring>
++
++#include <simde/arm/neon.h>
 +
 +#include <rex/ppc/intrinsics.h>
 +
@@ -30942,6 +32162,101 @@ index 0000000000000000000000000000000000000000..16abe9faa5c4b16ebcf79c07060cc062
 +              static_cast<unsigned long long>(gt8), static_cast<unsigned long long>(gt16),
 +              static_cast<unsigned long long>(avg8), static_cast<unsigned long long>(avg16));
 +
++  // The signed word average and the per-lane shifts. Counts: every small value, the lane sizes and their
++  // neighbours, values whose low byte alone would mislead USHL (256, 0x8000, 0xFF10), and random ones.
++  uint64_t avg32 = 0, sl16 = 0, sr16 = 0, sa16 = 0, sl8 = 0, shift_model = 0, shifts = 0;
++  static const uint16_t kCounts[] = {0, 1, 2, 7, 8, 9, 14, 15, 16, 17, 31, 32, 33, 127, 128, 129, 255, 256, 257,
++                                     0x7FFF, 0x8000, 0x8001, 0xFF00, 0xFF10, 0xFFFF};
++  for (int k = 0; k < 3000000; ++k) {
++    uint8_t a[16], c[16];
++    uint64_t r[4] = {Next(), Next(), Next(), Next()};
++    std::memcpy(a, &r[0], 16);
++    std::memcpy(c, &r[2], 16);
++    if ((k & 3) != 3) {
++      // Mostly edge counts: random ones are almost always "too large".
++      for (int i = 0; i < 8; ++i) {
++        const uint16_t n = kCounts[(Next() >> 20) % (sizeof(kCounts) / sizeof(kCounts[0]))];
++        std::memcpy(c + 2 * i, &n, 2);
++      }
++      if ((k & 3) == 1) {
++        for (int i = 0; i < 16; ++i) c[i] = uint8_t(kCounts[(Next() >> 20) % 21]);  // byte counts 0..255
++      }
++    }
++    simde__m128i va, vc;
++    std::memcpy(&va, a, 16);
++    std::memcpy(&vc, c, 16);
++    uint8_t out[16], model[16];
++    simde__m128i x = rex::ppc::simde_mm_avg_epi32(va, vc);
++    std::memcpy(out, &x, 16);
++    for (int i = 0; i < 4; ++i) {
++      int32_t p, q, got;
++      std::memcpy(&p, a + 4 * i, 4);
++      std::memcpy(&q, c + 4 * i, 4);
++      std::memcpy(&got, out + 4 * i, 4);
++      avg32 += got != int32_t((int64_t(p) + int64_t(q) + 1) >> 1);
++    }
++    const simde_uint16x8_t na = simde_vreinterpretq_u16_u8(simde_vld1q_u8(a));
++    const simde_uint16x8_t nc = simde_vreinterpretq_u16_u8(simde_vld1q_u8(c));
++    // sllv_epi16
++    x = rex::ppc::simde_mm_sllv_epi16(va, vc);
++    std::memcpy(out, &x, 16);
++    simde_vst1q_u8(model, simde_vreinterpretq_u8_u16(simde_vshlq_u16(
++                              na, simde_vreinterpretq_s16_u16(simde_vminq_u16(nc, simde_vdupq_n_u16(16))))));
++    shift_model += std::memcmp(out, model, 16) != 0;
++    for (int i = 0; i < 8; ++i) {
++      uint16_t p, n, got;
++      std::memcpy(&p, a + 2 * i, 2);
++      std::memcpy(&n, c + 2 * i, 2);
++      std::memcpy(&got, out + 2 * i, 2);
++      sl16 += got != (n >= 16 ? 0 : uint16_t(p << n));
++    }
++    // srlv_epi16
++    x = rex::ppc::simde_mm_srlv_epi16(va, vc);
++    std::memcpy(out, &x, 16);
++    simde_vst1q_u8(model, simde_vreinterpretq_u8_u16(simde_vshlq_u16(
++                              na, simde_vnegq_s16(simde_vreinterpretq_s16_u16(
++                                      simde_vminq_u16(nc, simde_vdupq_n_u16(16)))))));
++    shift_model += std::memcmp(out, model, 16) != 0;
++    for (int i = 0; i < 8; ++i) {
++      uint16_t p, n, got;
++      std::memcpy(&p, a + 2 * i, 2);
++      std::memcpy(&n, c + 2 * i, 2);
++      std::memcpy(&got, out + 2 * i, 2);
++      sr16 += got != (n >= 16 ? 0 : uint16_t(p >> n));
++    }
++    // srav_epi16
++    x = rex::ppc::simde_mm_srav_epi16(va, vc);
++    std::memcpy(out, &x, 16);
++    simde_vst1q_u8(model, simde_vreinterpretq_u8_s16(simde_vshlq_s16(
++                              simde_vreinterpretq_s16_u16(na),
++                              simde_vnegq_s16(simde_vreinterpretq_s16_u16(
++                                  simde_vminq_u16(nc, simde_vdupq_n_u16(15)))))));
++    shift_model += std::memcmp(out, model, 16) != 0;
++    for (int i = 0; i < 8; ++i) {
++      int16_t p, got;
++      uint16_t n;
++      std::memcpy(&p, a + 2 * i, 2);
++      std::memcpy(&n, c + 2 * i, 2);
++      std::memcpy(&got, out + 2 * i, 2);
++      sa16 += got != int16_t(p >> (n >= 15 ? 15 : n));
++    }
++    // sllv_epi8
++    x = rex::ppc::simde_mm_sllv_epi8(va, vc);
++    std::memcpy(out, &x, 16);
++    simde_vst1q_u8(model, simde_vshlq_u8(simde_vld1q_u8(a),
++                                         simde_vreinterpretq_s8_u8(simde_vminq_u8(simde_vld1q_u8(c),
++                                                                                  simde_vdupq_n_u8(8)))));
++    shift_model += std::memcmp(out, model, 16) != 0;
++    for (int i = 0; i < 16; ++i) sl8 += out[i] != (c[i] >= 8 ? 0 : uint8_t(a[i] << c[i]));
++    ++shifts;
++  }
++  std::printf("%llu random vector pairs: SRHADD words (vavgsw) %llu differences; shifts against the scalar statement: "
++              "sllv16 %llu, srlv16 %llu, srav16 %llu, sllv8 %llu; against the NEON expression (simde's model): %llu\n",
++              static_cast<unsigned long long>(shifts), static_cast<unsigned long long>(avg32),
++              static_cast<unsigned long long>(sl16), static_cast<unsigned long long>(sr16),
++              static_cast<unsigned long long>(sa16), static_cast<unsigned long long>(sl8),
++              static_cast<unsigned long long>(shift_model));
++
 +  uint64_t mask_bytes = 0, mask_bad = 0;
 +  for (const uint8_t byte : rex::ppc::VectorMaskL) {
 +    ++mask_bytes;
@@ -30953,7 +32268,8 @@ index 0000000000000000000000000000000000000000..16abe9faa5c4b16ebcf79c07060cc062
 +  }
 +  std::printf("VectorMaskL / VectorMaskR: %llu bytes, %llu outside {0..15, bit 7 set}\n",
 +              static_cast<unsigned long long>(mask_bytes), static_cast<unsigned long long>(mask_bad));
-+  const bool ok = !ucvtf_differences && !add && !gt8 && !gt16 && !avg8 && !avg16 && !mask_bad;
++  const bool ok = !ucvtf_differences && !add && !gt8 && !gt16 && !avg8 && !avg16 && !mask_bad && !avg32 && !sl16 &&
++                  !sr16 && !sa16 && !sl8 && !shift_model;
 +  std::printf(ok ? "RESULT: ok (0 differences)\n" : "RESULT: differences found (see above)\n");
 +  return ok ? 0 : 1;
 +}

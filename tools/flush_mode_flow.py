@@ -33,6 +33,19 @@ Across calls, a summary per recompiled function of what it does to the mode:
   - "same": a function with flush-mode statements whose every return is reached in the mode it was entered with.
   - "unknown" otherwise.
 
+Into a function (sa2-nx, 2026-10-12; with --image): the mode it is entered in, instead of "unknown". A function
+that can only be entered by a direct call from recompiled code starts in the mode all those call sites are proven
+to be in (computed from "unknown" for every function up to a fixed point, so each step only uses facts). "Only by a
+direct call" means all of:
+  - its address is nowhere in the image as a 32-bit word (any section but the unwind and relocation tables, at any
+    byte offset: a virtual table, a function pointer, an export), and it is not the entry point;
+  - no function builds its address in code: no `lis` constant of a function combined with an `addi` / `ori` immediate
+    of the same function gives it, and no constant assignment is it;
+  - no source file of the app or the SDK and no toml of the app mentions its address (a hook, a host call of
+    __imp__sub_X, a function the generator was told about).
+The localized copies (tools/localize_native.py) are made from these same statements and are entered through a hook
+(their original's address is in the sources: unknown at entry), so their call sites are the ones analysed here.
+
 A proven check becomes REX_FLUSH_KNOWN_ON() / REX_FLUSH_KNOWN_OFF(); the macros go into the generated pch:
   - on the Switch: nothing;
   - elsewhere (the PC build): the same test as before, and a call to RexFlushFlowMismatch(on) followed by the real
@@ -41,6 +54,7 @@ A proven check becomes REX_FLUSH_KNOWN_ON() / REX_FLUSH_KNOWN_OFF(); the macros 
   - with REX_FLUSH_FLOW_OFF defined: the original calls (the Switch build's off switch).
 
   python tools/flush_mode_flow.py --gen app/generated/default [--check] [--undo] [--redo] [--stats] [--no-calls]
+                                  [--image out/default_image.bin] [--sources DIR ...] [--tomls DIR]
 Idempotent. --check writes nothing; --undo restores the generator's calls; --no-calls uses no summaries (every call
 makes the mode unknown).
 --redo (sa2-nx; tools/post_codegen.py uses it): --undo and then the proof, in memory, writing only the files whose
@@ -49,8 +63,10 @@ calls of a function hooked since the last run back into hooked calls: proofs fro
 native replacement need not leave the mode the original left). Run after direct_calls.py.
 """
 import argparse
+import array
 import os
 import re
+import struct
 import sys
 
 ENABLE = 'ctx.fpscr.enableFlushMode();'
@@ -63,7 +79,8 @@ FUNC = re.compile(r'^DEFINE_REX_FUNC\((\w+)\) \{$')
 LABEL = re.compile(r'^(loc_[0-9A-Fa-f]+):$')
 GOTO = re.compile(r'^goto (loc_[0-9A-Fa-f]+);$')
 IFGOTO = re.compile(r'^if \(.*\) goto (loc_[0-9A-Fa-f]+);$')
-RETURN = re.compile(r'^return\b[^;]*;$')
+# Also the return of a leaf function after tools/leaf_locals.py: `{ REX_LEAF_STORE(l_r3, r3); return; }`.
+RETURN = re.compile(r'^(?:\{ (?:REX_LEAF_STORE\(\w+, \w+\); )+)?return\b[^;]*;(?: \})?$')
 DIRECT_CALL = re.compile(r'^__imp__(sub_[0-9A-F]{8})\(ctx, base\);$')
 TRAILING_COMMENT = re.compile(r'^(.*?[;{}:])\s*//.*$')
 # Hands ctx to other code, or touches the mode word some other way.
@@ -223,8 +240,15 @@ class Flow:
             exit_state = meet(exit_state, out[k] if kind[k] != KEEP and kind[k] != ENTRY else inn[k])
         return inn, (UNKNOWN if exit_state == TOP else exit_state)
 
-    def proven(self, summaries):
-        inn, _ = self.run(UNKNOWN, summaries)
+    def call_states(self, entry, summaries):
+        """(callee, mode before the call) for every direct call of the function, given its entry mode."""
+        inn, _ = self.run(entry, summaries)
+        for k, kind in enumerate(self.kind):
+            if isinstance(kind, tuple) and inn[k] != TOP:
+                yield kind[1], inn[k]
+
+    def proven(self, summaries, entry=UNKNOWN):
+        inn, _ = self.run(entry, summaries)
         result = {}
         for k, s in enumerate(self.code):
             if self.kind[k] == UNKNOWN:
@@ -236,9 +260,62 @@ class Flow:
         return result
 
 
+CONST_ASSIGN = re.compile(r'\.s64 = (-?\d+);$')
+ADD_IMM = re.compile(r'\.s64 = (?:ctx\.)?r\d+\.s64 \+ (-?\d+);$')
+OR_IMM = re.compile(r'\.u64 = (?:ctx\.)?r\d+\.u64 \| (\d+);$')
+ADDRESS = re.compile(r'(?<![0-9A-Fa-f])(8[2-9][0-9A-Fa-f]{6})(?![0-9A-Fa-f])')
+
+
+def addresses_in_image(path, wanted):
+    """The members of `wanted` (guest addresses) that are in the image as a big-endian 32-bit word, plus its entry
+    point. Every section but the unwind table and the relocations, at every byte offset."""
+    image = open(path, 'rb').read()
+    pe = struct.unpack_from('<I', image, 0x3C)[0]
+    if image[:2] != b'MZ' or image[pe:pe + 4] != b'PE\0\0':
+        sys.exit('ERROR (post-codegen patch): flush_mode_flow: the image dump is not a PE image')
+    sections, opt_size = struct.unpack_from('<H', image, pe + 6)[0], struct.unpack_from('<H', image, pe + 20)[0]
+    base = struct.unpack_from('<I', image, pe + 24 + 28)[0]
+    found = {(base + struct.unpack_from('<I', image, pe + 24 + 16)[0]) & 0xFFFFFFFF} & wanted
+    table = pe + 24 + opt_size
+    for i in range(sections):
+        name, vsize, va = struct.unpack_from('<8sII', image, table + 40 * i)
+        if name.rstrip(b'\0') in (b'.pdata', b'.reloc'):
+            continue
+        data = image[va:va + vsize]
+        for shift in range(4):
+            part = data[shift:]
+            part = part[:len(part) & ~3]
+            words = array.array('I', part)
+            if sys.byteorder == 'little':
+                words.byteswap()
+            found |= wanted.intersection(words)
+    return found
+
+
+def addresses_in_text(folders, tomls):
+    found = set()
+    for folder in folders:
+        for d, _, names in os.walk(folder):
+            for name in names:
+                if name.endswith(('.cpp', '.h', '.inc', '.hpp', '.c')):
+                    text = open(os.path.join(d, name), encoding='utf-8', errors='ignore').read()
+                    found.update(int(x, 16) for x in ADDRESS.findall(text))
+    if tomls and os.path.isdir(tomls):
+        for name in os.listdir(tomls):
+            if name.endswith('.toml'):
+                text = open(os.path.join(tomls, name), encoding='utf-8', errors='ignore').read()
+                found.update(int(x, 16) for x in ADDRESS.findall(text))
+    return found
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--gen', required=True, help='generated folder (*_recomp.N.cpp and *_pch.h)')
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ap.add_argument('--image', help="the code generator's image dump: enables the entry modes")
+    ap.add_argument('--sources', nargs='*', default=[os.path.join(root, 'app', 'src'), os.path.join(root, 'sdk', 'src'),
+                                                     os.path.join(root, 'sdk', 'include')])
+    ap.add_argument('--tomls', default=os.path.join(root, 'app'))
     ap.add_argument('--check', action='store_true')
     ap.add_argument('--undo', action='store_true')
     ap.add_argument('--redo', action='store_true', help='undo and prove again, writing only files that change')
@@ -268,6 +345,9 @@ def main():
     # what a "keeps" summary needs: whether anything but direct calls could change the mode, and whom they call.
     with_mode = {}   # name -> (file, first body line, Flow)
     plain = {}       # name -> set of direct callees, for functions that may "keep"
+    callers = {}     # name -> Flow, for functions without flush-mode statements that call directly (entry modes)
+    all_callees = {} # name -> set of direct callees
+    built = set()    # addresses a function builds in code: a `lis` constant with an immediate of the same function
     defined = set()
     already = 0
     for f in files:
@@ -288,11 +368,23 @@ def main():
             has_mode = False
             other_reset = False
             callees = set()
+            highs, lows = set(), set()
             while j < len(lines) and lines[j] != '}':
                 s = lines[j].strip()
                 if s and not s.startswith('//'):
                     if 'REX_FLUSH_KNOWN_' in s:
                         already += 1
+                    if a.image:
+                        c = CONST_ASSIGN.search(s)
+                        if c:
+                            value = int(c.group(1)) & 0xFFFFFFFF
+                            built.add(value)
+                            if not value & 0xFFFF:
+                                highs.add(value)
+                        else:
+                            c = ADD_IMM.search(s) or OR_IMM.search(s)
+                            if c:
+                                lows.add(int(c.group(1)))
                     c = DIRECT_CALL.match(s)
                     if c:
                         callees.add(c.group(1))
@@ -302,10 +394,18 @@ def main():
                         other_reset = True
                 j += 1
             defined.add(name)
+            all_callees[name] = callees
+            for h in highs:
+                for low in lows:
+                    built.add((h + low) & 0xFFFFFFFF)
+                    built.add((h | (low & 0xFFFF)) & 0xFFFFFFFF)
             if has_mode:
                 with_mode[name] = (f, i + 1, Flow(lines[i + 1:j]))
-            elif not other_reset:
-                plain[name] = callees
+            else:
+                if not other_reset:
+                    plain[name] = callees
+                if a.image and callees:
+                    callers[name] = Flow(lines[i + 1:j])
             i = j + 1
 
     summaries = None
@@ -336,6 +436,40 @@ def main():
                 break
         by_exit = sum(1 for name in with_mode if summaries.get(name, UNKNOWN) != UNKNOWN)
 
+    # The mode each function is entered in (see the header). From "unknown" up: every round only uses proven facts.
+    entry = {}
+    entry_known = 0
+    if a.image and summaries is not None:
+        address_of = {int(name[4:], 16): name for name in defined if re.match(r'sub_[0-9A-F]{8}$', name)}
+        wanted = set(address_of)
+        taken = addresses_in_image(a.image, wanted) | (built & wanted) | \
+            (addresses_in_text(a.sources, a.tomls) & wanted)
+        eligible = {address_of[x] for x in wanted - taken}
+        flows = {name: flow for name, (_, _, flow) in with_mode.items()}
+        flows.update(callers)
+        dirty = set(flows)
+        sites_of = {}  # caller -> [(callee, mode)]
+        for _ in range(40):
+            for name in dirty:
+                flow = flows[name]
+                if flow.ok:
+                    sites_of[name] = list(flow.call_states(entry.get(name, UNKNOWN), summaries))
+                else:
+                    sites_of[name] = [(c, UNKNOWN) for c in all_callees[name]]
+            seen = {}
+            for name, sites in sites_of.items():
+                for callee, mode in sites:
+                    if mode == ENTRY or mode == KEEP:
+                        mode = UNKNOWN
+                    seen[callee] = meet(seen.get(callee, TOP), mode)
+            # A caller that is not in `flows` has no direct call; a function nobody calls directly stays unknown.
+            new = {name: mode for name, mode in seen.items() if name in eligible and mode in (ON, OFF)}
+            dirty = {name for name in flows if new.get(name, UNKNOWN) != entry.get(name, UNKNOWN)}
+            entry = new
+            if not dirty:
+                break
+        entry_known = len(entry)
+
     proven_total = kept = skipped = functions = 0
     top = []
     touched = set()
@@ -349,7 +483,7 @@ def main():
             kept += checks
             continue
         functions += 1
-        proven = flow.proven(summaries)
+        proven = flow.proven(summaries, entry.get(name, UNKNOWN))
         kept += checks - len(proven)
         proven_total += len(proven)
         if proven:
@@ -378,8 +512,9 @@ def main():
           'functions (%d left alone), %d files with proofs, %d written; callee summaries: %s' %
           (' (check only)' if a.check else '', proven_total, already, kept, functions, skipped, len(touched), written,
            'none (--no-calls)' if a.no_calls else
-           '%d functions keep the mode, %d with flush-mode statements return in a known mode' %
-           (kept_functions, by_exit)))
+           '%d functions keep the mode, %d with flush-mode statements return in a known mode; %s' %
+           (kept_functions, by_exit,
+            '%d functions are entered in a known mode' % entry_known if a.image else 'no entry modes (no --image)')))
     if a.stats:
         for p, c, name in sorted(top, reverse=True)[:25]:
             print('  %4d of %4d  %s' % (p, c, name))

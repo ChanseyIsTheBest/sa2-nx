@@ -74,6 +74,8 @@ set(SA2_SOURCES
     # Switchable enhancements (docs/enhancements.md): masters sa2_cpu_enhancements / sa2_noncpu_enhancements, one key
     # each, a startup line and a 10 s use report.
     src/cpu/sa2_enhancements.cpp
+    # The PC side of the post-codegen self-checks and the indirect call census (second CPU round; empty on the Switch).
+    src/cpu/sa2_codegen_checks.cpp
     src/cpu/sa2_gpu_wait.cpp
     src/cpu/sa2_gpu_boost.cpp
     # Native replacements of hot guest functions (src/cpu/hot), each with a self-check guard and its own key.
@@ -186,6 +188,78 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         endif()
     endforeach()
 endif()
+
+# The game code only (candidate 1 of 2026-10-12): `sqrt` without the errno check (a compare and a branch to the
+# library after every fsqrt: 1,223 calls in 667 functions of the released ELF). Values are unchanged: nothing reads
+# errno. With the Switch compiler three recompiled files came out 0.3 to 1.4 % smaller. OFF puts the default back.
+option(SA2_GAME_NO_MATH_ERRNO "-fno-math-errno on the recompiled game code" ON)
+# -fno-trapping-math is a separate switch and OFF (audit of 2026-10-12): it lets the compiler run a float operation
+# earlier than the code does (out of a branch, out of a loop). The recompiled code changes the host's flush mode in
+# between (msr fpcr), which the compiler does not know a float operation depends on, so an operation moved in front
+# of a mode check would compute a denormal operand in the wrong mode. The flag buys at most 0.5 % of one file.
+option(SA2_GAME_NO_TRAPPING_MATH "-fno-trapping-math on the recompiled game code (not exact, see the comment)" OFF)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    foreach(target sa2_recomp sa2_Data_DLL)
+        if(TARGET ${target})
+            if(SA2_GAME_NO_MATH_ERRNO)
+                target_compile_options(${target} PRIVATE -fno-math-errno)
+            endif()
+            if(SA2_GAME_NO_TRAPPING_MATH)
+                target_compile_options(${target} PRIVATE -fno-trapping-math)
+            endif()
+        endif()
+    endforeach()
+endif()
+
+# The second CPU round of 2026-10-12 (docs/enhancements.md): one switch back per post-codegen step
+# (tools/post_codegen.py). OFF compiles the statements as they were before the step, on every platform, so a PC build
+# can take one step out to find which of them a difference comes from.
+option(SA2_GEN_RO_CONSTANTS "Loads from the image's read-only data as constants" ON)
+option(SA2_GEN_FLOAT_LOADS "Single-precision loads straight into a float register" ON)
+# The three stack-frame elisions of tools/frame_traffic.py are OFF: they change what stale data the guest's stack
+# frames hold, and SA2 reads a frame word it never initialised (with the non-volatile saves gone the two-player
+# demo's characters came out tinted blue; PC lockstep capture of 2026-10-12, docs/enhancements.md).
+option(SA2_GEN_LR_MOVES_ELIDE "No moves of the guest link register in prologues and epilogues (NOT exact)" OFF)
+option(SA2_GEN_NV_SAVES_ELIDE "No prologue saves of non-volatile registers that are locals (NOT exact: tint)" OFF)
+option(SA2_GEN_BACK_CHAIN_ELIDE "No back-chain stores of the stack frames (NOT exact for a guest stack walk)" OFF)
+option(SA2_GEN_LEAF_LOCALS "ctx registers of leaf functions with loops as locals" ON)
+option(SA2_GEN_COLD_TRAPS "The trap helper out of line and cold" ON)
+option(SA2_GEN_PROMOTED_CALLS "Guarded direct calls at the promoted indirect call sites" ON)
+set(_sa2_round2_definitions "")
+if(NOT SA2_GEN_RO_CONSTANTS)
+    list(APPEND _sa2_round2_definitions REX_RO_CONSTANTS_OFF)
+endif()
+if(NOT SA2_GEN_FLOAT_LOADS)
+    list(APPEND _sa2_round2_definitions REX_FLOAT_LOADS_INTEGER)
+endif()
+if(SA2_GEN_LR_MOVES_ELIDE)
+    list(APPEND _sa2_round2_definitions REX_LR_MOVES_ELIDE)
+endif()
+if(SA2_GEN_NV_SAVES_ELIDE)
+    list(APPEND _sa2_round2_definitions REX_NV_SAVES_ELIDE)
+endif()
+if(SA2_GEN_BACK_CHAIN_ELIDE)
+    list(APPEND _sa2_round2_definitions REX_BACK_CHAIN_ELIDE)
+endif()
+if(NOT SA2_GEN_LEAF_LOCALS)
+    list(APPEND _sa2_round2_definitions REX_LEAF_LOCALS_OFF)
+endif()
+if(NOT SA2_GEN_COLD_TRAPS)
+    list(APPEND _sa2_round2_definitions "REX_TRAP_ATTR=")
+endif()
+if(NOT SA2_GEN_PROMOTED_CALLS)
+    list(APPEND _sa2_round2_definitions REX_PROMOTED_CALLS_OFF)
+endif()
+# The game code, the stage module and the app (whose localized copies are the same generated statements).
+foreach(target sa2_recomp sa2_Data_DLL sa2)
+    if(TARGET ${target} AND _sa2_round2_definitions)
+        target_compile_definitions(${target} PRIVATE ${_sa2_round2_definitions})
+    endif()
+endforeach()
+message(STATUS "sa2: second CPU round: read-only constants ${SA2_GEN_RO_CONSTANTS}, float loads "
+               "${SA2_GEN_FLOAT_LOADS}, elided: link register moves ${SA2_GEN_LR_MOVES_ELIDE}, non-volatile saves "
+               "${SA2_GEN_NV_SAVES_ELIDE}, back chain ${SA2_GEN_BACK_CHAIN_ELIDE}; leaf locals "
+               "${SA2_GEN_LEAF_LOCALS}, cold traps ${SA2_GEN_COLD_TRAPS}, promoted calls ${SA2_GEN_PROMOTED_CALLS}")
 
 # PC diagnostic (2026-10-12): the game code and the app count the executions of the any-mode float helpers
 # (rex/ppc/diet_ops.h, REX_DIET_CENSUS_ON) in counters the app defines (src/cpu/sa2_enhancements.cpp), for the

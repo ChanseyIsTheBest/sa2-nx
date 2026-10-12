@@ -13,12 +13,15 @@
 
 #include <rex/platform/fpscr.h>
 
+#include <simde/x86/sse2.h>
+
 // PC diagnostic (sa2-nx, 2026-10-12): how often the any-mode helpers below run, and how often they take a cold path.
 // A flush-mode switch saved is paid for with a test in every one of these calls, so the two counts decide whether the
 // generator's fp_mode_lookahead pays in a given game. Counted only when the build defines REX_DIET_CENSUS_ON (a PC
 // app does, for its game code; the Switch build and the unit tests do not): plain lossy counters the app defines.
 #if defined(REX_DIET_CENSUS_ON) && !defined(__SWITCH__)
-extern "C" volatile unsigned long long g_rex_diet_census[4];  // conversions, compares, arithmetic, cold paths
+// conversions, compares, arithmetic, cold paths, float copy loads, float copy stores
+extern "C" volatile unsigned long long g_rex_diet_census[6];
 #define REX_DIET_CENSUS(k) (g_rex_diet_census[k] = g_rex_diet_census[k] + 1)
 #else
 #define REX_DIET_CENSUS(k) ((void)0)
@@ -43,6 +46,95 @@ inline int64_t fctiwz(double v) noexcept {
     return INT32_MAX;
   return (v > -2147483648.0) ? int64_t(int32_t(v)) : int64_t(INT32_MIN);
 #endif
+}
+
+/// sa2-nx, second CPU round (codegen option fcti_inline): the other three conversions to integer the same way.
+///
+/// fctidz: truncate toward zero to int64 with PPC saturation, NaN -> INT64_MIN. The old expression was
+/// `isnan ? INT64_MIN : v > 2^63 ? INT64_MAX : simde_mm_cvttsd_si64(v)`. On AArch64 simde's conversion is a C cast,
+/// which the compiler writes as the saturating `fcvtzs`: with the NaN select that is every value the old expression
+/// gave there. On x86 `cvttsd2si` answers INT64_MIN for everything out of range, so the old expression gave
+/// INT64_MIN for exactly v == 2^63 (its test is `>`); the Xbox 360 and the AArch64 build give INT64_MAX there, and
+/// so does this helper: the one input where it differs from the old x86 code.
+inline int64_t fctidz(double v) noexcept {
+#if defined(__aarch64__)
+  int64_t r;
+  asm("fcvtzs %x0, %d1" : "=r"(r) : "w"(v));
+  return __builtin_isnan(v) ? INT64_MIN : r;
+#else
+  if (__builtin_isnan(v))
+    return INT64_MIN;
+  if (v >= 9223372036854775808.0)
+    return INT64_MAX;
+  return (v >= -9223372036854775808.0) ? int64_t(v) : INT64_MIN;
+#endif
+}
+
+/// fctid: round to int64 in the current rounding mode (the guest's: FPSCR.RN is mirrored into the host's) with PPC
+/// saturation, NaN -> INT64_MIN. The old expression was
+/// `isnan ? INT64_MIN : v > 2^63 ? INT64_MAX : simde_mm_cvtsd_si64(v)`. On x86 that is `cvtsd2si` (current mode,
+/// INT64_MIN out of range) and so is this helper; it differs only, as fctidz, at v == 2^63 (INT64_MAX, as on the
+/// 360). On AArch64 simde's portable version is `(int64_t)round(v)`: halves AWAY from zero (0.5 -> 1, 2.5 -> 3) in
+/// every mode, where the 360 and x86 give 0 and 2. `frinti` (to an integral double in the current mode, no inexact
+/// flag) and the saturating `fcvtzs` round as the 360 does: the helper CORRECTS that build.
+inline int64_t fctid(double v) noexcept {
+  if (__builtin_isnan(v)) [[unlikely]]
+    return INT64_MIN;
+#if defined(__aarch64__)
+  double integral;
+  asm("frinti %d0, %d1" : "=w"(integral) : "w"(v));
+  int64_t r;
+  asm("fcvtzs %x0, %d1" : "=r"(r) : "w"(integral));
+  return r;
+#else
+  if (v >= 9223372036854775808.0)
+    return INT64_MAX;
+  return simde_mm_cvtsd_si64(simde_mm_set_sd(v));
+#endif
+}
+
+/// fctiw: the same to int32, as the s64 register image the old expression produced (NaN -> 0x0000000080000000,
+/// everything else sign extended). Old: `isnan ? 0x80000000U : v >= INT_MAX ? INT_MAX : simde_mm_cvtsd_si32(v)`;
+/// on x86 this is that expression, on AArch64 the halves are corrected as for fctid.
+inline int64_t fctiw(double v) noexcept {
+  if (__builtin_isnan(v)) [[unlikely]]
+    return int64_t(0x80000000U);
+#if defined(__aarch64__)
+  double integral;
+  asm("frinti %d0, %d1" : "=w"(integral) : "w"(v));
+  int32_t r;
+  asm("fcvtzs %w0, %d1" : "=r"(r) : "w"(integral));
+  return int64_t(r);
+#else
+  if (v >= 2147483647.0)
+    return INT32_MAX;
+  return int64_t(simde_mm_cvtsd_si32(simde_mm_set_sd(v)));
+#endif
+}
+
+/// Codegen option fp_copy_pairs: lfs directly followed by stfs of the same register.
+///
+/// lfs without a mode: the value `double(float)` gives with the flush mode off, in either mode and without touching
+/// the mode. Only a denormal single reads differently with the mode on; it is converted with integer arithmetic
+/// (normalise the fraction, rebuild the double), so the function is pure and the compiler removes it when the
+/// register is not read again.
+inline double SingleToDoublePure(uint32_t bits) noexcept {
+  REX_DIET_CENSUS(4);
+  const uint32_t fraction = bits & 0x007FFFFFu;
+  if ((bits & 0x7F800000u) == 0 && fraction != 0) [[unlikely]] {
+    const int shift = __builtin_clz(fraction) - 8;  // 1..23: brings the leading one to bit 23
+    const uint64_t exponent = uint64_t(1023 - 126 - shift);
+    const uint64_t mantissa = uint64_t((fraction << shift) & 0x007FFFFFu) << 29;
+    return std::bit_cast<double>((uint64_t(bits >> 31) << 63) | (exponent << 52) | mantissa);
+  }
+  return double(std::bit_cast<float>(bits));
+}
+
+/// stfs of the value such an lfs loaded: `float(double(single))` with the mode off is the single again, except
+/// that the two conversions quiet a signalling NaN (they set the top fraction bit and keep the rest).
+inline uint32_t QuietSingleBits(uint32_t bits) noexcept {
+  REX_DIET_CENSUS(5);
+  return (bits & 0x7FFFFFFFu) > 0x7F800000u ? (bits | 0x00400000u) : bits;
 }
 
 /// sa2-nx round 7 (codegen option fp_moves_modeless): the lfs/stfs conversions with the IEEE result, i.e. the one

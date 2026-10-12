@@ -50,7 +50,15 @@ enum : unsigned {
   kCensusFlushWrite = 64,     // guest code switched the host flush mode (an `msr fpcr` on AArch64)
   kCensusFlushSame = 65,      // ... of those, unconditional writes that left the mode as it was
   kCensusNoteShaderLocked = 66,  // NoteShaderObject calls that took the shared mutex (app)
-  kCensusCount = 72,
+  kCensusCritSecPcrOwner = 67,   // critical section calls that took the owner id from the PCR (no thread lookup)
+  kCensusCritSecOwnerMismatch = 68,  // ... where that id was not the looked-up thread's (PC self-check: must be 0)
+  // The SDK's own overhead (sa2-nx, the third survey of 2026-10-12): how often the runtime makes an out-of-line
+  // call for something that is one load or nothing.
+  kCensusLogCall = 69,        // log statements executed (rex::GetLoggerRaw calls), at any level, written or not
+  kCensusLookupHeap = 70,     // Memory::LookupHeap calls (one inside every Memory::TranslateVirtual)
+  kCensusRetainRelease = 71,  // XObject::Retain and Release calls
+  kCensusKernelState = 72,    // rex::system::kernel_state() calls
+  kCensusCount = 76,
 };
 
 #if !defined(__SWITCH__)

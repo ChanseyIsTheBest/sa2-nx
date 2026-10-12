@@ -56,7 +56,7 @@ def main():
             else:
                 calls['hookable'] += 1
                 hooked_targets[m.group(2)[4:]] += 1
-        calls['indirect'] += text.count('REX_CALL_INDIRECT_FUNC(')
+        calls['indirect'] += len(re.findall(r'REX_CALL_INDIRECT_FUNC(?:_AT)?\(', text))
         calls['imports'] += len(re.findall(r'^\s*__imp__(?!sub_)\w+\(ctx, base\);', text, re.M))
         idioms['sqrt calls'] += len(re.findall(r'\bsqrtf?\(', text))
         idioms['single loads'] += len(re.findall(r'double\(temp\.f32\)|SingleToDoubleAnyMode\(', text))

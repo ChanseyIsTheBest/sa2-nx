@@ -85,6 +85,28 @@
 # masseffect-nx: +15-20 % fps), tools\loop_barriers.py, tools\direct_calls.py (calls between unhooked functions become
 # direct, so GCC can inline them), and sasrt-nx's of 2026-10-12: tools\guest_cas.py, tools\flush_mode_flow.py,
 # tools\vec_byteswap.py and tools\pch_neon_shuffles.py.
+#
+# The second CPU round of 2026-10-12 (docs/enhancements.md; sa2-nx's own additions to the generator):
+# fcti_inline: fctid / fctiw / fctidz through rex::ppc helpers (`fcvtzs`, after `frinti` for the two that round,
+# and a NaN select on the A57) instead of an isnan test, a range compare and simde's scalar conversion each. For
+# fctid and fctiw this also corrects the Switch build: simde's portable conversion rounds halves away from zero, the
+# Xbox 360 and the PC build round in the current mode (sdk/tests/fcti_copy_test.cpp).
+# fp_copy_pairs: a float copied through a register (lfs, then stfs of the same register: structure and matrix
+# copies) needs no flush mode: the store writes the loaded bits (a signalling NaN quieted, as the two conversions
+# did), the register gets its value without touching the mode. The store may follow its load at a distance and one
+# load may feed several stores, as long as nothing else writes the register in between (straight-line code only).
+# Used where VMX mode is known to be current (the plain forms would switch the mode, the any-mode helpers cost a
+# test and a conversion each).
+# fp_copy_only_functions (the same forms in every copy-only function, whatever the mode, so that function has no
+# mode statement at all) is NOT set: SA2's scalar matrix copies are entered from vector code one call in seven, and
+# the PC census counted 5.25 million copy forms a second to save 22,000 mode switches a second (235 tests per
+# switch saved). The cost of one switch on the A57 is the number that would decide it (the profiler's report now
+# measures it, "FPCR on this CPU").
+# dcbt_prefetch (dcbt / dcbtst as the host's prefetch) is NOT set: 217 sites, no measurement on the console yet.
+# Its post-codegen steps (tools\post_codegen.py): tools\indirect_calls.py, tools\ro_constants.py,
+# tools\float_loads.py, tools\leaf_locals.py, tools\pch_cold_traps.py and the entry modes of
+# tools\flush_mode_flow.py. tools\frame_traffic.py only marks its statements: its elisions are opt-in and OFF
+# (removing the dead prologue saves tinted SA2's characters: the game reads a stack word it never wrote).
 cr_as_local = true
 ctr_as_local = true
 xer_as_local = true
@@ -99,4 +121,6 @@ non_argument_as_local = true
 fp_compares_modeless = true
 fp_mode_lookahead = true
 fp_mode_lookahead_past_branch = false
+fcti_inline = true
+fp_copy_pairs = true
 non_argument_as_local_keep = [0x827F5144, 0x82801D90, 0x827EFE34, 0x88010BE4]

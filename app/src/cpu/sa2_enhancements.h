@@ -70,6 +70,11 @@ void VerifyCheck(uint64_t n = 1);
 void VerifyDifference();
 bool VerifyMode();
 
+// The PC side of the generated code's self-checks and the indirect call census (sa2_codegen_checks.cpp; nothing on
+// the Switch). Init: once, from Resolve. Report: with every use report.
+void CodegenChecksInit();
+void CodegenChecksReport(int seconds);
+
 // Non-CPU: the handheld GPU profile (sa2_gpu_boost; sa2_gpu_boost.cpp). Called once by the app before setup.
 void ApplyGpuBoost();
 

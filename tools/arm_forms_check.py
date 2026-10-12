@@ -25,7 +25,8 @@ DEVKITA64 = next((d + '/devkitA64/bin/' for d in (os.environ.get('DEVKITPRO', ''
 EXE = '.exe' if os.name == 'nt' else ''
 FUNC = re.compile(r'^[0-9a-f]+ <(\w+)>:$')
 INS = re.compile(r'^\s+[0-9a-f]+:\s+(\S+)\s*(.*)$')
-INTERESTING = ('ldaxr', 'stlxr', 'ldxr', 'stxr', 'dmb', 'tbl', 'fcvtzs', 'fcvtzu', 'msr', 'mrs', 'bl')
+INTERESTING = ('ldaxr', 'stlxr', 'ldxr', 'stxr', 'dmb', 'tbl', 'fcvtzs', 'fcvtzu', 'msr', 'mrs', 'bl', 'frinti', 'uqadd',
+               'srhadd', 'urhadd', 'ucvtf', 'cmhi', 'ushl', 'sshl', 'clz')
 
 
 def switch_flags():
@@ -119,7 +120,9 @@ def main():
         if name.startswith('check_'):
             print('%-28s %5d  %s' % (name, len(ins), describe(ins)))
     print('with -DREX_VMX_HELPERS_X86_FORM:')
-    for name in ('check_vperm', 'check_vctsxs', 'check_vctuxs'):
+    for name in ('check_vperm', 'check_vctsxs', 'check_vctuxs', 'check_adds_epu32', 'check_avg_epi8', 'check_avg_epi16',
+                 'check_avg_epi32', 'check_cvtepu32_ps', 'check_cmpgt_epu8', 'check_cmpgt_epu16', 'check_sllv_epi16',
+                 'check_srlv_epi16', 'check_srav_epi16', 'check_sllv_epi8'):
         print('%-28s %5d  %s' % (name, len(x86[name]), describe(x86[name])))
 
     def ops(name, table=neon):
@@ -145,6 +148,30 @@ def main():
     for name in ('check_vperm', 'check_vctsxs', 'check_vctuxs'):
         if len(x86[name]) <= len(neon[name]):
             problems.append('%s: the x86 form is not longer than the NEON form' % name)
+    # The second CPU round (sa2-nx): the conversions to integer and the float copy helpers.
+    for name in ('check_fctid', 'check_fctiw'):
+        o = ops(name)
+        if 'frinti' not in o or 'fcvtzs' not in o or 'bl' in o:
+            problems.append('%s: not frinti + fcvtzs without a call' % name)
+    if 'fcvtzs' not in ops('check_fctidz') or 'bl' in ops('check_fctidz'):
+        problems.append('check_fctidz: not fcvtzs without a call')
+    for name in ('check_single_pure', 'check_quiet_single'):
+        o = ops(name)
+        if 'bl' in o or 'msr' in o or 'mrs' in o:
+            problems.append('%s: a call or a mode access' % name)
+    if len(neon['check_quiet_single']) > 8:
+        problems.append('check_quiet_single: more than 8 instructions')
+    # The small VMX helpers as their NEON instruction, and shorter than the x86 emulation.
+    for name, wanted in (('check_adds_epu32', 'uqadd'), ('check_avg_epi8', 'srhadd'), ('check_avg_epi16', 'srhadd'),
+                         ('check_avg_epi32', 'srhadd'), ('check_cvtepu32_ps', 'ucvtf'), ('check_cmpgt_epu8', 'cmhi'),
+                         ('check_cmpgt_epu16', 'cmhi'), ('check_sllv_epi16', 'ushl'), ('check_srlv_epi16', 'ushl'),
+                         ('check_srav_epi16', 'sshl'), ('check_sllv_epi8', 'ushl')):
+        if wanted not in ops(name):
+            problems.append('%s: no %s' % (name, wanted))
+        # Not shorter: for avg_epi32 the compiler already makes the x86 form the same two instructions.
+        if len(x86[name]) < len(neon[name]):
+            problems.append('%s: the x86 form (%d) is shorter than the NEON form (%d)' %
+                            (name, len(x86[name]), len(neon[name])))
     if problems:
         print('PROBLEMS:')
         for p in problems:

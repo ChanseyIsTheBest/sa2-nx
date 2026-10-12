@@ -58,6 +58,11 @@ bool build_fcfid(BuilderContext& ctx) {
 
 bool build_fctid(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (ctx.config().fctiInline) {
+    ctx.println("\t{0}.s64 = rex::ppc::fctid({1}.f64);", ctx.f(ctx.insn.operands[0]),
+                ctx.f(ctx.insn.operands[1]));
+    return true;
+  }
   ctx.println(
       "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x8000000000000000ULL) : "
       "({1}.f64 > double(LLONG_MAX)) ? LLONG_MAX : "
@@ -68,6 +73,11 @@ bool build_fctid(BuilderContext& ctx) {
 
 bool build_fctidz(BuilderContext& ctx) {
   ctx.emit_flush_mode_for_modeless();
+  if (ctx.config().fctiInline) {
+    ctx.println("\t{0}.s64 = rex::ppc::fctidz({1}.f64);", ctx.f(ctx.insn.operands[0]),
+                ctx.f(ctx.insn.operands[1]));
+    return true;
+  }
   ctx.println(
       "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x8000000000000000ULL) : "
       "({1}.f64 > double(LLONG_MAX)) ? LLONG_MAX : "
@@ -78,6 +88,11 @@ bool build_fctidz(BuilderContext& ctx) {
 
 bool build_fctiw(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
+  if (ctx.config().fctiInline) {
+    ctx.println("\t{0}.s64 = rex::ppc::fctiw({1}.f64);", ctx.f(ctx.insn.operands[0]),
+                ctx.f(ctx.insn.operands[1]));
+    return true;
+  }
   ctx.println(
       "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x80000000U) : "
       "({1}.f64 >= double(INT_MAX)) ? INT_MAX : "

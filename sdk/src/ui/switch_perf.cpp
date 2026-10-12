@@ -915,6 +915,45 @@ struct TicOverlay {
   }
 };
 
+// sa2-nx, second CPU round (2026-10-12): what one access of FPCR costs on this CPU. The recompiled code switches the
+// host's float flush mode with `msr fpcr`, and every choice between "a test in each conversion" and "a switch" (the
+// generator's fp_moves_modeless, fp_mode_lookahead and fp_copy_pairs) hangs on that cost, which had never been
+// measured on the A57. Four loops of the same shape, the best of five runs each: empty, a read, a write of the
+// value already there, a write that toggles FZ (what a real switch does). Run once, for the report's header.
+struct FpcrCost {
+  double read_ns, write_same_ns, write_toggle_ns;
+};
+FpcrCost MeasureFpcrCost(u64 tick_freq) {
+  constexpr int kCount = 200000;
+  u64 saved;
+  asm volatile("mrs %0, fpcr" : "=r"(saved));
+  const auto loop = [&](int kind) {
+    u64 best = ~u64(0);
+    for (int run = 0; run < 5; ++run) {
+      u64 v = saved;
+      const u64 t0 = armGetSystemTick();
+      for (int i = 0; i < kCount; ++i) {
+        if (kind == 1) {
+          asm volatile("mrs %0, fpcr" : "=r"(v));
+        } else if (kind == 2) {
+          asm volatile("msr fpcr, %0" : : "r"(v));
+        } else if (kind == 3) {
+          v ^= u64(1) << 24;  // FZ
+          asm volatile("msr fpcr, %0" : : "r"(v));
+        } else {
+          asm volatile("" : "+r"(v));
+        }
+      }
+      const u64 t = armGetSystemTick() - t0;
+      if (t < best) best = t;
+      asm volatile("msr fpcr, %0" : : "r"(saved));
+    }
+    return double(best) * 1e9 / double(tick_freq) / double(kCount);
+  };
+  const double empty = loop(0);
+  return {loop(1) - empty, loop(2) - empty, loop(3) - empty};
+}
+
 void ProfilerMain(void*) {
   const u64 tick_freq = armGetSystemTickFreq();
 
@@ -971,6 +1010,11 @@ void ProfilerMain(void*) {
     std::fprintf(f, "image 0x%016" PRIx64 ", code up to 0x%016" PRIx64 "\n\n", g_base,
                  g_text_hi);
     std::fprintf(f, "Stack sampling: %s\n", sample_stacks ? "active (1 ms)" : "disabled");
+    const FpcrCost fpcr = MeasureFpcrCost(tick_freq);
+    std::fprintf(f,
+                 "FPCR on this CPU (per access, loop overhead taken off): read %.1f ns, write of the same value "
+                 "%.1f ns, write that toggles the flush mode %.1f ns (one cycle is 0.98 ns at 1020 MHz)\n",
+                 fpcr.read_ns, fpcr.write_same_ns, fpcr.write_toggle_ns);
     std::fclose(f);
   }
 

@@ -22,7 +22,9 @@ $tests = @(
     @{ name = 'vec_byteswap_test'; flags = @('-O2', '-std=c++23', '-march=x86-64-v2'); runs = @(, @()) },
     @{ name = 'vmx_helpers_neon_test'; flags = @('-O2', '-std=c++23', '-march=x86-64-v2'); runs = @(, @()) },
     @{ name = 'vmx_small_helpers_test'; flags = @('-O2', '-std=c++23', '-march=x86-64-v2'); runs = @(, @()) },
-    @{ name = 'neon_shuffles_test'; flags = @('-O2', '-std=c++23', '-march=x86-64-v2'); runs = @(, @()) }
+    @{ name = 'neon_shuffles_test'; flags = @('-O2', '-std=c++23', '-march=x86-64-v2'); runs = @(, @()) },
+    @{ name = 'fcti_copy_test'; flags = @('-O2', '-std=c++23', '-ffp-contract=off'); runs = @(, @()) },
+    @{ name = 'float_loads_test'; flags = @('-O2', '-std=c++23', '-march=x86-64-v2'); runs = @(, @()) }
 )
 $failed = 0
 foreach ($t in $tests) {

@@ -6,7 +6,7 @@ what changed, and let you apply the same changes to a fresh upstream checkout.
 
 | Patch | Upstream base | What it changes |
 |---|---|---|
-| `rexglue-sdk-v0.10.0.patch` | [rexglue/rexglue-sdk](https://github.com/rexglue/rexglue-sdk) v0.10.0, commit `c94f5ebdcb3c9d1a460ca48e04f9758448f8d518` | The whole SDK fork (`sdk/`): the Horizon (Switch) layer, the code generator's options, the console tuning of the runtime, and the SDK's build of FFmpeg (`thirdparty/CMakeLists.txt`, `thirdparty/ffmpeg-overlay/codec_list.c`). 194 files, +24,643 / -857 lines |
+| `rexglue-sdk-v0.10.0.patch` | [rexglue/rexglue-sdk](https://github.com/rexglue/rexglue-sdk) v0.10.0, commit `c94f5ebdcb3c9d1a460ca48e04f9758448f8d518` | The whole SDK fork (`sdk/`): the Horizon (Switch) layer, the code generator's options, the console tuning of the runtime, and the SDK's build of FFmpeg (`thirdparty/CMakeLists.txt`, `thirdparty/ffmpeg-overlay/codec_list.c`). 199 files, +25,655 / -880 lines |
 | `ffmpeg-0604b46.patch` | [wmarti/FFmpeg](https://github.com/wmarti/FFmpeg) commit `0604b464c7cb4ebc94940cf1f324a3b26b87717c`, the FFmpeg submodule of rexglue-sdk v0.10.0 | `config.h` (the Switch configuration), `libavcodec/fft_template.c` and `libavcodec/mdct_template.c` (a table cache), and two new files: `config_switch_aarch64.h` and `config_masseffect_wmv3.h` |
 | `xenosrecomp-990d03b.patch` | [hedge-dev/XenosRecomp](https://github.com/hedge-dev/XenosRecomp) commit `990d03b28a27b50277ee5d8d942e1c5f873869d1` | The shader translator (`shaders/XenosRecomp`): `shader_recompiler.cpp`/`.h` and `shader_common.h`, and the new `pch_min.h`. What each change does is in `shaders/README.md` |
 

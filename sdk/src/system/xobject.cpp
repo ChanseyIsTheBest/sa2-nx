@@ -26,6 +26,7 @@
 #include <rex/system/xsemaphore.h>
 #include <rex/system/xsymboliclink.h>
 #include <rex/system/xthread.h>
+#include <rex/sys_counters.h>
 
 #include "global_lock_spin.h"
 
@@ -88,16 +89,6 @@ void XObject::RetainHandle() {
 bool XObject::ReleaseHandle() {
   // FIXME: Return true when handle is actually released.
   return kernel_state_->object_table()->ReleaseHandle(handles_[0]) == X_STATUS_SUCCESS;
-}
-
-void XObject::Retain() {
-  ++pointer_ref_count_;
-}
-
-void XObject::Release() {
-  if (--pointer_ref_count_ == 0) {
-    delete this;
-  }
 }
 
 X_STATUS XObject::Delete() {

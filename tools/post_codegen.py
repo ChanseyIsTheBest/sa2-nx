@@ -14,10 +14,26 @@ manifest, a toml, the xex, the generator binary) and that would otherwise drop t
     Switch, still tested in the PC build), tools/vec_byteswap.py (the 16-byte reversal of guest vector loads and
     stores without a table lookup on AArch64) and tools/pch_neon_shuffles.py (constant word shuffles as one
     permutation on AArch64);
+  - optimised, the second CPU round of 2026-10-12 (each step has its own compile-time switch back, see the tool):
+      tools/indirect_calls.py   every `bctrl` tagged with its site (PC census), and the sites of
+                                app/indirect_promotions.txt as a guarded direct call. Before direct_calls.py.
+      tools/ro_constants.py     loads from the image's read-only data as constants. Before float_loads.py.
+      tools/float_loads.py      a single-precision load straight into a float register
+      tools/frame_traffic.py    the link register and the non-volatile saves of the function prologues
+      tools/leaf_locals.py      the ctx registers of leaf functions with loops as locals. Last: it renames registers.
+      tools/pch_cold_traps.py   the pch's trap helper (before every division) out of line and cold
+    ro_constants.py and the entry modes of flush_mode_flow.py need the generator's image dump (out/default_image.bin,
+    written by tools/codegen.ps1 through REXGLUE_DUMP_IMAGE); the steps whose PC form calls into the app
+    (indirect_calls, ro_constants) run on the game's tree only, not on the stage module (a DLL of its own on the PC);
   - both: the localized native copies (tools/localize_native.py --list app/src/cpu/hot/localized.txt) and
     app/generated/codegen_flavor.txt (the build's name in the first "[enh]" log line).
 
-  python tools/post_codegen.py
+Every step is idempotent and the whole sequence is too: a second run of this script on a processed tree changes no
+file (checked on a copy: tools/scratch_ab.py copy, then this script twice with --gen out/gen_scratch and a hash of the
+tree after each run; the profile of a PGO build fits only the exact
+text it was made from).
+
+  python tools/post_codegen.py [--gen <generated folder>]
 """
 import os
 import re
@@ -27,6 +43,8 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, 'app')
 GEN = os.path.join(APP, 'generated')
+IMAGE = os.path.join(ROOT, 'out', 'default_image.bin')
+PROMOTIONS = os.path.join(APP, 'indirect_promotions.txt')
 
 
 def run(*args):
@@ -35,36 +53,69 @@ def run(*args):
         sys.exit(f'post_codegen: {" ".join(os.path.basename(a) for a in args[:1])} failed ({result.returncode})')
 
 
+def tool(name):
+    return os.path.join(ROOT, 'tools', name)
+
+
 def main():
+    gen = sys.argv[sys.argv.index('--gen') + 1] if '--gen' in sys.argv else GEN
+    scratch = gen != GEN  # a copy for measurements (tools/scratch_ab.py): no localized copies, no flavour file
     flavor_toml = open(os.path.join(APP, 'codegen_flavor.toml'), encoding='utf-8').read()
     optimised = re.search(r'^\s*[a-z_]+\s*=\s*true', flavor_toml, re.M) is not None
     flavor = 'optimised' if optimised else 'classic'
+    trees = [t for t in ('default', 'data_dll') if os.path.isdir(os.path.join(gen, t))]
     if optimised:
-        run(os.path.join(ROOT, 'tools', 'pch_no_volatile.py'), os.path.join(GEN, 'default', 'sa2_pch.h'),
-            os.path.join(GEN, 'data_dll', 'sa2_pch.h'))
-        # REQUIRED with the line above: without barriers GCC turns guest polling loops into infinite loops.
-        run(os.path.join(ROOT, 'tools', 'loop_barriers.py'), os.path.join(GEN, 'default'),
-            os.path.join(GEN, 'data_dll'))
+        if not os.path.isfile(IMAGE):
+            sys.exit('post_codegen: out/default_image.bin is missing (the image dump of the code generator): run '
+                     'tools\\codegen.ps1 -Flavor optimised once, it writes it (REXGLUE_DUMP_IMAGE)')
+        xex = os.path.join(ROOT, 'assets', 'game_root', 'default.xex')
+        if os.path.isfile(xex) and os.path.getmtime(xex) > os.path.getmtime(IMAGE):
+            sys.exit('post_codegen: out/default_image.bin is older than assets/game_root/default.xex: run '
+                     'tools\\codegen.ps1 -Flavor optimised (it writes the dump again)')
+        run(tool('pch_no_volatile.py'), *[os.path.join(gen, t, 'sa2_pch.h') for t in trees])
         os.environ.setdefault('REXSDK_DIR', os.path.join(ROOT, 'sdk'))
-        for tree in ('default', 'data_dll'):
+        # Second round: the tagged and promoted indirect calls. Before direct_calls.py (a promoted call is a direct
+        # call like any other: __imp__ where its target has no hook) and BEFORE loop_barriers.py: a loop needs no
+        # barrier when every way round it passes an indirect call, and a promoted call is no longer one (the
+        # compiler can inline its target and see that it leaves the polled memory alone).
+        run(tool('indirect_calls.py'), '--gen', os.path.join(gen, 'default'), '--promote', PROMOTIONS)
+        # REQUIRED with pch_no_volatile.py: without barriers GCC turns guest polling loops into infinite loops.
+        run(tool('loop_barriers.py'), *[os.path.join(gen, t) for t in trees])
+        run(tool('pch_cold_traps.py'), *[os.path.join(gen, t, 'sa2_pch.h') for t in trees])
+        for tree in trees:
             # Undo and redo in one pass: a function hooked since the last run (a new native) must be called through
             # its hook again. --redo writes only the files that change, so the build does not recompile the others.
-            run(os.path.join(ROOT, 'tools', 'direct_calls.py'), '--redo', '--gen', os.path.join(GEN, tree))
-        for tree in ('default', 'data_dll'):
+            run(tool('direct_calls.py'), '--redo', '--gen', os.path.join(gen, tree))
+        for tree in trees:
             # sasrt-nx's steps (2026-10-12). After direct_calls.py: the flush-mode proofs depend on which callees are
             # called directly, and --redo drops proofs from before a function was hooked. They only rename calls to
             # macros of the generated pch, so the localized copies below are made from the same statements.
-            run(os.path.join(ROOT, 'tools', 'guest_cas.py'), '--gen', os.path.join(GEN, tree))
-            run(os.path.join(ROOT, 'tools', 'flush_mode_flow.py'), '--redo', '--gen', os.path.join(GEN, tree))
-            run(os.path.join(ROOT, 'tools', 'vec_byteswap.py'), '--gen', os.path.join(GEN, tree))
-            run(os.path.join(ROOT, 'tools', 'pch_neon_shuffles.py'), os.path.join(GEN, tree, 'sa2_pch.h'))
-    run(os.path.join(ROOT, 'tools', 'localize_native.py'), '--list',
-        os.path.join(APP, 'src', 'cpu', 'hot', 'localized.txt'))
+            run(tool('guest_cas.py'), '--gen', os.path.join(gen, tree))
+            # The entry modes (second round) need the image: the game's tree only.
+            run(tool('flush_mode_flow.py'), '--redo', '--gen', os.path.join(gen, tree),
+                *(['--image', IMAGE] if tree == 'default' else []))
+            run(tool('vec_byteswap.py'), '--gen', os.path.join(gen, tree))
+            run(tool('pch_neon_shuffles.py'), os.path.join(gen, tree, 'sa2_pch.h'))
+        # Second round, the rest. ro_constants before float_loads (it folds the integer form of a float load).
+        run(tool('ro_constants.py'), '--gen', os.path.join(gen, 'default'), '--image', IMAGE)
+        for tree in trees:
+            run(tool('float_loads.py'), '--gen', os.path.join(gen, tree))
+            run(tool('frame_traffic.py'), '--gen', os.path.join(gen, tree))
+    if not scratch:
+        # Before leaf_locals.py in a fresh tree; after it when this script runs again (the tool reads both forms).
+        run(tool('localize_native.py'), '--list', os.path.join(APP, 'src', 'cpu', 'hot', 'localized.txt'))
+    if optimised:
+        for tree in trees:
+            run(tool('leaf_locals.py'), '--gen', os.path.join(gen, tree))
+    if scratch:
+        print(f'post_codegen: {flavor} codegen steps done on {gen}')
+        return
     # Round 7: the options added since round 6 are named too, so a console log tells the builds apart.
     extras = [name for key, name in (('non_volatile_as_local', 'non-volatile locals'), ('elide_lr_stores', 'no lr stores'),
                                      ('fp_moves_modeless', 'modeless fp moves'),
                                      ('non_argument_as_local', 'non-argument locals'),
-                                     ('fp_mode_lookahead', 'fp mode lookahead'))
+                                     ('fp_mode_lookahead', 'fp mode lookahead'),
+                                     ('fcti_inline', 'second round'))
               if re.search(r'^\s*' + key + r'\s*=\s*true', flavor_toml, re.M)]
     # Written only when it changes: the file is a CMake configure dependency (app/CMakeLists.txt), and rewriting it
     # made every build re-run CMake, rebuild the generator and run the codegen again (2026-10-07).

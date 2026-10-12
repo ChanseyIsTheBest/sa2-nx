@@ -104,6 +104,12 @@ the old form back; `docs/enhancements.md` has what each does): `SA2_SWITCH_OMIT_
 `SA2_SWITCH_FLUSH_FLOW`, `SA2_SWITCH_GUEST_CAS`, `SA2_SWITCH_VEC_BYTESWAP`, `SA2_SWITCH_NEON_SHUFFLES`,
 `SA2_SWITCH_NEON_VMX_HELPERS`. A build with them has not run on a console yet.
 
+The second round's switches work on every platform (a PC build can take one step out to find where a difference
+comes from). ON: `SA2_GEN_RO_CONSTANTS`, `SA2_GEN_FLOAT_LOADS`, `SA2_GEN_LEAF_LOCALS`, `SA2_GEN_COLD_TRAPS`,
+`SA2_GEN_PROMOTED_CALLS`, `SA2_GAME_NO_MATH_ERRNO`. OFF, because they are not exact: `SA2_GEN_NV_SAVES_ELIDE` (it
+tinted SA2's characters), `SA2_GEN_LR_MOVES_ELIDE`, `SA2_GEN_BACK_CHAIN_ELIDE`, `SA2_GAME_NO_TRAPPING_MATH`.
+The post-codegen steps need the generator's image dump `out\default_image.bin`; `tools\codegen.ps1` writes it.
+
 ### Profile-guided optimisation
 
 `pgo/` holds the profile the released NRO was built with (one console session of version 1.0.0). To build with it:
@@ -141,6 +147,9 @@ Do not change the game or app code between steps 1 and 3: a changed function los
 | `tools\switch_compile_check.py <file> ...` | Compiles chosen files with the Switch compiler and the Switch build's flags into a scratch folder: code only the Switch builds, checked on the PC in a minute |
 | `tools\one_file_ab.py <N> name=flags ...` | One recompiled file in several variants with the Switch compiler; instructions, loads and stores counted |
 | `tools\pgo_fit.py <N> ...` | How many functions of a recompiled file still match the committed profile |
+| `tools\scratch_ab.py copy / count N... / save NAME / compare NAME` | A scratch copy of the generated code (`out\gen_scratch`) to develop a post-codegen step on and measure it with the Switch compiler. `tools\post_codegen.py --gen out\gen_scratch` runs the whole sequence on it |
+| `tools\indirect_promotions.py --census <file> --gen app\generated\default` | Makes `app\indirect_promotions.txt` from a PC run with `sa2_diag_indirect_census = "<file>"`: the indirect call sites that go to one target |
+| `tools\crt_signatures.py make / scan` | Signatures of the C runtime functions one port found (`tools\crt_signatures.json`), looked for in any game's image dump |
 | `tools\census_summary.py <log>`, `tools\census_sites.py <log>` | A run with `sa2_diag_runtime_census = true`: float-mode switches and runtime calls per Swap, and the functions the switches come from |
 
 Lockstep captures (`REX_VBLANK_PER_SWAP=true`, `REX_SA2_VIDEO_FRAME=6000`) pin every frame to a presented swap, and

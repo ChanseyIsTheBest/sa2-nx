@@ -1742,6 +1742,152 @@ port the version is the floor, the string the released build has. Committed on `
 `tools/generated_code_census.py`, `tools/make_sdk_patch.py`, `tools\win\run_sdk_tests.ps1`, and the four
 post-codegen steps (`guest_cas.py`, `flush_mode_flow.py`, `vec_byteswap.py`, `pch_neon_shuffles.py`).
 
+### The second CPU round of 2026-10-12: the fifteen candidates built, more found, everything audited
+
+The user's requests after the round above: build the fifteen candidates listed under "Candidates" below, find and
+build more that fit any ReXGlue port, then audit all of it for what could backfire on the A57. Everything here was
+verified on the PC build only. Nothing has run on the console, no NRO was built, and the committed profile no longer
+fits this code (see "PGO" at the end).
+
+**Result in one paragraph.** With the Switch compiler, three recompiled files come out 2.0 to 3.1 % smaller than after
+the first round (2.7 to 3.3 % with the errno flag), with 2.5 to 7.7 % fewer loads. About 21,000 indirect calls a frame
+were counted; 78 % of them now go straight to their target behind a compare. Two steps that looked free were not:
+one changed the picture (found by the frame comparison, not by any self-check) and one cost more than it saved
+(found by the census). Both are switched off.
+
+#### The fifteen candidates
+
+| # | Candidate | State | What was measured |
+|---|---|---|---|
+| 1 | `-fno-math-errno` on the game code | **on** (`SA2_GAME_NO_MATH_ERRNO`) | 0.2 to 0.6 % fewer instructions on top of the rest. `-fno-trapping-math` was split off and is **off** (audit, below) |
+| 2 | Loop barriers only where a guest load could be hoisted | **on** (`tools/loop_barriers.py`) | 6,281 of 20,249 loop headers lose their barrier: the loop reads no guest memory and calls nothing, or every way round it passes an indirect call |
+| 3 | Registers as locals in leaf functions with loops | **on** (`tools/leaf_locals.py`) | 1,005 functions, 8,526 registers (1,333 only read, not written back). One file: 6.5 % fewer loads |
+| 4 | A float copied through a register without a mode | generator option `fp_copy_pairs`, **on where certain**; `fp_copy_only_functions` **off** | Exact for all 2^32 singles (unit test). Where vector mode is current: 71 statements, 1.6 million executions a second, the any-mode conversions drop from 1.32 million to 126,000 a second. In every copy-only function: a loss, see the audit |
+| 5 | The cost of one `msr fpcr` on the A57 | built into the profiler's report header ("FPCR on this CPU") | Compiles with the Switch compiler; runs only on the console |
+| 6 | Indirect calls with one usual target called directly | **on** (`tools/indirect_calls.py`, `app/indirect_promotions.txt`) | 20,624 sites tagged. PC census of the attract demo: 1.2 to 1.36 million indirect calls a second (about 21,000 a frame), 82 % from sites with one target. 222 sites promoted; calls through the table fall to 283,000 a second. 72.5 million promoted calls checked in one run, 0 wrong |
+| 7 | Flush-mode proofs into a function from its direct callers | **on** (`tools/flush_mode_flow.py --image`) | 1,185 functions are entered in a known mode; proven checks 15,477 -> 16,139 of 40,168 |
+| 8 | NEON forms for the small VMX helpers | **on** (`rex/ppc/intrinsics.h`) | Ten helpers: 2 to 5 instructions instead of 4 to 41, one of them was 2 already (`tools/arm_forms_check.py`); 0 differences against the x86 forms |
+| 9 | `fctidz` as `fcvtzs` and a NaN select | **on** (generator option `fcti_inline`) | 843 sites |
+| 10 | `fctid` / `fctiw` round halves to even on ARM | **on** (same option) | 10 sites. A correction of the Switch build: simde's portable conversion rounded halves away from zero. 240 million results against an integer model in the four rounding modes, 0 differences |
+| 11 | No address loads from the GOT in the libraries | **not built** | Measured: a forced include with `#pragma GCC visibility push(hidden)` takes one kernel file from 893 to 371 GOT loads. It changes how every library symbol links, which only a linked and run NRO can validate |
+| 12 | Critical sections without the thread lookup | **on** (SDK key `kernel_critsec_pcr_owner`) | 28,000 enters a second in SA2. The owner comes from the guest context (r13 -> KPCR -> current thread); 8.3 million calls compared with the lookup in one run, 0 wrong. In the Switch object the enter path has no call left |
+| 13 | One signature table of the C runtime for all ports | tool built (`tools/crt_signatures.py`, `tools/crt_signatures.json`) | SA2's `memcpy`, `memmove` and `memset` are found at one address each in another game's image (Banjo-Kazooie) |
+| 14 | LTO and PGO for the SDK's libraries | **not built** | Confirmed: the SDK is compiled without `-flto` (177 of the Switch build's 1,253 compile commands have it: the game code and the app). A link-time change: needs an NRO build |
+| 15 | Hot words of the shared constant block as push constants | **not built** | It changes the translated shaders, so the shader library the installer builds; a decision for the user, not a CPU step |
+
+#### More that was found while building them
+
+| Step | State | What was measured |
+|---|---|---|
+| Loads from the image's read-only data as constants (`tools/ro_constants.py`) | **on** | 14,297 float, 792 double and 1,380 integer loads folded (the address is built from `lis` / `addi` constants and lies in `.rdata`). The PC build still loads and compares: 59.7 million in one run, 0 wrong |
+| A single-precision load straight into a float register (`tools/float_loads.py`) | **on** | 72,124 loads: `ldr s; rev32; fcvt` instead of `ldr w; rev; fmov; fcvt` (the general-to-float move is the slow step on the A57) |
+| The trap helper out of line and cold (`tools/pch_cold_traps.py`) | **on** | 1,219 trap sites (mostly the guards in front of divisions) no longer carry logging code inline. A layout change: -0.4 / -0.8 / +0.25 % instructions |
+| `dcbt` as the host's prefetch (generator option `dcbt_prefetch`) | built, **off** | 217 sites, no measurement on the console |
+| No link-register moves in prologues (`tools/frame_traffic.py`) | marked, **off** | 9,880 `mflr` with their saves, 10,682 `mtlr`. Passed the frame comparison, but see the audit |
+| No prologue saves of non-volatile locals (same tool) | marked, **off: NOT exact** | 14,979 saves. Changed the picture, see the audit |
+| No back-chain stores (same tool) | marked, **off** | 22,597 stores |
+| The stack pointer as a C++ local | measured and **dropped** | 1.3 to 1.6 % MORE instructions: a local that lives across a call needs a callee-saved host register |
+| Pointer translation without a heap lookup (SDK, off Windows) | **on** | `Memory::TranslateVirtual` called `LookupHeap` for an offset that is 0 on every platform but Windows and macOS on ARM. 318 call sites; 5,700 a second in SA2 |
+| Object reference counts inline (SDK) | **on** | `XObject::Retain` / `Release`: 577 call sites; 14,700 a second in SA2 |
+
+Checked and nothing to gain: the Switch compiler already expands atomics inline (no `-moutline-atomics` helpers), and
+no indirect call of SA2 leaves the main image (0 % go through the cross-module resolver).
+
+#### The audit: what could backfire, and what was changed because of it
+
+1. **Removing the dead saves of non-volatile registers changes the picture. Off, and opt-in in the tool.** With
+   `non_volatile_as_local` these saves write zeros (the callee's fresh locals) into the frame. The game reads a stack
+   word it never initialised: zero is harmless, stale data is not. In the two-player demo Sonic's and Shadow's red
+   parts came out purple and white road lines blue (`out/pc/captures/broken_r2/`, the user spotted the tint).
+   Every self-check passed; only the lockstep frame comparison showed it. The released build depends on those zeros
+   too. The reader has not been found yet.
+2. **The link-register half is off as well.** It passed the same comparison, but it changes stale frame contents in
+   9,880 functions in the same way, and one demo scene is not enough after item 1.
+3. **`-fno-trapping-math` is off.** It lets the compiler run a float operation earlier than the code does (out of a
+   branch or a loop). The recompiled code changes the host's flush mode in between, which the compiler does not know
+   a float operation depends on. It bought at most 0.5 % of one file. sasrt-nx and masseffect-nx ship it.
+4. **The float copy forms in every copy-only function are off.** They removed 24 % of the mode switches (92,300 ->
+   70,000 a second) but ran 5.25 million times a second to do it: 235 extra tests per switch saved. SA2's matrix
+   copies run about 1,500 times a frame and only about one call in six comes from vector code. The same bet lost in the
+   first round (`fp_mode_lookahead_past_branch`). The number that would decide it is candidate 5's.
+5. **Promoted calls and loop barriers.** A loop needs no barrier when every way round it passes an indirect call. A
+   promoted call is no longer one: the compiler can inline its target. So `tools/indirect_calls.py` now runs before
+   `tools/loop_barriers.py`, and 23 loops got their barrier back.
+6. **Promoted calls otherwise.** The guard compares the target, so a site that goes elsewhere is still correct and
+   pays one compare. The list comes from one scene (the attract demo); a census of more scenes would make it better,
+   not safer. `SA2_GEN_PROMOTED_CALLS=OFF` makes every guard false.
+7. **Read-only constants** assume nothing writes the image's `.rdata`. No source of the app does (it only reads
+   constants there), and every PC run compares each folded load with memory. A future patch that writes there would
+   show up as a `DIFFERENCE` line on the PC, not on the console.
+8. **Leaf locals** load every register at entry and store the changed ones at each return. That pays when the loop
+   runs at least once; a leaf that usually skips its loop does a little more than before. Only leaves that still
+   have a barrier are taken.
+9. **The NEON `vcfux`** rounds in the current mode like the x86 form, but the two differ in rare cases when the
+   guest has set a mode other than round-to-nearest. The 360 always rounds vector conversions to nearest, so neither
+   was exact there.
+10. **Entry modes, critical section owners, pointer translation**: each has its check. The first two are compared
+    on every execution in the PC build; the third aborts at start-up if a heap's offset disagrees with the constant.
+11. **The post-codegen sequence is idempotent**: a second run on a processed tree changes no file (compared by
+    hash). It was not at first: the barrier step decided differently on text the later steps had rewritten.
+
+#### Verification (PC, final build)
+
+- **Unit tests** (`tools\win\run_sdk_tests.ps1`): 9 of 9. New: `sdk/tests/fcti_copy_test.cpp` (17.4 billion checks,
+  0 differences; its negative control finds 16,777,214) and `sdk/tests/float_loads_test.cpp` (the vector form of a
+  float load against the integer form, all 2^32 patterns).
+- **Lockstep capture** against the first round's reference (`r2f_crcensus0`): 2,942 of 2,995 frames identical in
+  place; the other 53 are the known loading-screen frames. The same with the run-time keys off.
+- **Verify mode**: 208 million native checks, 0 differences; 1,938 of 1,991 frames identical plus the same 53.
+- **Self-checks of one run**: 59.7 million folded constants, 72.5 million promoted calls, 8.3 million critical
+  section owners, 514 million flush-mode proofs; 0 wrong.
+- **Switch compiler**: every changed SDK and app source and four generated files compile
+  (`tools/switch_compile_check.py`); `tools/arm_forms_check.py`: all claims hold.
+
+#### Switches
+
+| Kind | Name | Default |
+|---|---|---|
+| Generator (`app/perf_overrides.toml`) | `fcti_inline`, `fp_copy_pairs` | set |
+| Generator | `fp_copy_only_functions`, `dcbt_prefetch` | not set |
+| Build (`SA2_GEN_*`, every platform) | `RO_CONSTANTS`, `FLOAT_LOADS`, `LEAF_LOCALS`, `COLD_TRAPS`, `PROMOTED_CALLS` | ON |
+| Build | `SA2_GEN_LR_MOVES_ELIDE`, `SA2_GEN_NV_SAVES_ELIDE`, `SA2_GEN_BACK_CHAIN_ELIDE` | OFF (not exact) |
+| Build | `SA2_GAME_NO_MATH_ERRNO` / `SA2_GAME_NO_TRAPPING_MATH` | ON / OFF |
+| Run time (SDK) | `kernel_critsec_pcr_owner` | true |
+| Run time (PC diagnostic) | `sa2_diag_indirect_census = "<file>"` | empty |
+
+The promotion list is made with `python tools/indirect_promotions.py --census <file> --gen app/generated/default`.
+
+#### PGO
+
+`tools/pgo_fit.py` on three files: 29.7 % of the functions lose the committed profile (12.9 % after the first round).
+A release build from this code needs a new instrumented session first; without one it may be slower than v1.0.0.
+
+### Fifteen more candidates, mostly in the SDK (2026-10-12; found, two built)
+
+The user's next request: look at the SDK itself. "Sites" are call sites in the 138 Switch objects of the SDK's
+kernel, system and core sources (`objdump -r`). "A second" is the PC census of SA2's attract demo at 58 frames a
+second (`sa2_diag_runtime_census`, new line "runtime overhead"). In SA2 all of these are small: its game thread makes
+a few hundred kernel calls a frame. They weigh more in a port with more kernel traffic (sasrt-nx enters 85,000
+critical sections a second, three times SA2).
+
+| # | Candidate | Sites | A second in SA2 | State |
+|---|---|---|---|---|
+| 1 | Every log statement calls `rex::GetLoggerRaw` out of line before it tests its level, written or not. An inline level gate in front | 3,012 (plus 245 category accessors) | 1,360 | not built |
+| 2 | `Memory::TranslateVirtual` looked a heap up for an offset that is 0 off Windows | 318 | 5,700 | **built** |
+| 3 | `XObject::Retain` / `Release` out of line | 577 | 14,700 | **built** |
+| 4 | `rex::system::kernel_state()`: an out-of-line call that returns one pointer | 378 | 12,000 | not built (a DLL data boundary on Windows) |
+| 5 | A setting read (`REXCVAR_GET`) is a call that returns a reference to a function-local static | 319 over 63 settings | not counted | built for the critical sections only |
+| 6 | Handle lookups take the global recursive mutex and retain the object | 72 | 7,400 (16 to 28 find the lock taken) | not built (a concurrency change) |
+| 7 | Waits and events look their host object up from the guest dispatcher header | - | 3,200 | not built |
+| 8 | The guest clock behind a mutex | - | 2,700 | not built |
+| 9 | Thread-local reads are calls on the Switch (`__aarch64_read_tp`); kernel exports ask for the current thread and thread state that way. Hand them the guest context instead, as the critical sections now get | 51 + 48 + 23 | not counted | built for the critical sections only |
+| 10 | Every kernel export goes through a `noinline` shim and, when it returns a value, a compiler barrier that spills everything | 1,363 exports | about 1,100 a frame | not built |
+| 11 | The profiler's counters are out-of-line calls on the Switch even with the report off (one per handle lookup, per clock read) | 18 | not counted | not built |
+| 12 | Sites with two or three usual targets: a chain of guards. 18 % of the calls came from sites with several targets (the largest, `sub_8214B520`, the render-state table, has more than four and stays indirect) | - | 283,000 indirect calls left | not built |
+| 13 | Signed division is written `(d && !(n == INT32_MIN && d == -1)) ? n / d : 0`; AArch64's `sdiv` already answers 0 for a zero divisor, so one of the two tests can go | 3,643 in the game code | not counted | not built |
+| 14 | A host call into guest code zero-fills a whole `PPCContext` first (its 128 vector registers alone are 2 KB) | - | 117 | not built |
+| 15 | Each log statement expands to a formatted call inside a try / catch in the function that logs | 2,271 handler sites | - | not built (code layout) |
+
 ## Build-time: the codegen flavour (A/B NRO pair)
 
 These options cannot be switched at run time:
@@ -1828,7 +1974,7 @@ On the console the ring thread used only 7 to 15 % of a core in the attract loop
 gameplay show the ring thread is busy.
 | Null vertex shader one-point draws through the 4x depth alias (sasrt-nx: XXH3 fingerprint AFCC8377CE2A398F, a whole shadow map moved to the 4x image and back per memexport draw) | not seen | No SA2 log (PC or console) names that fingerprint; recheck in stages. This changes EDRAM/depth ownership, so it needs a long play test. |
 
-### Fifteen CPU candidates for any ReXGlue port (2026-10-12; found, not built)
+### Fifteen CPU candidates for any ReXGlue port (2026-10-12; as found. Built since: see the second round)
 
 The user's request after the round above. Each has what was counted for it in SA2, on the PC or with the Switch
 compiler; none has run on the console. "Sites" are places in the generated code (`tools/generated_code_census.py` counts them for any port), "per

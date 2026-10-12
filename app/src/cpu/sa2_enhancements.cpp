@@ -72,7 +72,7 @@ extern "C" {
 volatile unsigned long long g_rex_flush_flow_checked = 0;  // a plain lossy count: "at least this many"
 // rex/ppc/diet_ops.h, REX_DIET_CENSUS_ON: executions of the any-mode float helpers in the game code (conversions,
 // compares, arithmetic, cold paths). Plain lossy counts too.
-volatile unsigned long long g_rex_diet_census[4] = {};
+volatile unsigned long long g_rex_diet_census[6] = {};
 }
 namespace {
 std::atomic<uint64_t> g_flush_flow_mismatches{0};
@@ -177,6 +177,7 @@ void Resolve() {
   g_cpu_master = REXCVAR_GET(sa2_cpu_enhancements);
   g_noncpu_master = REXCVAR_GET(sa2_noncpu_enhancements);
   g_verify_mode = rex::cvar::GetFlagByName("sa2_cpu_verify") == "true";
+  CodegenChecksInit();
   if (VerifyMode()) {
     // The renderer's own self-checks (old and new path compared, DIFFERENCE/MISMATCH logged) check every use.
     rex::cvar::SetFlagByName("sa2_native_verify_n", "2147483647");
@@ -270,6 +271,7 @@ void StartReport() {
                       proven);
         }
       }
+      CodegenChecksReport(seconds);
       if (REXCVAR_GET(sa2_diag_runtime_census)) {
         // sa2_diag_runtime_census: the SDK's counters (rex/sys_counters.h), as calls per second.
         using namespace rex::syscount;
@@ -292,9 +294,9 @@ void StartReport() {
                     flush, flush_same);
         {
           // What the switches saved by the generator's any-mode forms cost: a test in each of these calls.
-          static uint64_t last_diet[4] = {}, last_proven = 0;
-          double diet[4];
-          for (int i = 0; i < 4; ++i) {
+          static uint64_t last_diet[6] = {}, last_proven = 0;
+          double diet[6];
+          for (int i = 0; i < 6; ++i) {
             const uint64_t now = g_rex_diet_census[i];
             diet[i] = double(now - last_diet[i]) / double(seconds);
             last_diet[i] = now;
@@ -305,6 +307,8 @@ void StartReport() {
           REXLOG_INFO("[census] any-mode float helpers per second: conversions {:.0f}, compares {:.0f}, arithmetic "
                       "{:.0f}, cold paths {:.0f}; proven flush checks executed {:.0f}",
                       diet[0], diet[1], diet[2], diet[3], proven_s);
+          REXLOG_INFO("[census] float copy forms per second (fp_copy_pairs): loads {:.0f}, stores {:.0f}", diet[4],
+                      diet[5]);
         }
         // Where the mode is switched: the most counted code addresses so far, as offsets into the executable
         // (tools/census_sites.py turns them into functions and generated source lines).
@@ -318,6 +322,16 @@ void StartReport() {
             list += fmt::format(" +{:X}:{}", addresses[i] - CensusImageBase(), counts[i]);
           }
           if (n) REXLOG_INFO("[census] flush-mode switch sites (cumulative, image offset:count):{}", list);
+        }
+        {
+          // The third survey: the runtime's own out-of-line calls for what is one load or nothing.
+          const double logs = per_s(kCensusLogCall), heaps = per_s(kCensusLookupHeap);
+          const double refs = per_s(kCensusRetainRelease), states = per_s(kCensusKernelState);
+          const double pcr_owner = per_s(kCensusCritSecPcrOwner);
+          REXLOG_INFO("[census] runtime overhead per second: {:.0f} log statements reached (written or not), {:.0f} "
+                      "heap lookups for a pointer translation, {:.0f} object retains and releases, {:.0f} kernel "
+                      "state reads; {:.0f} critical section owners from the PCR",
+                      logs, heaps, refs, states, pcr_owner);
         }
         REXLOG_INFO("[census] runtime calls per second: guest clock {:.0f} ({:.0f} found its mutex taken); critical "
                     "sections entered {:.0f} ({:.0f} already owned, {:.0f} tried, {:.0f} waited); events set {:.0f}, "
