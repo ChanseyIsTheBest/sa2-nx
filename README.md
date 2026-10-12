@@ -112,11 +112,13 @@ hitch while its render targets are made again). The image in handheld mode is ex
 ## Performance
 
 The CPU is what limits it: the game runs on three cores at 1020 MHz. In single player it holds 60 FPS with barely any
-dips. The two-player race is the heaviest part of the game: it often runs around 50 FPS. With relaxed vsync a missed
-frame costs a few FPS instead of halving the frame rate.
+dips. The two-player race is the heaviest part of the game: in version 1.0.0 it often ran around 50 FPS. With relaxed
+vsync a missed frame costs a few FPS instead of halving the frame rate.
 
-The released NRO is built with PGO from a console session, which made it about 15 % faster than the same build
-without it.
+The released NRO is built with PGO from a console session, which made 1.0.0 about 15 % faster than the same build
+without it. Version 1.0.1 is about 15 % faster again in play (an estimate, not a measurement): three rounds of work
+on the translated code and the runtime, a new profile and a better link, all in
+[docs/cpu-rounds.md](docs/cpu-rounds.md).
 
 What was done to get there, round by round and with the measurements, is in
 [docs/enhancements.md](docs/enhancements.md).
@@ -176,6 +178,7 @@ optimisation this port uses.
 | [docs/porting-guide.md](docs/porting-guide.md) | Porting an Xbox 360 game to the Switch, from the first translation to a 60 FPS build |
 | [docs/building.md](docs/building.md) | How to build the PC test build, the NRO, the shader package and the SD folder |
 | [docs/enhancements.md](docs/enhancements.md) | Every optimisation, why it is exact, how it was checked and its setting |
+| [docs/cpu-rounds.md](docs/cpu-rounds.md) | The three CPU rounds and the link of version 1.0.1: what each change does, what was measured, what was dropped |
 | [docs/api-renderer.md](docs/api-renderer.md) | Replacing the game's Direct3D with native code |
 | [docs/direct-renderer.md](docs/direct-renderer.md) | Taking the GPU emulation out of the renderer, step by step |
 | [docs/gpu-optimisation-candidates.md](docs/gpu-optimisation-candidates.md) | The GPU's cost on the Tegra X1 with NVK, and what was cut |

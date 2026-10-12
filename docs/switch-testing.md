@@ -17,7 +17,17 @@ card as `switch\sa2-nx`. With a loose `game_root/` folder instead of the pack (`
 the pack on the card (a few minutes, logged as `[pack] packing N %`); the folder can be deleted afterwards. When a pack
 exists it is always used, so an old `game_root/` folder from earlier tests is no longer read and can be deleted.
 
-## This build (2026-10-08, version 1.0.0, PGO-optimised)
+## This build (2026-10-13, version 1.0.1)
+
+- **Faster:** three rounds of CPU optimisations, a new profile recorded on the console with this code, and a better
+  link (`docs/cpu-rounds.md` of the repository). In play it was estimated at about 15 % faster than 1.0.0.
+- **Chao garden and kindergarten:** the black speckles on the ground are fixed (a shadow map was read from freed
+  memory; `sa2_native_partial_resolve_inside`).
+- **A self-check at every start:** if an instruction form of this processor gave a wrong result, the game writes
+  `sa2_selfcheck_failed.txt` next to the NRO. No file means every check passed.
+- **Only `sa2.nro` changes:** `sa2.toml`, the shader package and the game files are the ones of 1.0.0.
+
+## Version 1.0.0 (2026-10-08, PGO-optimised)
 
 - **Optimised from your PGO session** (`sa2_pgo_1.stream`): the compiler now knows which code the game really runs and
   lays it out and optimises it for that. Code your session did not reach is compiled as before.

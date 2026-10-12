@@ -100,9 +100,9 @@ and icon (`app/icon.jpg`) are in `app/CMakeLists.txt`. The settings compiled int
 `app/sa2_switch_defaults.toml`, and the player's `sa2.toml` is `app/sa2_switch.toml`.
 
 The Switch build's own switches for the CPU round of 2026-10-12, all ON (`-DSA2_SWITCH_...=OFF` at the configure puts
-the old form back; `docs/enhancements.md` has what each does): `SA2_SWITCH_OMIT_FRAME_POINTER`,
+the old form back; `docs/cpu-rounds.md` has what each does): `SA2_SWITCH_OMIT_FRAME_POINTER`,
 `SA2_SWITCH_FLUSH_FLOW`, `SA2_SWITCH_GUEST_CAS`, `SA2_SWITCH_VEC_BYTESWAP`, `SA2_SWITCH_NEON_SHUFFLES`,
-`SA2_SWITCH_NEON_VMX_HELPERS`. A build with them has not run on a console yet.
+`SA2_SWITCH_NEON_VMX_HELPERS`. Version 1.0.1 is built with them.
 
 The second round's switches work on every platform (a PC build can take one step out to find where a difference
 comes from). ON: `SA2_GEN_RO_CONSTANTS`, `SA2_GEN_FLOAT_LOADS`, `SA2_GEN_LEAF_LOCALS`, `SA2_GEN_LOOP_LOCALS` (third
@@ -135,7 +135,7 @@ Do not change the game or app code between steps 1 and 3: a changed function los
 decides can still change, because GCC adds the counters before its interprocedural inliner runs: a build that uses a
 profile gives the game code `--param=max-inline-insns-auto=64` and `--param=inline-unit-growth=12`
 (`SA2_SWITCH_INLINE_AUTO`, `SA2_SWITCH_INLINE_UNIT_GROWTH`; empty for the compiler's 30 and 40).
-`docs/enhancements.md`, "Link-time optimisation of a recompiled program", has the measurements.
+`docs/cpu-rounds.md`, "Link-time optimisation of a recompiled program", has the measurements.
 
 ## Tests on the PC
 
@@ -157,6 +157,7 @@ profile gives the game code `--param=max-inline-insns-auto=64` and `--param=inli
 | `tools\switch_compile_check.py --like <known source> <new source>` | A source the configured Switch tree does not list yet, compiled with a sibling's flags |
 | `tools\lto_census.py <elf>` | What the LTO link left in a Switch ELF: the calls between game functions that were not inlined (by the callee's size), functions with one call site left, calls out of the LTO unit, the clones and cold parts the optimiser made |
 | `tools\lto_inline_report.py [--save NAME] [--against NAME]` | After a Switch link configured with `-DSA2_SWITCH_LTO_DUMP=ON`: the calls the inliner took and refused (by reason), counted as often as they ran in the profile's session, GCC's profile-weighted time estimate, the size of the hot functions, and against a saved report the copies a setting added |
+| `tools\nro_set_version.py <in.nro> <out.nro> <version>` | Sets the version the homebrew menu shows (the NACP's display version) in a copy of an NRO, so a release is byte for byte the build that was tested. 1.0.1 was made this way from the tested build |
 | `tools\address_taken_census.py` | An estimate of the game functions nobody takes the address of, and how many of them are called from one place (the code LTO cannot treat as it would in an ordinary program) |
 | `tools\crt_signatures.py make / scan` | Signatures of the C runtime functions one port found (`tools\crt_signatures.json`), looked for in any game's image dump |
 | `tools\census_summary.py <log>`, `tools\census_sites.py <log>` | A run with `sa2_diag_runtime_census = true`: float-mode switches and runtime calls per Swap, and the functions the switches come from |
