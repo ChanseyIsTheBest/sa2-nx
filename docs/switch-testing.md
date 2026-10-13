@@ -17,7 +17,18 @@ card as `switch\sa2-nx`. With a loose `game_root/` folder instead of the pack (`
 the pack on the card (a few minutes, logged as `[pack] packing N %`); the folder can be deleted afterwards. When a pack
 exists it is always used, so an old `game_root/` folder from earlier tests is no longer read and can be deleted.
 
-## This build (2026-10-13, version 1.0.1)
+## This build (2026-10-13, version 1.0.2, pre-release)
+
+- **Long sessions:** after an hour or two of play, 1.0.0 and 1.0.1 could show glitchy shadows, then black textures
+  and missing level geometry, objects and enemies until the game was closed. The renderer kept a copy of every
+  render-target texture for the whole session and GPU memory filled up. Copies the game stopped using are now
+  released (`sa2_native_resolved_retire_idle`; `docs/enhancements.md` of the repository).
+- **A pre-release because the fix is not confirmed on the console yet:** the test is a session of several hours
+  without closing the game, ideally docked. If the glitches still appear, a run with one of the `configs/` files
+  (they turn the log on) shows the memory numbers.
+- **Only `sa2.nro` changes** against 1.0.1.
+
+## Version 1.0.1 (2026-10-13)
 
 - **Faster:** three rounds of CPU optimisations, a new profile recorded on the console with this code, and a better
   link (`docs/cpu-rounds.md` of the repository). In play it was estimated at about 15 % faster than 1.0.0.
