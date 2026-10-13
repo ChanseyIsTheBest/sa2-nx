@@ -1192,6 +1192,57 @@ per-category GPU timestamps and the resolve log (`sa2_diag_resolves_from`, `sa2_
   addresses, and `sa2_native_partial_resolve_inside N` in the `[enh] uses` line.
 - **Off:** `sa2_native_partial_resolve_inside = false`.
 
+### `sa2_native_resolved_retire_idle`: resolved textures are released when the game stops using them (long sessions, 2026-10-13)
+
+- **The reports (version 1.0.0):** after an hour or two of play the shadows glitch, then textures turn black and
+  level geometry, objects and enemies go missing; closing and reopening the game fixes it, and the longer the
+  session the worse it gets (four or five times in a nine-hour playthrough). nfsmw-nx, which shares this renderer,
+  has the same report: black textures and invisible cars that can still be hit, after one to two hours.
+- **What the renderer did.** A resolve copies a render target into a texture. The renderer keeps one image per
+  destination address (`resolved_`) and samples it when a draw's texture address matches. An entry was only ever
+  replaced when the same address was resolved with another size or format; nothing else removed one. The game frees
+  a render target's texture when a stage, a cutscene or a garden ends, and the next one allocates its own at an
+  address that depends on what was loaded before, so the entries pile up: about four 512x512 shadow maps per scene,
+  1.1 MB each at 720p and 2.4 MB at the docked 1080p. Measured on the PC: 10 entries after the first two demo
+  stages of the attract loop (which then repeats the same addresses and stays at 11); City Escape and Wild Canyon
+  leave 8 behind (the Chao garden investigation above). The old shapes parked by `banjo_native_park_resolved` (up
+  to 64) were never released either.
+- **Why that ends in black textures.** GPU memory. The console's budget is about 1,490 MB; about 240 MB was in use
+  besides the texture cache when that was measured (at 1024x576; more at 1080p), and the cache may grow to 512 MB. When an image does not fit, the code drops half the
+  texture cache and tries once more (`out of GPU memory for a ... target`, `... for a ... texture`). What cannot be
+  created then is missing: a resolved texture or a render target is a shadow map read from guest memory instead
+  (speckled shadows, as in the Chao garden's photos); a texture is drawn black or, where the draw tests alpha, not
+  at all. That is the order of the reports: shadows first, then black and missing things.
+- **Not shown: the console running out of memory.** Version 1.0.0 writes no log, the PC has too much memory, and a
+  scripted PC session has too little variety (the attract loop repeats its addresses). The estimate from the
+  numbers above: 740 MB of headroom is about 300 leftover shadow maps docked, the leftovers of about 77 scenes.
+  Another cause on top of this one is not excluded; the report line below would show it in a console log.
+- **What.** Every entry records the presented frame of its last resolve and of its last read. About once a second
+  the entries that had neither for `sa2_native_resolved_idle_frames` presented frames (3,600: one minute at 60 fps)
+  are released: their descriptor slots are given back and the image is destroyed. The parked shapes go by the same
+  rule. An entry with deferred work attached stays: an alias in either direction (`sa2_gpu_resolve_alias`), a
+  deferred front copy, an EDRAM tile owner. And when any GPU allocation fails, the next Swap releases everything
+  idle for 120 frames, so a shortage ends at the next frame instead of lasting until the game is closed.
+- **Why exact.** An image nothing resolved to or read for a minute is in no pending work (the texture cache evicts
+  after 120 frames on the same argument). If the game resolves to that address again, it gets a new image and the
+  resolve fills it, as on first use. The one case that would differ is a render target filled once and read again
+  after more than a minute in which nothing read it. The PC build counts fetches at released addresses to catch
+  that (none in any run) and reports the oldest read after a resolve: at most 74 presented frames in these runs
+  (the front buffer during a load).
+- **Tests (PC).** Lockstep capture of the attract demo against the reference, the final code:
+  - shipped defaults: 2,932 of 2,985 frames identical, the other 53 the loading frames that differ by timing; no
+    entry is idle for a minute inside the window, so nothing was released;
+  - `sa2_native_resolved_idle_frames = 120`: four shadow maps released when the first demo ended and four created
+    again when the loop came back to their addresses; 2,930 of 2,983 identical, the same 53; no fetch at a released
+    address;
+  - the same in verify mode: 1,942 of 1,995 identical, the same 53; 206 million checks, no difference;
+  - the key off: identical too (2,983 of 2,983 in that run).
+- **Not verified:** a long session on the console, which is the only test of the diagnosis.
+- **Log:** every 600 presented frames `[native] targets: N resolved textures and P parked hold X MB; R released when
+  idle so far (Y MB; ...); the oldest read came F presented frames after its resolve (at A); K fetches at released
+  addresses`; the first 24 releases as `resolved texture at A (WxH, B KB) released: ...`.
+- **Off:** `sa2_native_resolved_retire_idle = false`.
+
 ### GPU round 2 (2026-10-07): per-draw constant traffic and per-vertex/pixel tests, from round 8's console log
 
 Six keys (all `kNonCpu`, default on; `REX_SA2_GPU_<KEY>=false` turns one off). Four need the shader package of this

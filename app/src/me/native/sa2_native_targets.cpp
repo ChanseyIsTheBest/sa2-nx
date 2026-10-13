@@ -150,6 +150,21 @@ REXCVAR_DEFINE_STRING(sa2_diag_stale_resolved, "", "SA2",
                       "line). Before the first color resolve to guest address BASE, a resolved texture of the same "
                       "width and format (and HEIGHT, default the same) is created PAGES 4 KB pages below it, as an "
                       "earlier resolve to memory the game has since freed leaves it. Empty = off");
+// Long sessions (reports of version 1.0.0, and the same of nfsmw-nx: after one to two hours of play the shadows
+// glitch, then textures turn black and geometry goes missing until the game is restarted). A resolved texture lived
+// for the whole session: the game frees a render target's texture when a stage or cutscene ends and the next one
+// allocates its own somewhere else, but resolved_ kept the image of every address ever resolved to (about four
+// 512x512 shadow maps per stage; 2.4 MB each docked). GPU memory fills up; then a target cannot be created ("out of
+// GPU memory for a ... target"), the texture cache is dropped to make room, and at last targets and textures go
+// missing. docs/enhancements.md has the measurements.
+SA2_ENHANCEMENT(g_resolved_retire, sa2_native_resolved_retire_idle, sa2::enh::kNonCpu, true,
+                "Renderer: a resolved texture nothing resolved to or read for sa2_native_resolved_idle_frames "
+                "presented frames is released (the game freed its render target's texture long ago). Without it "
+                "every address ever resolved to keeps its image for the whole session and GPU memory fills up in "
+                "long sessions");
+REXCVAR_DEFINE_INT32(sa2_native_resolved_idle_frames, 3600, "SA2 renderer",
+                     "Presented frames without a resolve or a read after which sa2_native_resolved_retire_idle "
+                     "releases a resolved texture (3600 is one minute at 60 fps; at least 120)");
 SA2_ENHANCEMENT(g_edram_memo, sa2_cpu_ring_edram_memo, sa2::enh::kCpu, true,
                 "Ring thread: a draw with the same render-target state as the previous draw reuses its EDRAM preparation "
                 "(only when the full path would do no work: same images, tiles owned in the same epoch, nothing pending; "
@@ -614,6 +629,9 @@ struct Resolved {
   uint64_t revision = 0;
   // sa2_gpu_resolve_alias: its bytes are still in another texture (ContextTargets::aliases_).
   bool alias_pending = false;
+  // sa2_native_resolved_retire_idle: the presented frame of the last resolve into it and of the last read of it.
+  uint64_t last_write = 0;
+  uint64_t last_read = 0;
 };
 
 struct ResolvedClip {
@@ -2671,6 +2689,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
       return false;
     }
     Resolved& resolved = it->second;
+    resolved.last_read = presented_;  // sa2_native_resolved_retire_idle: the front buffer is read by the output
     const uint32_t w = std::min(width ? width : resolved.image.width, resolved.image.width);
     const uint32_t h = std::min(height ? height : resolved.image.height, resolved.image.height);
     // sa2-nx render resolution: the guest output is the front buffer's host size (1920x1080 docked by default); the
@@ -2691,6 +2710,13 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
         });
     if (painted) {
       ++presented_;
+      if (retire_resolved_urgently_.load(std::memory_order_relaxed)) [[unlikely]] {  // memory ran short this frame
+        retire_resolved_urgently_.store(false, std::memory_order_relaxed);
+        RetireIdleResolved(120);
+      } else if ((presented_ & 63) == 0) {  // sa2_native_resolved_retire_idle: about once a second
+        RetireIdleResolved(uint64_t(std::max(REXCVAR_GET(sa2_native_resolved_idle_frames), 120)));
+        ReportResolved();
+      }
     }
     RescaleIfWanted();  // sa2-nx render resolution: docked <-> handheld, at this frame boundary
     return painted;
@@ -2899,11 +2925,21 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
     return image;
   }
 
+  void GpuMemoryIsShort() override { retire_resolved_urgently_.store(true, std::memory_order_relaxed); }
+
   const ImageNative* ResolvedTexture(uint32_t address) override {
     const auto it = resolved_.find(address);
     if (it == resolved_.end()) {
+      if (!retired_resolved_.empty()) [[unlikely]] NoteFetchAfterRetirement(address);
       return nullptr;
     }
+    // sa2_native_resolved_retire_idle: a read keeps it alive, and the oldest read (in frames since the resolve that
+    // filled it) is reported: it says how long a texture may sit unresolved and still be wanted.
+    if (const uint64_t age = presented_ - it->second.last_write; age > oldest_read_resolved_) [[unlikely]] {
+      oldest_read_resolved_ = age;
+      oldest_read_address_ = address;
+    }
+    it->second.last_read = presented_;
     // And how many times each address is requested, for the per-render-target copy report. A resolved
     // texture that is copied every frame and never requested is a copy that is not needed. It is a ++ on the
     // entry that has already been looked up: it costs nothing even though this is called thousands of times
@@ -8449,6 +8485,139 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
                 height);
   }
 
+  // sa2_native_resolved_retire_idle. Releases the resolved textures that nothing resolved to or read for `idle`
+  // presented frames, and returns the bytes released. It needs no wait for the GPU, for the reason the texture
+  // cache's eviction needs none: no pending submission can reference an image unused for that many frames, and
+  // ForgetImage gives its descriptor slots back. A texture with deferred work attached stays: an alias in either
+  // direction (sa2_gpu_resolve_alias), a deferred front copy (sa2_native_lazy_front), an EDRAM tile owner.
+  uint64_t RetireIdleResolved(uint64_t idle) {
+    if (!g_resolved_retire.active || resolved_pool_device_error_ || ResolverNoCopy()) return 0;
+    uint64_t released = 0;
+    uint32_t count = 0;
+    for (auto it = resolved_.begin(); it != resolved_.end();) {
+      Resolved& r = it->second;
+      const uint32_t base = it->first;
+      bool keep = presented_ - std::max(r.last_write, r.last_read) < idle || r.alias_pending ||
+                  aliases_.count(base) != 0 || pending_fronts_.count(base) != 0;
+      if (!keep) {
+        for (const auto& [alias_address, alias] : aliases_)
+          if (alias.source == base) { keep = true; break; }
+      }
+      if (!keep) {
+        for (const auto& [address, pending] : pending_fronts_)
+          if (pending.texture_vk == r.image.image || pending.source_vk == r.image.image) { keep = true; break; }
+      }
+      if (!keep) {
+        for (const auto& owner : owners_tiles_edram4_)
+          if (owner.image == &r.image) { keep = true; break; }
+      }
+      if (keep) {
+        ++it;
+        continue;
+      }
+      VkDeviceSize bytes = 0;
+      if (r.image.image != VK_NULL_HANDLE) {
+        VkMemoryRequirements requirements{};
+        dfn_.vkGetImageMemoryRequirements(device_, r.image.image, &requirements);
+        bytes = requirements.size;
+      }
+      if (retired_resolved_logged_ < 24) {
+        ++retired_resolved_logged_;
+        REXLOG_INFO("[native] targets: resolved texture at {:08X} ({}x{}, {} KB) released: not resolved to for {} "
+                    "presented frames, not read for {} (sa2_native_resolved_retire_idle)",
+                    base, r.image.width, r.image.height, bytes >> 10, presented_ - r.last_write,
+                    presented_ - r.last_read);
+      }
+      if (r.image.image != VK_NULL_HANDLE) {
+        if (draws_) draws_->ForgetImage(r.image.image);
+        Destroy(r.image);
+      }
+      presented_fronts_.erase(base);
+      expired_fronts_.erase(base);
+#if !defined(__SWITCH__)
+      // The PC build remembers the address: a fetch there before the next resolve is reported (ResolvedTexture).
+      if (retired_resolved_.size() < 4096) retired_resolved_[base] = presented_;
+#endif
+      released += bytes;
+      ++count;
+      it = resolved_.erase(it);
+    }
+    // The parked images too (banjo_native_park_resolved keeps up to 64 old shapes of an address for its next change
+    // of shape): one that waited this long for its shape to come back is not coming back.
+    for (auto it = parked_resolved_.begin(); it != parked_resolved_.end();) {
+      Resolved& r = it->second;
+      bool keep = presented_ - std::max(r.last_write, r.last_read) < idle;
+      if (!keep) {
+        for (const auto& [address, pending] : pending_fronts_)
+          if (pending.texture_vk == r.image.image || pending.source_vk == r.image.image) { keep = true; break; }
+      }
+      if (keep) {
+        ++it;
+        continue;
+      }
+      if (r.image.image != VK_NULL_HANDLE) {
+        VkMemoryRequirements requirements{};
+        dfn_.vkGetImageMemoryRequirements(device_, r.image.image, &requirements);
+        released += requirements.size;
+        if (draws_) draws_->ForgetImage(r.image.image);
+        Destroy(r.image);
+      }
+      ++count;
+      it = parked_resolved_.erase(it);
+    }
+    if (count) {
+      g_resolved_retire.Use();
+      retired_resolved_count_ += count;
+      retired_resolved_bytes_ += released;
+      if (draws_) draws_->InvalidateTextures();  // those addresses are no longer sampled from a resolved texture
+    }
+    return released;
+  }
+
+  // PC build: a tiled fetch at an address whose resolved texture was released and that has not been resolved to
+  // since. Either the game reuses the memory for an ordinary texture (what the release is for) or it reads a render
+  // target it filled long ago: the log line names the address so the two can be told apart.
+  void NoteFetchAfterRetirement(uint32_t address) {
+    const auto it = retired_resolved_.find(address);
+    if (it == retired_resolved_.end()) return;
+    ++fetches_after_retirement_;
+    if (it->second == UINT64_MAX) return;  // reported already
+    if (fetches_after_retirement_logged_ < 32) {
+      ++fetches_after_retirement_logged_;
+      REXLOG_INFO("[native] targets: fetch at {:08X}, whose resolved texture was released {} presented frames ago "
+                  "(sa2_native_resolved_retire_idle): the texture in guest memory is read",
+                  address, presented_ - it->second);
+    }
+    it->second = UINT64_MAX;
+  }
+
+  // Every 600 presented frames: how many resolved textures there are and what they hold (with the key off this is
+  // the growth of a long session), what was released, and the oldest read of one after the resolve that filled it.
+  void ReportResolved() {
+    if (presented_ < report_resolved_next_) return;
+    report_resolved_next_ = presented_ + 600;
+    VkDeviceSize bytes = 0;
+    for (const auto& [base, r] : resolved_) {
+      if (r.image.image == VK_NULL_HANDLE) continue;
+      VkMemoryRequirements requirements{};
+      dfn_.vkGetImageMemoryRequirements(device_, r.image.image, &requirements);
+      bytes += requirements.size;
+    }
+    for (const auto& [key, r] : parked_resolved_) {
+      if (r.image.image == VK_NULL_HANDLE) continue;
+      VkMemoryRequirements requirements{};
+      dfn_.vkGetImageMemoryRequirements(device_, r.image.image, &requirements);
+      bytes += requirements.size;
+    }
+    REXLOG_INFO("[native] targets: {} resolved textures and {} parked hold {} MB; {} released when idle so far "
+                "({} MB; sa2_native_resolved_retire_idle {}); the oldest read came {} presented frames after its "
+                "resolve (at {:08X}); {} fetches at released addresses",
+                resolved_.size(), parked_resolved_.size(), bytes >> 20, retired_resolved_count_,
+                retired_resolved_bytes_ >> 20,
+                g_resolved_retire.active ? "on" : "off", oldest_read_resolved_, oldest_read_address_,
+                fetches_after_retirement_);
+  }
+
   void ResolvedReportPool(bool detail = false) {
     if (REXCVAR_GET(sa2_native_edram_alias_mode) != 4) return;
     const auto now = std::chrono::steady_clock::now();
@@ -8637,6 +8806,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
         it->second.swap_rb = swap_rb;
         it->second.image.swap_rb = swap_rb;
         it->second.image.resolved_guest_format = format;
+        it->second.last_write = presented_;  // sa2_native_resolved_retire_idle
         ResolvedReportPool();
         return &it->second;
       }
@@ -8662,6 +8832,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
       if (REXCVAR_GET(banjo_native_park_resolved) && !ResolverNoCopy() && !owned && parked_resolved_.size() < 64) {
         const uint64_t old_key = ParkedKey(base, it->second.image.width, it->second.image.height,
                                            uint32_t(it->second.image.format));
+        it->second.last_write = presented_;  // sa2_native_resolved_retire_idle: its idle time counts from here
         parked_resolved_[old_key] = std::move(it->second);
         resolved_.erase(it);
         ++parked_resolved_stores_;
@@ -8675,6 +8846,7 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
           back.image.swap_rb = swap_rb;
           back.image.resolved_guest_format = format;
           back.reads = reads;
+          back.last_write = back.last_read = presented_;
           ++parked_resolved_reuses_;
           if (draws_) draws_->InvalidateTextures();  // that address is now sampled from this image
           return &resolved_.emplace(base, std::move(back)).first->second;
@@ -8697,6 +8869,8 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
     Resolved resolved;
     resolved.reads = reads;
     resolved.revision = ++revision_resolved_;
+    resolved.last_write = resolved.last_read = presented_;
+    if (!retired_resolved_.empty()) retired_resolved_.erase(base);  // resolved to again: a live texture
     // The attachment usage (color or depth) is needed for sa2_native_resolver_no_copy: this image can
     // end up being the render target it is swapped with.
     const VkImageUsageFlags usage_target = host_format == VK_FORMAT_R32_SFLOAT ? 0u :
@@ -9102,6 +9276,9 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
         REXLOG_ERROR("[native] targets: out of GPU memory for a {}x{} target (format {}) and dropping the cache "
                      "was not enough",
                      info.extent.width, info.extent.height, uint32_t(format));
+        // sa2_native_resolved_retire_idle: at the next Swap the resolved textures idle for two seconds go too (not
+        // here: callers of Create may be walking resolved_).
+        retire_resolved_urgently_.store(true, std::memory_order_relaxed);
         return false;
       }
     }
@@ -10559,6 +10736,12 @@ const std::array<std::pair<const uint32_t*, size_t>, 9> codes_conversion{{
   std::unordered_set<uint64_t> partial_recorded_;
   std::unordered_set<uint64_t> partial_refused_;  // sa2_native_partial_resolve_inside: pairs already logged
   bool diag_stale_done_ = false;                  // sa2_diag_stale_resolved: made its texture
+  // sa2_native_resolved_retire_idle
+  uint64_t retired_resolved_count_ = 0, retired_resolved_bytes_ = 0, report_resolved_next_ = 600;
+  uint64_t oldest_read_resolved_ = 0, fetches_after_retirement_ = 0;
+  uint32_t oldest_read_address_ = 0, retired_resolved_logged_ = 0, fetches_after_retirement_logged_ = 0;
+  std::unordered_map<uint32_t, uint64_t> retired_resolved_;  // PC build: address -> presented_ when released
+  std::atomic<bool> retire_resolved_urgently_{false};        // GPU memory was short: release at the next Swap
   VkRect2D area_edram_{};
   uint32_t msaa_edram_actual_ = 0;
   // sa2-nx render resolution: the scale (quarters of the guest size, me_resolution_scale.h) new images are created at;
