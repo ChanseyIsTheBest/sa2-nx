@@ -1237,11 +1237,62 @@ per-category GPU timestamps and the resolve log (`sa2_diag_resolves_from`, `sa2_
     address;
   - the same in verify mode: 1,942 of 1,995 identical, the same 53; 206 million checks, no difference;
   - the key off: identical too (2,983 of 2,983 in that run).
-- **Not verified:** a long session on the console, which is the only test of the diagnosis.
+- **The console's answer (version 1.0.2, 2026-10-14):** this was not the cause of the reports. With the key on,
+  textures turned black and geometry went missing again after three to four hours of play. The key stays (the
+  entries did pile up and are memory), and the cause that fits the reports is in the next section.
 - **Log:** every 600 presented frames `[native] targets: N resolved textures and P parked hold X MB; R released when
   idle so far (Y MB; ...); the oldest read came F presented frames after its resolve (at A); K fetches at released
   addresses`; the first 24 releases as `resolved texture at A (WxH, B KB) released: ...`.
 - **Off:** `sa2_native_resolved_retire_idle = false`.
+
+### `sa2_native_texture_slots_evict`: the texture cache makes room in the descriptor heaps (long sessions, 2026-10-14)
+
+- **The report (version 1.0.2):** the release of idle resolved textures above did not cure the long sessions.
+  After three to four hours of play textures are black and geometry is missing again, until the game is closed.
+  (The glitching shadows have not come back since 1.0.1.)
+- **The cause.** A draw reads a texture through a view in a descriptor heap, and the heaps have a fixed number of
+  slots: 4,096 for 2D textures, 16 for 3D, 64 for cubes (`kCapacityHeap`). The texture cache released textures by
+  one rule only, the texel bytes it holds against `sa2_native_textures_mb_max` (512 MB, dripping from 384). SA2's
+  textures are small: on the PC the 398 textures cached in the attract loop's second demo stage are 20 MB
+  together, and 36 textures new within ten seconds of a stage are 0.1 MB. So 4,096 textures are nowhere near
+  384 MB, nothing is ever released, and the slots run out first. From then on `ReserveSlot` returns 0 and the draw
+  is given slot 0, the empty texture (`texture pool full`, a warning logged once): black where the draw is opaque,
+  nothing where it tests alpha. Nothing made room afterwards, so every texture first seen after that moment stayed
+  that way until the game was closed, which is the report: the longer the session, the more is black or missing.
+  The images were still created, without a view (each takes at least one 64 KB unit of the texture pool on the
+  console), so memory kept growing as well.
+- **How long that takes.** The cache's key holds the texture's guest address, so a stage loaded again at another
+  address counts again. The attract loop's two demo stages bring about 110 and more than 330 textures, and the loop holds
+  687 after seven minutes on the PC. A few dozen stages, cutscenes and gardens fill the heap: hours of play, which
+  is when the reports come (about every two hours in 1.0.0's nine-hour playthrough, three to four hours in 1.0.2's).
+- **What.** Once a frame, before the byte limit is looked at:
+  - an image heap that is more than three quarters full releases its 32 coldest textures every 16 frames, until
+    it is back under five eighths;
+  - a view that found no slot marks its heap, and at the next frame an eighth of that heap's textures goes at
+    once (512 for the 2D heap): the view showed the empty texture for one frame, not for the rest of the session.
+
+  Cold is the byte limit's rule: not drawn with for 120 frames. A released texture's views and slots go with it.
+  If the game draws with it again, it is read from guest memory again, as the first time.
+- **Why exact.** A texture not prepared for 120 frames is in no pending work (the byte limit's own argument), and
+  a texture created again is the same upload as its first one. With the shipped 4,096 slots nothing is released
+  before 3,072 textures are cached, which no test run here reaches.
+- **Tests (PC).** `sa2_diag_texture_slots = 384` hands out 384 of the 2D heap's slots, so the attract demo runs
+  out in its second demo stage. Lockstep captures of the demo against the reference:
+  - 384 slots, the key off: the heap is full after three minutes and stays full; 2,582 views found no slot by the
+    end of the capture, the cache went on growing (434 textures for 383 slots), and 701 of 2,979 frames differ
+    from the reference, 653 of them in one stretch up to the end of the capture;
+  - 384 slots, the key on: 224 textures released in seven batches, no view without a slot, 2,982 of 2,982 frames
+    identical;
+  - shipped defaults: 454 of 4,095 slots in use at the end, nothing released, 2,907 of 2,960 frames identical;
+    the other 53 are the loading frames that differ by timing between any two runs.
+- **Not verified:** a long session on the console. The PC shows the mechanism with fewer slots; that the
+  console's sessions end this way is an inference from the numbers above, and the report line below is what a
+  console log would settle it with.
+- **Log:** every 600 frames `[native] C3 slots: 2D N of 4095 in use, 3D ..., cube ..., samplers ...; T textures in
+  the cache (M MB of texels); R released for slots so far, V views found no slot`; a warning `descriptor heap H had
+  no free slot (...): D cold textures released` for the first 16 times a view finds none.
+- **Off:** `sa2_native_texture_slots_evict = false`.
+- **Diagnostic:** `sa2_diag_texture_slots = N` (64 to 4,095; 0 = all the slots).
 
 ### GPU round 2 (2026-10-07): per-draw constant traffic and per-vertex/pixel tests, from round 8's console log
 
