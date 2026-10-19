@@ -17,7 +17,7 @@ card as `switch\sa2-nx`. With a loose `game_root/` folder instead of the pack (`
 the pack on the card (a few minutes, logged as `[pack] packing N %`); the folder can be deleted afterwards. When a pack
 exists it is always used, so an old `game_root/` folder from earlier tests is no longer read and can be deleted.
 
-## This build (2026-10-14, version 1.0.2.1, pre-release)
+## This build (version 1.0.2.1; pre-release 2026-10-14, full release and installer page 2026-10-19)
 
 - **Long sessions, second fix:** 1.0.2 did not cure them. After three to four hours of play textures were black and
   geometry was missing again until the game was closed. The cause found since: the renderer has 4,096 slots for 2D
@@ -25,9 +25,8 @@ exists it is always used, so an old `game_root/` folder from earlier tests is no
   small that the slots ran out first; every texture first seen after that was drawn black or not at all. The cache
   now also makes room when the slots run low (`sa2_native_texture_slots_evict`; `docs/enhancements.md` of the
   repository). On the PC the fault was reproduced with fewer slots and is gone with the fix, frame for frame.
-- **A pre-release because the fix is not confirmed on the console yet:** the test is a session of four hours or
-  more without closing the game. If the glitches still appear, a run with one of the `configs/` files (they turn
-  the log on) shows the numbers: the line `[native] C3 slots: 2D N of 4095 in use ...` every ten seconds.
+- **If the glitches still appear** after hours of play, a run with one of the `configs/` files (they turn the log
+  on) shows the numbers: the line `[native] C3 slots: 2D N of 4095 in use ...` every ten seconds.
 - **Logging and the profiler are off**, as in every release.
 - **Only `sa2.nro` changes** against 1.0.1 and 1.0.2.
 - **If the game crashes:** please send `switch/sa2-nx/logs/rex/rex_crash.log` from the SD card; it is written even
