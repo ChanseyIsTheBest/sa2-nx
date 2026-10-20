@@ -185,6 +185,8 @@ optimisation this port uses.
 | Document | What it explains |
 | --- | --- |
 | [docs/porting-guide.md](docs/porting-guide.md) | Porting an Xbox 360 game to the Switch, from the first translation to a 60 FPS build |
+| [docs/deko3d-renderer-guide.md](docs/deko3d-renderer-guide.md) | Making a deko3d renderer for a port: Renut's renderer on the Switch's own graphics API, with no Vulkan driver and shaders made by the installer page (version 1.0.3's road) |
+| [docs/renut-renderer.md](docs/renut-renderer.md) | Renut's renderer on SA2: the hooks, the device layout, every change and its console measurements |
 | [docs/building.md](docs/building.md) | How to build the PC test build, the NRO, the shader package and the SD folder |
 | [docs/enhancements.md](docs/enhancements.md) | Every optimisation, why it is exact, how it was checked and its setting |
 | [docs/cpu-rounds.md](docs/cpu-rounds.md) | The three CPU rounds and the link of version 1.0.1: what each change does, what was measured, what was dropped |

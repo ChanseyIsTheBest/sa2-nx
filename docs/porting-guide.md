@@ -6,9 +6,16 @@ order of work, the tools of this repository, the traps that cost days, and every
 order they pay off.
 
 The method comes from [nfsmw-nx](https://github.com/StevensND/nfsmw-nx) (the Switch layer, the NVK driver, PGO),
-[masseffect-nx](https://github.com/nebadasSwifty/masseffect-nx) (the native renderer), and the sibling ports
-(Banjo-Kazooie: Nuts & Bolts, Sonic & All-Stars Racing Transformed, Mushihimesama Futari, Peggle 2). Each of them
-found some of what is below.
+[masseffect-nx](https://github.com/nebadasSwifty/masseffect-nx) (the native renderer),
+[reNut](https://github.com/masterspike52/reNut) by masterspike52 (the Direct3D-level renderer SA2 draws with from 1.0.3),
+and the sibling ports (Banjo-Kazooie: Nuts & Bolts, Sonic & All-Stars Racing Transformed, Mushihimesama Futari, Peggle
+2): banjo-nx built the deko3d back end, and peggle2-nx made the shaders in the installer page. Each of them found some
+of what is below.
+
+From version 1.0.3, SA2 draws with Renut's renderer on deko3d, the Switch's own graphics API, and links no Vulkan
+driver. Sections 5, 6, 10 and 11 describe the native Vulkan renderer that came first. It is still the clearest way to
+get a game drawing correctly and to have a reference to compare against.
+[deko3d-renderer-guide.md](deko3d-renderer-guide.md) is the road from there to deko3d, step by step.
 
 ## Contents
 
@@ -29,6 +36,8 @@ found some of what is below.
 14. [Traps](#14-traps)
 15. [Glossary](#15-glossary)
 
+Companion guide: [Making a deko3d renderer](deko3d-renderer-guide.md) (Renut's renderer on deko3d, as SA2 1.0.3 ships).
+
 ---
 
 ## 0. The big picture
@@ -42,9 +51,12 @@ A native port replaces each of them:
 ```text
 default.xex (PowerPC)  --rexglue codegen-->  C++ (app/generated)  --clang / GCC-->  sa2.exe / sa2.nro
 kernel, XAM            -->  ReXGlue SDK: the system as C++ (sdk/), with a Horizon layer for the Switch
-Direct3D + Xenos GPU   -->  the native renderer: the game's GPU work drawn with Vulkan (app/src/me)
-GPU programs (shaders) -->  translated ahead of time: XenosRecomp -> HLSL -> DXC -> SPIR-V (the shader package)
-Vulkan on the Switch   -->  NVK (Mesa), linked statically into the NRO
+Direct3D + Xenos GPU   -->  up to 1.0.2.1: the native renderer, the game's GPU work drawn with Vulkan (app/src/me)
+                            1.0.3 on: Renut's renderer, the game's Direct3D calls drawn on deko3d (app/src/renut_engine)
+GPU programs (shaders) -->  translated ahead of time: XenosRecomp -> HLSL -> DXC -> SPIR-V (the shader package);
+                            for deko3d, then SPIRV-Cross -> GLSL, made by the installer page (deko3d_glsl.bin)
+the Switch's GPU API   -->  up to 1.0.2.1: NVK (Mesa), linked statically into the NRO
+                            1.0.3 on: deko3d, with uam compiling each shader variant on the console
 ```
 
 Nothing is interpreted or emulated at run time except what you have not replaced yet. The CPU code is translated
@@ -72,7 +84,10 @@ measured and tuned on the console.
   20** (ReXGlue's code generator and the PC build need clang), Python 3, Git.
 - **[devkitPro](https://devkitpro.org)**: devkitA64 (GCC for the Switch) and libnx.
 - **NVK** built from [mesa-switch](https://github.com/danfromtico/mesa-switch) as a static `libvulkan.a`, with a patch
-  for draw costs, ZCULL and shader compiler fixes. nfsmw-nx's build works for any port.
+  for draw costs, ZCULL and shader compiler fixes. nfsmw-nx's build works for any port. Only the Vulkan renderer needs
+  it: the deko3d route (1.0.3) uses libdeko3d from devkitPro and uam from `app/thirdparty`.
+- **Ryujinx** (banjo-nx's build) runs deko3d NROs, for testing before the console
+  ([deko3d-renderer-guide.md](deko3d-renderer-guide.md), section 5).
 - **This repository's SDK fork** (`sdk/`): ReXGlue 0.10 with the Horizon (Switch) layer, the code generator changes and
   the fixes of every port. Start a new port from it rather than from upstream ReXGlue.
 - **ffmpeg** (videos of test runs), **DXC** (the shader compiler; any recent build with SPIR-V output).
@@ -195,6 +210,16 @@ These come with the renderer and are worth knowing before you tune it:
 - **Upload memory:** vertices and indices go through a CPU-cached buffer published before each submit (SA2's console
   wrote 5,251 MB/s there, against 2,506 in uncached memory).
 
+### 5.4 The other road: an API-level renderer on deko3d
+
+The renderer above still reads the game's PM4 and models EDRAM, and section 10 replaces Direct3D under it step by
+step. SA2 1.0.3 took the shorter road banjo-nx opened: Renut's Direct3D-level renderer (from reNut). It hooks about
+twenty Direct3D functions, reads the device's own state at each draw, and replays the frame on one render thread
+through plume, on deko3d on the Switch. There is no ring, no register file, no EDRAM model and no Vulkan driver. In
+City Escape on the console, after its tuning, its render thread needs 11.1 ms a frame and the game thread 15.5 ms.
+Get the game drawing correctly first, with this section's renderer or the emulated GPU as the reference. Then follow
+[deko3d-renderer-guide.md](deko3d-renderer-guide.md).
+
 ## 6. Shaders
 
 ### 6.1 The pipeline
@@ -209,6 +234,10 @@ container (vs_/ps_<hash>.bin)  --XenosRecomp-->  HLSL  --DXC-->  SPIR-V  --me_pa
 `tools/build_shader_library.sh <dump folders>` runs all of it. At run time the renderer identifies each shader the
 game loads by its microcode and uses the package's SPIR-V. The `.idx` lets the console read the index only, and each
 SPIR-V when it is first used.
+
+For deko3d (1.0.3), Renut's copy of the translator writes the SPIR-V, which goes on through SPIRV-Cross to GLSL,
+banjo-nx's text passes and a package. uam compiles each variant on the console the first time it is drawn
+([deko3d-renderer-guide.md](deko3d-renderer-guide.md), section 4). Collecting every shader (6.2) is the same work.
 
 ### 6.2 Collecting every shader
 
@@ -257,12 +286,15 @@ When a shader looks wrong, compare its HLSL with the microcode's disassembly bef
 - devkitA64's GCC compiles the same C++ (`tools/win/build_switch.ps1`; the toolchain file is
   `tools/switch/cmake/switch-devkitA64.cmake`). The generated code is shared with the PC build. A cross build cannot
   run the code generator, so translate on the PC first.
-- The NRO links NVK statically. Check that the right driver went in: a generic Mesa from devkitPro's portlibs once
-  got linked instead (`tools/check_switch_build.py` checks the Mesa version string).
+- Up to 1.0.2.1 the NRO linked NVK statically. Check that the right driver went in: a generic Mesa from devkitPro's
+  portlibs once got linked instead (`tools/check_switch_build.py` checks the Mesa version string). From 1.0.3 the NRO
+  links no driver (`build_switch.ps1 -NoNvk`), and the check then makes sure no Mesa string is left.
 - `tools/check_switch_build.py` runs on every build. It checks that the start-up code is at address 0 (a section
   ordering file once moved it and the NRO would not boot), that the optimised flavour is in, that no vector fused
   multiply-add leaked past `-ffp-contract=off`, and that branch-to-self loops are only known guest halts (a polling
-  loop GCC turned into `b .` means a missing barrier).
+  loop GCC turned into `b .` means a missing barrier). One vector multiply-add is allowed, with its evidence: in 1.0.3's
+  PGO build, GCC packed two of the guest's own `fmadds` (two `std::fma` in the generated code) into one 2-lane `fmla`.
+  Each lane is still one fused operation, so the results are the same (`KNOWN_VECTOR_FMA`).
 
 ### 7.2 The Horizon layer (in `sdk/`, shared by every port)
 
@@ -524,8 +556,10 @@ flush and shader load, DrawVerticesUP, the window-scissor writer, Clear, and (in
 
    The next round brought the layer to 8-9 % of the thread.
 
-The end state (still in progress in SA2): no PM4 at all, records through a host queue, and EDRAM replaced by images
-per Direct3D surface.
+The end state: no PM4 at all, records through a host queue, and EDRAM replaced by images per Direct3D surface. SA2
+reached it another way in 1.0.3: Renut's renderer has no PM4 and no EDRAM model at all (5.4). The steps above are still
+the way to replace Direct3D under a ring-based renderer, and their verify method is the one to use for any native
+Direct3D code.
 
 ## 11. Making the GPU fast
 
@@ -546,6 +580,9 @@ The Tegra X1's GPU (Maxwell, 256 cores, 460-768 MHz) is the limit only in some s
   for the depth buffers that can have one.
 - **Resolution and MSAA:** render scale (720p handheld, 1080p docked, switched live when docking) and optional 2x/4x
   MSAA (`app/src/me/sa2_render_mode.cpp`). Handheld 720p without MSAA is exactly the game's own image.
+- **On deko3d (1.0.3):** uam with banjo-nx's shader passes, each proven by a differential test, early depth for
+  shaders that discard, and MSAA on the game's single-sample targets (`sa2_renut_msaa`, 0/2/4/8, 2 by default). It
+  draws 1280x720 in both modes ([deko3d-renderer-guide.md](deko3d-renderer-guide.md), sections 4 and 9).
 
 ## 12. Proving every change
 
@@ -591,7 +628,14 @@ This is what lets one person change a renderer and a CPU path every day without 
     v2025.1, which wrote different SPIR-V than the PC's 1.8 for 10 of 35 shaders: the same arithmetic, inputs read
     directly instead of through a local copy. That library was then checked in lockstep on the PC (2,999 of 2,999
     frames identical) before it was released.
-- **First-start stutter:** say in the README that the first session compiles pipelines, and that `cache/` keeps them.
+  - **From 1.0.3** the NRO keeps only the shader table (hashes, masks, formats and literal constants: numbers) and
+    no translated shader. The page makes `deko3d_glsl.bin` with peggle2-nx-installer's chain: Renut's translator,
+    DXC and SPIRV-Cross in WebAssembly, and the GLSL passes in JavaScript. The result is pinned by its SHA-256, and
+    the NRO was tested with the page's own package ([deko3d-renderer-guide.md](deko3d-renderer-guide.md), section 10).
+    Because the update needs the player's game files, a bare NRO is not enough: the release notes send players to the
+    page's update zip.
+- **First-start stutter:** say in the README that the first session compiles pipelines, and that `cache/` keeps them
+  (1.0.3: uam compiles each shader variant once, and `deko3d_shaders.bin` keeps them).
 
 ## 14. Traps
 
@@ -613,6 +657,12 @@ Each of these cost a day or more somewhere:
 - **PGO counts from threads are inconsistent:** use `-fprofile-correction` (9.2).
 - **The PC's timings:** a change that halves a PC profile entry can do nothing on the A57, and the reverse. Measure
   on the console.
+- **The build check's rules age with the build.** The release without the Vulkan driver failed the Mesa string test,
+  and a PGO build packed two of the guest's own `fmadds` into one vector `fmla`. Update the check with the evidence
+  instead of skipping it (7.1).
+- **The deko3d road's own traps** (direct calls bypassing new hooks, the display gamma ramp, a shader pass that
+  changes the early depth test, setting another thread's core mask) are in
+  [deko3d-renderer-guide.md](deko3d-renderer-guide.md), section 12.
 
 ## 15. Glossary
 
@@ -632,7 +682,13 @@ Each of these cost a day or more somewhere:
 | Native | A function replaced by hand-written C++ that does the same thing |
 | Guard / verify mode | Running a native and the original on copies of the state and comparing them |
 | Ring thread | The renderer's thread that reads the game's GPU work and records Vulkan |
-| NVK | Mesa's open-source Vulkan driver for NVIDIA GPUs, ported to the Switch |
+| NVK | Mesa's open-source Vulkan driver for NVIDIA GPUs, ported to the Switch (SA2's up to 1.0.2.1) |
+| deko3d | The Switch's own low-level graphics API (fincs, devkitPro); SA2 draws with it from 1.0.3 |
+| uam | deko3d's shader compiler (GLSL to Maxwell code, from Mesa's nouveau), run on the console per shader variant |
+| DKSH | A shader compiled by uam; `deko3d_shaders.bin` keeps them between sessions |
+| plume | The graphics API layer Renut's renderer draws through (D3D12 or Vulkan on the PC, deko3d on the Switch) |
+| Renut's renderer | reNut's Direct3D-level renderer: hooks the game's Direct3D calls and replays them on a render thread |
+| Store cards | One byte per 4 KB guest page, cleared by every store, so cached copies are proven unchanged without hashing |
 | NRO | A Switch homebrew executable |
 | LTO / PGO | Link-time optimisation / profile-guided optimisation |
 | Lockstep capture | A recording where every presented frame is captured in order, so two runs can be compared frame by frame |

@@ -6,12 +6,14 @@
 Checks (exit 1 if any fails):
   - _start is at address 0 (nfsmw-nx: a section-ordering file that moved the start-up code made the NRO unbootable);
   - the build names the optimised codegen flavour (the only one delivered);
-  - the NRO links the nfsmw NVK driver of the SDK (its "Mesa x.y.z" string; the generic portlibs Mesa once got in);
+  - the NRO links the nfsmw NVK driver of the SDK (its "Mesa x.y.z" string; the generic portlibs Mesa once got in), or,
+    for a build without the driver (1.0.3 on: no nvk_ symbol in the ELF), no Mesa string at all;
   - branch-to-self loops in recompiled functions are only in the functions with a known guest halt (KNOWN_HALTS; a
     polling loop GCC turned into "b ." with non-volatile memory means a missing loop barrier);
   - no vector fmla/fmls in recompiled functions: the generated code has no vector fused multiply-add (VMX multiply-adds
     are a multiply and an add), so any would be contraction that leaked past -ffp-contract=off (e.g. at an LTO link).
-    Scalar fmadd/fmsub/fnmadd/fnmsub come from the guest's own std::fma and are only counted.
+    Scalar fmadd/fmsub/fnmadd/fnmsub come from the guest's own std::fma and are only counted, and so are the vector
+    ones checked to be two of them packed together (KNOWN_VECTOR_FMA).
 """
 import argparse
 import collections
@@ -29,6 +31,14 @@ KNOWN_HALTS = ['sub_8215CB08', 'sub_8216E7F8', 'sub_82176F68', 'sub_821B15E0', '
                'sub_828DB988', 'sub_829296A8', 'sub_8293FA08']
 DEVKITA64 = next((d + '/devkitA64/bin/' for d in (os.environ.get('DEVKITPRO', ''), 'C:/devkitPro', '/opt/devkitpro')
                   if d and os.path.isdir(d + '/devkitA64/bin')), 'C:/devkitPro/devkitA64/bin/')
+# Vector fmla/fmls that are the guest's own fused multiply-adds, not contraction: two scalar std::fma (fmadds) of the
+# generated code that GCC's SLP vectorizer packed into one 2-lane double fmla (each lane is still one fused operation,
+# rounded to float afterwards as before, so the results are bit-identical). Function -> count, with the evidence.
+KNOWN_VECTOR_FMA = {
+    # 1.0.3 (PGO build, 2026-10-20): fmla v31.2d, v29.2d, v25.d[0] = [f6, f7] * f0 + [f12, f13] (ctx +384 / +432),
+    # the guest's "fmadds f2,f6,f0,f12" and "fmadds f1,f7,f0,f13".
+    '__imp__sub_8238EC08': 1,
+}
 EXE = '.exe' if os.name == 'nt' else ''
 
 
@@ -85,10 +95,18 @@ def main():
     else:
         print('flavour: optimised codegen')
     mesa = sorted(set(re.findall(rb'Mesa \d+\.\d+\.\d+ \(git-[0-9a-f]+\)', nro)))
-    sdk = sorted(set(re.findall(rb'Mesa \d+\.\d+\.\d+ \(git-[0-9a-f]+\)', open(a.sdk_vulkan, 'rb').read())))
-    print('Mesa in the NRO:', [m.decode() for m in mesa], '| in the SDK:', [m.decode() for m in sdk])
-    if not mesa or mesa != sdk:
-        failures.append('the NRO does not carry the SDK driver\'s Mesa string')
+    nvk = sum(1 for l in nm.splitlines() if ' nvk_' in l)
+    if nvk == 0:
+        # 1.0.3 on: a build without the driver (REXGLUE_SWITCH_NO_NVK, Renut on deko3d) must carry none of Mesa's
+        # driver: no nvk_ symbol (above) and no Mesa version string.
+        print('Vulkan driver: none linked (no nvk_ symbols); Mesa in the NRO:', [m.decode() for m in mesa])
+        if mesa:
+            failures.append('a build without the NVK driver carries a Mesa version string')
+    else:
+        sdk = sorted(set(re.findall(rb'Mesa \d+\.\d+\.\d+ \(git-[0-9a-f]+\)', open(a.sdk_vulkan, 'rb').read())))
+        print('Mesa in the NRO:', [m.decode() for m in mesa], '| in the SDK:', [m.decode() for m in sdk])
+        if not mesa or mesa != sdk:
+            failures.append('the NRO does not carry the SDK driver\'s Mesa string')
 
     # One streaming pass over the disassembly: per function, b-to-self and fused multiply-adds.
     proc = subprocess.Popen([DEVKITA64 + 'aarch64-none-elf-objdump' + EXE, '-d', '--no-show-raw-insn', a.elf],
@@ -138,11 +156,16 @@ def main():
     if unknown:
         failures.append('branch-to-self outside the known guest halts (a polling loop without its barrier?): '
                         + ', '.join(unknown[:20]))
+    paired = {k: v for k, v in vector_fma.items() if KNOWN_VECTOR_FMA.get(k) == v}
+    leaked = collections.Counter({k: v for k, v in vector_fma.items() if k not in paired})
     print(f'fused multiply-adds in recompiled functions: scalar {scalar_fma} (the guest\'s own), vector '
-          f'{sum(vector_fma.values())} in {len(vector_fma)} functions (must be 0)')
-    if vector_fma:
-        failures.append('vector fmla/fmls in recompiled code (contraction leaked): '
-                        + ', '.join(f'{k} x{v}' for k, v in vector_fma.most_common(10)))
+          f'{sum(leaked.values())} in {len(leaked)} functions (must be 0)'
+          + (f'; {sum(paired.values())} more the guest\'s own fmadds paired by GCC (KNOWN_VECTOR_FMA: '
+             f'{", ".join(sorted(paired))})' if paired else ''))
+    if leaked:
+        failures.append('vector fmla/fmls in recompiled code (contraction leaked, or a new pairing of the guest\'s '
+                        'own fmadds to check and add to KNOWN_VECTOR_FMA): '
+                        + ', '.join(f'{k} x{v}' for k, v in leaked.most_common(10)))
     if failures:
         print('\nFAILED:\n  - ' + '\n  - '.join(failures))
         sys.exit(1)

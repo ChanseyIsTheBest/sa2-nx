@@ -8,8 +8,10 @@ reach the renderer at the API level: the draws read the device's state (the shad
 textures, streams and targets are read from guest memory and their headers, and a render thread replays the frame on
 plume (Vulkan or D3D12 on the PC, banjo-nx's deko3d back end on the Switch).
 
-The emulated GPU stays the default (`sa2_renderer = "xenos"`) until this renderer is verified frame by frame against
-it. `sa2_renderer = "renut"` chooses it at boot (environment: `REX_SA2_RENDERER=renut`). The build links it with the
+On the PC the emulated GPU stays the default (`sa2_renderer = "xenos"`), as the reference to compare against.
+`sa2_renderer = "renut"` chooses it at boot (environment: `REX_SA2_RENDERER=renut`). On the Switch it is the only
+renderer from version 1.0.3: the compiled-in defaults choose it, and the build without the Vulkan driver runs nothing
+else. The way there, for other ports, is [deko3d-renderer-guide.md](deko3d-renderer-guide.md). The build links it with the
 CMake option `SA2_RENUT_RENDERER` (on).
 
 ## Where it lives
@@ -367,8 +369,8 @@ draw), `memmove` 2.8 % (not the device copies: 0 Begin*Vertices draws are whole 
     `ui/vulkan/vulkan_instance.cpp`, the ICD pair plume's Vulkan back end starts from); `sdk/src/ui/switch_no_vulkan.c`
     answers them with "no driver" (and supplies `posix_memalign`, which FFmpeg took from the driver's archive), plume's
     `PLUME_SWITCH_NO_NVK` drops its copy of the driver, and that build runs Renut on deko3d whatever `sa2_renderer` and
-    `renut_gpu_backend` say. The NRO went from 58.2 MB to 43.8 MB. The release build keeps the driver (its renderers
-    use Vulkan).
+    `renut_gpu_backend` say. The NRO went from 58.2 MB to 43.8 MB. Up to 1.0.2.1 the release kept the driver (its
+    renderer used Vulkan); 1.0.3's release links none either (`build_switch.ps1 -NoNvk`).
 
 26. Found comparing the generated code with the hand-written natives (2026-10-20 12:50): since item 4, every guest
     store a hand-written native made marked its card through a call of the C library's `memset` (GCC turned
