@@ -105,6 +105,8 @@ void LatchGraphicsOptionsLocked() {
   g_latched.full_ambient_occlusion = REXCVAR_GET(renut_ambient_occlusion) == "Full";
   // banjo-nx (2026-10-18): deko3d draws every target at the console's scale (its shaders are made for 1x, pass scale1
   // of tools/deko3d_glsl_opt.py): shadow maps follow the resolution (1x) and the ambient occlusion is the game's.
+  // sa2-nx (1.0.3.1): kept: on deko3d the shadow maps follow the render resolution (1.5x at 1080p docked, with the
+  // package made without scale1) and the ambient occlusion is the game's, SA2's defaults on every back end.
   if (IsDeko3D()) {
     g_latched.shadow_follows_resolution = true;
     g_latched.shadow_scale = {};

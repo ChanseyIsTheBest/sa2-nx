@@ -23,6 +23,10 @@ uint32_t ScaleQuartersOf(bool docked);
 // The current mode (the console's on the Switch, the simulated one on the PC).
 bool Docked();
 
+// The render height set for a mode (sa2_render_height_docked / _handheld, as set: not rounded, not gated by
+// sa2_gpu_render_scale). Renut's renderer follows the mode with its own key (sa2_renut_dock_resolution, 1.0.3.1).
+int32_t RenderHeightOf(bool docked);
+
 // PC simulation of docking: flips the simulated mode (the hotkey). No effect on the Switch.
 void ToggleDocked();
 

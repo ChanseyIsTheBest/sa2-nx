@@ -420,7 +420,8 @@ draw), `memmove` 2.8 % (not the device copies: 0 Begin*Vertices draws are whole 
     the calling thread (the main thread, at its first Swap) pins itself at once, every other guest thread applies its
     own mask at its next wait (`ApplyGuestCoreLayoutAtWait`, called from `XObject::Wait`, `SignalAndWait`,
     `WaitMultiple` and `XThread::Delay`), and threads made later at their start, as before. No thread sets another's.
-33. **`sa2_renut_msaa`** (2 by default: the user's call for the final build, 2026-10-20): SA2 makes every render target
+33. **`sa2_renut_msaa`** (2 by default in 1.0.3: the user's call for the final build, 2026-10-20; 0 by default from
+    1.0.3.1, the user's call: on the console 2x cost a little too much CPU): SA2 makes every render target
     single-sample (all "x1 samples" in the logs), so Renut's multisampling (banjo-nx's, for N&B's own multisampled
     targets: the colour and depth resolves of multisampled surfaces, their readbacks, alpha to coverage) never ran in
     SA2. `BuildTarget` (`render/surfaces.cpp`) now gives the game's single-sample targets 2 (or 4 or 8: the key takes 0, 2, 4, 8) host samples, as the
@@ -428,6 +429,18 @@ draw), `memmove` 2.8 % (not the device copies: 0 Begin*Vertices draws are whole 
     aliases) stay as they are. PC, lockstep through the 2-player City Escape demo, 196 frame pairs on and off: channel
     means equal, 1.3 % of the pixels apart by more than 8 levels (the edges), the edges visibly smoother; no errors. 4x and
     8x the same way (1.8-2 % of the pixels, the edges; plume's deko3d back end maps 8 to DkMsMode_8x).
+34. **`sa2_renut_dock_resolution`** (on; 1.0.3.1, the user's request: 1920x1080 docked, as the native renderer drew it
+    on NVK): Renut's render scale follows the console's mode (`sa2::render::Docked`, the heights of
+    `sa2_render_height_docked` / `_handheld`: 1080 and 720) at the next frame, on every back end; banjo-nx's deko3d path
+    forced 1x. On deko3d the swapchain takes the display's size with it (`plume::Deko3DSetSwapChainSize`: 1920x1080
+    docked; the window gets it with `nwindowSetDimensions` once the old swapchain has released its buffers): before, the
+    window and swapchain stayed 1280x720 and a 1080p frame would have been scaled down again. The GLSL package is made
+    without the passes `scale1` and `fragscale` (5 of 103 shaders change: the texel-size divide by the texture's scale
+    code; at 1x the same values; `fragscale` changes none of SA2's), and a package made with `scale1` keeps 1x
+    (`deko3d::PackageScales` looks for the scale code's read). The PC's test toggles (`sa2_render_test_toggle_at`) now
+    reach Renut too. PC (D3D12): the title screen and the 2-player City Escape demo at 1920x1080 against 1280x720, the
+    same pictures at a finer resolution (mean 3.2 and 5.3 levels apart after scaling down, the edges and textures);
+    docking and undocking every 90 frames, no fault. Ryujinx (deko3d, the 2-player City Escape demo; the build before MSAA went off by default): handheld, 1.0.3.1 against 1.0.3 at 1280x720, 27 of 27 overlapping frames identical (full-resolution hashes); docked, the window and swapchain went from 1280x720 to 1920x1080 at the first frame and the game drew 1920x1080, the pictures right, no errors. The user's console (2026-10-20): "it works perfect".
 29. plume's Switch `VulkanInterface` returns without an instance when volk finds no `vkCreateInstance` (the no-NVK
     build's stubs), instead of calling `vkEnumerateInstanceExtensionProperties` through null (from banjo-nx, passed
     on by Peggle 2).
@@ -480,8 +493,9 @@ identical, the delta verify key 0 of about 860,000 draws different; package 4's 
   run), uam and the upload cleaner on core 2. Renut's record worker (`banjo_renut_record_worker`) is Vulkan only:
   `record::Wrap` hands deko3d the real command list, so the worker and its core key do nothing on the Switch
   (banjo-nx, 2026-10-20; the test package's core A/B was dropped).
-- Docked: 1280x720 in both modes on deko3d (banjo-nx's shader passes `scale1`/`fragscale` assume the 1x scale; the
-  console scales the picture to the TV), where the native renderer draws 1080p docked (`sa2_render_height_docked`).
+- Docked: up to 1.0.3, 1280x720 in both modes on deko3d (banjo-nx's shader passes `scale1`/`fragscale` assumed the 1x
+  scale; the console scaled the picture to the TV). From 1.0.3.1, 1920x1080 docked as the native renderer drew it
+  (item 34).
 - 2026-10-20, version 1.0.3 (the release): Renut's renderer on deko3d is the Switch build's only renderer
   (`sa2_renderer = "renut"`, `renut_gpu_backend = "deko3d"`, both in the hidden defaults). Built with
   `tools/win/build_switch.ps1 -Pgo use -NoNvk -ReleaseShaders` from `out/nx-renut-pgo`, with the PGO profile of a

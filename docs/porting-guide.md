@@ -581,8 +581,9 @@ The Tegra X1's GPU (Maxwell, 256 cores, 460-768 MHz) is the limit only in some s
 - **Resolution and MSAA:** render scale (720p handheld, 1080p docked, switched live when docking) and optional 2x/4x
   MSAA (`app/src/me/sa2_render_mode.cpp`). Handheld 720p without MSAA is exactly the game's own image.
 - **On deko3d (1.0.3):** uam with banjo-nx's shader passes, each proven by a differential test, early depth for
-  shaders that discard, and MSAA on the game's single-sample targets (`sa2_renut_msaa`, 0/2/4/8, 2 by default). It
-  draws 1280x720 in both modes ([deko3d-renderer-guide.md](deko3d-renderer-guide.md), sections 4 and 9).
+  shaders that discard, and MSAA on the game's single-sample targets (`sa2_renut_msaa`, 0/2/4/8; off by default from
+  1.0.3.1, 2x in 1.0.3). From 1.0.3.1 it draws 1920x1080 docked and 1280x720 handheld, as the native renderer did
+  ([deko3d-renderer-guide.md](deko3d-renderer-guide.md), sections 4 and 9).
 
 ## 12. Proving every change
 

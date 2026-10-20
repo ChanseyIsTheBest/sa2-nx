@@ -640,6 +640,11 @@ namespace plume {
     bool Deko3DSetSharedWords(RenderCommandList *commandList, const void *cpu, uint32_t size);
     // banjo-nx: the queue lost (dkQueueIsInErrorState).
     bool Deko3DDeviceLost(RenderDevice *device);
+    // sa2-nx (2026-10-20, 1.0.3.1): the size the swapchain should have, the console display's (1920x1080 docked,
+    // 1280x720 handheld); 0 x 0 = the window's, as before. A swapchain of another size asks for a resize
+    // (needsResize), which gives the window that size while no buffer is registered (nwindowSetDimensions) and makes
+    // the images again. Any thread.
+    void Deko3DSetSwapChainSize(uint32_t width, uint32_t height);
     // banjo-nx (2026-10-19, latency batch 3): a copy of what a command fence's last submit signals, taken on the thread
     // that submits (the fence itself is re-armed by the next submit of its slot), and whether the GPU has signalled it
     // (dkFenceWait with no wait): any thread may test its own copy.

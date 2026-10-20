@@ -229,6 +229,44 @@ bool PackageAvailable() {
   return all.source[0].ok || all.source[1].ok;
 }
 
+bool PackageScales() {
+  // sa2-nx (2026-10-20, 1.0.3.1): a package made with tools/deko3d_glsl_opt.py's pass scale1 (1.0.3's, from an older
+  // installer page) has every texture's scale code folded to 0: drawn above 1x, its shaders would take host texel
+  // sizes for guest ones. The passes leave the code's read, "(... >> 26u) & 7u", in every shader that has one (SA2:
+  // 5 pixel shaders without scale1, none with it), so a package scales when each package in use has it somewhere.
+  static const bool scales = [] {
+    Packages &all = Open();
+    static constexpr char kScaleCode[] = ">> 26u) & 7u";
+    bool any = false;
+    for (Package &p : all.source) {
+      if (!p.ok)
+        continue;
+      any = true;
+      bool found = false;
+      std::vector<char> text;
+      std::lock_guard<std::mutex> lock(p.mutex);
+      for (uint32_t i = 0; i < p.header->count && !found; ++i) {
+        const PackageEntry &e = p.entries[i];
+        text.resize(e.size);
+        const size_t n = p.dict ? ZSTD_decompress_usingDDict(p.dctx, text.data(), e.size, p.data + e.offset,
+                                                             e.compressedSize, p.dict)
+                                : ZSTD_decompressDCtx(p.dctx, text.data(), e.size, p.data + e.offset, e.compressedSize);
+        if (ZSTD_isError(n) || n != e.size)
+          continue;
+        found = std::search(text.begin(), text.end(), kScaleCode, kScaleCode + sizeof(kScaleCode) - 1) != text.end();
+      }
+      if (!found) {
+        REXLOG_WARN("[deko3d] the {} GLSL package was made for 1280x720 only (pass scale1): the game draws at "
+                    "1280x720; make deko3d_glsl.bin again with the installer page for 1920x1080 when docked",
+                    &p == &all.source[0] ? "deko3d_glsl.bin" : "built-in");
+        return false;
+      }
+    }
+    return any;
+  }();
+  return scales;
+}
+
 #if defined(PLUME_DEKO3D)
 
 std::unique_ptr<plume::RenderShader> CreateGameShader(plume::RenderDevice *device, uint64_t hash) {

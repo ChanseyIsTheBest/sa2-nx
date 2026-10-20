@@ -251,11 +251,27 @@ Lessons that cost time:
 
 ## 9. Step 7: picture options
 
-- **MSAA** (`sa2_renut_msaa`: 0, 2, 4 or 8; 2 by default). SA2 makes every render target single-sample, so Renut's
+- **MSAA** (`sa2_renut_msaa`: 0, 2, 4 or 8; 2 by default in 1.0.3, off from 1.0.3.1: on the console 2x cost a little
+  too much CPU). SA2 makes every render target single-sample, so Renut's
   multisampling never ran. `BuildTarget` (`render/surfaces.cpp`) now gives the game's single-sample targets 2, 4 or 8
   host samples. The game's own resolves downsample them, and its genuinely multisampled surfaces stay as they are.
-- **Resolution.** banjo-nx's shader passes `scale1` and `fragscale` assume the 1x scale, so the game draws 1280x720
-  in both modes and the console scales the image for the TV.
+- **Resolution: 1920x1080 docked, 1280x720 handheld** (1.0.3.1, `sa2_renut_dock_resolution`). Three parts:
+  - **The render scale follows the console's mode.** `LatchResolutionScaleLocked` (`render/surfaces.cpp`) reads the
+    mode every frame (libnx's cached operation mode, Reverse-NX obeyed; the SDK's applet loop keeps it current) and
+    takes the scale from the heights set for it (`sa2_render_height_docked` 1080, `_handheld` 720). banjo-nx's deko3d
+    path forced 1x there; that is gone. The change applies at the next frame, and the targets are made again at the
+    new scale.
+  - **The swapchain takes the display's size.** On deko3d the window and swapchain were fixed at 1280x720 (libnx's
+    default window, and display sync's own), so a 1080p frame would only be scaled down again. plume's
+    `Deko3DSetSwapChainSize` asks for 1920x1080 docked: `needsResize` reports it, and `resize` destroys the old
+    swapchain first, because `nwindowSetDimensions` is refused while buffers are registered with the window.
+  - **Shaders without `scale1` and `fragscale`.** Those two passes fold the texture scale code to 1x. Without them,
+    5 of SA2's 103 shaders change (the ones that read a texture's size for texel offsets: `(x >> 26u) & 7u`, then a
+    divide by the scale). At 720p they divide whole-number sizes by 1.0, so they compute the same values. `fragscale`
+    changes none of SA2's shaders. The installer page's pass list is in the build's manifest entry, so only the list
+    changes. A package made with `scale1` (1.0.3's) is found at start, and the game then stays at 1280x720
+    (`deko3d::PackageScales`).
+  The shadow maps follow the render resolution (1.5x at 1080p), as on the PC.
 
 ## 10. Step 8: shipping without game shaders
 
@@ -282,8 +298,8 @@ peggle2-nx did:
 - **Pin the result.** The build's manifest entry holds the pass list, every shader's hash, every container's SHA-256
   and the package's SHA-256. The page refuses a package that differs. The browser's DXC (v2025.1) is not the PC's
   (1.8): 97 of SA2's 103 shaders came out byte for byte the native chain's, and the other 6 differ only in the numbers
-  of SPIR-V temporaries. Use the default pass list the native packages were tested with. A shorter list gave 5 of 103
-  identical.
+  of SPIR-V temporaries. Use the pass list the native packages were tested with (1.0.3.1: the default list without
+  `scale1` and `fragscale`). A shorter list gave 5 of 103 identical.
 - **Test the NRO with the page's own package.** SA2's 1.0.3 was run with the page's `deko3d_glsl.bin`: 103 shaders
   loaded, uam compiling variants, the attract demo drawn right, no errors. Then `test/release_node.mjs --deko3d
   ... --no-library --write` fills in the manifest.
@@ -322,6 +338,8 @@ peggle2-nx did:
   (`switch_thread_stack_pool`, 64).
 - **A depth target smaller than its colour target** is a GPU exception on Maxwell. Log it if your game ever binds one.
 - **Setting another thread's core mask can hang** (section 7).
+- **The deko3d swapchain stays 1280x720 unless asked.** Rendering 1080p docked without resizing it gives nothing: the
+  frame is scaled back down. Resize it with the window, after the old swapchain has let go of its buffers (section 9).
 - **A second `viOpenDefaultDisplay` fails on the console.** Display sync must use libnx's default window.
 - **The emulator and the PC are not timing evidence.** Only console profiles decide what stays.
 - **Don't run several emulator instances at once on a full disk.** When the page file cannot grow, `CreateThread`
@@ -337,6 +355,7 @@ peggle2-nx did:
 6. Drop NVK (`REXGLUE_SWITCH_NO_NVK`, `PLUME_SWITCH_NO_NVK`).
 7. Console profile. Deltas, store cards, chain reuse, wake batching, core layout, each keyed and verified.
 8. Late input with the SDK's read hook, display sync, eager kicks. Double buffer as an option.
-9. MSAA on single-sample targets if you want it.
+9. MSAA on single-sample targets if you want it. 1080p docked: the scale from the console's mode, the swapchain at
+   the display's size, the shaders without `scale1` and `fragscale`.
 10. Release shaders: the table in the NRO, the GLSL from the installer page, pinned by SHA-256, tested with the page's
     own package. PGO from a console session of this renderer. Patches, notices and licences updated.

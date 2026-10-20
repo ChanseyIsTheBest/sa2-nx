@@ -1765,7 +1765,7 @@ index cfc13f2..4fc0b5b 100644
 +
  } // namespace renut::gpu
 diff --git a/app/src/renut_engine/gpu/banjo_renut_deko3d.cpp b/app/src/renut_engine/gpu/banjo_renut_deko3d.cpp
-index 8d0e544..8cd6ae0 100644
+index 8d0e544..36616e0 100644
 --- a/app/src/renut_engine/gpu/banjo_renut_deko3d.cpp
 +++ b/app/src/renut_engine/gpu/banjo_renut_deko3d.cpp
 @@ -16,6 +16,7 @@
@@ -1925,7 +1925,7 @@ index 8d0e544..8cd6ae0 100644
                                            : "deko3d_shaders_f" + std::to_string(flags) + ".bin").string();
    c.file = std::fopen(c.path.c_str(), "r+b");
    bool fresh = c.file == nullptr;
-@@ -164,19 +224,25 @@ void LoadCache() {
+@@ -164,19 +224,63 @@ void LoadCache() {
  
  }  // namespace
  
@@ -1933,6 +1933,44 @@ index 8d0e544..8cd6ae0 100644
 +bool PackageAvailable() {
 +  Packages &all = Open();
 +  return all.source[0].ok || all.source[1].ok;
++}
++
++bool PackageScales() {
++  // sa2-nx (2026-10-20, 1.0.3.1): a package made with tools/deko3d_glsl_opt.py's pass scale1 (1.0.3's, from an older
++  // installer page) has every texture's scale code folded to 0: drawn above 1x, its shaders would take host texel
++  // sizes for guest ones. The passes leave the code's read, "(... >> 26u) & 7u", in every shader that has one (SA2:
++  // 5 pixel shaders without scale1, none with it), so a package scales when each package in use has it somewhere.
++  static const bool scales = [] {
++    Packages &all = Open();
++    static constexpr char kScaleCode[] = ">> 26u) & 7u";
++    bool any = false;
++    for (Package &p : all.source) {
++      if (!p.ok)
++        continue;
++      any = true;
++      bool found = false;
++      std::vector<char> text;
++      std::lock_guard<std::mutex> lock(p.mutex);
++      for (uint32_t i = 0; i < p.header->count && !found; ++i) {
++        const PackageEntry &e = p.entries[i];
++        text.resize(e.size);
++        const size_t n = p.dict ? ZSTD_decompress_usingDDict(p.dctx, text.data(), e.size, p.data + e.offset,
++                                                             e.compressedSize, p.dict)
++                                : ZSTD_decompressDCtx(p.dctx, text.data(), e.size, p.data + e.offset, e.compressedSize);
++        if (ZSTD_isError(n) || n != e.size)
++          continue;
++        found = std::search(text.begin(), text.end(), kScaleCode, kScaleCode + sizeof(kScaleCode) - 1) != text.end();
++      }
++      if (!found) {
++        REXLOG_WARN("[deko3d] the {} GLSL package was made for 1280x720 only (pass scale1): the game draws at "
++                    "1280x720; make deko3d_glsl.bin again with the installer page for 1920x1080 when docked",
++                    &p == &all.source[0] ? "deko3d_glsl.bin" : "built-in");
++        return false;
++      }
++    }
++    return any;
++  }();
++  return scales;
 +}
  
  #if defined(PLUME_DEKO3D)
@@ -1957,7 +1995,7 @@ index 8d0e544..8cd6ae0 100644
    std::vector<uint8_t> blob(sizeof(plume::Deko3DShaderBlob) + e->size);
    plume::Deko3DShaderBlob header;
    header.stage = e->stage;
-@@ -185,8 +251,10 @@ std::unique_ptr<plume::RenderShader> CreateGameShader(plume::RenderDevice *devic
+@@ -185,8 +289,10 @@ std::unique_ptr<plume::RenderShader> CreateGameShader(plume::RenderDevice *devic
    std::memcpy(blob.data(), &header, sizeof(header));
    {
      std::lock_guard<std::mutex> lock(p.mutex);
@@ -1970,7 +2008,7 @@ index 8d0e544..8cd6ae0 100644
      if (ZSTD_isError(n) || n != e->size) {
        REXLOG_ERROR("[deko3d] shader {:016X}: the GLSL did not unpack ({})", hash,
                     ZSTD_isError(n) ? ZSTD_getErrorName(n) : "short");
-@@ -260,6 +328,10 @@ void InstallShaderCache() {
+@@ -260,6 +366,10 @@ void InstallShaderCache() {
          std::memcpy(record.data() + 12, dksh.data(), dksh.size());
          if (std::fseek(c.file, c.end, SEEK_SET) == 0 &&
              std::fwrite(record.data(), 1, record.size(), c.file) == record.size() && std::fflush(c.file) == 0) {
@@ -1981,7 +2019,7 @@ index 8d0e544..8cd6ae0 100644
            c.index[key] = {c.end + 12, size};
            c.end += long(record.size());
            c.added++;
-@@ -297,19 +369,28 @@ std::string Report() { return {}; }
+@@ -297,19 +407,28 @@ std::string Report() { return {}; }
  
  #endif
  
@@ -2016,10 +2054,21 @@ index 8d0e544..8cd6ae0 100644
  
  }  // namespace banjo::renut_gpu::deko3d
 diff --git a/app/src/renut_engine/gpu/banjo_renut_deko3d.h b/app/src/renut_engine/gpu/banjo_renut_deko3d.h
-index aab50ac..2c9d3b7 100644
+index aab50ac..3390ef1 100644
 --- a/app/src/renut_engine/gpu/banjo_renut_deko3d.h
 +++ b/app/src/renut_engine/gpu/banjo_renut_deko3d.h
-@@ -23,6 +23,10 @@ std::unique_ptr<plume::RenderShader> CreateGameShader(plume::RenderDevice *devic
+@@ -17,12 +17,21 @@ namespace banjo::renut_gpu::deko3d {
+ // Whether the NRO carries the GLSL package (Switch builds made with one).
+ bool PackageAvailable();
+ 
++// sa2-nx (2026-10-20, 1.0.3.1): whether the GLSL packages in use draw right above 1x (made without
++// tools/deko3d_glsl_opt.py's pass scale1, as the installer page makes them from 1.0.3.1 on). Read once (logged when
++// not); render/surfaces.cpp keeps 1280x720 otherwise.
++bool PackageScales();
++
+ // The deko3d shader (plume::Deko3DShaderBlob) of a game shader by its container hash, or null (logged once).
+ std::unique_ptr<plume::RenderShader> CreateGameShader(plume::RenderDevice *device, uint64_t hash);
+ 
  // The boolean specialization constants (ids 1000..1255) a game shader has, as ShaderBoolSpecMask gives them.
  bool BoolSpecMask(uint64_t hash, uint32_t mask[8]);
  
@@ -2695,7 +2744,7 @@ index 07f8a96..e9a3dcc 100644
  constexpr u8 kFlagsNoHardware = 0x80;
  constexpr u8 kFlags1ImmediateFences = 0x02;
 diff --git a/app/src/renut_engine/gpu/d3d/hooks/device.cpp b/app/src/renut_engine/gpu/d3d/hooks/device.cpp
-index e5b04de..19e6ed0 100644
+index e5b04de..cd91ae3 100644
 --- a/app/src/renut_engine/gpu/d3d/hooks/device.cpp
 +++ b/app/src/renut_engine/gpu/d3d/hooks/device.cpp
 @@ -15,6 +15,7 @@
@@ -2706,19 +2755,20 @@ index e5b04de..19e6ed0 100644
  #include <algorithm>
  #include <array>
  #include <atomic>
-@@ -33,6 +34,11 @@
+@@ -33,6 +34,12 @@
  #include "renut_engine/gpu/banjo_renut_tuning.h"  // banjo-nx: CountFenceQuery
  #include "renut_engine/gpu/banjo_renut_checks.h"  // banjo-nx (package 27c): QueueKickFlush
  #include "renut_engine/gpu/banjo_renut_select.h"
 +#include "renut_engine/gpu/sa2_renut_pacing.h"  // sa2-nx
 +#include "renut_engine/gpu/banjo_renut_capture.h"  // sa2-nx: lockstep captures
 +#include "sa2_capture.h"                            // sa2-nx: lockstep captures
++#include "me/sa2_render_mode.h"                     // sa2-nx (1.0.3.1): the PC's docked test toggles
 +
 +#include <rex/cvar.h>
  #include <rex/kernel/xboxkrnl/video.h>
  #include <rex/ppc.h>
  #include <rex/system/xvideo.h>
-@@ -56,6 +62,12 @@
+@@ -56,6 +63,12 @@
  
  using namespace renut::gpu;
  
@@ -2731,7 +2781,7 @@ index e5b04de..19e6ed0 100644
  // Kernel exports the device code uses.
  REX_IMPORT(__imp__rex_GetCurrentThreadId, GuestGetCurrentThreadId, u32());
  REX_IMPORT(__imp__RtlInitializeCriticalSection, RtlInitializeCriticalSection, void(u32));
-@@ -76,37 +88,41 @@ constexpr u32 kRingSinkGuaranteeMargin = 256u << 10;
+@@ -76,37 +89,41 @@ constexpr u32 kRingSinkGuaranteeMargin = 256u << 10;
  constexpr u32 kRingDataSize = 1u << 20;
  
  // CDevice-private state Direct3D_CreateDevice (0x8264DF28) sets up, as byte
@@ -2786,7 +2836,7 @@ index e5b04de..19e6ed0 100644
  
  constexpr u32 kE_OUTOFMEMORY = 0x8007000Eu;
  
-@@ -848,11 +864,42 @@ void D3DDevice_RunCommandBuffer_hook(u32 device_va, u32 command_buffer,
+@@ -848,11 +865,44 @@ void D3DDevice_RunCommandBuffer_hook(u32 device_va, u32 command_buffer,
  // The frame goes to the render thread, which presents it; the game thread
  // goes on with the next one, waiting only when it is more than
  // render_thread::kMaxFramesAhead ahead.
@@ -2819,6 +2869,8 @@ index e5b04de..19e6ed0 100644
 +  sa2::renut::PaceSwap(device_va);
 +  // sa2-nx: SA2's game frame count (src/sa2_d3d_trace.cpp: the flip, which only the GPU's vblank interrupt reaches).
 +  const uint64_t game_frame = g_sa2_game_frames.fetch_add(1, std::memory_order_relaxed) + 1;
++  // sa2-nx (1.0.3.1): the PC's docked / handheld test toggles (sa2_render_test_toggle_at; nothing on the Switch).
++  sa2::render::OnPresented(game_frame);
 +  // sa2-nx: a lockstep recording (sa2_capture.cpp) takes this very frame: asked before it is queued.
 +  const uint64_t capture_ticket = sa2::capture::RenutLockstepOn() ? RequestFrameCapture() : 0;
    renut::frame_stats::OnGameFrame();
@@ -2829,7 +2881,7 @@ index e5b04de..19e6ed0 100644
  
    // What the original does after handing the frame to the video hardware:
    // count the swap, record the frame's fence tag, and end the frame with a
-@@ -867,11 +914,18 @@ void D3DDevice_Swap_hook(u32 device_va, u32 front_buffer, u32 /*parameters*/) {
+@@ -867,11 +917,18 @@ void D3DDevice_Swap_hook(u32 device_va, u32 front_buffer, u32 /*parameters*/) {
      word(d3d::kDeviceOffsetSwapFenceTag) = fence_tag;
      word(d3d::kDeviceOffsetPresentFenceTag) = fence_tag;
      device[d3d::kDeviceOffsetSwapFlags] &= u8(~d3d::kSwapFlagPending);
@@ -2848,7 +2900,7 @@ index e5b04de..19e6ed0 100644
    }
  
    render_thread::QueueFrame([front_buffer, swap_ordinal] {
-@@ -887,16 +941,26 @@ void D3DDevice_Swap_hook(u32 device_va, u32 front_buffer, u32 /*parameters*/) {
+@@ -887,16 +944,26 @@ void D3DDevice_Swap_hook(u32 device_va, u32 front_buffer, u32 /*parameters*/) {
      }
      MaybeReportMemory();
      // The front buffer is the texture the game resolved the frame into.
@@ -2878,7 +2930,7 @@ index e5b04de..19e6ed0 100644
  }
  
  // void D3DDevice_InsertCallback(D3DDevice*, D3DCALLBACKTYPE, D3DCALLBACK pCallback,
-@@ -1214,35 +1278,141 @@ void SetFence(u32 device_va) {
+@@ -1214,35 +1281,141 @@ void SetFence(u32 device_va) {
  
  } // namespace renut::gpu::native
  
@@ -4476,7 +4528,7 @@ index 79960fd..a9339a1 100644
  // A vertex declaration record at 'declaration_va' is being destroyed.
  void ForgetVertexDeclarationLocked(u32 declaration_va);
 diff --git a/app/src/renut_engine/gpu/render/graphics_options.cpp b/app/src/renut_engine/gpu/render/graphics_options.cpp
-index 6a3ea3d..1fb9745 100644
+index 6a3ea3d..ea7323a 100644
 --- a/app/src/renut_engine/gpu/render/graphics_options.cpp
 +++ b/app/src/renut_engine/gpu/render/graphics_options.cpp
 @@ -28,7 +28,8 @@ REXCVAR_DEFINE_STRING(renut_anisotropic_filtering, "Game", "Nuts&Bolts/Graphics"
@@ -4489,6 +4541,15 @@ index 6a3ea3d..1fb9745 100644
                        "Precision of the bloom, depth of field and SSAO buffers: Game keeps the "
                        "console's 8 bits (faint glow shows as blobs sliding over dark areas), High "
                        "uses 16 bits.")
+@@ -104,6 +105,8 @@ void LatchGraphicsOptionsLocked() {
+   g_latched.full_ambient_occlusion = REXCVAR_GET(renut_ambient_occlusion) == "Full";
+   // banjo-nx (2026-10-18): deko3d draws every target at the console's scale (its shaders are made for 1x, pass scale1
+   // of tools/deko3d_glsl_opt.py): shadow maps follow the resolution (1x) and the ambient occlusion is the game's.
++  // sa2-nx (1.0.3.1): kept: on deko3d the shadow maps follow the render resolution (1.5x at 1080p docked, with the
++  // package made without scale1) and the ambient occlusion is the game's, SA2's defaults on every back end.
+   if (IsDeko3D()) {
+     g_latched.shadow_follows_resolution = true;
+     g_latched.shadow_scale = {};
 diff --git a/app/src/renut_engine/gpu/render/pipeline.cpp b/app/src/renut_engine/gpu/render/pipeline.cpp
 index 1dbfa34..7da6749 100644
 --- a/app/src/renut_engine/gpu/render/pipeline.cpp
@@ -4685,10 +4746,30 @@ index a946565..9bac515 100644
  // The pipeline list: every pipeline a draw needed is written to a file
  // (renut_pipeline_list), and at the next start worker threads build the ones
 diff --git a/app/src/renut_engine/gpu/render/surfaces.cpp b/app/src/renut_engine/gpu/render/surfaces.cpp
-index a09792b..849399a 100644
+index a09792b..3001af1 100644
 --- a/app/src/renut_engine/gpu/render/surfaces.cpp
 +++ b/app/src/renut_engine/gpu/render/surfaces.cpp
-@@ -25,6 +25,16 @@ REXCVAR_DEFINE_STRING(renut_resolution, "720p", "Nuts&Bolts/Graphics",
+@@ -20,11 +20,37 @@
+ #include "renut_engine/gpu/guest/widescreen.h"
+ #include "renut_engine/gpu/log.h"
+ #include "renut_engine/gpu/backend/video.h"
++#include "me/sa2_render_mode.h"  // sa2-nx (1.0.3.1): the console's mode and the heights set for it
++#if defined(PLUME_DEKO3D)
++#include <plume_deko3d.h>                             // sa2-nx (1.0.3.1): Deko3DSetSwapChainSize
++#include "renut_engine/gpu/banjo_renut_deko3d.h"     // sa2-nx (1.0.3.1): PackageScales
++#endif
++
++// sa2-nx (2026-10-20, 1.0.3.1, the user's request: 1920x1080 docked, as the native renderer drew it up to 1.0.2.1):
++// the render resolution follows the console's mode (sa2::render::Docked: libnx's operation mode, Reverse-NX obeyed; the
++// PC's simulated one, F9) at the next frame, at the heights the native renderer's keys set. On deko3d the swapchain
++// takes the display's size with it (1920x1080 docked), and a GLSL package made for 1x only keeps 1280x720.
++REXCVAR_DEFINE_BOOL(sa2_renut_dock_resolution, true, "SA2/Renderer",
++                    "Renut's renderer: render at sa2_render_height_docked (1080 = 1920x1080) when docked and at "
++                    "sa2_render_height_handheld (720 = the game's 1280x720) in handheld mode, switching at the next "
++                    "frame (the PC: sa2_render_docked, F9). Heights of 480, 720, 1080, 1440 or 2160. Off: "
++                    "renut_resolution");
+ 
+ REXCVAR_DEFINE_STRING(renut_resolution, "720p", "Nuts&Bolts/Graphics",
                        "Internal render resolution, by its height: 480p, 720p (the game's own), "
                        "1080p, 1440p or 4K (2160 lines). Applies from the next frame.")
      .allowed({"480p", "720p", "1080p", "1440p", "4K"});
@@ -4696,16 +4777,17 @@ index a09792b..849399a 100644
 +// so Renut's multisampling (N&B's targets are multisampled: banjo-nx's resolves, depth resolves and readbacks of them)
 +// never ran. The game's single-sample targets get this many samples on the host, as the native renderer's sa2_msaa did;
 +// the game's resolves downsample them. Its 4x surfaces (Direct3D's fast Clear aliases) stay as they are.
-+REXCVAR_DEFINE_INT32(sa2_renut_msaa, 2, "SA2/Renderer",
++// sa2-nx (1.0.3.1, the user's call: 2x cost the console a little too much CPU): off by default again.
++REXCVAR_DEFINE_INT32(sa2_renut_msaa, 0, "SA2/Renderer",
 +                     "Renut's renderer: multisample anti-aliasing of the game's single-sample render targets: 0 = off "
-+                     "(the game's own), 2 = 2x (default), 4 = 4x, 8 = 8x. Smoother edges; each step costs more GPU time "
-+                     "and memory (8x: about 30 MB more for each 1280x720 target). Read at start")
++                     "(the game's own, default), 2 = 2x, 4 = 4x, 8 = 8x. Smoother edges; each step costs more GPU and "
++                     "CPU time and memory (8x: about 30 MB more for each 1280x720 target). Read at start")
 +    .range(0, 8)
 +    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
  
  namespace renut::gpu {
  
-@@ -180,6 +190,17 @@ bool BuildTarget(HostSurface &surface, const d3d::SurfaceDesc &desc, uint32_t mi
+@@ -180,6 +206,17 @@ bool BuildTarget(HostSurface &surface, const d3d::SurfaceDesc &desc, uint32_t mi
    const uint32_t host_height = surface.scale.Size(surface.height);
    surface.depth = d3d::IsDepthFormat(surface.format_word);
    surface.samples = SampleCount(surface.info_word);
@@ -4723,7 +4805,7 @@ index a09792b..849399a 100644
    if (surface.depth) {
      surface.format = DepthTargetFormat(surface.format_word);  // banjo-nx (2026-10-19, banjo_deko3d_depth24)
      if (banjo::renut_gpu::Depth24On()) {
-@@ -227,6 +248,9 @@ bool BuildTarget(HostSurface &surface, const d3d::SurfaceDesc &desc, uint32_t mi
+@@ -227,6 +264,9 @@ bool BuildTarget(HostSurface &surface, const d3d::SurfaceDesc &desc, uint32_t mi
  
  } // namespace
  
@@ -4733,6 +4815,64 @@ index a09792b..849399a 100644
  RenderScale ResolutionScale() {
    return g_resolution_scale;
  }
+@@ -240,16 +280,50 @@ void LatchResolutionScaleLocked() {
+                     : resolution == "1440p" ? 3u
+                     : resolution == "4K"    ? 4u
+                                             : 0u};
+-  // banjo-nx (2026-10-18): the deko3d renderer draws at the console's resolution only; its shaders are made for it
+-  // (tools/deko3d_glsl_opt.py, pass scale1: no per-texture scale divisor, resolution_scale 1).
++  // sa2-nx (2026-10-20, 1.0.3.1): the console's mode picks the resolution (sa2_renut_dock_resolution).
++  static const bool follow_mode = REXCVAR_GET(sa2_renut_dock_resolution);
++  const bool docked = follow_mode && sa2::render::Docked();
++  if (follow_mode) {
++    const int32_t height = sa2::render::RenderHeightOf(docked);
++    RenderScale mode;
++    // The render resolutions only (codes 0-4: 720p, 480p, 1080p, 1440p, 2160p).
++    if (height <= 0 || !RenderScale::FromRatio(uint32_t(height), 720, mode) || mode.code > 4) {
++      static bool logged = false;
++      if (!logged) {
++        logged = true;
++        RGPU_WARN("sa2_render_height_{} = {} is not one of 480, 720, 1080, 1440, 2160: 720 (1280x720)",
++                  docked ? "docked" : "handheld", height);
++      }
++      mode = {};
++    }
++    scale = mode;
++  }
++  // banjo-nx (2026-10-18): the deko3d renderer drew at the console's resolution only; its shaders were made for it
++  // (tools/deko3d_glsl_opt.py, pass scale1: no per-texture scale divisor, resolution_scale 1). sa2-nx (1.0.3.1): the
++  // installer page's package is made without scale1 and fragscale, and draws at any scale; a package made with them
++  // (1.0.3's) keeps 1x (deko3d::PackageScales logs it).
+   if (IsDeko3D() && scale.code != 0) {
+-    static bool logged = false;
+-    if (!logged) {
+-      logged = true;
+-      RGPU_WARN("renut_resolution = \"{}\" is not taken on deko3d: it draws at the console's 1280x720", resolution);
++#if defined(PLUME_DEKO3D)
++    const bool scales = banjo::renut_gpu::deko3d::PackageScales();
++#else
++    const bool scales = false;
++#endif
++    if (!scales)
++      scale = {};
++  }
++#if defined(PLUME_DEKO3D)
++  // sa2-nx (1.0.3.1): the swapchain at the display's size (1920x1080 docked, 1280x720 handheld): the present scales the
++  // frame to it, and the console shows it as it is. Before, it stayed 1280x720 and the console scaled it to the TV.
++  if (IsDeko3D() && follow_mode) {
++    static int last_docked = -1;
++    if (last_docked != int(docked)) {
++      last_docked = int(docked);
++      plume::Deko3DSetSwapChainSize(docked ? 1920u : 1280u, docked ? 1080u : 720u);
++      RGPU_INFO("[renut] {} mode: the swapchain at {}", docked ? "docked" : "handheld",
++                docked ? "1920x1080" : "1280x720");
+     }
+-    scale = {};
+   }
++#endif
+   if (!g_resolution_latched || scale != g_resolution_scale) {
+     RGPU_INFO("Render resolution {}x{} ({:.3g}x)", scale.Size(GuestScreenWidth()), scale.Size(720),
+               scale.Factor());
 diff --git a/app/src/renut_engine/gpu/render/surfaces.h b/app/src/renut_engine/gpu/render/surfaces.h
 index cd64578..9d8742b 100644
 --- a/app/src/renut_engine/gpu/render/surfaces.h

@@ -17,7 +17,17 @@ card as `switch\sa2-nx`. With a loose `game_root/` folder instead of the pack (`
 the pack on the card (a few minutes, logged as `[pack] packing N %`); the folder can be deleted afterwards. When a pack
 exists it is always used, so an old `game_root/` folder from earlier tests is no longer read and can be deleted.
 
-## This build (version 1.0.3, 2026-10-20)
+## This build (version 1.0.3.1, 2026-10-20)
+
+- **1920x1080 docked** again, as up to 1.0.2.1: the game draws 1920x1080 when docked and 1280x720 in handheld mode,
+  and switches when you dock or undock. 1.0.3 drew 1280x720 docked too.
+- **Update with the installer page:** its update zip has the new `deko3d_glsl.bin` (5 shaders change). With 1.0.3's
+  file the game stays at 1280x720 docked.
+- **Anti-aliasing off by default** (`sa2_renut_msaa = 0`): 2x cost the console a little too much CPU. A `sa2.toml`
+  written by 1.0.3 keeps its `sa2_renut_msaa = 2`: set it to 0, or delete the file to get the new default one.
+- Everything else is 1.0.3's.
+
+## Version 1.0.3 (2026-10-20)
 
 - **A new renderer:** Renut's Direct3D-level renderer (from reNut, as banjo-nx carries it) on deko3d, the Switch's own
   graphics API. The NRO has no Vulkan driver any more (58 MB -> 47 MB) and draws the game's Direct3D calls natively:

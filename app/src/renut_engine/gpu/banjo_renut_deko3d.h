@@ -17,6 +17,11 @@ namespace banjo::renut_gpu::deko3d {
 // Whether the NRO carries the GLSL package (Switch builds made with one).
 bool PackageAvailable();
 
+// sa2-nx (2026-10-20, 1.0.3.1): whether the GLSL packages in use draw right above 1x (made without
+// tools/deko3d_glsl_opt.py's pass scale1, as the installer page makes them from 1.0.3.1 on). Read once (logged when
+// not); render/surfaces.cpp keeps 1280x720 otherwise.
+bool PackageScales();
+
 // The deko3d shader (plume::Deko3DShaderBlob) of a game shader by its container hash, or null (logged once).
 std::unique_ptr<plume::RenderShader> CreateGameShader(plume::RenderDevice *device, uint64_t hash);
 

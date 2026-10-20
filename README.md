@@ -96,7 +96,7 @@ pair.
 | Setting | What it does |
 | --- | --- |
 | `language` | `auto` follows the Switch's language; or `english`, `japanese`, `french`, `german`, `spanish`, `italian` |
-| `sa2_renut_msaa` | Anti-aliasing: `0` off, `2` (default), `4` or `8` (smoother edges, more GPU work) |
+| `sa2_renut_msaa` | Anti-aliasing: `0` off (default from 1.0.3.1), `2`, `4` or `8` (smoother edges, more GPU and CPU work) |
 | `sa2_vsync_relaxed` | `true` (default): a frame that misses 60 FPS is shown as soon as it is ready (50-59 FPS) instead of falling to 30 |
 | `sa2_renut_double_buffer` | `false` (default). `true`: two images instead of three, so a finished frame reaches the screen sooner (less input lag), but a frame that misses a refresh waits for the next one, so busy scenes (2-player) can drop frames |
 | `input_xbox_layout` | Face buttons by position (`true`, default) or by letter (`false`) |
@@ -109,8 +109,9 @@ If you delete `sa2.toml`, the game writes the default one again at the next star
 
 ## Resolution
 
-The game draws **1280x720**, as on the Xbox 360, in handheld mode and docked (the console scales it to the TV), with
-2x MSAA by default (`sa2_renut_msaa`).
+The game draws **1280x720** in handheld mode, as on the Xbox 360, and **1920x1080** docked (from 1.0.3.1; 1.0.3
+drew 1280x720 docked too), and switches when you dock or undock. Anti-aliasing is off by default from 1.0.3.1
+(`sa2_renut_msaa`: 2, 4 or 8 turn it on, at some CPU and GPU cost).
 
 ## Performance
 

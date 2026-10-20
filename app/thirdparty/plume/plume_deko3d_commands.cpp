@@ -1226,6 +1226,13 @@ namespace plume {
 
     // ---- Deko3DSwapChain
 
+    // sa2-nx (2026-10-20, 1.0.3.1): Deko3DSetSwapChainSize's size (width << 32 | height; 0 = the window's).
+    static std::atomic<uint64_t> g_wantedSwapChainSize{0};
+
+    void Deko3DSetSwapChainSize(uint32_t width, uint32_t height) {
+        g_wantedSwapChainSize.store(width && height ? (uint64_t(width) << 32 | height) : 0, std::memory_order_relaxed);
+    }
+
     Deko3DSwapChain::Deko3DSwapChain(Deko3DCommandQueue *queue, const RenderSwapChainDesc &desc) : queue(queue), device(queue->device), desc(desc) {
         resize();
     }
@@ -1250,13 +1257,26 @@ namespace plume {
         // swapchain.
         uint32_t w = 0, h = 0;
         NWindow *window = desc.renderWindow ? desc.renderWindow : nwindowGetDefault();
-        if (nwindowGetDimensions(window, &w, &h) != 0 || w < 64 || h < 64) {
+        // sa2-nx (2026-10-20, 1.0.3.1): a size set by Deko3DSetSwapChainSize (the console's display: 1080p docked)
+        // comes first; the window takes it below, once the old swapchain has let go of its buffers.
+        const uint64_t wanted = g_wantedSwapChainSize.load(std::memory_order_relaxed);
+        if (wanted) {
+            w = uint32_t(wanted >> 32);
+            h = uint32_t(wanted);
+        } else if (nwindowGetDimensions(window, &w, &h) != 0 || w < 64 || h < 64) {
             w = width ? width : 1280;
             h = height ? height : 720;
         }
         if (swapchain && w == width && h == height)
             return true;
         destroy();
+        if (wanted) {
+            uint32_t cw = 0, ch = 0;
+            if (nwindowGetDimensions(window, &cw, &ch) != 0 || cw != w || ch != h) {
+                const Result rc = nwindowSetDimensions(window, w, h);
+                logf("window: %ux%u -> %ux%u (%s)", cw, ch, w, h, R_SUCCEEDED(rc) ? "set" : "failed");
+            }
+        }
         width = w;
         height = h;
         DkImageFormat format = toDkFormat(desc.format);
@@ -1298,7 +1318,13 @@ namespace plume {
         return true;
     }
 
-    bool Deko3DSwapChain::needsResize() const { return swapchain == nullptr; }
+    bool Deko3DSwapChain::needsResize() const {
+        if (swapchain == nullptr)
+            return true;
+        // sa2-nx (2026-10-20, 1.0.3.1): another size wanted (docking or undocking).
+        const uint64_t wanted = g_wantedSwapChainSize.load(std::memory_order_relaxed);
+        return wanted && (uint32_t(wanted >> 32) != width || uint32_t(wanted) != height);
+    }
 
     void Deko3DSwapChain::setVsyncEnabled(bool vsyncEnabled) {
         vsync = vsyncEnabled;

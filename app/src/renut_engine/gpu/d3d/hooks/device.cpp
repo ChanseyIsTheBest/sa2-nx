@@ -37,6 +37,7 @@
 #include "renut_engine/gpu/sa2_renut_pacing.h"  // sa2-nx
 #include "renut_engine/gpu/banjo_renut_capture.h"  // sa2-nx: lockstep captures
 #include "sa2_capture.h"                            // sa2-nx: lockstep captures
+#include "me/sa2_render_mode.h"                     // sa2-nx (1.0.3.1): the PC's docked test toggles
 
 #include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/video.h>
@@ -893,6 +894,8 @@ void D3DDevice_Swap_hook(u32 device_va, u32 front_buffer, u32 /*parameters*/) {
   sa2::renut::PaceSwap(device_va);
   // sa2-nx: SA2's game frame count (src/sa2_d3d_trace.cpp: the flip, which only the GPU's vblank interrupt reaches).
   const uint64_t game_frame = g_sa2_game_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+  // sa2-nx (1.0.3.1): the PC's docked / handheld test toggles (sa2_render_test_toggle_at; nothing on the Switch).
+  sa2::render::OnPresented(game_frame);
   // sa2-nx: a lockstep recording (sa2_capture.cpp) takes this very frame: asked before it is queued.
   const uint64_t capture_ticket = sa2::capture::RenutLockstepOn() ? RequestFrameCapture() : 0;
   renut::frame_stats::OnGameFrame();

@@ -134,7 +134,7 @@ index 869de66..f3084cd 100644
          Deko3DDevice *d = static_cast<Deko3DDevice *>(device);
          return d && d->queue && dkQueueIsInErrorState(d->queue);
 diff --git a/app/thirdparty/plume/plume_deko3d.h b/app/thirdparty/plume/plume_deko3d.h
-index 2f325b1..d6afdf7 100644
+index 2f325b1..0b1c39b 100644
 --- a/app/thirdparty/plume/plume_deko3d.h
 +++ b/app/thirdparty/plume/plume_deko3d.h
 @@ -14,6 +14,7 @@
@@ -198,7 +198,19 @@ index 2f325b1..d6afdf7 100644
          // Zeros for missing vertex buffers (Vulkan's null buffer).
          DkMemBlock zeroBlock = nullptr;
          DkGpuAddr zeroAddr = 0;
-@@ -631,6 +650,8 @@ namespace plume {
+@@ -621,6 +640,11 @@ namespace plume {
+     bool Deko3DSetSharedWords(RenderCommandList *commandList, const void *cpu, uint32_t size);
+     // banjo-nx: the queue lost (dkQueueIsInErrorState).
+     bool Deko3DDeviceLost(RenderDevice *device);
++    // sa2-nx (2026-10-20, 1.0.3.1): the size the swapchain should have, the console display's (1920x1080 docked,
++    // 1280x720 handheld); 0 x 0 = the window's, as before. A swapchain of another size asks for a resize
++    // (needsResize), which gives the window that size while no buffer is registered (nwindowSetDimensions) and makes
++    // the images again. Any thread.
++    void Deko3DSetSwapChainSize(uint32_t width, uint32_t height);
+     // banjo-nx (2026-10-19, latency batch 3): a copy of what a command fence's last submit signals, taken on the thread
+     // that submits (the fence itself is re-armed by the next submit of its slot), and whether the GPU has signalled it
+     // (dkFenceWait with no wait): any thread may test its own copy.
+@@ -631,6 +655,8 @@ namespace plume {
      };
      Deko3DFenceCopy Deko3DCopyFence(const RenderCommandFence *fence);
      bool Deko3DFenceCopyDone(Deko3DFenceCopy &copy);
@@ -208,7 +220,7 @@ index 2f325b1..d6afdf7 100644
      // banjo-nx (2026-10-18, GPU bandwidth): options read when the device and its textures are made; set them before
      // CreateDeko3DInterface. depthCompression: depth/stencil targets get hardware compression (as colour targets do).
 diff --git a/app/thirdparty/plume/plume_deko3d_commands.cpp b/app/thirdparty/plume/plume_deko3d_commands.cpp
-index aca52f1..16ccb2d 100644
+index aca52f1..9c15ea9 100644
 --- a/app/thirdparty/plume/plume_deko3d_commands.cpp
 +++ b/app/thirdparty/plume/plume_deko3d_commands.cpp
 @@ -24,6 +24,7 @@ namespace plume {
@@ -272,6 +284,63 @@ index aca52f1..16ccb2d 100644
          }
          if (set->samplerBlock) {
              const DkGpuAddr addr = dkMemBlockGetGpuAddr(set->samplerBlock);
+@@ -1193,6 +1226,13 @@ namespace plume {
+ 
+     // ---- Deko3DSwapChain
+ 
++    // sa2-nx (2026-10-20, 1.0.3.1): Deko3DSetSwapChainSize's size (width << 32 | height; 0 = the window's).
++    static std::atomic<uint64_t> g_wantedSwapChainSize{0};
++
++    void Deko3DSetSwapChainSize(uint32_t width, uint32_t height) {
++        g_wantedSwapChainSize.store(width && height ? (uint64_t(width) << 32 | height) : 0, std::memory_order_relaxed);
++    }
++
+     Deko3DSwapChain::Deko3DSwapChain(Deko3DCommandQueue *queue, const RenderSwapChainDesc &desc) : queue(queue), device(queue->device), desc(desc) {
+         resize();
+     }
+@@ -1217,13 +1257,26 @@ namespace plume {
+         // swapchain.
+         uint32_t w = 0, h = 0;
+         NWindow *window = desc.renderWindow ? desc.renderWindow : nwindowGetDefault();
+-        if (nwindowGetDimensions(window, &w, &h) != 0 || w < 64 || h < 64) {
++        // sa2-nx (2026-10-20, 1.0.3.1): a size set by Deko3DSetSwapChainSize (the console's display: 1080p docked)
++        // comes first; the window takes it below, once the old swapchain has let go of its buffers.
++        const uint64_t wanted = g_wantedSwapChainSize.load(std::memory_order_relaxed);
++        if (wanted) {
++            w = uint32_t(wanted >> 32);
++            h = uint32_t(wanted);
++        } else if (nwindowGetDimensions(window, &w, &h) != 0 || w < 64 || h < 64) {
+             w = width ? width : 1280;
+             h = height ? height : 720;
+         }
+         if (swapchain && w == width && h == height)
+             return true;
+         destroy();
++        if (wanted) {
++            uint32_t cw = 0, ch = 0;
++            if (nwindowGetDimensions(window, &cw, &ch) != 0 || cw != w || ch != h) {
++                const Result rc = nwindowSetDimensions(window, w, h);
++                logf("window: %ux%u -> %ux%u (%s)", cw, ch, w, h, R_SUCCEEDED(rc) ? "set" : "failed");
++            }
++        }
+         width = w;
+         height = h;
+         DkImageFormat format = toDkFormat(desc.format);
+@@ -1265,7 +1318,13 @@ namespace plume {
+         return true;
+     }
+ 
+-    bool Deko3DSwapChain::needsResize() const { return swapchain == nullptr; }
++    bool Deko3DSwapChain::needsResize() const {
++        if (swapchain == nullptr)
++            return true;
++        // sa2-nx (2026-10-20, 1.0.3.1): another size wanted (docking or undocking).
++        const uint64_t wanted = g_wantedSwapChainSize.load(std::memory_order_relaxed);
++        return wanted && (uint32_t(wanted >> 32) != width || uint32_t(wanted) != height);
++    }
+ 
+     void Deko3DSwapChain::setVsyncEnabled(bool vsyncEnabled) {
+         vsync = vsyncEnabled;
 diff --git a/app/thirdparty/plume/plume_vulkan.cpp b/app/thirdparty/plume/plume_vulkan.cpp
 index 8a20155..900382e 100644
 --- a/app/thirdparty/plume/plume_vulkan.cpp

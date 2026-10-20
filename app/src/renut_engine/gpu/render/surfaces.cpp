@@ -20,6 +20,21 @@
 #include "renut_engine/gpu/guest/widescreen.h"
 #include "renut_engine/gpu/log.h"
 #include "renut_engine/gpu/backend/video.h"
+#include "me/sa2_render_mode.h"  // sa2-nx (1.0.3.1): the console's mode and the heights set for it
+#if defined(PLUME_DEKO3D)
+#include <plume_deko3d.h>                             // sa2-nx (1.0.3.1): Deko3DSetSwapChainSize
+#include "renut_engine/gpu/banjo_renut_deko3d.h"     // sa2-nx (1.0.3.1): PackageScales
+#endif
+
+// sa2-nx (2026-10-20, 1.0.3.1, the user's request: 1920x1080 docked, as the native renderer drew it up to 1.0.2.1):
+// the render resolution follows the console's mode (sa2::render::Docked: libnx's operation mode, Reverse-NX obeyed; the
+// PC's simulated one, F9) at the next frame, at the heights the native renderer's keys set. On deko3d the swapchain
+// takes the display's size with it (1920x1080 docked), and a GLSL package made for 1x only keeps 1280x720.
+REXCVAR_DEFINE_BOOL(sa2_renut_dock_resolution, true, "SA2/Renderer",
+                    "Renut's renderer: render at sa2_render_height_docked (1080 = 1920x1080) when docked and at "
+                    "sa2_render_height_handheld (720 = the game's 1280x720) in handheld mode, switching at the next "
+                    "frame (the PC: sa2_render_docked, F9). Heights of 480, 720, 1080, 1440 or 2160. Off: "
+                    "renut_resolution");
 
 REXCVAR_DEFINE_STRING(renut_resolution, "720p", "Nuts&Bolts/Graphics",
                       "Internal render resolution, by its height: 480p, 720p (the game's own), "
@@ -29,10 +44,11 @@ REXCVAR_DEFINE_STRING(renut_resolution, "720p", "Nuts&Bolts/Graphics",
 // so Renut's multisampling (N&B's targets are multisampled: banjo-nx's resolves, depth resolves and readbacks of them)
 // never ran. The game's single-sample targets get this many samples on the host, as the native renderer's sa2_msaa did;
 // the game's resolves downsample them. Its 4x surfaces (Direct3D's fast Clear aliases) stay as they are.
-REXCVAR_DEFINE_INT32(sa2_renut_msaa, 2, "SA2/Renderer",
+// sa2-nx (1.0.3.1, the user's call: 2x cost the console a little too much CPU): off by default again.
+REXCVAR_DEFINE_INT32(sa2_renut_msaa, 0, "SA2/Renderer",
                      "Renut's renderer: multisample anti-aliasing of the game's single-sample render targets: 0 = off "
-                     "(the game's own), 2 = 2x (default), 4 = 4x, 8 = 8x. Smoother edges; each step costs more GPU time "
-                     "and memory (8x: about 30 MB more for each 1280x720 target). Read at start")
+                     "(the game's own, default), 2 = 2x, 4 = 4x, 8 = 8x. Smoother edges; each step costs more GPU and "
+                     "CPU time and memory (8x: about 30 MB more for each 1280x720 target). Read at start")
     .range(0, 8)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
@@ -264,16 +280,50 @@ void LatchResolutionScaleLocked() {
                     : resolution == "1440p" ? 3u
                     : resolution == "4K"    ? 4u
                                             : 0u};
-  // banjo-nx (2026-10-18): the deko3d renderer draws at the console's resolution only; its shaders are made for it
-  // (tools/deko3d_glsl_opt.py, pass scale1: no per-texture scale divisor, resolution_scale 1).
-  if (IsDeko3D() && scale.code != 0) {
-    static bool logged = false;
-    if (!logged) {
-      logged = true;
-      RGPU_WARN("renut_resolution = \"{}\" is not taken on deko3d: it draws at the console's 1280x720", resolution);
+  // sa2-nx (2026-10-20, 1.0.3.1): the console's mode picks the resolution (sa2_renut_dock_resolution).
+  static const bool follow_mode = REXCVAR_GET(sa2_renut_dock_resolution);
+  const bool docked = follow_mode && sa2::render::Docked();
+  if (follow_mode) {
+    const int32_t height = sa2::render::RenderHeightOf(docked);
+    RenderScale mode;
+    // The render resolutions only (codes 0-4: 720p, 480p, 1080p, 1440p, 2160p).
+    if (height <= 0 || !RenderScale::FromRatio(uint32_t(height), 720, mode) || mode.code > 4) {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        RGPU_WARN("sa2_render_height_{} = {} is not one of 480, 720, 1080, 1440, 2160: 720 (1280x720)",
+                  docked ? "docked" : "handheld", height);
+      }
+      mode = {};
     }
-    scale = {};
+    scale = mode;
   }
+  // banjo-nx (2026-10-18): the deko3d renderer drew at the console's resolution only; its shaders were made for it
+  // (tools/deko3d_glsl_opt.py, pass scale1: no per-texture scale divisor, resolution_scale 1). sa2-nx (1.0.3.1): the
+  // installer page's package is made without scale1 and fragscale, and draws at any scale; a package made with them
+  // (1.0.3's) keeps 1x (deko3d::PackageScales logs it).
+  if (IsDeko3D() && scale.code != 0) {
+#if defined(PLUME_DEKO3D)
+    const bool scales = banjo::renut_gpu::deko3d::PackageScales();
+#else
+    const bool scales = false;
+#endif
+    if (!scales)
+      scale = {};
+  }
+#if defined(PLUME_DEKO3D)
+  // sa2-nx (1.0.3.1): the swapchain at the display's size (1920x1080 docked, 1280x720 handheld): the present scales the
+  // frame to it, and the console shows it as it is. Before, it stayed 1280x720 and the console scaled it to the TV.
+  if (IsDeko3D() && follow_mode) {
+    static int last_docked = -1;
+    if (last_docked != int(docked)) {
+      last_docked = int(docked);
+      plume::Deko3DSetSwapChainSize(docked ? 1920u : 1280u, docked ? 1080u : 720u);
+      RGPU_INFO("[renut] {} mode: the swapchain at {}", docked ? "docked" : "handheld",
+                docked ? "1920x1080" : "1280x720");
+    }
+  }
+#endif
   if (!g_resolution_latched || scale != g_resolution_scale) {
     RGPU_INFO("Render resolution {}x{} ({:.3g}x)", scale.Size(GuestScreenWidth()), scale.Size(720),
               scale.Factor());

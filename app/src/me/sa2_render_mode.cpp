@@ -105,6 +105,10 @@ uint32_t WantedScaleQuarters() {
   return q;
 }
 
+int32_t RenderHeightOf(bool docked) {
+  return docked ? REXCVAR_GET(sa2_render_height_docked) : REXCVAR_GET(sa2_render_height_handheld);
+}
+
 uint32_t ScaleQuartersOf(bool docked) {
   if (!g_render_scale.active) return 4;
   return QuartersOf(docked ? REXCVAR_GET(sa2_render_height_docked) : REXCVAR_GET(sa2_render_height_handheld));
