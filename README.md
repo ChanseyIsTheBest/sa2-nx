@@ -8,9 +8,10 @@
 A native Nintendo Switch port of the Xbox 360 (Xbox Live Arcade) version of **Sonic Adventure 2** (2012).
 
 It's not an emulator. The PowerPC code of the game's `default.xex` and its stage-data module is statically recompiled
-to C++ with [ReXGlue](https://github.com/rexglue/rexglue-sdk) and compiled for the Switch, and the game is drawn by a
-native Vulkan renderer running on NVK (Mesa). It targets **60 FPS at the console's stock clocks**: the game runs per
-frame, so a lower frame rate also slows the game down.
+to C++ with [ReXGlue](https://github.com/rexglue/rexglue-sdk) and compiled for the Switch, and the game is drawn
+natively on the Switch's own graphics API, deko3d, by Renut's Direct3D-level renderer (from
+[reNut](https://github.com/masterspike52/reNut), version 1.0.3 on; before it, a Vulkan renderer on NVK). It targets
+**60 FPS at the console's stock clocks**: the game runs per frame, so a lower frame rate also slows the game down.
 
 > [!NOTE]
 > You need your own copy of the Xbox Live Arcade game: its content package from an Xbox 360
@@ -33,8 +34,8 @@ Your `sa2-nx` folder should look like this:
   sa2.nro
   LICENSES.txt
   sa2.toml                  (your settings; written at the first start when it is missing)
-  sa2_shaders.mesp          (the game's shaders, made from your copy)
-  sa2_shaders.mesp.idx
+  deko3d_glsl.bin           (the game's shaders, made from your copy)
+  deko3d_shaders.bin        (the shaders compiled for the console; written as you play)
   game_root.nxpack          (the files of your game, in one file)
   game_root.nxidx
   dlc/                      (optional: the Battle DLC package)
@@ -48,12 +49,13 @@ To build everything yourself instead, see [docs/building.md](docs/building.md).
 > [!NOTE]
 > **Updating:** open the installer page again and press **Create sa2-nx-update.zip**. It only holds the new
 > `sa2.nro` and the shaders, so there is no need to copy the game again: extract it over your folder. Your
-> `sa2.toml`, the game files and the `cache` folder stay.
+> `sa2.toml` and the game files stay. Coming from 1.0.2.1 or older, the old `sa2_shaders.mesp` files and the `cache`
+> folder are no longer used and can be deleted.
 
 > [!CAUTION]
-> **The first time you play** after installing or updating, the game compiles the graphics pipelines it has not seen
-> yet, so **IT CAN STUTTER for a moment** in new places. They are saved in `cache/` on the SD card and later sessions
-> start smoothly.
+> **The first time you play** after installing or updating, the console compiles each shader the first time it is
+> drawn, so **IT CAN STUTTER for a moment** in new places. The compiled shaders are saved in `deko3d_shaders.bin` on
+> the SD card and later sessions start smoothly.
 
 ## Controls
 
@@ -94,8 +96,9 @@ pair.
 | Setting | What it does |
 | --- | --- |
 | `language` | `auto` follows the Switch's language; or `english`, `japanese`, `french`, `german`, `spanish`, `italian` |
-| `sa2_msaa` | Anti-aliasing: `0` off (default), `2` or `4` (smoother edges, more GPU work) |
+| `sa2_renut_msaa` | Anti-aliasing: `0` off, `2` (default), `4` or `8` (smoother edges, more GPU work) |
 | `sa2_vsync_relaxed` | `true` (default): a frame that misses 60 FPS is shown as soon as it is ready (50-59 FPS) instead of falling to 30 |
+| `sa2_renut_double_buffer` | `false` (default). `true`: two images instead of three, so a finished frame reaches the screen sooner (less input lag), but a frame that misses a refresh waits for the next one, so busy scenes (2-player) can drop frames |
 | `input_xbox_layout` | Face buttons by position (`true`, default) or by letter (`false`) |
 | `input_joycon_sideways` | Single Joy-Cons held sideways, one per player (`true`, default) |
 | `[input_p1]`, `[input_p2]` | Each player's buttons: for every Xbox button, the Switch buttons that press it, e.g. `a = "B, ZR"` |
@@ -106,8 +109,8 @@ If you delete `sa2.toml`, the game writes the default one again at the next star
 
 ## Resolution
 
-The game draws **1280x720** in handheld mode and **1920x1080** docked, and switches when you dock or undock (a short
-hitch while its render targets are made again). The image in handheld mode is exactly the Xbox 360's.
+The game draws **1280x720**, as on the Xbox 360, in handheld mode and docked (the console scales it to the TV), with
+2x MSAA by default (`sa2_renut_msaa`).
 
 ## Performance
 
@@ -119,6 +122,12 @@ The released NRO is built with PGO from a console session, which made 1.0.0 abou
 without it. Version 1.0.1 is about 15 % faster again in play (an estimate, not a measurement): three rounds of work
 on the translated code and the runtime, a new profile and a better link, all in
 [docs/cpu-rounds.md](docs/cpu-rounds.md).
+
+Version 1.0.3 draws with Renut's renderer on deko3d. On the console (City Escape, 1020 MHz, about 1,400 draws a
+frame) the game thread went from 19.2 ms to 15.5 ms a frame and the renderer's thread from 17.6 ms to 11.1 ms, under
+the 16.7 ms of a 60 FPS frame, before a new PGO profile from a console session; the GPU needs 7-9 ms a frame even at
+307 MHz. The heaviest scenes still drop a few frames now and then. The work is in
+[docs/renut-renderer.md](docs/renut-renderer.md).
 
 What was done to get there, round by round and with the measurements, is in
 [docs/enhancements.md](docs/enhancements.md).
@@ -148,15 +157,15 @@ Status Monitor shows the port's frame rate and resolution if SaltyNX is installe
   function of the game's program to C++, which is then compiled for the Switch. ReXGlue also gives the game what it
   expects from an Xbox 360: its system, files, audio and controllers. This port adds the Switch part: memory,
   threads, crash handling, clocks, audio output and showing the frames on screen.
-- **Its own renderer.** Imitating the Xbox 360 GPU was far too slow on the Switch. The port draws the game's frames
-  with Vulkan instead. The game's Direct3D draw, clear and state code is replaced by native code that hands the
-  renderer its records directly. Every replacement was checked call by call against the original.
-- **Shaders translated beforehand.** The game's GPU programs are translated with
-  [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) and DXC into one package. The vertex shaders Direct3D
-  rebuilds at run time for each vertex layout are recognised from the package as they load.
-- **Graphics driver.** Vulkan runs on NVK, from the Mesa project, through
-  [mesa-switch](https://github.com/danfromtico/mesa-switch), in the build of
-  [nfsmw-nx](https://github.com/StevensND/nfsmw-nx).
+- **Its own renderer.** Imitating the Xbox 360 GPU was far too slow on the Switch. From 1.0.3 the game's Direct3D
+  calls are drawn natively by Renut's renderer (from [reNut](https://github.com/masterspike52/reNut), as
+  [banjo-nx](https://github.com/ChanseyIsTheBest) carries it) through [plume](https://github.com/renderbag/plume) on
+  deko3d, the Switch's own graphics API: no GPU emulation, no Vulkan driver. Up to 1.0.2.1 a Vulkan renderer on NVK
+  (from masseffect-nx) drew them.
+- **Shaders made from your copy.** The game's GPU programs are translated by Renut's
+  [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) and DXC, turned into GLSL for deko3d by SPIRV-Cross and
+  banjo-nx's passes, all in the installer page from your own files (`deko3d_glsl.bin`), and compiled for the console's
+  GPU by [uam](https://github.com/devkitPro/uam) the first time each is drawn (`deko3d_shaders.bin`).
 - **Optimization.**
   - The busiest game functions run as hand-written or translated native code. Each one is checked against the
     original while the game runs.
@@ -204,7 +213,7 @@ Switch; Python; and your own copy of the game for the code generator. The whole 
 | `tools/` | Code generation steps, build and test scripts, analysis tools |
 | `patches/` | Every change to third-party code (the SDK, FFmpeg, XenosRecomp) as diffs against upstream |
 | `pgo/` | The PGO profile the released NRO was built with |
-| `mesa/` | Which NVK driver build the NRO links (this port does not change the driver) |
+| `mesa/` | Which NVK driver build the NRO linked up to 1.0.2.1 (1.0.3 links none) |
 | `docs/` | Documentation |
 
 </div>
@@ -221,11 +230,17 @@ Switch; Python; and your own copy of the game for the code generator. The whole 
 - **[nebadasSwifty](https://github.com/nebadasSwifty/masseffect-nx)** — masseffect-nx: the native renderer this port's
   renderer grew from.
 - **[hedge-dev](https://github.com/hedge-dev/XenosRecomp)** — XenosRecomp, the Xenos shader translator.
+- **[masterspike52](https://github.com/masterspike52/reNut)** — reNut: the Direct3D-level renderer
+  (`sa2_renderer = "renut"`, [docs/renut-renderer.md](docs/renut-renderer.md)), reused with the author's permission as
+  banjo-nx carries it; **[renderbag](https://github.com/renderbag/plume)** — plume; **[fincs](https://github.com/devkitPro/uam)**
+  — uam, the deko3d shader compiler.
 - **[danfromtico](https://github.com/danfromtico/mesa-switch)** and **[NaGaa95](https://github.com/NaGaa95/mesa-switch)**
-  — mesa-switch: Mesa, NVK and NAK on Horizon.
+  — mesa-switch: Mesa, NVK and NAK on Horizon (the driver of versions up to 1.0.2.1).
+- **[fincs](https://github.com/devkitPro/deko3d)** — deko3d, the Switch graphics API 1.0.3 draws with.
 - **[devkitPro](https://devkitpro.org) and [switchbrew](https://github.com/switchbrew/libnx)** — devkitA64 and libnx.
 - The sibling ports (Banjo-Kazooie: Nuts & Bolts, Sonic & All-Stars Racing Transformed, Mushihimesama Futari, Peggle
-  2), which share their fixes with this one.
+  2), which share their fixes with this one: banjo-nx's Renut renderer and deko3d back end, and peggle2-nx-installer's
+  deko3d shader chain in the browser.
 - The other libraries listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Legal

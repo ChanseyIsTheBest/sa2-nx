@@ -608,3 +608,89 @@ For SA2 itself the first three and 6 are the ones with weight: its game thread i
 kernel traffic (12, 14) and the mode switches (4, 5, 7) are small here. For sasrt-nx the order is the other way
 round.
 
+## banjo-nx's codegen round, ported (2026-10-19)
+
+The user asked for as many of banjo-nx's codegen improvements as could be brought over, all at once and then verified.
+banjo-nx's own record is its `docs/codegen-enhancements.md`; what follows is what SA2 took, the counts on SA2's tree,
+and what it left and why. Branch `banjo-codegen`.
+
+### Taken
+
+| Item | Where | On SA2's tree |
+|---|---|---|
+| `rotate_word_shifts`: `rlwinm` / `rlwimi` as the plain shift, extract or 32-bit rotate their mask makes (one A57 instruction instead of two or three) | generator (`sdk/src/codegen/builders/logical.cpp`), `perf_overrides.toml` | every `rlwinm` / `rlwimi` with a non-wrapping mask |
+| `fp_copy_forwarding`: an `lfs` -> `stfs` copy through other instructions and through `fneg` / `fabs` / `fnabs` as a bit copy in any mode | generator (`context.cpp`, `memory.cpp`) | |
+| `dcbt_prefetch` on, with banjo-nx's operand fix (the generator prefetched RA alone; `dcbt` decodes as {CT, RA, RB}) | generator (`system.cpp`), `perf_overrides.toml` | 217 sites |
+| setjmp copies the C++-local registers into its buffer and back after a longjmp (a correctness fix of the locals options; SA2's setjmp is libjpeg's error path) | generator (`function_graph.cpp`, `context.cpp`) | |
+| Loop barriers clobber the guest window only (4 GB + 4 KB: on the PC the addresses from 0xE0000000 lie 4 KB higher; peggle2-nx), not all memory | `tools/loop_barriers.py` (`SA2_GEN_NARROW_LOOP_BARRIER`) | |
+| `ro_constants --xex`: loads of the XEX's import records stay loads | `tools/ro_constants.py` | 0 put back (the 86 loads are folded elsewhere now: see below) |
+| Hooks named only in toml comments or in the non-argument keep list no longer count as hooks | `tools/direct_calls.py` | |
+| A `vperm` of one vector as a one-register lookup | `tools/vperm_one_source.py` (`SA2_GEN_VPERM1`) | 90 of 509 |
+| `fneg` / `fabs` / `fnabs` as float operations | `tools/fp_sign_ops.py` (`SA2_GEN_FP_SIGN_OPS`) | 1,528 / 1,446 / 16 |
+| Leaf write-backs no caller can read are skipped (whole-program liveness, every call kills nothing) | `tools/leaf_dead_stores.py` (`SA2_GEN_LEAF_DEAD`) | 1,981 of 19,923, in 269 functions |
+| Single-precision arithmetic in `float` where the inputs are proven singles | `tools/single_floats.py` (`SA2_GEN_SINGLE_FLOATS`) | 32,462 of 50,533 single operations |
+| `memcpy` / `memset` of a constant size up to 64 bytes inline (the original's `std r3,-8(r1)` kept, overlap, mirrors and the hardware window declined) | `tools/inline_memcalls.py` (`SA2_GEN_INLINE_MEMCALLS`) | 1,244 memcpy + 980 memset calls |
+| `stvlx` / `stvrx` as a few stores instead of byte loops | `tools/vec_unaligned_stores.py` (`SA2_GEN_VEC_UNALIGNED`) | 688 + 164 |
+| Read-only constants followed over the control-flow graph (loop heads) | `tools/ro_constants_cfg.py` (`SA2_GEN_RO_CFG`) | 22,957 more loads (22,371 `lfs`) |
+| Guest register writes no instruction can read are left out | `tools/dead_ctx_defs.py` (`SA2_GEN_DEAD_DEFS`) | 4,550 writes + 399 record forms, in 2,542 functions |
+| Loop-header flush-mode checks in front of call-free loops | `tools/flush_hoist.py` (`SA2_GEN_FLUSH_HOIST`) | 164 loops |
+| Link-register write-backs proven to store what ctx.lr holds compile to nothing (strictly: without `--assume-indirect`, which peggle2-nx's PC check caught wrong 1,473 times; with it SA2 had 10,091 sites) | `tools/lr_preserve.py --rewrite` (`SA2_GEN_LR_WRITE_SAME`) | 4,602 of 10,681 |
+| VMX `vsel` as one NEON bit select | `tools/vsel_neon.py` (`SA2_GEN_VSEL_NEON`) | 40 |
+| Inline copies of the tiny leaf functions each file calls in another | `tools/inline_leaves.py` (`SA2_GEN_INLINE_LEAVES`) | 4,183 calls, 2,963 copies |
+| `HostToGuestFunction` inlined into the export's hook, without its compiler barrier | `sdk/include/rex/ppc/function.h` | every kernel export |
+| The FPSCR rounding mode of every guest write counted (`[census] FPSCR rounding mode`, `sa2_diag_runtime_census`) | `sdk/include/rex/ppc/context.h`, `sa2_enhancements.cpp` | |
+| Generated files whose text did not change keep their old times (no full recompile after a re-run of the generator) | `tools/post_codegen.py` (`keep_unchanged_times`) | |
+| `-mearly-ra=none` for everything compiled for the console (`SA2_SWITCH_EARLY_RA=OFF`) | `app/CMakeLists.txt` | |
+
+The new steps run on the game's tree only (the stage module reaches it through pointers, which the analyses take for
+address-taken functions). The tools are banjo-nx's copies (sasrt-nx's for most of them) with SA2's image, entry point
+(0x82543108), C runtime addresses and no-return function (the C++ throw, 827F2E48);
+`app/src/cpu/hot/hand.txt` lists the hand-written natives whose calls the analyses may treat as calls of the original
+(memcpy, memset, memmove, the two Direct3D constant writers). `tools/localize_native.py` reads the new forms (the
+memcpy wrapper is taken off in a localized copy; `REX_LEAF_DEAD_R/F` go with the leaf stores).
+
+A second run of `tools/post_codegen.py` on a processed tree gives identical files (checked by hashing all 367 generated
+files after two runs): besides the late rewrites, peggle2-nx's `tools/round_restore.py` takes the round's other rewrites
+back out first, since the base steps decided differently on their forms (sa2-nx saw 165 hoisted loops on the first run
+and 164 on the second; peggle2-nx saw loop barriers, flush proofs and folded constants change). `tools/inline_leaves.py`
+no longer leaves an empty line per run (peggle2-nx). A PGO profile fits only the exact text it was made from.
+
+Found on the way: `tools/dead_ctx_defs.py`'s switch-back form did not compile (the macro parameter `compare` also
+replaced `.compare`); renamed, and reported to banjo-nx.
+
+### Checked (PC)
+
+- Final build (strict link-register proofs, 4 KB window, round_restore): lockstep 2,990 of 2,990 frames identical to
+  `r2f_crcensus0`; 0 self-check differences (92 million folded loads, 46 million link-register write-backs).
+- First build of the round: lockstep 2,899 of 2,952 frames identical, the other 53 the loading frames that differ
+  between any two runs. Self-checks 0 differences (98.6 million read-only
+  constant loads compared, 114 million link-register write-backs).
+- Verify mode: 171.6 million native-replacement checks and 185.6 million link-register write-backs, 0 differences;
+  1,585 of 1,638 frames identical (the same 53).
+- The poison build (`SA2_GEN_LEAF_DEAD_POISON` + `SA2_GEN_DEAD_DEFS_POISON`: every dropped write gets 0xDEADBEEF...):
+  2,880 of 2,933 frames identical (the same 53), no crash, 0 differences.
+- Rounding-mode census of the run: to nearest 14, toward zero 7, up or down 0 (fp_sign_ops is exact while that holds).
+- Static A/B with the Switch compiler (`switch_compile_check.py`, the four files that hold the hottest game-thread
+  functions, every step's switch-back on vs off; the generator options are in both): the hottest functions -0.8 %
+  instructions, -2.5 % stores; the whole files -8.0 % float conversions, -3.5 % byte reversals, -0.9 % calls, and
+  +2 % loads / stores where the inline memcpy / memset bodies stand in for calls (each such call no longer goes through
+  the hook and the native's dispatch at run time, which a static count does not see).
+
+### Not taken, and why
+
+- `r1_local.py` / `r1_preserve.py` (guest r1 as a local): a loss everywhere (+0.33 % in banjo-nx); it pays only with a
+  per-function choice measured on compiled code. Copied, not run.
+- The loop / leaf locals opt-out list (`tools/locals_choice.py`): needs a measurement of every function both ways with
+  the Switch compiler. Copied, not run.
+- Vector locals by value: SA2's loop and leaf locals already keep vectors by value.
+- `hot_layout.py`: SA2's PGO build already places the profile's hot code together.
+- `switch_goto.py --thread`, `limiter_lazy_log10.py`: banjo-nx's interpreters and its XAudio limiter; SA2's
+  equivalents (if any) were not looked for.
+- `store_cards.py`: for banjo-nx's Renut renderer only.
+- `non_volatile_as_local_keep` / `_exclude`: banjo-nx's WMV decoder's own register conventions.
+
+### PGO
+
+Most of these change the generated text, many of them the branching of their functions (inline memcpy / memset, the
+unaligned stores, the hoisted checks), so the committed profile no longer fits the functions they touch. A release
+built from this branch needs a new instrumented console session first (`build_switch.ps1 -Pgo generate`).

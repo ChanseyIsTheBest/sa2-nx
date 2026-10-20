@@ -294,6 +294,11 @@ void StartReport() {
         REXLOG_INFO("[census] guest code per second: {:.0f} flush-mode switches (each an msr fpcr on the console; "
                     "{:.0f} of them unconditional writes that left the mode as it was)",
                     flush, flush_same);
+        // The rounding mode of the guest's FPSCR writes, cumulative (tools/fp_sign_ops.py needs round-up / round-down
+        // never to be selected; from banjo-nx).
+        REXLOG_INFO("[census] FPSCR rounding mode written by the guest (cumulative): to nearest {}, toward zero {}, "
+                    "up or down {}",
+                    CensusRead(kCensusRoundNearest), CensusRead(kCensusRoundZero), CensusRead(kCensusRoundUpDown));
         {
           // What the switches saved by the generator's any-mode forms cost: a test in each of these calls.
           static uint64_t last_diet[6] = {}, last_proven = 0;

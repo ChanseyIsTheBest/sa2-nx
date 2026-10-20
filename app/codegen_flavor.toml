@@ -103,7 +103,7 @@
 # the PC census counted 5.25 million copy forms a second to save 22,000 mode switches a second (235 tests per
 # switch saved). The cost of one switch on the A57 is the number that would decide it (the profiler's report now
 # measures it, "FPCR on this CPU").
-# dcbt_prefetch (dcbt / dcbtst as the host's prefetch) is NOT set: 217 sites, no measurement on the console yet.
+# dcbt_prefetch (dcbt / dcbtst as the host's prefetch): set below since banjo-nx's codegen round (2026-10-19).
 #
 # The third CPU round of 2026-10-12:
 # div_inline: divw / divwu / divd / divdu (1,934 sites) through rex::ppc helpers. The C expression needs guards
@@ -133,4 +133,11 @@ fp_mode_lookahead_past_branch = false
 fcti_inline = true
 fp_copy_pairs = true
 div_inline = true
+# banjo-nx's codegen round (ported 2026-10-19): rlwinm / rlwimi as the plain shifts their masks make (one A57
+# instruction where the rotate of the duplicated word took two or three); lfs -> stfs copies through fneg / fabs /
+# fnabs and other instructions as bit copies in any mode; the dcbt / dcbtst hints as host prefetches (the operand fix
+# is in the generator: it prefetched RA alone before).
+rotate_word_shifts = true
+fp_copy_forwarding = true
+dcbt_prefetch = true
 non_argument_as_local_keep = [0x827F5144, 0x82801D90, 0x827EFE34, 0x88010BE4]

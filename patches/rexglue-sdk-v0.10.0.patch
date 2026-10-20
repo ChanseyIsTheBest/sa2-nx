@@ -319,10 +319,10 @@ index 41e6dce3254bae528ac80e52a6c799eb6c300373..19f2ed0c5d67887002853ebe1ca02a11
              INSTALL_RPATH "$ORIGIN"
 diff --git a/cmake/rexglue_switch.cmake b/cmake/rexglue_switch.cmake
 new file mode 100644
-index 0000000000000000000000000000000000000000..ac15bf3eb8dfa4b1b99d967606fe0b5b98aef2d8
+index 0000000000000000000000000000000000000000..08c0443ed50c686359993ec67569ecb1c4680d3b
 --- /dev/null
 +++ b/cmake/rexglue_switch.cmake
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,174 @@
 +#==========================================================
 +# rexglue_switch.cmake - Nintendo Switch (devkitA64 + libnx)
 +#
@@ -344,6 +344,13 @@ index 0000000000000000000000000000000000000000..ac15bf3eb8dfa4b1b99d967606fe0b5b
 +        "(no lib/libvulkan.a under '${REXGLUE_SWITCH_NVK_SDK}')")
 +endif()
 +
++# sa2-nx (2026-10-20): a build whose renderer does not use Vulkan (SA2's Renut on deko3d) can leave the driver out.
++# Only four of its symbols are linked by name (vkGetInstanceProcAddr / vkDestroyInstance in ui/vulkan/vulkan_instance.cpp,
++# the ICD pair plume's Vulkan back end starts from); src/ui/switch_no_vulkan.c answers them with "no driver", so a
++# Vulkan instance cannot be created and libvulkan.a is not linked. The SDK's headers path stays (plume and the SDK's
++# Vulkan sources still compile against it).
++option(REXGLUE_SWITCH_NO_NVK "Switch: do not link Mesa's NVK driver (a renderer without Vulkan; no Vulkan presenter)" OFF)
++
 +# Static NVK. Not find_package(Vulkan): the Mesa SDK's config requires libelf,
 +# which devkitPro does not package. switch_elf_stubs.c satisfies the linker
 +# instead; the NVIDIA CUBIN parser that uses libelf never runs on Switch.
@@ -361,10 +368,14 @@ index 0000000000000000000000000000000000000000..ac15bf3eb8dfa4b1b99d967606fe0b5b
 +    # silently linked it instead of REXGLUE_SWITCH_NVK_SDK's (nfsmw, Mesa 26.2.2), so the renderer's driver paths
 +    # (patch_nvk_set4, the nvk_switch_draw contract) stayed off. Found by banjo-nx; check the ELF with
 +    # `strings -n 8 out/nx/sa2 | grep -m1 "Mesa 26"`.
++    if(REXGLUE_SWITCH_NO_NVK)
++        target_link_libraries(rexglue_switch_nvk INTERFACE zstd z nx stdc++ m)
++    else()
 +    target_link_libraries(rexglue_switch_nvk INTERFACE
 +        "${REXGLUE_SWITCH_NVK_SDK}/lib/libvulkan.a" expat zstd z nx
 +        "${REXGLUE_SWITCH_NVK_SDK}/lib/libvulkan.a" expat zstd z nx
 +        stdc++ m)
++    endif()
 +    target_link_options(rexglue_switch_nvk INTERFACE -pthread)
 +endif()
 +
@@ -378,9 +389,15 @@ index 0000000000000000000000000000000000000000..ac15bf3eb8dfa4b1b99d967606fe0b5b
 +#   switch_crash_hooks.c  abort()/exit() reports and stderr to the SD; abort
 +#                       must be defined before libc.a is searched
 +if(NOT TARGET rexglue_switch_startup)
++    # sa2-nx: without the driver, its four entry points instead of the libelf stubs it needed.
++    if(REXGLUE_SWITCH_NO_NVK)
++        set(_rexglue_switch_driver_stubs "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_no_vulkan.c")
++    else()
++        set(_rexglue_switch_driver_stubs "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_elf_stubs.c")
++    endif()
 +    add_library(rexglue_switch_startup OBJECT
 +        "${CMAKE_CURRENT_LIST_DIR}/../src/ui/runtime_switch.cpp"
-+        "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_elf_stubs.c"
++        "${_rexglue_switch_driver_stubs}"
 +        "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_crash_hooks.c"
 +        "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_perf.cpp"
 +        # FPS and resolution for the console overlays (SaltyNX) and Reverse-NX reading.
@@ -742,10 +759,10 @@ index 8426798741687cc8201871bc16dabd0732b6f479..9d00a7f345d4421da6bbdd006437b5ef
  
  }  // namespace rex::audio
 diff --git a/include/rex/codegen/config.h b/include/rex/codegen/config.h
-index 8200139a62d727f28389cfd0566d5fccfb57d8df..7546f810e84a18240d133b417d458aadfdc76e15 100644
+index 8200139a62d727f28389cfd0566d5fccfb57d8df..0418785da1a5c01a1d9787fa79fe326b83109267 100644
 --- a/include/rex/codegen/config.h
 +++ b/include/rex/codegen/config.h
-@@ -89,15 +89,101 @@ struct RecompilerConfig {
+@@ -89,15 +89,116 @@ struct RecompilerConfig {
  
    // === Code generation options (optional) ===
    bool skipLr = false;
@@ -783,6 +800,14 @@ index 8200139a62d727f28389cfd0566d5fccfb57d8df..7546f810e84a18240d133b417d458aad
 +  // mask reaches the upper half, so the result is the same; the compiler then sees a plain shift, bit-field
 +  // extract or AND (one instruction instead of three on AArch64).
 +  bool rotateWordNarrow = false;
++  // banjo-nx (2026-10-16, measured by its CPU codegen agent; ported to sa2-nx 2026-10-19): rlwinm / rlwimi with an
++  // immediate shift and a mask that does not wrap (mb <= me) written as the plain 32-bit operation the mask makes of it:
++  // a left shift when the mask takes only bits the left shift supplies, a right shift when it takes only bits the right
++  // shift supplies, a 32-bit rotate otherwise (and an AND when the mask is narrower). GCC makes lsl / lsr / ubfiz / ubfx
++  // of those (one instruction) where the 64-bit rotate of the duplicated word took two or three. Same zero-extended
++  // value (banjo-nx's sdk/tests/rotate_word_test.cpp, every shift and mask). Takes precedence over rotate_word_narrow
++  // for rlwinm / rlwimi; rlwnm (a register shift) unchanged.
++  bool rotateWordShifts = false;
 +  // sa2-nx (second CPU round, 2026-10-12): fctid, fctiw and fctidz as rex::ppc::fctid / fctiw / fctidz
 +  // (rex/ppc/diet_ops.h) instead of an isnan test, a range compare and simde's scalar conversion around each. On
 +  // AArch64 they are `fcvtzs` (after `frinti` for the two that round) and a NaN select. For fctid and fctiw this
@@ -801,6 +826,13 @@ index 8200139a62d727f28389cfd0566d5fccfb57d8df..7546f810e84a18240d133b417d458aad
 +  // Used where VMX mode is known to be current: there the plain forms would switch the mode off and back, and the
 +  // any-mode helpers they otherwise go through cost a test and a conversion each.
 +  bool fpCopyPairs = false;
++  // banjo-nx (2026-10-19, CPU proposal 15; ported to sa2-nx 2026-10-19): with fpCopyPairs, a store of loaded bits
++  // whatever the mode, and through other instructions: going back from the stfs / stfsx in its block, the first
++  // instruction that writes its register must be the lfs / lfsx of it or an fneg / fabs / fnabs of the register in
++  // place (bit 31 of the bits flipped, cleared or set: the double's sign is the single's), and nothing between is a
++  // branch, call or trap. An lfs / lfsx whose bits such a store writes takes the copy form as well, so the bits local is
++  // always written: the two decisions are the same test. The forms need no mode.
++  bool fpCopyForwarding = false;
 +  // sa2-nx (second CPU round): with fpCopyPairs, also in every copy-only function (no instruction that needs FPU
 +  // mode, every lfs / stfs form an lfs / lfsx or a store of loaded bits), whatever the mode: such a function then
 +  // has no mode statement at all, and a caller in VMX mode no longer pays a switch into it and one back. A BET, and
@@ -1606,7 +1638,7 @@ index e3fc40dc997a643ffe437012616e3093dff43cee..aebb2a5af9f0d22b37ff0b4372b45623
  
  inline constexpr const char* kVulkanLoader = "libvulkan.so";
 diff --git a/include/rex/ppc/context.h b/include/rex/ppc/context.h
-index 0ede54262059bff41c8c1f5047602fe406d68e03..741856184d62a9685256c88a96ea3d3a813c52cd 100644
+index 0ede54262059bff41c8c1f5047602fe406d68e03..98f029116b204881c1bd8af12f48a12f3a433197 100644
 --- a/include/rex/ppc/context.h
 +++ b/include/rex/ppc/context.h
 @@ -18,7 +18,9 @@
@@ -1639,7 +1671,17 @@ index 0ede54262059bff41c8c1f5047602fe406d68e03..741856184d62a9685256c88a96ea3d3a
    }
  
    inline void setFromMask(simde__m128 mask, int imm) noexcept {
-@@ -178,17 +189,22 @@ struct FPSCRRegister {
+@@ -172,23 +183,32 @@ struct FPSCRRegister {
+   }
+ 
+   inline void storeFromGuest(uint32_t value) noexcept {
++    REX_SYS_CENSUS((value & kRoundMask) == kRoundNearest  ? rex::syscount::kCensusRoundNearest
++                   : (value & kRoundMask) == kRoundTowardZero ? rex::syscount::kCensusRoundZero
++                                                              : rex::syscount::kCensusRoundUpDown,
++                   1);
+     csr &= ~RoundMaskVal;
+     csr |= Platform::GuestToHost[value & kRoundMask];
+     setcsr(csr);
    }
  
    inline void enableFlushModeUnconditional() noexcept {
@@ -1662,7 +1704,7 @@ index 0ede54262059bff41c8c1f5047602fe406d68e03..741856184d62a9685256c88a96ea3d3a
        csr |= FlushMask;
        setcsr(csr);
      }
-@@ -196,11 +212,16 @@ struct FPSCRRegister {
+@@ -196,11 +216,16 @@ struct FPSCRRegister {
  
    inline void disableFlushMode() noexcept {
      if ((csr & FlushMask) != 0) [[unlikely]] {
@@ -1679,7 +1721,7 @@ index 0ede54262059bff41c8c1f5047602fe406d68e03..741856184d62a9685256c88a96ea3d3a
    inline void InitHost() noexcept {
      csr = getcsr();
      Platform::InitHostExceptions(csr);
-@@ -440,6 +461,14 @@ struct alignas(0x40) PPCContext {
+@@ -440,6 +465,14 @@ struct alignas(0x40) PPCContext {
    PPCVRegister v126;
    PPCVRegister v127;
  
@@ -2058,8 +2100,36 @@ index 0000000000000000000000000000000000000000..c4c8032625319a96927ef1146980ac58
 +}
 +
 +}  // namespace rex::ppc
+diff --git a/include/rex/ppc/function.h b/include/rex/ppc/function.h
+index 611a52f41fe92b76759311e1f6af172ccf61cf2b..8a3678079478a2ae912ad89cc6db0cf2bfcb020e 100644
+--- a/include/rex/ppc/function.h
++++ b/include/rex/ppc/function.h
+@@ -402,8 +402,10 @@ void _translate_args_to_guest(PPCContext& ctx, uint8_t* base, std::tuple<TArgs..
+ //=============================================================================
+ // Calls a native C++ function with arguments extracted from PPC context
+ 
++// banjo-nx (2026-10-19, CPU proposal 25): inlined into its one caller, the hook's REX_FUNC body (it was a second
++// call per export).
+ template <auto Func>
+-__attribute__((noinline)) void HostToGuestFunction(PPCContext& ctx, uint8_t* base) {
++[[gnu::always_inline]] inline void HostToGuestFunction(PPCContext& ctx, uint8_t* base) {
+   using ret_t = decltype(std::apply(Func, function_args(Func)));
+ 
+   auto args = function_args(Func);
+@@ -414,8 +416,9 @@ __attribute__((noinline)) void HostToGuestFunction(PPCContext& ctx, uint8_t* bas
+   } else {
+     auto v = std::apply(Func, args);
+ 
+-    // Memory barrier to ensure compiler doesn't reorder
+-    asm volatile("" ::: "memory");
++    // banjo-nx (2026-10-19, CPU proposal 25): no compiler barrier here. It made everything the shim held go back to
++    // memory and ordered nothing another observer sees: ctx belongs to this thread, and the call to Func is opaque
++    // (whatever it wrote is in memory before it returns).
+ 
+     if constexpr (std::is_pointer<ret_t>()) {
+       if (v != nullptr) {
 diff --git a/include/rex/ppc/intrinsics.h b/include/rex/ppc/intrinsics.h
-index 3c2fe09065d089f949314425bd08e09ab5082d68..265f59971c46f072fb9ffa81975e812be0ebb5b9 100644
+index 3c2fe09065d089f949314425bd08e09ab5082d68..4a6a6d3e8a6fd984f8520b2930b187e0568dc032 100644
 --- a/include/rex/ppc/intrinsics.h
 +++ b/include/rex/ppc/intrinsics.h
 @@ -116,35 +116,68 @@ inline uint8_t VectorShiftTableR[] = {
@@ -2131,7 +2201,7 @@ index 3c2fe09065d089f949314425bd08e09ab5082d68..265f59971c46f072fb9ffa81975e812b
    simde__m128i xmm1 = simde_mm_add_epi32(src1, simde_mm_set1_epi32(127));
    simde__m128i xmm0 = simde_mm_slli_epi32(src1, 31 - 8);
    xmm0 = simde_mm_srli_epi32(xmm0, 31);
-@@ -153,30 +186,52 @@ inline simde__m128 simde_mm_cvtepu32_ps_(simde__m128i src1) {
+@@ -153,30 +186,68 @@ inline simde__m128 simde_mm_cvtepu32_ps_(simde__m128i src1) {
    xmm0 = simde_mm_add_epi32(xmm0, simde_mm_set1_epi32(0x4F800000));
    simde__m128 xmm2 = simde_mm_cvtepi32_ps(src1);
    return simde_mm_blendv_ps(xmm2, simde_mm_castsi128_ps(xmm0), simde_mm_castsi128_ps(src1));
@@ -2152,6 +2222,22 @@ index 3c2fe09065d089f949314425bd08e09ab5082d68..265f59971c46f072fb9ffa81975e812b
    simde__m128i e = simde_mm_sub_epi8(d, simde_mm_and_si128(c, d));
    return simde_mm_blendv_epi8(simde_mm_shuffle_epi8(a, e), simde_mm_shuffle_epi8(b, e),
                                simde_mm_slli_epi32(c, 3));
++#endif
++}
++
++// vperm with both sources the same vector (from sasrt-nx, 2026-10-14; sa2-nx's idea 8): byte i = a[15 - (c[i] & 15)],
++// bit 4 of c[i] choosing between two equal halves. One one-register table lookup (TBL with one table register and
++// the index (c & 0x0F) ^ 0x0F) instead of a two-register one, which needs a register pair. Exact: with a == b the
++// two-source form above takes the same byte from either half. tools/vperm_one_source.py writes it (REX_VPERM1);
++// sdk/tests/vmx_helpers_neon_test.cpp checks both forms against the two-source one.
++inline simde__m128i simde_mm_perm1_epi8_(simde__m128i a, simde__m128i c) {
++#if defined(REX_VMX_HELPERS_NEON)
++  const uint8x16_t index =
++      veorq_u8(vandq_u8(simde__m128i_to_neon_u8(c), vdupq_n_u8(0x0F)), vdupq_n_u8(0x0F));
++  return simde__m128i_from_neon_u8(vqtbl1q_u8(simde__m128i_to_neon_u8(a), index));
++#else
++  simde__m128i d = simde_mm_set1_epi8(0xF);
++  return simde_mm_shuffle_epi8(a, simde_mm_sub_epi8(d, simde_mm_and_si128(c, d)));
 +#endif
  }
  
@@ -2184,7 +2270,7 @@ index 3c2fe09065d089f949314425bd08e09ab5082d68..265f59971c46f072fb9ffa81975e812b
    simde__m128 xmm2 = simde_mm_cmpunord_ps(src1, src1);
    simde__m128i xmm0 = simde_mm_cvttps_epi32(src1);
    simde__m128i xmm1 = simde_mm_cmpeq_epi32(xmm0, simde_mm_set1_epi32(INT_MIN));
-@@ -185,12 +240,17 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1) {
+@@ -185,12 +256,17 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1) {
                                          simde_mm_castsi128_ps(simde_mm_set1_epi32(INT_MAX)),
                                          simde_mm_castsi128_ps(xmm1));
    return simde_mm_andnot_si128(simde_mm_castps_si128(xmm2), simde_mm_castps_si128(dest));
@@ -2202,7 +2288,7 @@ index 3c2fe09065d089f949314425bd08e09ab5082d68..265f59971c46f072fb9ffa81975e812b
    simde__m128 nan_mask = simde_mm_cmpunord_ps(src1, src1);
    simde__m128 neg_mask = simde_mm_cmplt_ps(src1, simde_mm_setzero_ps());
    simde__m128 max_val = simde_mm_set1_ps(4294967295.0f);  // UINT_MAX as float
-@@ -220,6 +280,7 @@ inline simde__m128i simde_mm_vctuxs(simde__m128 src1) {
+@@ -220,6 +296,7 @@ inline simde__m128i simde_mm_vctuxs(simde__m128 src1) {
        simde_mm_and_si128(simde_mm_castps_si128(overflow_mask), simde_mm_set1_epi32(-1)));
  
    return result;
@@ -2210,7 +2296,7 @@ index 3c2fe09065d089f949314425bd08e09ab5082d68..265f59971c46f072fb9ffa81975e812b
  }
  
  // Vector Shift Right
-@@ -340,6 +401,12 @@ inline simde__m128i simde_mm_vsro(simde__m128i a, simde__m128i b) {
+@@ -340,6 +417,12 @@ inline simde__m128i simde_mm_vsro(simde__m128i a, simde__m128i b) {
  
  // Variable 16-bit shift left: widen to 32-bit, shift, narrow back
  inline simde__m128i simde_mm_sllv_epi16(simde__m128i a, simde__m128i count) {
@@ -2223,7 +2309,7 @@ index 3c2fe09065d089f949314425bd08e09ab5082d68..265f59971c46f072fb9ffa81975e812b
    simde__m128i zero = simde_mm_setzero_si128();
    simde__m128i a_lo = simde_mm_unpacklo_epi16(a, zero);
    simde__m128i a_hi = simde_mm_unpackhi_epi16(a, zero);
-@@ -351,10 +418,16 @@ inline simde__m128i simde_mm_sllv_epi16(simde__m128i a, simde__m128i count) {
+@@ -351,10 +434,16 @@ inline simde__m128i simde_mm_sllv_epi16(simde__m128i a, simde__m128i count) {
    r_lo = simde_mm_and_si128(r_lo, mask16);
    r_hi = simde_mm_and_si128(r_hi, mask16);
    return simde_mm_packus_epi32(r_lo, r_hi);
@@ -2240,7 +2326,7 @@ index 3c2fe09065d089f949314425bd08e09ab5082d68..265f59971c46f072fb9ffa81975e812b
    simde__m128i zero = simde_mm_setzero_si128();
    simde__m128i a_lo = simde_mm_unpacklo_epi16(a, zero);
    simde__m128i a_hi = simde_mm_unpackhi_epi16(a, zero);
-@@ -363,10 +436,17 @@ inline simde__m128i simde_mm_srlv_epi16(simde__m128i a, simde__m128i count) {
+@@ -363,10 +452,17 @@ inline simde__m128i simde_mm_srlv_epi16(simde__m128i a, simde__m128i count) {
    simde__m128i r_lo = simde_mm_srlv_epi32(a_lo, s_lo);
    simde__m128i r_hi = simde_mm_srlv_epi32(a_hi, s_hi);
    return simde_mm_packus_epi32(r_lo, r_hi);
@@ -2258,7 +2344,7 @@ index 3c2fe09065d089f949314425bd08e09ab5082d68..265f59971c46f072fb9ffa81975e812b
    simde__m128i zero = simde_mm_setzero_si128();
    // Sign-extend a: duplicate each 16-bit lane, then arithmetic shift right by 16
    simde__m128i a_lo = simde_mm_srai_epi32(simde_mm_unpacklo_epi16(a, a), 16);
-@@ -376,10 +456,15 @@ inline simde__m128i simde_mm_srav_epi16(simde__m128i a, simde__m128i count) {
+@@ -376,10 +472,15 @@ inline simde__m128i simde_mm_srav_epi16(simde__m128i a, simde__m128i count) {
    simde__m128i r_lo = simde_mm_srav_epi32(a_lo, s_lo);
    simde__m128i r_hi = simde_mm_srav_epi32(a_hi, s_hi);
    return simde_mm_packs_epi32(r_lo, r_hi);
@@ -2274,7 +2360,7 @@ index 3c2fe09065d089f949314425bd08e09ab5082d68..265f59971c46f072fb9ffa81975e812b
    simde__m128i zero = simde_mm_setzero_si128();
    simde__m128i a_lo = simde_mm_unpacklo_epi8(a, zero);
    simde__m128i a_hi = simde_mm_unpackhi_epi8(a, zero);
-@@ -391,6 +476,7 @@ inline simde__m128i simde_mm_sllv_epi8(simde__m128i a, simde__m128i count) {
+@@ -391,6 +492,7 @@ inline simde__m128i simde_mm_sllv_epi8(simde__m128i a, simde__m128i count) {
    r_lo = simde_mm_and_si128(r_lo, mask8);
    r_hi = simde_mm_and_si128(r_hi, mask8);
    return simde_mm_packus_epi16(r_lo, r_hi);
@@ -2282,6 +2368,183 @@ index 3c2fe09065d089f949314425bd08e09ab5082d68..265f59971c46f072fb9ffa81975e812b
  }
  
  }  // namespace rex::ppc
+diff --git a/include/rex/ppc/memcalls.h b/include/rex/ppc/memcalls.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca952dc891697e7e59dd9eb171000ff7ee329702
+--- /dev/null
++++ b/include/rex/ppc/memcalls.h
+@@ -0,0 +1,90 @@
++/**
++ * @file        rex/ppc/memcalls.h
++ * @brief       The pure parts of the inline constant-size memcpy / memset (from sasrt-nx, 2026-10-14; banjo-nx's copy)
++ *
++ * tools/inline_memcalls.py writes the C runtime's memcpy / memset calls whose size is a constant of 1-64 bytes as
++ * REX_MEMCPY_CONST / REX_MEMSET_CONST (sa2-nx's idea 6, sonic-unleashed-nx's SWITCH_INLINE_MEMCPY). The helpers that
++ * touch guest memory live in the generated pch (they need its address macros); what they decide with lives here, so
++ * sdk/tests/memcalls_test.cpp tests the same code.
++ *
++ * banjo-nx's addition (the same test its hand-written memcpy, app/src/cpu/hot/banjo_hand_natives.h, makes): the CRT
++ * memcpy stores r3 at -8(r1) first and reloads r3 from there at every return, so a destination that covers that slot
++ * returns copied bytes in r3. CoversSlot declines it (the original runs).
++ */
++#pragma once
++
++#include <cstdint>
++
++namespace rex::ppc {
++
++/// A guest range of N bytes the inline helpers may handle: not in 0x7F000000-0x7FFFFFFF (hardware registers, where
++/// the width of each write matters) or from 0xA0000000 (the physical views, which alias each other: two different
++/// guest addresses can be the same memory), and not wrapping around 4 GB. Anything else runs the original routine.
++template <uint32_t N>
++[[gnu::always_inline]] inline bool PlainRange(uint32_t x) noexcept {
++  static_assert(N >= 1 && N <= 64);
++  const uint32_t e = x + (N - 1);
++  if (e < x) return false;
++  if (x < 0x7F000000u) return e < 0x7F000000u;
++  return x >= 0x80000000u && e < 0xA0000000u;
++}
++
++/// The CRT memcpy copies forward, unit by unit with each unit's loads before its stores: for dst <= src that is what
++/// memmove gives, for dst > src with overlapping ranges it smears already-copied bytes. The helper copies like
++/// memmove, so that case must run the original: true when dst > src and dst - src < N.
++template <uint32_t N>
++[[gnu::always_inline]] inline bool CopySmears(uint32_t dst, uint32_t src) noexcept {
++  return uint32_t(dst - src - 1u) < N - 1u;
++}
++
++/// True when [dst, dst + N) overlaps the 8-byte save slot [slot, slot + 8) (slot = r1 - 8).
++template <uint32_t N>
++[[gnu::always_inline]] inline bool CoversSlot(uint32_t dst, uint32_t slot) noexcept {
++  return uint64_t(uint32_t(slot + 7u - dst)) < uint64_t(N) + 7u;
++}
++
++/// N bytes, 1 <= N <= 64, every load before every store (two to eight loads and as many stores, overlapping where N
++/// is not a power of two).
++template <uint32_t N>
++[[gnu::always_inline]] inline void CopyConst(uint8_t* d, const uint8_t* s) noexcept {
++  static_assert(N >= 1 && N <= 64);
++  if constexpr (N > 32) {
++    uint8_t a[16], b[16], c[16], e[16];
++    __builtin_memcpy(a, s, 16);
++    __builtin_memcpy(b, s + 16, 16);
++    __builtin_memcpy(c, s + N - 32, 16);
++    __builtin_memcpy(e, s + N - 16, 16);
++    __builtin_memcpy(d, a, 16);
++    __builtin_memcpy(d + 16, b, 16);
++    __builtin_memcpy(d + N - 32, c, 16);
++    __builtin_memcpy(d + N - 16, e, 16);
++  } else if constexpr (N >= 16) {
++    uint8_t a[16], e[16];
++    __builtin_memcpy(a, s, 16);
++    __builtin_memcpy(e, s + N - 16, 16);
++    __builtin_memcpy(d, a, 16);
++    __builtin_memcpy(d + N - 16, e, 16);
++  } else if constexpr (N >= 8) {
++    uint64_t a, e;
++    __builtin_memcpy(&a, s, 8);
++    __builtin_memcpy(&e, s + N - 8, 8);
++    __builtin_memcpy(d, &a, 8);
++    __builtin_memcpy(d + N - 8, &e, 8);
++  } else if constexpr (N >= 4) {
++    uint32_t a, e;
++    __builtin_memcpy(&a, s, 4);
++    __builtin_memcpy(&e, s + N - 4, 4);
++    __builtin_memcpy(d, &a, 4);
++    __builtin_memcpy(d + N - 4, &e, 4);
++  } else if constexpr (N >= 2) {
++    uint16_t a, e;
++    __builtin_memcpy(&a, s, 2);
++    __builtin_memcpy(&e, s + N - 2, 2);
++    __builtin_memcpy(d, &a, 2);
++    __builtin_memcpy(d + N - 2, &e, 2);
++  } else {
++    *d = *s;
++  }
++}
++
++}  // namespace rex::ppc
+diff --git a/include/rex/ppc/vec_unaligned.h b/include/rex/ppc/vec_unaligned.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..da20c5529d071c73de55ad8a6fe0a51adebc9380
+--- /dev/null
++++ b/include/rex/ppc/vec_unaligned.h
+@@ -0,0 +1,75 @@
++/**
++ * @file        rex/ppc/vec_unaligned.h
++ * @brief       stvlx / stvrx without byte loops (from sasrt-nx, 2026-10-14; idea 5 of sa2-nx's list; banjo-nx's copy)
++ *
++ * The generator writes the left and right unaligned vector stores as loops of single-byte stores:
++ *   stvlx vS,EA:  for (i = 0; i < 16 - (EA & 15); i++) MEM[EA + i]     = vS.u8[15 - i]   (guest bytes 0.. of vS)
++ *   stvrx vS,EA:  for (i = 0; i < (EA & 15); i++)      MEM[EA - i - 1] = vS.u8[i]        (its last EA & 15 bytes)
++ * (a register's guest byte j is u8[15 - j]). tools/vec_unaligned_stores.py writes them as REX_STVLX / REX_STVRX, which
++ * reverse the vector once and store the same bytes with at most five stores of 16, 8, 4, 2 and 1 bytes.
++ *
++ * Exact: every byte the loop writes gets the same value, and no other byte is written.
++ *   left:  b[j] = u8[15 - j], and MEM[EA + j] = b[j] for j < 16 - (EA & 15), the loop's bytes;
++ *   right: with k = EA & 15 and block = EA & ~15, MEM[block + m] = b[16 - k + m] = u8[k - 1 - m] for m < k, which is
++ *          the loop's MEM[EA - i - 1] = u8[i] with m = k - 1 - i.
++ * The range stays inside EA's 16-byte block, which never straddles 0xE0000000 (the host offset of that view), so one
++ * host address serves the whole range. Only the order of the byte writes differs, which another thread reading the
++ * block in the middle of the store could see (these are ordinary data stores, never hardware registers).
++ *
++ * Tested by sdk/tests/vec_unaligned_test.cpp (every alignment against the loops).
++ */
++#pragma once
++
++#include <cstdint>
++
++namespace rex::ppc {
++
++/// The guest byte order of a vector register's 16 bytes (u8[15 - j] is guest byte j). The register is copied to a
++/// local first, so the compiler knows it cannot overlap `b` (otherwise GCC adds an overlap test and a byte path).
++[[gnu::always_inline]] inline void GuestBytes(const uint8_t* u8, uint8_t* b) noexcept {
++  uint8_t in[16];
++  __builtin_memcpy(in, u8, 16);
++  for (int j = 0; j < 16; ++j) b[j] = in[15 - j];
++}
++
++/// 1 <= n <= 16 bytes from s to d, at most five stores.
++[[gnu::always_inline]] inline void StoreBytes(uint8_t* d, const uint8_t* s, uint32_t n) noexcept {
++  if (n == 16) {
++    __builtin_memcpy(d, s, 16);
++    return;
++  }
++  if (n & 8) {
++    __builtin_memcpy(d, s, 8);
++    d += 8;
++    s += 8;
++  }
++  if (n & 4) {
++    __builtin_memcpy(d, s, 4);
++    d += 4;
++    s += 4;
++  }
++  if (n & 2) {
++    __builtin_memcpy(d, s, 2);
++    d += 2;
++    s += 2;
++  }
++  if (n & 1) *d = *s;
++}
++
++/// stvlx: `host` is the host address of `ea`; the guest bytes 0 .. 15 - (ea & 15) of the vector at ea, upward.
++[[gnu::always_inline]] inline void StoreVectorLeft(uint8_t* host, uint32_t ea, const uint8_t* u8) noexcept {
++  uint8_t b[16];
++  GuestBytes(u8, b);
++  StoreBytes(host, b, 16 - (ea & 15));
++}
++
++/// stvrx: `block` is the host address of ea & ~15; the vector's last ea & 15 guest bytes at the start of the block.
++[[gnu::always_inline]] inline void StoreVectorRight(uint8_t* block, uint32_t ea, const uint8_t* u8) noexcept {
++  const uint32_t k = ea & 15;
++  if (!k) return;
++  uint8_t b[16];
++  GuestBytes(u8, b);
++  StoreBytes(block, b + 16 - k, k);
++}
++
++}  // namespace rex::ppc
 diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
 index 1f524802ee642116261f190563b6246a3b6ede27..9d7901deb21aea13c32dfd883952790382abd2e7 100644
 --- a/include/rex/rex_app.h
@@ -2301,10 +2564,10 @@ index 1f524802ee642116261f190563b6246a3b6ede27..9d7901deb21aea13c32dfd8839527903
    /// Use this for data patches and recomp-specific achievement registration.
 diff --git a/include/rex/sys_counters.h b/include/rex/sys_counters.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..e1d7ec8ba17fa672eb7a8302c7f6b26a12bc23fc
+index 0000000000000000000000000000000000000000..34073b6019977c25c36e4d77dc9ca219fc5bc141
 --- /dev/null
 +++ b/include/rex/sys_counters.h
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,96 @@
 +#pragma once
 +/**
 + * @file        sys_counters.h
@@ -2365,7 +2628,12 @@ index 0000000000000000000000000000000000000000..e1d7ec8ba17fa672eb7a8302c7f6b26a
 +  kCensusLookupHeap = 70,     // Memory::LookupHeap calls (one inside every Memory::TranslateVirtual)
 +  kCensusRetainRelease = 71,  // XObject::Retain and Release calls
 +  kCensusKernelState = 72,    // rex::system::kernel_state() calls
-+  kCensusCount = 76,
++  // banjo-nx (2026-10-14): the rounding mode of each guest FPSCR write (mtfsf). tools/fp_sign_ops.py (float negation
++  // folds) is exact only while the game never selects round-up or round-down.
++  kCensusRoundNearest = 76,   // guest FPSCR writes with RN = round to nearest
++  kCensusRoundZero = 77,      // ... RN = toward zero
++  kCensusRoundUpDown = 78,    // ... RN = toward +infinity or -infinity
++  kCensusCount = 79,
 +};
 +
 +#if !defined(__SWITCH__)
@@ -2469,10 +2737,49 @@ index 6063f3cc5d6c2f3b097a27c719dd34235a6d1cc4..8b164c5083d2c32afdaff966a7d90a7e
    void RemoveIOCompletionPort(uint32_t key);
  
 diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
-index 0c39a42009e4e4e8d64c7325196ba5690559f335..baf25b42cc091942bfb9bcb0899d540f4ca934f8 100644
+index 0c39a42009e4e4e8d64c7325196ba5690559f335..2a4c90c2774e97b0fad8cb8e90bbafd7749eeed2 100644
 --- a/include/rex/system/xmemory.h
 +++ b/include/rex/system/xmemory.h
-@@ -385,12 +385,20 @@ class Memory {
+@@ -60,6 +60,38 @@ inline T GuestPtr(u8* base, u32 guest_address) noexcept {
+ 
+ class Memory;
+ 
++// sa2-nx (2026-10-20, from banjo-nx's SDK of 2026-10-19, CPU proposal 1): the store cards (tools/store_cards.py). A
++// byte per 4 KB guest page at the guest address of its page number (the first MB of the guest window, which
++// Memory::Initialize keeps for them): every guest store outside the stack zeroes its page's card, and so do the host
++// writers of guest memory (MarkStoreCards: the CRT memory hooks, PhysicalHeap::TriggerCallbacks for file reads,
++// decommits and releases, SA2's native replacements). Renut sets the cards of the pages it checks to 1 and proves its
++// cached vertex, index and texture copies by them (banjo_renut_store_cards). The guest window's base: nullptr before
++// Memory::Initialize. Data of the runtime: code outside it (the app; on Windows the runtime is a DLL) passes the guest
++// window's base (Memory::virtual_membase) to MarkStoreCardsAt instead.
++extern u8* g_store_cards;
++
++inline void MarkStoreCardsAt(u8* cards, u32 guest_address, u32 length) noexcept {
++  if (!cards || !length) return;
++  const uint64_t end = uint64_t(guest_address) + length - 1;
++  const u32 last = end > 0xFFFFFFFFull ? 0xFFFFFu : u32(end >> 12);
++  for (u32 page = guest_address >> 12; page <= last; ++page) cards[page] = 0;
++}
++
++inline void MarkStoreCards(u32 guest_address, u32 length) noexcept {
++  MarkStoreCardsAt(g_store_cards, guest_address, length);
++}
++
++// The same for a host pointer into the guest window (a hook's argument); anything outside it is left alone.
++inline void MarkStoreCardsHost(const void* host, size_t length) noexcept {
++  u8* cards = g_store_cards;
++  if (!cards || !length) return;
++  const uint64_t offset = uint64_t(reinterpret_cast<const u8*>(host) - cards);
++  if (offset >= 0x100000000ull) return;
++  u32 guest = u32(offset);
++  if (detail::PhysicalHostOffset(guest) && guest >= 0xE0001000u) guest -= 0x1000u;
++  MarkStoreCards(guest, length > 0xFFFFFFFFull ? 0xFFFFFFFFu : u32(length));
++}
++
+ enum SystemHeapFlag : uint32_t {
+   kSystemHeapVirtual = 1 << 0,
+   kSystemHeapPhysical = 1 << 1,
+@@ -385,12 +417,20 @@ class Memory {
    // Note that the contents at the specified host address are big-endian.
    template <typename T = uint8_t*>
    inline T TranslateVirtual(uint32_t guest_address) const {
@@ -7167,10 +7474,22 @@ index 3908bdf9e6c6ed0f6251279b11044cb42e81d7b6..4713a215e22bcf9b17820e74522b9019
    return true;
  }
 diff --git a/src/codegen/builders/builder_context.h b/src/codegen/builders/builder_context.h
-index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..4f6e071c9688b0f60dbd3af72f23770109eac317 100644
+index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..75141a848b4f2be6aec88d9f1a1ee48054ff0a07 100644
 --- a/src/codegen/builders/builder_context.h
 +++ b/src/codegen/builders/builder_context.h
-@@ -35,6 +35,7 @@ struct RecompilerLocalVariables {
+@@ -25,6 +25,11 @@ namespace rex::codegen {
+ 
+ class FunctionNode;
+ 
++/// A setjmp site leaves these two markers in the body; FunctionGraph::emit replaces them once the
++/// function's whole set of C++-local registers is known (BuilderContext::emit_function_call; from banjo-nx).
++inline constexpr std::string_view kSetjmpSaveLocalsMarker = "/*REX_SETJMP_SAVE_LOCALS*/";
++inline constexpr std::string_view kSetjmpRestoreLocalsMarker = "/*REX_SETJMP_RESTORE_LOCALS*/";
++
+ struct RecompilerLocalVariables {
+   bool ctr{};
+   bool xer{};
+@@ -35,6 +40,7 @@ struct RecompilerLocalVariables {
    bool v[128]{};
    bool env{};
    bool temp{};
@@ -7178,7 +7497,21 @@ index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..4f6e071c9688b0f60dbd3af72f237701
    bool v_temp{};
    bool ea{};
  
-@@ -98,6 +99,9 @@ struct BuilderContext {
+@@ -70,6 +76,13 @@ enum class CSRState { Unknown, FPU, VMX };
+ /**
+  * @brief Context passed to instruction builders during code generation.
+  */
++/// banjo-nx (fp_copy_forwarding): what the fneg / fabs / fnabs between an lfs and its stfs do to the single's bits:
++/// (bits & keep) ^ flip.
++struct FloatCopySign {
++  uint32_t keep = 0xFFFFFFFFu;
++  uint32_t flip = 0;
++};
++
+ struct BuilderContext {
+   /// Raw output buffer for code generation
+   std::string& out;
+@@ -98,6 +111,9 @@ struct BuilderContext {
    /// Pointer to active jump table for bctr dispatch, or nullptr
    const JumpTable* activeJumpTable = nullptr;
  
@@ -7188,7 +7521,7 @@ index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..4f6e071c9688b0f60dbd3af72f237701
    /// Get the recompiler configuration
    const RecompilerConfig& config() const;
  
-@@ -156,6 +160,8 @@ struct BuilderContext {
+@@ -156,6 +172,8 @@ struct BuilderContext {
  
    /// Get expression for vector temporary variable (always "vTemp")
    const char* v_temp();
@@ -7197,7 +7530,7 @@ index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..4f6e071c9688b0f60dbd3af72f237701
  
    /// Get expression for setjmp environment storage (always "env")
    const char* env();
-@@ -231,6 +237,46 @@ struct BuilderContext {
+@@ -231,6 +249,46 @@ struct BuilderContext {
     */
    void emit_function_call(uint32_t address);
  
@@ -7244,7 +7577,7 @@ index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..4f6e071c9688b0f60dbd3af72f237701
    /**
     * @brief Emit C++ code for a conditional branch.
     * @param not_ If true, invert the condition
-@@ -247,6 +293,73 @@ struct BuilderContext {
+@@ -247,6 +305,73 @@ struct BuilderContext {
     */
    void emit_set_flush_mode(bool enable);
  
@@ -7268,7 +7601,7 @@ index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..4f6e071c9688b0f60dbd3af72f237701
 +  /// fp_copy_pairs: this stfs / stfsx writes loaded bits: its register still holds what an lfs / lfsx of the
 +  /// same block put there (see RecompilerConfig::fpCopyPairs), and the form pays. It writes
 +  /// rex::ppc::QuietSingleBits of the register's bits local, without a conversion and without a mode statement.
-+  bool float_copy_pair_store() const;
++  bool float_copy_pair_store(FloatCopySign* sign = nullptr) const;
 +
 +  /// An lfs/stfs form: true when the conversion must go through rex::ppc::SingleToDoubleAnyMode /
 +  /// DoubleToSingleAnyMode (fp_moves_modeless with VMX mode current: no switch); otherwise switches to FPU mode as
@@ -7318,7 +7651,7 @@ index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..4f6e071c9688b0f60dbd3af72f237701
    /// Emit mid-asm hook if configured for current address
    void emit_mid_asm_hook();
  
-@@ -325,6 +438,14 @@ struct BuilderContext {
+@@ -325,6 +450,14 @@ struct BuilderContext {
     */
    void emit_load_d_form(const char* load_macro, const char* dest_type, bool check_mmio = true);
  
@@ -7334,7 +7667,7 @@ index 33ac6d0b275b4d0d6f8d187947b9d1bcc24293c2..4f6e071c9688b0f60dbd3af72f237701
     * @brief Emit load with X-form addressing: rD = LOAD(rA + rB)
     * @param load_macro The load macro name
 diff --git a/src/codegen/builders/context.cpp b/src/codegen/builders/context.cpp
-index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..548d4f82224fa159e2e2ba813dc5c8d9b8a6bc25 100644
+index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..a60b1cd8f5cfc94aa2b1e12fe305ce17faaa8d0e 100644
 --- a/src/codegen/builders/context.cpp
 +++ b/src/codegen/builders/context.cpp
 @@ -18,8 +18,12 @@
@@ -7442,7 +7775,24 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..548d4f82224fa159e2e2ba813dc5c8d9
  const char* BuilderContext::v_temp() {
    locals.v_temp = true;
    return "vTemp";
-@@ -212,17 +236,28 @@ void BuilderContext::emit_function_call(uint32_t address) {
+@@ -184,10 +208,15 @@ void BuilderContext::emit_function_call(uint32_t address) {
+   if (address == cfg.setJmpAddress) {
+     // Save PPCContext for restoration after longjmp
+     println("\t{} = ctx;", env());
++    // Registers kept in C++ locals (cr/ctr/xer_as_local, non_volatile_as_local, ...) are not in ctx: copy them
++    // into env as well and take them back after a longjmp (from banjo-nx). The guest's longjmp gives the setjmp
++    // caller its registers as they were at the setjmp; C++ leaves a local that changed in between indeterminate.
++    // The full set of locals is known only at the end of the function, so FunctionGraph fills in the markers.
++    println("\t{}", kSetjmpSaveLocalsMarker);
+     // Use custom ppc_setjmp that uses guest address as key
+     println("\t{}.s64 = ppc_setjmp({}.u32);", temp(), r(3));
+     // Restore PPCContext if returning from longjmp
+-    println("\tif ({}.s64 != 0) ctx = {};", temp(), env());
++    println("\tif ({}.s64 != 0) {{ ctx = {}; {} }}", temp(), env(), kSetjmpRestoreLocalsMarker);
+     println("\t{} = {};", r(3), temp());
+     return;
+   }
+@@ -212,17 +241,28 @@ void BuilderContext::emit_function_call(uint32_t address) {
        // the owner left live, so hand it the localized copies through ctx and take
        // them back afterwards. Only registers already localized here can be live at
        // this point, so that set is the whole live-in the funclet can see.
@@ -7481,7 +7831,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..548d4f82224fa159e2e2ba813dc5c8d9
          return;
        }
  
-@@ -276,6 +311,91 @@ void BuilderContext::emit_function_call(uint32_t address) {
+@@ -276,6 +316,91 @@ void BuilderContext::emit_function_call(uint32_t address) {
    println("\tREX_FATAL(\"Unresolved call from 0x{:08X} to 0x{:08X}\");", base, address);
  }
  
@@ -7573,7 +7923,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..548d4f82224fa159e2e2ba813dc5c8d9
  void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
    uint32_t target = insn.operands[1];
  
-@@ -298,7 +418,14 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
+@@ -298,7 +423,14 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
            auto* targetFn = callTarget->asFunction();
            emitCtx.reference(targetFn->name());
            println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
@@ -7589,7 +7939,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..548d4f82224fa159e2e2ba813dc5c8d9
            println("\t\treturn;");
            println("\t}}");
          } else if (callTarget->isImport()) {
-@@ -340,6 +467,388 @@ void BuilderContext::emit_set_flush_mode(bool enable) {
+@@ -340,6 +472,458 @@ void BuilderContext::emit_set_flush_mode(bool enable) {
    }
  }
  
@@ -7648,10 +7998,21 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..548d4f82224fa159e2e2ba813dc5c8d9
 +// must be an lfs / lfsx of it; before that only other lfs / lfsx / stfs / stfsx (they write their own register or
 +// none) and plain integer instructions. No label after the load up to the store (a jump would arrive without the
 +// load), no mid-asm hook from the load to the store (it could change the register).
-+uint32_t FloatCopyLoadOf(const BuilderContext& ctx, uint32_t store, const uint32_t* storeData) {
++//
++// banjo-nx (fp_copy_forwarding): other instructions may stand between as well, unless they write the store's register
++// or branch; an fneg / fabs / fnabs of the register in place is followed through, and `sign` receives what the
++// sign operations do to the single's bits: (bits & keep) ^ flip.
++bool StartsWith(std::string_view name, std::string_view prefix) {
++  return name.substr(0, prefix.size()) == prefix;
++}
++
++uint32_t FloatCopyLoadOf(const BuilderContext& ctx, uint32_t store, const uint32_t* storeData,
++                         FloatCopySign* sign = nullptr) {
 +  if (!ctx.config().fpCopyPairs || ctx.labels == nullptr) {
 +    return 0;
 +  }
++  const bool forwarding = ctx.config().fpCopyForwarding;
++  FloatCopySign ops;
 +  ppc_insn self;
 +  rex::codegen::ppc::Disassemble(storeData, 4, store, self);
 +  const auto& hooks = ctx.config().midAsmHooks;
@@ -7676,7 +8037,39 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..548d4f82224fa159e2e2ba813dc5c8d9
 +    rex::codegen::ppc::Disassemble(p, 4, address, previous);
 +    if (IsSingleLoad(previous)) {
 +      if (previous.operands[0] == self.operands[0]) {
++        if (sign) {
++          *sign = ops;
++        }
 +        return address;  // a label AT the load is fine: whoever jumps there runs the load
++      }
++    } else if (forwarding) {
++      if (previous.opcode == nullptr || previous.opcode->name == nullptr) {
++        return 0;
++      }
++      const std::string_view name = previous.opcode->name;
++      if (StartsWith(name, "b") || StartsWith(name, "sc") || StartsWith(name, "tw") || StartsWith(name, "td")) {
++        return 0;
++      }
++      // The instructions that write a float register write their first operand: every f* but the compares, every
++      // lf*, mffs. (Stores, mtfsf / mtfsb, vector and integer instructions write none.)
++      const bool fpr_write =
++          (StartsWith(name, "f") && !StartsWith(name, "fcmp")) || StartsWith(name, "lf") || StartsWith(name, "mffs");
++      if (fpr_write && previous.operands[0] == self.operands[0]) {
++        uint32_t keep, flip;
++        if (StartsWith(name, "fneg")) {
++          keep = 0xFFFFFFFFu, flip = 0x80000000u;
++        } else if (StartsWith(name, "fabs")) {
++          keep = 0x7FFFFFFFu, flip = 0;
++        } else if (StartsWith(name, "fnabs")) {
++          keep = 0x7FFFFFFFu, flip = 0x80000000u;
++        } else {
++          return 0;
++        }
++        if (previous.operands[1] != self.operands[0]) {
++          return 0;  // from another register
++        }
++        // This operation comes before the ones found so far: those apply to its result.
++        ops = FloatCopySign{keep & ops.keep, (flip & ops.keep) ^ ops.flip};
 +      }
 +    } else if (!IsSingleStore(previous) && !IsPlainIntegerInstruction(previous)) {
 +      return 0;
@@ -7687,16 +8080,43 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..548d4f82224fa159e2e2ba813dc5c8d9
 +  }
 +  return 0;
 +}
++
++// fp_copy_forwarding: whether a store after the load at `base` in its block writes the bits it loads (the store's
++// own test, FloatCopyLoadOf, names this load).
++bool FeedsCopyStore(const BuilderContext& ctx, uint32_t load, const uint32_t* loadData) {
++  uint32_t end = 0;
++  for (const auto& block : ctx.fn.blocks()) {
++    if (load >= block.base && load < block.end()) {
++      end = block.end();
++      break;
++    }
++  }
++  const uint32_t* p = loadData + 1;
++  for (uint32_t address = load + 4, n = 0; address < end && n < kFloatCopyReach; address += 4, ++p, ++n) {
++    ppc_insn next;
++    rex::codegen::ppc::Disassemble(p, 4, address, next);
++    if (IsSingleStore(next) && FloatCopyLoadOf(ctx, address, p) == load) {
++      return true;
++    }
++  }
++  return false;
++}
 +}  // namespace
 +
 +bool BuilderContext::float_copy_pair_load() const {
-+  return config().fpCopyPairs && IsSingleLoad(insn) && !has_mid_asm_hook() && float_copy_pair_pays();
++  if (!config().fpCopyPairs || !IsSingleLoad(insn) || has_mid_asm_hook()) {
++    return false;
++  }
++  // fp_copy_forwarding: also whenever one of its stores takes the form (they need the bits local).
++  return float_copy_pair_pays() || (config().fpCopyForwarding && FeedsCopyStore(*this, base, data));
 +}
 +
-+bool BuilderContext::float_copy_pair_store() const {
++bool BuilderContext::float_copy_pair_store(FloatCopySign* sign) const {
 +  // Its load took the copy form: the tracked mode can only have become FPU between the two (nothing there sets
-+  // VMX mode or forgets the mode), and then this store does not take the form either.
-+  return config().fpCopyPairs && float_copy_pair_pays() && FloatCopyLoadOf(*this, base, data) != 0;
++  // VMX mode or forgets the mode), and then this store does not take the form either. fp_copy_forwarding: any mode;
++  // the load takes the form because this store names it (FeedsCopyStore).
++  return config().fpCopyPairs && (float_copy_pair_pays() || config().fpCopyForwarding) &&
++         FloatCopyLoadOf(*this, base, data, sign) != 0;
 +}
 +
 +void BuilderContext::emit_flush_mode_for_modeless() {
@@ -7978,7 +8398,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..548d4f82224fa159e2e2ba813dc5c8d9
  bool BuilderContext::has_mid_asm_hook() const {
    return config().midAsmHooks.find(base) != config().midAsmHooks.end();
  }
-@@ -487,24 +996,33 @@ void BuilderContext::emit_vec_var_shift(const char* shift_dir, const char* eleme
+@@ -487,24 +1071,33 @@ void BuilderContext::emit_vec_var_shift(const char* shift_dir, const char* eleme
  // Memory (Load/Store) Code Generation Helpers
  //=============================================================================
  
@@ -8024,7 +8444,7 @@ index f78e0d8fe89924e97e0ed3eaf10b688bd36478eb..548d4f82224fa159e2e2ba813dc5c8d9
  }
  
  void BuilderContext::emit_load_x_form(const char* load_macro, const char* dest_type,
-@@ -531,20 +1049,15 @@ void BuilderContext::emit_store_d_form(const char* store_macro, const char* src_
+@@ -531,20 +1124,15 @@ void BuilderContext::emit_store_d_form(const char* store_macro, const char* src_
                                         bool check_mmio) {
    // D-form: STORE(rA + D, rS) where operands[0]=rS, operands[1]=D, operands[2]=rA
    // store_macro should be like "REX_STORE_U8" - we replace REX_STORE with REX_MM_STORE for MMIO
@@ -8354,13 +8774,44 @@ index dbc8d51538acce81bc33166b4679036736844a21..5f27bda3a64cf0f95c0f61d7c1a32d7e
  
  /**
 diff --git a/src/codegen/builders/logical.cpp b/src/codegen/builders/logical.cpp
-index a58f51d06dfd94ec3e806206fe93ff8cbc79f2ff..024ee34dde11a0ac6e9d85bc34b6945b735c047f 100644
+index a58f51d06dfd94ec3e806206fe93ff8cbc79f2ff..cb1d1733200c10b2aa3c337497cca8f92bdab787 100644
 --- a/src/codegen/builders/logical.cpp
 +++ b/src/codegen/builders/logical.cpp
-@@ -278,6 +278,15 @@ bool build_rotldi(BuilderContext& ctx) {
+@@ -276,8 +276,46 @@ bool build_rotldi(BuilderContext& ctx) {
+ // Rotate Left Word
+ //=============================================================================
  
++namespace {
++// rotate_word_shifts (see config.h): the 32-bit value of rotl32(rS, sh) & mask (mask within the low word, not
++// wrapping) as the cheapest exact expression (from banjo-nx; its sdk/tests/rotate_word_test.cpp checks the rules).
++std::string RotateWordShiftForm(const std::string& rs, uint32_t sh, uint32_t mask) {
++  if (sh == 0)
++    return fmt::format("({}.u32 & 0x{:X}u)", rs, mask);
++  if ((mask & ((1u << sh) - 1u)) == 0) {  // only bits the left shift brings: x << sh
++    if (mask == (0xFFFFFFFFu << sh))
++      return fmt::format("((uint32_t)({}.u32 << {}))", rs, sh);
++    return fmt::format("((uint32_t)({}.u32 << {}) & 0x{:X}u)", rs, sh, mask);
++  }
++  if (mask < (1u << sh)) {  // only bits the right shift brings: x >> (32 - sh)
++    if (mask == (1u << sh) - 1u)
++      return fmt::format("({}.u32 >> {})", rs, 32 - sh);
++    return fmt::format("(({}.u32 >> {}) & 0x{:X}u)", rs, 32 - sh, mask);
++  }
++  return fmt::format("(__builtin_rotateleft32({}.u32, {}) & 0x{:X}u)", rs, sh, mask);
++}
++}  // namespace
++
  bool build_rlwimi(BuilderContext& ctx) {
    const uint64_t mask = compute_mask(ctx.insn.operands[3] + 32, ctx.insn.operands[4] + 32);
++  if (ctx.config().rotateWordShifts && ctx.insn.operands[3] <= ctx.insn.operands[4]) {
++    // rotate_word_shifts: the inserted bits as a 32-bit expression (zero-extended in the OR, as the masked 64-bit
++    // form was); the kept bits of the destination (all of its upper word) are unchanged.
++    ctx.println("\t{}.u64 = {} | ({}.u64 & 0x{:X});", ctx.r(ctx.insn.operands[0]),
++                RotateWordShiftForm(ctx.r(ctx.insn.operands[1]), ctx.insn.operands[2], static_cast<uint32_t>(mask)),
++                ctx.r(ctx.insn.operands[0]), ~mask);
++    emitRecordFormCompare(ctx);
++    return true;
++  }
 +  if (ctx.config().rotateWordNarrow && ctx.insn.operands[3] <= ctx.insn.operands[4]) {
 +    // rotate_word_narrow: the mask lies in the low word, where the 64-bit rotate of the duplicated word equals the
 +    // 32-bit rotate. The kept bits of the destination (all of its upper word) are unchanged.
@@ -8373,10 +8824,19 @@ index a58f51d06dfd94ec3e806206fe93ff8cbc79f2ff..024ee34dde11a0ac6e9d85bc34b6945b
    ctx.println(
        "\t{}.u64 = (__builtin_rotateleft64({}.u32 | ({}.u64 << 32), {}) & 0x{:X}) | ({}.u64 & "
        "0x{:X});",
-@@ -288,6 +297,15 @@ bool build_rlwimi(BuilderContext& ctx) {
+@@ -288,6 +326,24 @@ bool build_rlwimi(BuilderContext& ctx) {
  }
  
  bool build_rlwinm(BuilderContext& ctx) {
++  if (ctx.config().rotateWordShifts && ctx.insn.operands[3] <= ctx.insn.operands[4]) {
++    // rotate_word_shifts: the u32 result is zero-extended, as the masked 64-bit form was.
++    ctx.println("\t{}.u64 = {};", ctx.r(ctx.insn.operands[0]),
++                RotateWordShiftForm(ctx.r(ctx.insn.operands[1]), ctx.insn.operands[2],
++                                    static_cast<uint32_t>(compute_mask(ctx.insn.operands[3] + 32,
++                                                                       ctx.insn.operands[4] + 32))));
++    emitRecordFormCompare(ctx);
++    return true;
++  }
 +  if (ctx.config().rotateWordNarrow && ctx.insn.operands[3] <= ctx.insn.operands[4]) {
 +    // rotate_word_narrow: see build_rlwimi. The u32 result is zero-extended, as the masked 64-bit form was.
 +    ctx.println("\t{}.u64 = __builtin_rotateleft32({}.u32, {}) & 0x{:X}u;", ctx.r(ctx.insn.operands[0]),
@@ -8389,7 +8849,7 @@ index a58f51d06dfd94ec3e806206fe93ff8cbc79f2ff..024ee34dde11a0ac6e9d85bc34b6945b
    ctx.println("\t{}.u64 = __builtin_rotateleft64({}.u32 | ({}.u64 << 32), {}) & 0x{:X};",
                ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]), ctx.r(ctx.insn.operands[1]),
                ctx.insn.operands[2],
-@@ -298,6 +316,14 @@ bool build_rlwinm(BuilderContext& ctx) {
+@@ -298,6 +354,14 @@ bool build_rlwinm(BuilderContext& ctx) {
  
  bool build_rlwnm(BuilderContext& ctx) {
    // Like rlwinm but shift amount comes from register, not immediate
@@ -8405,7 +8865,7 @@ index a58f51d06dfd94ec3e806206fe93ff8cbc79f2ff..024ee34dde11a0ac6e9d85bc34b6945b
                ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]), ctx.r(ctx.insn.operands[1]),
                ctx.r(ctx.insn.operands[2]),  // Register, not immediate
 diff --git a/src/codegen/builders/memory.cpp b/src/codegen/builders/memory.cpp
-index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..45d4021478528e50fa21f3f5b225f82b64807d0f 100644
+index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..2ab8b1b82b025543a64a236b568c0ba18afccef1 100644
 --- a/src/codegen/builders/memory.cpp
 +++ b/src/codegen/builders/memory.cpp
 @@ -220,16 +220,15 @@ bool build_ldarx(BuilderContext& ctx) {
@@ -8574,9 +9034,20 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..45d4021478528e50fa21f3f5b225f82b
    ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
    if (ctx.insn.operands[1] != 0)
      ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
-@@ -485,18 +510,35 @@ bool build_stfiwx(BuilderContext& ctx) {
+@@ -484,19 +509,46 @@ bool build_stfiwx(BuilderContext& ctx) {
+   return true;
  }
  
++// fp_copy_pairs: the stored bits, the sign operations between included (fp_copy_forwarding).
++std::string CopyStoreBits(BuilderContext& ctx, const FloatCopySign& sign) {
++  std::string bits = fmt::format("rex::ppc::QuietSingleBits({}.u32)", ctx.f_bits(ctx.insn.operands[0]));
++  if (sign.keep != 0xFFFFFFFFu)
++    bits = fmt::format("({} & 0x{:08X}u)", bits, sign.keep);
++  if (sign.flip != 0)
++    bits = fmt::format("({} ^ 0x{:08X}u)", bits, sign.flip);
++  return bits;
++}
++
  bool build_stfs(BuilderContext& ctx) {
 -  ctx.emit_set_flush_mode(false);
 -  ctx.println("\t{}.f32 = float({}.f64);", ctx.temp(), ctx.f(ctx.insn.operands[0]));
@@ -8585,11 +9056,11 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..45d4021478528e50fa21f3f5b225f82b
 -    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
 -  ctx.println("{}, {}.u32);", static_cast<int32_t>(ctx.insn.operands[1]), ctx.temp());
 +  // fp_copy_pairs: the register's bits local still holds what its lfs loaded.
-+  const bool pair = ctx.float_copy_pair_store();
++  FloatCopySign sign;
++  const bool pair = ctx.float_copy_pair_store(&sign);
 +  const bool any_mode = !pair && ctx.single_conversion_any_mode();
 +  if (pair)
-+    ctx.println("\t{}.u32 = rex::ppc::QuietSingleBits({}.u32);", ctx.temp(),
-+                ctx.f_bits(ctx.insn.operands[0]));
++    ctx.println("\t{}.u32 = {};", ctx.temp(), CopyStoreBits(ctx, sign));
 +  else if (any_mode)
 +    ctx.println("\t{}.f32 = rex::ppc::DoubleToSingleAnyMode({}.f64);", ctx.temp(),
 +                ctx.f(ctx.insn.operands[0]));
@@ -8605,11 +9076,11 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..45d4021478528e50fa21f3f5b225f82b
  bool build_stfsx(BuilderContext& ctx) {
 -  ctx.emit_set_flush_mode(false);
 -  ctx.println("\t{}.f32 = float({}.f64);", ctx.temp(), ctx.f(ctx.insn.operands[0]));
-+  const bool pair = ctx.float_copy_pair_store();
++  FloatCopySign sign;
++  const bool pair = ctx.float_copy_pair_store(&sign);
 +  const bool any_mode = !pair && ctx.single_conversion_any_mode();
 +  if (pair)
-+    ctx.println("\t{}.u32 = rex::ppc::QuietSingleBits({}.u32);", ctx.temp(),
-+                ctx.f_bits(ctx.insn.operands[0]));
++    ctx.println("\t{}.u32 = {};", ctx.temp(), CopyStoreBits(ctx, sign));
 +  else if (any_mode)
 +    ctx.println("\t{}.f32 = rex::ppc::DoubleToSingleAnyMode({}.f64);", ctx.temp(),
 +                ctx.f(ctx.insn.operands[0]));
@@ -8618,7 +9089,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..45d4021478528e50fa21f3f5b225f82b
    ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
    if (ctx.insn.operands[1] != 0)
      ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
-@@ -506,7 +548,7 @@ bool build_stfsx(BuilderContext& ctx) {
+@@ -506,7 +558,7 @@ bool build_stfsx(BuilderContext& ctx) {
  
  bool build_stfdu(BuilderContext& ctx) {
    // Store Floating-point Double with Update
@@ -8627,7 +9098,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..45d4021478528e50fa21f3f5b225f82b
    ctx.println("\t{} = {} + {}.u32;", ctx.ea(), static_cast<int32_t>(ctx.insn.operands[1]),
                ctx.r(ctx.insn.operands[2]));
    ctx.println("\tREX_STORE_U64({}, {}.u64);", ctx.ea(), ctx.f(ctx.insn.operands[0]));
-@@ -516,10 +558,14 @@ bool build_stfdu(BuilderContext& ctx) {
+@@ -516,10 +568,14 @@ bool build_stfdu(BuilderContext& ctx) {
  
  bool build_stfsu(BuilderContext& ctx) {
    // Store Floating-point Single with Update (convert double to float first)
@@ -8644,7 +9115,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..45d4021478528e50fa21f3f5b225f82b
    ctx.println("\tREX_STORE_U32({}, {}.u32);", ctx.ea(), ctx.temp());
    ctx.println("\t{}.u32 = {};", ctx.r(ctx.insn.operands[2]), ctx.ea());
    return true;
-@@ -527,8 +573,12 @@ bool build_stfsu(BuilderContext& ctx) {
+@@ -527,8 +583,12 @@ bool build_stfsu(BuilderContext& ctx) {
  
  bool build_stfsux(BuilderContext& ctx) {
    // Store Floating-point Single with Update Indexed
@@ -8660,7 +9131,7 @@ index 3dd7fa567f02e9456cc7e27368023339aeaf6c3c..45d4021478528e50fa21f3f5b225f82b
                ctx.r(ctx.insn.operands[2]));
    ctx.println("\t{}({}, {}.u32);", ctx.mmio_check_x_form() ? "REX_MM_STORE_U32" : "REX_STORE_U32",
 diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
-index b2d70f53f8e74ea2be6e0de26efbcc91ea19950f..bf65e550b313c5204c88849a3d724df9c13c4ab0 100644
+index b2d70f53f8e74ea2be6e0de26efbcc91ea19950f..3251480ea1354b9a49d9d8124bf753d469e615c6 100644
 --- a/src/codegen/builders/system.cpp
 +++ b/src/codegen/builders/system.cpp
 @@ -31,20 +31,24 @@ bool build_attn(BuilderContext& ctx) {
@@ -8694,7 +9165,7 @@ index b2d70f53f8e74ea2be6e0de26efbcc91ea19950f..bf65e550b313c5204c88849a3d724df9
    return true;
  }
  
-@@ -135,15 +139,28 @@ bool build_dcbf(BuilderContext& ctx) {
+@@ -135,15 +139,31 @@ bool build_dcbf(BuilderContext& ctx) {
    return true;
  }
  
@@ -8704,10 +9175,13 @@ index b2d70f53f8e74ea2be6e0de26efbcc91ea19950f..bf65e550b313c5204c88849a3d724df9
 +  if (!ctx.config().dcbtPrefetch) {
 +    return;
 +  }
++  // dcbt / dcbtst decode as {CT, RA, RB} (thirdparty/disasm/ppc-dis.c), unlike dcbz's {RA, RB}: the address is
++  // (RA|0) + RB. banjo-nx found (2026-10-16) that this read operands 0 and 1, so every prefetch went to RA alone (or
++  // r0) instead of RA + RB. A prefetch changes no value either way.
 +  ctx.print("\tREX_PREFETCH(");
-+  if (ctx.insn.operands[0] != 0)
-+    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[0]));
-+  ctx.println("{}.u32, {});", ctx.r(ctx.insn.operands[1]), write);
++  if (ctx.insn.operands[1] != 0)
++    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
++  ctx.println("{}.u32, {});", ctx.r(ctx.insn.operands[2]), write);
 +}
 +}  // namespace
 +
@@ -8906,10 +9380,10 @@ index a0484fb45e39a0ee0644db75c185b80a71338b87..5d068ea94147ce533f24e4c8d0986f67
  
      println("#include \"{}_funcs.{}.h\"\n", projectName, index);
 diff --git a/src/codegen/config.cpp b/src/codegen/config.cpp
-index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..e038c15a1cfe6654ec91f2f889ddd0d2f8d72e8c 100644
+index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..0127b9e9b8ee85c7cf87d092abb797a1143770ee 100644
 --- a/src/codegen/config.cpp
 +++ b/src/codegen/config.cpp
-@@ -101,6 +101,28 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -101,6 +101,32 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
    // Bool scalars
    auto hasBool = [&](const char* key) -> bool { return toml[key].is_boolean(); };
    MergeBool(cfg.skipLr, toml["skip_lr"].value_or(false), hasBool("skip_lr"), "skip_lr");
@@ -8929,8 +9403,12 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..e038c15a1cfe6654ec91f2f889ddd0d2
 +            hasBool("fp_mode_lookahead_past_branch"), "fp_mode_lookahead_past_branch");
 +  MergeBool(cfg.rotateWordNarrow, toml["rotate_word_narrow"].value_or(false), hasBool("rotate_word_narrow"),
 +            "rotate_word_narrow");
++  MergeBool(cfg.rotateWordShifts, toml["rotate_word_shifts"].value_or(false), hasBool("rotate_word_shifts"),
++            "rotate_word_shifts");
 +  MergeBool(cfg.fctiInline, toml["fcti_inline"].value_or(false), hasBool("fcti_inline"), "fcti_inline");
 +  MergeBool(cfg.fpCopyPairs, toml["fp_copy_pairs"].value_or(false), hasBool("fp_copy_pairs"), "fp_copy_pairs");
++  MergeBool(cfg.fpCopyForwarding, toml["fp_copy_forwarding"].value_or(false), hasBool("fp_copy_forwarding"),
++            "fp_copy_forwarding");
 +  MergeBool(cfg.fpCopyOnlyFunctions, toml["fp_copy_only_functions"].value_or(false),
 +            hasBool("fp_copy_only_functions"), "fp_copy_only_functions");
 +  MergeBool(cfg.dcbtPrefetch, toml["dcbt_prefetch"].value_or(false), hasBool("dcbt_prefetch"), "dcbt_prefetch");
@@ -8938,7 +9416,7 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..e038c15a1cfe6654ec91f2f889ddd0d2
    MergeBool(cfg.skipMsr, toml["skip_msr"].value_or(false), hasBool("skip_msr"), "skip_msr");
    MergeBool(cfg.ctrAsLocalVariable, toml["ctr_as_local"].value_or(false), hasBool("ctr_as_local"),
              "ctr_as_local");
-@@ -116,6 +138,19 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -116,6 +142,19 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
              hasBool("non_volatile_as_local"), "non_volatile_as_local");
    MergeBool(cfg.generateExceptionHandlers, toml["generate_exception_handlers"].value_or(false),
              hasBool("generate_exception_handlers"), "generate_exception_handlers");
@@ -8958,7 +9436,7 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..e038c15a1cfe6654ec91f2f889ddd0d2
    if (hasBool("is_dll")) {
      cfg.isDll = toml["is_dll"].value_or(false);
    }
-@@ -278,6 +313,16 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -278,6 +317,16 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
          REXCODEGEN_ERROR("Missing 'labels' in [[switch_tables]] entry");
          continue;
        }
@@ -8975,7 +9453,7 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..e038c15a1cfe6654ec91f2f889ddd0d2
  
        JumpTable jt;
        jt.bctrAddress = *address_opt;
-@@ -372,6 +417,24 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
+@@ -372,6 +421,24 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
  
    // --- Sets: additive ---
  
@@ -9000,7 +9478,7 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..e038c15a1cfe6654ec91f2f889ddd0d2
    // indirect_calls -> knownIndirectCallHints (set)
    if (auto indirectCallArray = toml["indirect_calls"].as_array()) {
      for (auto& entry : *indirectCallArray) {
-@@ -531,6 +594,9 @@ RecompilerConfig::ValidationResult RecompilerConfig::Validate() const {
+@@ -531,6 +598,9 @@ RecompilerConfig::ValidationResult RecompilerConfig::Validate() const {
      }
    }
  
@@ -9011,7 +9489,7 @@ index 5da54a0d825a40ac25bd1c8e7f3a57127be6a679..e038c15a1cfe6654ec91f2f889ddd0d2
    for (const auto& [addr, size] : functions) {
      if (addr & 0x3) {
 diff --git a/src/codegen/function_graph.cpp b/src/codegen/function_graph.cpp
-index fc918bb2d0b170bb338b5f15197664d427e578ac..aaa76f7a011ebf636f7e221c14f8c64ebe310c8f 100644
+index fc918bb2d0b170bb338b5f15197664d427e578ac..47b0a5c9ef2af6e1bf70490481708b6afc19495a 100644
 --- a/src/codegen/function_graph.cpp
 +++ b/src/codegen/function_graph.cpp
 @@ -582,6 +582,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
@@ -9022,7 +9500,47 @@ index fc918bb2d0b170bb338b5f15197664d427e578ac..aaa76f7a011ebf636f7e221c14f8c64e
  
          if (hasHookBefore) {
            builderCtx.emit_mid_asm_hook();
-@@ -669,6 +670,10 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+@@ -637,6 +638,39 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+     emit_println(body, "}}\n");
+   }
+ 
++  // --- setjmp sites: copy every C++-local register into env, and back after a longjmp ---
++  if (localVariables.env) {
++    std::string save, restore;
++    auto add = [&](const std::string& reg) {
++      save += fmt::format("env.{0} = {0}; ", reg);
++      restore += fmt::format("{0} = env.{0}; ", reg);
++    };
++    if (localVariables.ctr)
++      add("ctr");
++    if (localVariables.xer)
++      add("xer");
++    if (localVariables.reserved)
++      add("reserved");
++    for (size_t i = 0; i < 8; i++)
++      if (localVariables.cr[i])
++        add(fmt::format("cr{}", i));
++    for (size_t i = 0; i < 32; i++)
++      if (localVariables.r[i])
++        add(fmt::format("r{}", i));
++    for (size_t i = 0; i < 32; i++)
++      if (localVariables.f[i])
++        add(fmt::format("f{}", i));
++    for (size_t i = 0; i < 128; i++)
++      if (localVariables.v[i])
++        add(fmt::format("v{}", i));
++    auto replaceAll = [&](std::string_view marker, const std::string& with) {
++      for (size_t at = body.find(marker); at != std::string::npos; at = body.find(marker, at + with.size()))
++        body.replace(at, marker.size(), with);
++    };
++    replaceAll(kSetjmpSaveLocalsMarker, save);
++    replaceAll(kSetjmpRestoreLocalsMarker, restore);
++  }
++
+   // --- Emit local variable declarations, then body ---
+   if (localVariables.ctr)
+     emit_println(out, "\tPPCRegister ctr{{}};");
+@@ -669,6 +703,10 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
      emit_println(out, "\tPPCContext env{{}};");
    if (localVariables.temp)
      emit_println(out, "\tPPCRegister temp{{}};");
@@ -11453,7 +11971,7 @@ index 0000000000000000000000000000000000000000..6ef31c31f271471a37f4c6f70f5432ba
 +
 +#endif  // REX_PLATFORM_SWITCH
 diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
-index ef5bdf4e6e352848cf40798c6e4ff32b8b6f4be1..aa39fa6b4d95b4066f7d79abb7c98ce836656cef 100644
+index ef5bdf4e6e352848cf40798c6e4ff32b8b6f4be1..1fc030fb50391b97d0bcfa352f4220e67945f89c 100644
 --- a/src/core/filesystem_posix.cpp
 +++ b/src/core/filesystem_posix.cpp
 @@ -37,7 +37,7 @@
@@ -11479,7 +11997,7 @@ index ef5bdf4e6e352848cf40798c6e4ff32b8b6f4be1..aa39fa6b4d95b4066f7d79abb7c98ce8
  std::filesystem::path GetExecutablePath() {
  #if defined(__APPLE__)
    // Darwin has no /proc; query the executable path via the dyld API. The first
-@@ -91,6 +98,32 @@ std::filesystem::path GetExecutablePath() {
+@@ -91,6 +98,43 @@ std::filesystem::path GetExecutablePath() {
    std::error_code ec;
    std::filesystem::path canonical_path = std::filesystem::weakly_canonical(executable_path, ec);
    return ec ? std::filesystem::path(executable_path) : canonical_path;
@@ -11508,11 +12026,22 @@ index ef5bdf4e6e352848cf40798c6e4ff32b8b6f4be1..aa39fa6b4d95b4066f7d79abb7c98ce8
 +    }
 +    return std::filesystem::path(path);
 +  }
++#if defined(REX_SWITCH_FALLBACK_EXE)
++  // sa2-nx (2026-10-20, from banjo-nx): an emulator (Ryujinx) starts NROs without argv, so the app would not know its
++  // folder (no toml, logs or game_root next to it). The app names its usual place on the SD (the root form, as above),
++  // used when it is there. hbloader on a console always passes argv[0].
++  {
++    struct stat st;
++    if (stat(REX_SWITCH_FALLBACK_EXE, &st) == 0) {
++      return std::filesystem::path(REX_SWITCH_FALLBACK_EXE);
++    }
++  }
++#endif
 +  return {};
  #else
    char buff[FILENAME_MAX] = "";
    readlink("/proc/self/exe", buff, FILENAME_MAX);
-@@ -104,6 +137,14 @@ std::filesystem::path GetExecutableFolder() {
+@@ -104,6 +148,14 @@ std::filesystem::path GetExecutableFolder() {
  }
  
  std::filesystem::path GetUserFolder() {
@@ -11527,7 +12056,7 @@ index ef5bdf4e6e352848cf40798c6e4ff32b8b6f4be1..aa39fa6b4d95b4066f7d79abb7c98ce8
    // get preferred data home
    if (auto xdg = rex::platform::env::get("XDG_DATA_HOME")) {
      return std::filesystem::path(*xdg);
-@@ -121,6 +162,7 @@ std::filesystem::path GetUserFolder() {
+@@ -121,6 +173,7 @@ std::filesystem::path GetUserFolder() {
    getpwuid_r(getuid(), &pw1, buf, sizeof(buf), &pw);
    assert(&pw1 == pw);  // sanity check
    return std::filesystem::path(pw->pw_dir) / ".local" / "share";
@@ -11537,10 +12066,10 @@ index ef5bdf4e6e352848cf40798c6e4ff32b8b6f4be1..aa39fa6b4d95b4066f7d79abb7c98ce8
  FILE* OpenFile(const std::filesystem::path& path, const std::string_view mode) {
 diff --git a/src/core/guest_memory_switch.cpp b/src/core/guest_memory_switch.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..eb24fd7bf9e47dbdfbd037f5fe9916be19009619
+index 0000000000000000000000000000000000000000..54f0a0f8c5d8be35a1323e3a294c2e967b48f270
 --- /dev/null
 +++ b/src/core/guest_memory_switch.cpp
-@@ -0,0 +1,761 @@
+@@ -0,0 +1,803 @@
 +/* See guest_memory_switch.h for the design and the reason behind each decision. */
 +
 +#if defined(__SWITCH__)
@@ -11663,7 +12192,24 @@ index 0000000000000000000000000000000000000000..eb24fd7bf9e47dbdfbd037f5fe9916be
 +    return s;
 +}
 +
-+Handle Proc() { return envGetOwnProcessHandle(); }
++// sa2-nx (2026-10-20): banjo-nx's emulator changes in this file (Proc, EagerViews and their uses), as banjo-nx has them.
++// banjo-nx (2026-10-17): hbloader passes the process handle; an emulator (Ryujinx) runs NROs without a loader, so
++// there is none, and the current-process pseudo-handle stands in for it.
++Handle Proc() {
++  const Handle h = envGetOwnProcessHandle();
++  return h != INVALID_HANDLE ? h : CUR_PROCESS_HANDLE;
++}
++
++/*
++ * banjo-nx (2026-10-17): without a loader (the same test) the views are mapped when a chunk is committed, not on the
++ * first access: an emulator (Ryujinx) does not deliver data aborts to the homebrew's exception handler, so the fault
++ * that RexGmFaultIn answers on a console ends the process there. A console always has the loader's handle and keeps
++ * the lazy views (the process limit on mappable memory, see RexGmCommit).
++ */
++bool EagerViews() {
++  static const bool eager = envGetOwnProcessHandle() == INVALID_HANDLE;
++  return eager;
++}
 +
 +bool Intersect(size_t a, size_t al, size_t b, size_t bl, size_t* lo, size_t* hi) {
 +    const size_t l = a > b ? a : b;
@@ -12007,6 +12553,15 @@ index 0000000000000000000000000000000000000000..eb24fd7bf9e47dbdfbd037f5fe9916be
 +     * time it is touched.
 +     */
 +    s.views.push_back(v);
++    if (EagerViews()) {
++        /* banjo-nx: no faults to map it later (EagerViews): every committed chunk this view covers, now. */
++        const size_t vi = s.views.size() - 1;
++        for (const auto& [off, c] : s.chunks) {
++            size_t lo, hi;
++            if (Intersect(c.offset, c.length, v.offset, v.length, &lo, &hi))
++                MapChunkIntoView(s, vi, c);
++        }
++    }
 +    return true;
 +}
 +
@@ -12099,6 +12654,14 @@ index 0000000000000000000000000000000000000000..eb24fd7bf9e47dbdfbd037f5fe9916be
 +        const Chunk c{cur, sz, backing, shadow};
 +        s.chunks[cur] = c;
 +        s.committed += sz;
++        if (EagerViews()) {
++            /* banjo-nx: no faults to map it later (EagerViews): into every view that covers it, now. */
++            for (size_t vi = 0; vi < s.views.size(); vi++) {
++                size_t lo, hi;
++                if (Intersect(c.offset, c.length, s.views[vi].offset, s.views[vi].length, &lo, &hi))
++                    MapChunkIntoView(s, vi, c);
++            }
++        }
 +
 +        cur = gap_end;
 +    }
@@ -12172,6 +12735,14 @@ index 0000000000000000000000000000000000000000..eb24fd7bf9e47dbdfbd037f5fe9916be
 +    const size_t end   = AlignUp(static_cast<size_t>(addr - wbase) + length, kPageSize);
 +
 +    if (out_old) *out_old = AccessOf(s, begin);
++
++    /*
++     * banjo-nx (2026-10-17): without a loader (EagerViews: an emulator) the pages keep full access. Ryujinx delivers no
++     * data abort, so a protected page ends the process at its next access instead of being watched; and its
++     * svcSetProcessMemoryPermission throws on the views rather than refusing (the deko3d renderer's first emulator
++     * runs). A console takes the path below.
++     */
++    if (EagerViews()) return true;
 +
 +    const bool must_be = (access == REX_GM_WRITE);
 +
@@ -14340,7 +14911,7 @@ index 0000000000000000000000000000000000000000..225ec8214d9ddcf2a69be4110606dbc6
 +    diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_ShouldNotHappen));
 +}
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e348c21d22 100644
+index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..b26ac242dec0faa53886dee5e702e6f2ba2edfaa 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -14,13 +14,18 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
@@ -14389,10 +14960,19 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  #include <rex/thread/timer_queue.h>
  
  #include <sched.h>
-@@ -62,6 +79,24 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+@@ -62,6 +79,33 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
  #define REX_HAS_SIGEV_THREAD_ID 0
  #endif
  
++// sa2-nx (2026-10-20): see switch_reaper's pool below.
++REXCVAR_DEFINE_INT32(switch_thread_stack_pool, 64, "Threading",
++                     "Switch: guest thread stacks (16 MB each) kept for the next threads instead of going back to the "
++                     "heap. 4 before 2026-10-20: SA2 runs up to 55 guest threads at once at a stage load, so each load "
++                     "took new 16 MB blocks from the heap and gave them back, and the heap fragmented (Ryujinx, 9 "
++                     "minutes of the attract demos: 1.4 GB more taken with 4, 0.76 GB with 24, flat with 64 after the "
++                     "first load, the memory in use the same)")
++    .range(4, 64)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 +REXCVAR_DEFINE_BOOL(thread_wait_blocking, true, "Threading",
 +                    "Event-driven waits: WaitMultiple parks on a wake point instead of polling every 1 ms, "
 +                    "and alertable waits are woken by the queued APC hint instead of a 1 ms poll slice. "
@@ -14414,7 +14994,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  namespace rex::thread {
  
  #if REX_PLATFORM_ANDROID
-@@ -115,7 +150,7 @@ enum class SignalType {
+@@ -115,7 +159,7 @@ enum class SignalType {
  };
  
  int GetSystemSignal(SignalType num) {
@@ -14423,7 +15003,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
    // macOS has no realtime signals (SIGRTMIN..SIGRTMAX); map the runtime's
    // signals onto the two user-defined signals.
    switch (num) {
-@@ -135,7 +170,7 @@ int GetSystemSignal(SignalType num) {
+@@ -135,7 +179,7 @@ int GetSystemSignal(SignalType num) {
  }
  
  SignalType GetSystemSignalType(int num) {
@@ -14432,7 +15012,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
    switch (num) {
      case SIGUSR1:
        return SignalType::kThreadSuspend;
-@@ -156,6 +191,15 @@ std::array<std::atomic<bool>, static_cast<size_t>(SignalType::k_Count)> signal_h
+@@ -156,6 +200,15 @@ std::array<std::atomic<bool>, static_cast<size_t>(SignalType::k_Count)> signal_h
  static void signal_handler(int signal, siginfo_t* info, void* context);
  
  void install_signal_handler(SignalType type) {
@@ -14448,7 +15028,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
    bool expected = false;
    if (!signal_handler_installed[static_cast<size_t>(type)].compare_exchange_strong(expected,
                                                                                     true)) {
-@@ -168,6 +212,7 @@ void install_signal_handler(SignalType type) {
+@@ -168,6 +221,7 @@ void install_signal_handler(SignalType type) {
    if (sigaction(GetSystemSignal(type), &action, nullptr) != 0) {
      signal_handler_installed[static_cast<size_t>(type)] = false;
    }
@@ -14456,7 +15036,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  }
  
  // TODO(dougvj)
-@@ -178,6 +223,8 @@ void EnableAffinityConfiguration() {}
+@@ -178,6 +232,8 @@ void EnableAffinityConfiguration() {}
  uint32_t current_thread_system_id() {
  #if defined(__APPLE__)
    return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
@@ -14465,7 +15045,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  #else
    return static_cast<uint32_t>(syscall(SYS_gettid));
  #endif
-@@ -206,26 +253,9 @@ void Sleep(std::chrono::microseconds duration) {
+@@ -206,26 +262,9 @@ void Sleep(std::chrono::microseconds duration) {
    } while (ret == -1 && errno == EINTR);
  }
  
@@ -14493,7 +15073,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  
  TlsHandle AllocateTlsHandle() {
    auto key = static_cast<pthread_key_t>(-1);
-@@ -267,6 +297,22 @@ static sem_t* RexCreateAnonymousSemaphore() {
+@@ -267,6 +306,22 @@ static sem_t* RexCreateAnonymousSemaphore() {
  }
  #endif  // __APPLE__
  
@@ -14516,7 +15096,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  class PosixConditionBase {
   public:
    PosixConditionBase() {
-@@ -287,10 +333,69 @@ class PosixConditionBase {
+@@ -287,10 +342,69 @@ class PosixConditionBase {
    virtual ~PosixConditionBase() = default;
    virtual bool Signal() = 0;
  
@@ -14589,7 +15169,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
      auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
      int lock_result = pthread_mutex_lock(native_mutex);
      if (lock_result == EOWNERDEAD) {
-@@ -305,14 +410,27 @@ class PosixConditionBase {
+@@ -305,14 +419,27 @@ class PosixConditionBase {
      if (predicate()) {
        executed = true;
      } else {
@@ -14617,7 +15197,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
        post_execution();
        return WaitResult::kSuccess;
      } else {
-@@ -320,13 +438,18 @@ class PosixConditionBase {
+@@ -320,13 +447,18 @@ class PosixConditionBase {
      }
    }
  
@@ -14638,7 +15218,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
        return std::make_pair(result, 0);
      }
  
-@@ -335,14 +458,34 @@ class PosixConditionBase {
+@@ -335,14 +467,34 @@ class PosixConditionBase {
                          ? std::chrono::steady_clock::time_point::max()
                          : start_time + timeout;
  
@@ -14676,7 +15256,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
        for (size_t i = 0; i < handles.size(); ++i) {
  #if REX_PLATFORM_LINUX
          auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
-@@ -367,7 +510,25 @@ class PosixConditionBase {
+@@ -367,7 +519,25 @@ class PosixConditionBase {
  
        if (!all_locked) {
          locks.clear();
@@ -14702,7 +15282,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
          continue;
        }
  
-@@ -411,11 +572,43 @@ class PosixConditionBase {
+@@ -411,11 +581,43 @@ class PosixConditionBase {
          return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
        }
  
@@ -14748,7 +15328,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
          std::this_thread::sleep_for(sleep_time);
        }
      }
-@@ -428,8 +621,24 @@ class PosixConditionBase {
+@@ -428,8 +630,24 @@ class PosixConditionBase {
   protected:
    inline virtual bool signaled() const = 0;
    inline virtual void post_execution() = 0;
@@ -14773,7 +15353,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  };
  
  // There really is no native POSIX handle for a single wait/signal construct
-@@ -447,9 +656,16 @@ class PosixCondition<Event> : public PosixConditionBase {
+@@ -447,9 +665,16 @@ class PosixCondition<Event> : public PosixConditionBase {
    virtual ~PosixCondition() = default;
  
    bool Signal() override {
@@ -14793,7 +15373,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
      return true;
    }
  
-@@ -486,7 +702,10 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+@@ -486,7 +711,10 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
        *out_previous_count = count_;
      }
      count_ += release_count;
@@ -14805,7 +15385,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
      return true;
    }
  
-@@ -494,7 +713,8 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+@@ -494,7 +722,8 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
    inline bool signaled() const override { return count_ > 0; }
    inline void post_execution() override {
      count_--;
@@ -14815,7 +15395,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
    }
    uint32_t count_;
    const uint32_t maximum_count_;
-@@ -514,11 +734,16 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+@@ -514,11 +743,16 @@ class PosixCondition<Mutant> : public PosixConditionBase {
  
    bool Release() {
      if (owner_ == std::this_thread::get_id() && count_ > 0) {
@@ -14836,7 +15416,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
        }
        return true;
      }
-@@ -548,9 +773,12 @@ class PosixCondition<Timer> : public PosixConditionBase {
+@@ -548,9 +782,12 @@ class PosixCondition<Timer> : public PosixConditionBase {
    virtual ~PosixCondition() { Cancel(); }
  
    bool Signal() override {
@@ -14851,7 +15431,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
      return true;
    }
  
-@@ -621,6 +849,240 @@ struct ThreadStartData {
+@@ -621,6 +858,259 @@ struct ThreadStartData {
    Thread* thread_obj;
  };
  
@@ -14903,14 +15483,19 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
 + * So a big stack is a block of our own, from here or, when none is kept, from the heap. It goes to libnx through
 + * pthread_attr_setstack: threadCreate maps it into the stack region without owning it (it carves the TLS and the
 + * reent out of its top, as it does with its own allocation) and the join (threadClose) unmaps it. Then the block
-+ * comes back here instead of to the heap. At most kPoolMaxBlocks blocks and kPoolMaxBytes are kept; any other block
++ * comes back here instead of to the heap. At most PoolBlocks() blocks and PoolMaxBytes() are kept; any other block
 + * goes back to the heap.
 + */
 +// Only the guest threads' 16 MB stacks. The SDK's own threads (4 MB by default, long-lived) stay with libnx as
 +// before, and their blocks never take the pool's places.
 +constexpr size_t kPoolMinStack = size_t(8) << 20;
-+constexpr size_t kPoolMaxBlocks = 4;
-+constexpr size_t kPoolMaxBytes = size_t(80) << 20;  // four guest stacks (16 MB each, with their TLS)
++// sa2-nx (2026-10-20): switch_thread_stack_pool blocks (4 before), each a guest stack of 16 MB with its TLS.
++constexpr size_t kPoolMaxBlocks = 64;
++size_t PoolBlocks() {
++  static const size_t blocks = size_t(std::clamp<int32_t>(REXCVAR_GET(switch_thread_stack_pool), 4, 64));
++  return blocks;
++}
++size_t PoolMaxBytes() { return PoolBlocks() * (size_t(20) << 20); }
 +struct Stack {
 +  void* base;
 +  size_t bytes;
@@ -14921,6 +15506,8 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
 +std::atomic<uint64_t> g_stacks_new{0};     // stack blocks taken from the heap
 +std::atomic<uint64_t> g_stacks_reused{0};  // ... and from the pool
 +std::atomic<uint64_t> g_early_joins{0};    // creations that went through once JoinFinishedNow had joined threads
++std::atomic<uint64_t> g_stacks_live{0};    // sa2-nx (2026-10-20): pooled-size stacks taken and not given back yet
++std::atomic<uint64_t> g_stacks_peak{0};    // ... their most at once
 +
 +// libnx's linker script (switch.ld): the thread-local segment that threadCreate sets up in every new thread.
 +extern "C" char __tls_start[];
@@ -14961,17 +15548,26 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
 +}
 +
 +// A block for a new thread's stack: a kept one, else a new one from the heap. Null when the heap has none either.
++void NoteStackTaken() {
++  const uint64_t live = g_stacks_live.fetch_add(1, std::memory_order_relaxed) + 1;
++  uint64_t peak = g_stacks_peak.load(std::memory_order_relaxed);
++  while (live > peak && !g_stacks_peak.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {
++  }
++}
++
 +void* TakeStack(size_t bytes) {
 +  {
 +    std::lock_guard<std::mutex> lock(g_mutex);
 +    if (void* const base = PopPooledLocked(bytes)) {
 +      g_stacks_reused.fetch_add(1, std::memory_order_relaxed);
++      NoteStackTaken();
 +      return base;
 +    }
 +  }
 +  void* const base = memalign(0x1000, bytes);
 +  if (base != nullptr) {
 +    g_stacks_new.fetch_add(1, std::memory_order_relaxed);
++    NoteStackTaken();
 +  }
 +  return base;
 +}
@@ -14982,9 +15578,10 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
 +  if (base == nullptr) {
 +    return;
 +  }
++  g_stacks_live.fetch_sub(1, std::memory_order_relaxed);
 +  {
 +    std::lock_guard<std::mutex> lock(g_mutex);
-+    if (g_pool_count < kPoolMaxBlocks && g_pool_bytes + bytes <= kPoolMaxBytes) {
++    if (g_pool_count < PoolBlocks() && g_pool_bytes + bytes <= PoolMaxBytes()) {
 +      g_pool[g_pool_count++] = {base, bytes};
 +      g_pool_bytes += bytes;
 +      g_drained.notify_all();  // a creation may be waiting for one (JoinFinishedNow)
@@ -15023,10 +15620,11 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
 +        kept_bytes = g_pool_bytes;
 +      }
 +      REXSYS_INFO("[threads] {} finished host threads released (kernel slot and stack); stacks: {} from the heap, "
-+                  "{} reused, {} kept ({} MB); {} creations helped by joining finished threads early",
++                  "{} reused, {} kept ({} MB, at most {}), {} at most in use at once; {} creations helped by "
++                  "joining finished threads early",
 +                  reaped, g_stacks_new.load(std::memory_order_relaxed),
-+                  g_stacks_reused.load(std::memory_order_relaxed), kept, kept_bytes >> 20,
-+                  g_early_joins.load(std::memory_order_relaxed));
++                  g_stacks_reused.load(std::memory_order_relaxed), kept, kept_bytes >> 20, PoolBlocks(),
++                  g_stacks_peak.load(std::memory_order_relaxed), g_early_joins.load(std::memory_order_relaxed));
 +    }
 +    lock.lock();
 +    g_joining = false;
@@ -15068,6 +15666,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
 +  });
 +  if (stack != nullptr) {
 +    g_stacks_reused.fetch_add(1, std::memory_order_relaxed);
++    NoteStackTaken();
 +  }
 +  return stack;
 +}
@@ -15092,7 +15691,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  template <>
  class PosixCondition<Thread> : public PosixConditionBase {
    enum class State {
-@@ -667,7 +1129,90 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -667,7 +1157,90 @@ class PosixCondition<Thread> : public PosixConditionBase {
          return false;
        }
      }
@@ -15184,7 +15783,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
        pthread_attr_destroy(&attr);
        return false;
      }
-@@ -758,12 +1303,29 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -758,12 +1331,29 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
  #if defined(__APPLE__)
    uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
@@ -15214,7 +15813,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  #if defined(__APPLE__)
      // macOS doesn't expose Linux-style pthread affinity masks; report every
      // logical processor as available.
-@@ -795,6 +1357,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -795,6 +1385,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
    void set_affinity_mask(uint64_t mask) {
      WaitStarted();
@@ -15222,7 +15821,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  #if defined(__APPLE__)
      // macOS doesn't expose Linux-style pthread affinity masks; keep this a
      // no-op so higher layers can build and run.
-@@ -821,6 +1384,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -821,6 +1412,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
    int priority() {
      WaitStarted();
@@ -15230,7 +15829,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
      int policy;
      sched_param param{};
      int ret = pthread_getschedparam(thread_, &policy, &param);
-@@ -833,6 +1397,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -833,6 +1425,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
  
    void set_priority(int new_priority) {
      WaitStarted();
@@ -15238,7 +15837,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
      sched_param param{};
      param.sched_priority = new_priority;
      int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
-@@ -868,7 +1433,21 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -868,7 +1461,21 @@ class PosixCondition<Thread> : public PosixConditionBase {
        return;
      }
  
@@ -15261,7 +15860,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
      // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
      // without the sigval payload.
      int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
-@@ -887,6 +1466,27 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -887,6 +1494,27 @@ class PosixCondition<Thread> : public PosixConditionBase {
      }
    }
  
@@ -15289,7 +15888,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
    bool DispatchQueuedUserCallbacks() {
      if (!has_pending_user_callbacks_.load(std::memory_order_acquire)) {
        return false;
-@@ -924,6 +1524,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -924,6 +1552,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
      --suspend_count_;
      if (suspend_count_ == 0 && state_ == State::kSuspended) {
        state_ = State::kRunning;
@@ -15305,7 +15904,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
        // Async-signal-safe wakeup for WaitSuspended() from signal handler path.
        sem_post(suspend_sem_ptr());
      }
-@@ -951,8 +1560,21 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -951,8 +1588,21 @@ class PosixCondition<Thread> : public PosixConditionBase {
        return true;
      }
  
@@ -15327,7 +15926,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
    }
  
    void Terminate(int exit_code) {
-@@ -972,6 +1594,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -972,6 +1622,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
        }
        state_ = State::kFinished;
      }
@@ -15337,7 +15936,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  
      {
        std::lock_guard<std::mutex> lock(mutex_);
-@@ -980,6 +1605,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -980,6 +1633,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
        signaled_ = true;
        cond_.notify_all();
      }
@@ -15345,7 +15944,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
      if (is_current_thread) {
        pthread_exit(reinterpret_cast<void*>(exit_code));
      } else {
-@@ -1014,8 +1640,12 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1014,8 +1668,12 @@ class PosixCondition<Thread> : public PosixConditionBase {
    static void* ThreadStartRoutine(void* parameter);
    inline bool signaled() const override { return signaled_; }
    inline void post_execution() override {
@@ -15359,7 +15958,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
      }
  #if defined(__APPLE__)
      if (suspend_sem_ != SEM_FAILED) {
-@@ -1027,6 +1657,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1027,6 +1685,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
  #endif
    }
    pthread_t thread_;
@@ -15371,7 +15970,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
    bool signaled_;
    int exit_code_;
    State state_;             // Protected by state_mutex_
-@@ -1043,6 +1678,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+@@ -1043,6 +1706,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
    mutable std::condition_variable state_signal_;
    std::deque<std::function<void()>> user_callbacks_;
    std::atomic<bool> has_pending_user_callbacks_{false};
@@ -15381,7 +15980,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  #if REX_PLATFORM_ANDROID
    // Name accessible via name() on Android before API 26 which added
    // pthread_getname_np.
-@@ -1070,7 +1708,44 @@ bool DispatchCurrentThreadUserCallback() {
+@@ -1070,7 +1736,44 @@ bool DispatchCurrentThreadUserCallback() {
  
  namespace {
  
@@ -15427,7 +16026,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  
  class ScopedAlertableState {
   public:
-@@ -1104,14 +1779,16 @@ bool HasAlertableTimeoutElapsed(std::chrono::steady_clock::time_point deadline)
+@@ -1104,14 +1807,16 @@ bool HasAlertableTimeoutElapsed(std::chrono::steady_clock::time_point deadline)
  std::chrono::milliseconds ComputeAlertableWaitTimeout(
      std::chrono::steady_clock::time_point deadline) {
    if (deadline == std::chrono::steady_clock::time_point::max()) {
@@ -15447,7 +16046,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  }
  
  }  // namespace
-@@ -1165,18 +1842,26 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
+@@ -1165,18 +1870,26 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
  
    ScopedAlertableState alertable_state_guard(true);
    auto deadline = ComputeAlertableDeadline(timeout);
@@ -15478,7 +16077,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
    }
  }
  
-@@ -1198,17 +1883,20 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
+@@ -1198,17 +1911,20 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
  
    ScopedAlertableState alertable_state_guard(true);
    auto deadline = ComputeAlertableDeadline(timeout);
@@ -15503,7 +16102,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
    }
  }
  
-@@ -1224,24 +1912,71 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
+@@ -1224,24 +1940,71 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
      }
      conditions.push_back(&handle->condition());
    }
@@ -15580,7 +16179,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
    }
  }
  
-@@ -1443,6 +2178,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1443,6 +2206,9 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
      std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
      thread->handle_.state_ = State::kFinished;
    }
@@ -15590,7 +16189,7 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
  
    {
      std::unique_lock<std::mutex> lock(thread->handle_.mutex_);
-@@ -1450,6 +2188,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+@@ -1450,6 +2216,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
      thread->handle_.signaled_ = true;
      thread->handle_.cond_.notify_all();
    }
@@ -15600,10 +16199,10 @@ index 9ac8d15f97755399a7fe9e0e1c3ec62c61f0b504..7b62c546192bc088481698da7e4cf5e3
    current_thread_condition_ = nullptr;
 diff --git a/src/core/threading_switch.cpp b/src/core/threading_switch.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..b84b309cecfd07dcaa10be2849a77252e771e781
+index 0000000000000000000000000000000000000000..f043735ba2663a412a58763d1fbe965073ea231a
 --- /dev/null
 +++ b/src/core/threading_switch.cpp
-@@ -0,0 +1,377 @@
+@@ -0,0 +1,407 @@
 +/**
 + * @file        rex/core/threading_switch.cpp
 + * @brief       Thread shim for Horizon: affinity, priority and suspension
@@ -15632,6 +16231,7 @@ index 0000000000000000000000000000000000000000..b84b309cecfd07dcaa10be2849a77252
 +#include <stdio.h>
 +#include <stdlib.h>
 +
++#include <cstring>
 +#include <mutex>
 +#include <unordered_map>
 +
@@ -15906,6 +16506,35 @@ index 0000000000000000000000000000000000000000..b84b309cecfd07dcaa10be2849a77252
 +  return R_SUCCEEDED(svcSetThreadCoreMask(h, core, mask));
 +}
 +
++bool RexSwitchSetThreadMaskOf(void* native_handle, int preferred, unsigned long long mask) {
++  pthread_t thread;
++  static_assert(sizeof(thread) == sizeof(native_handle));
++  std::memcpy(&thread, &native_handle, sizeof(thread));
++  const RexSwitchHandle h = RexSwitchHandleFor(thread);
++  const u64 m = u64(mask) & 0x7;
++  if (h == REX_SWITCH_INVALID_HANDLE || m == 0 || preferred < 0 || !(m & (u64(1) << preferred))) return false;
++  return R_SUCCEEDED(svcSetThreadCoreMask(h, preferred, m));
++}
++
++bool RexSwitchSetCurrentThreadMask(int preferred, unsigned long long mask) {
++  Thread* yo = threadGetSelf();
++  Handle h = (yo != nullptr) ? yo->handle : CUR_THREAD_HANDLE;
++  s32 current_preferred = 0;
++  u64 current = 0;
++  if (R_FAILED(svcGetThreadCoreMask(&current_preferred, &current, h))) {
++    if (h == CUR_THREAD_HANDLE ||
++        R_FAILED(svcGetThreadCoreMask(&current_preferred, &current, CUR_THREAD_HANDLE))) {
++      return false;
++    }
++    h = CUR_THREAD_HANDLE;
++  }
++  const u64 m = u64(mask) & 0x7;  // the process's three cores
++  if (m == 0 || preferred < 0 || !(m & (u64(1) << preferred))) {
++    return false;
++  }
++  return R_SUCCEEDED(svcSetThreadCoreMask(h, preferred, m));
++}
++
 +/*
 + * The real pin, with the mask reduced to a single core.
 + *
@@ -15983,10 +16612,10 @@ index 0000000000000000000000000000000000000000..b84b309cecfd07dcaa10be2849a77252
 +#endif  /* REX_PLATFORM_SWITCH */
 diff --git a/src/core/threading_switch.h b/src/core/threading_switch.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..055eb0782e475c95fd51302e5a26324871883f1e
+index 0000000000000000000000000000000000000000..0c686ebe7b699eff63ee73ca4006bd6597432035
 --- /dev/null
 +++ b/src/core/threading_switch.h
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,195 @@
 +/*
 + * POSIX compatibility layer for threads on Horizon.
 + *
@@ -16147,6 +16776,14 @@ index 0000000000000000000000000000000000000000..055eb0782e475c95fd51302e5a263248
 + * accepted it. See the long comment in the .cpp.
 + */
 +bool RexSwitchSetCurrentThreadCore(int core);
++
++/*
++ * sa2-nx (2026-10-20): the calling thread's core mask (the process's cores only) with 'preferred' as its preferred
++ * core (one of the mask's). False if the kernel refuses it or the mask leaves none of the process's cores.
++ */
++bool RexSwitchSetCurrentThreadMask(int preferred, unsigned long long mask);
++/* sa2-nx (2026-10-20): the same for another registered thread, by its pthread (Thread::native_handle()). */
++bool RexSwitchSetThreadMaskOf(void* native_handle, int preferred, unsigned long long mask);
 +
 +/*
 + * The real pin: besides preferring that core, it forbids the others. More dangerous than
@@ -20982,19 +21619,27 @@ index 3ea35358a8b3b2032cc85e5d6836cb3a7bcd6901..edcc1fe5f23ca0a2e34d3a24e86c001f
 +    target_link_libraries(rexinput PUBLIC SDL3::SDL3)
 +endif()
 diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
-index 813bb1c993939a7eab44772705367d24fba43f74..79062d77b7dba274862e6eedaa53857434fb51b2 100644
+index 813bb1c993939a7eab44772705367d24fba43f74..8ef6bdb4d3bec915bad9bb01acb27e1e8c5d5060 100644
 --- a/src/input/input_system.cpp
 +++ b/src/input/input_system.cpp
-@@ -9,6 +9,7 @@
+@@ -9,6 +9,12 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
++#include <atomic>
 +#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
  #include <algorithm>
  #include <cmath>
  
-@@ -19,15 +20,27 @@
+@@ -17,17 +23,38 @@
+ #include <rex/input/flags.h>
+ #include <rex/input/input_driver.h>
  #include <rex/input/input_system.h>
++#include <rex/input/read_hook.h>  // sa2-nx (2026-10-20)
  #include <rex/input/mnk/mnk_input_driver.h>
  #include <rex/input/nop/nop_input_driver.h>
 +#if REX_PLATFORM_SWITCH
@@ -21015,13 +21660,21 @@ index 813bb1c993939a7eab44772705367d24fba43f74..79062d77b7dba274862e6eedaa538574
 +#endif
  
  REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
++// sa2-nx (2026-10-20, from banjo-nx's input_script, with the stick and hold times of SA2's PC SA2_AUTO_INPUT): scripted
++// pad input on any platform (the Switch's too: Ryujinx test runs), read from sa2.toml at boot.
++REXCVAR_DEFINE_STRING(input_script, "", "Input",
++                      "Test automation: pad input for user 0 as 'seconds:button[:hold seconds],...' counted from the "
++                      "first input poll (wall time). Buttons A B X Y START BACK UP DOWN LEFT RIGHT LB RB LT RT, sticks "
++                      "LX+ LX- LY+ LY- RX+ RX- RY+ RY-; held 0.2 s unless a hold is given. While set, user 0 always "
++                      "has a pad connected (works minimized, with no controller) and reads only the script")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 +REXCVAR_DEFINE_BOOL(input_rumble, false, "Input",
 +                    "Controller vibration (off by default: controllers only get "
 +                    "zero vibration). true = the game's vibration");
  namespace rex::input {
  
  namespace {
-@@ -79,6 +92,25 @@ void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignme
+@@ -79,6 +106,25 @@ void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignme
  }
  
  void InputSystem::RefreshDevices() {
@@ -21047,7 +21700,7 @@ index 813bb1c993939a7eab44772705367d24fba43f74..79062d77b7dba274862e6eedaa538574
    std::vector<DeviceInfo> seen;
    std::vector<InputDriver*> owners;
    std::vector<DeviceInfo> enumerated;
-@@ -164,6 +196,12 @@ void InputSystem::RefreshDevices() {
+@@ -164,6 +210,12 @@ void InputSystem::RefreshDevices() {
    if (changed && assignment_) {
      assignment_->OnDevicesChanged(devices_);
    }
@@ -21060,7 +21713,144 @@ index 813bb1c993939a7eab44772705367d24fba43f74..79062d77b7dba274862e6eedaa538574
  }
  
  InputDriver* InputSystem::DriverForDevice(DeviceId id) {
-@@ -268,6 +306,12 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
+@@ -175,6 +227,79 @@ InputDriver* InputSystem::DriverForDevice(DeviceId id) {
+   return nullptr;
+ }
+ 
++namespace {
++// input_script: the presses, parsed once.
++struct ScriptedPress {
++  double at = 0.0, hold = 0.2;
++  uint16_t buttons = 0;
++  uint8_t lt = 0, rt = 0;
++  int16_t lx = 0, ly = 0, rx = 0, ry = 0;
++};
++const std::vector<ScriptedPress>& InputScript() {
++  static const std::vector<ScriptedPress> presses = [] {
++    std::vector<ScriptedPress> out;
++    const std::string text = REXCVAR_GET(input_script);
++    size_t at = 0;
++    while (at < text.size()) {
++      size_t end = text.find_first_of(",;", at);
++      if (end == std::string::npos) end = text.size();
++      const std::string item = text.substr(at, end - at);
++      at = end + 1;
++      const size_t c1 = item.find(':');
++      if (c1 == std::string::npos) continue;
++      const size_t c2 = item.find(':', c1 + 1);
++      ScriptedPress p;
++      p.at = std::atof(item.substr(0, c1).c_str());
++      const std::string name = item.substr(c1 + 1, c2 == std::string::npos ? std::string::npos : c2 - c1 - 1);
++      if (c2 != std::string::npos) p.hold = std::atof(item.substr(c2 + 1).c_str());
++      static const std::pair<const char*, uint16_t> kButtons[] = {
++          {"UP", 0x0001},   {"DOWN", 0x0002}, {"LEFT", 0x0004}, {"RIGHT", 0x0008}, {"START", 0x0010},
++          {"BACK", 0x0020}, {"LB", 0x0100},   {"RB", 0x0200},   {"A", 0x1000},     {"B", 0x2000},
++          {"X", 0x4000},    {"Y", 0x8000}};
++      bool known = false;
++      for (const auto& [button, bits] : kButtons)
++        if (name == button) p.buttons = bits, known = true;
++      if (name == "LT") p.lt = 0xFF, known = true;
++      if (name == "RT") p.rt = 0xFF, known = true;
++      if (name == "LX+") p.lx = INT16_MAX, known = true;
++      if (name == "LX-") p.lx = -INT16_MAX, known = true;
++      if (name == "LY+") p.ly = INT16_MAX, known = true;
++      if (name == "LY-") p.ly = -INT16_MAX, known = true;
++      if (name == "RX+") p.rx = INT16_MAX, known = true;
++      if (name == "RX-") p.rx = -INT16_MAX, known = true;
++      if (name == "RY+") p.ry = INT16_MAX, known = true;
++      if (name == "RY-") p.ry = -INT16_MAX, known = true;
++      if (known) out.push_back(p);
++    }
++    if (!out.empty()) REXLOG_INFO("input_script: {} presses scripted", out.size());
++    return out;
++  }();
++  return presses;
++}
++// What the script holds now for user 0 (the clock starts at the first poll).
++ScriptedPress ScriptedState() {
++  static const auto start = std::chrono::steady_clock::now();
++  const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
++  ScriptedPress s;
++  for (const ScriptedPress& p : InputScript()) {
++    if (now < p.at || now >= p.at + p.hold) continue;
++    s.buttons |= p.buttons;
++    s.lt = std::max(s.lt, p.lt);
++    s.rt = std::max(s.rt, p.rt);
++    if (p.lx) s.lx = p.lx;
++    if (p.ly) s.ly = p.ly;
++    if (p.rx) s.rx = p.rx;
++    if (p.ry) s.ry = p.ry;
++    static double logged = -1.0;
++    if (logged != p.at) {
++      logged = p.at;
++      REXLOG_INFO("input_script: input at {:.1f} s (scripted for {:.1f} s)", now, p.at);
++    }
++  }
++  return s;
++}
++}  // namespace
++
+ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
+   for (const auto& device : devices_) {
+     if (device.id == id) {
+@@ -187,6 +312,15 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
+ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
+   SCOPE_profile_cpu_f("hid");
++  if (out_caps && user_index == 0 && !InputScript().empty()) {  // input_script: a standard pad
++    std::memset(out_caps, 0, sizeof(*out_caps));
++    out_caps->type = 0x01;      // XINPUT_DEVTYPE_GAMEPAD
++    out_caps->sub_type = 0x01;  // XINPUT_DEVSUBTYPE_GAMEPAD
++    out_caps->gamepad.buttons = 0xF3FF;
++    out_caps->gamepad.left_trigger = 0xFF;
++    out_caps->gamepad.right_trigger = 0xFF;
++    return X_ERROR_SUCCESS;
++  }
+   if (!out_caps || !assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -212,8 +346,40 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+   return driver->GetDeviceCapabilities(chosen, flags, out_caps);
+ }
+ 
++// sa2-nx (2026-10-20, rex/input/read_hook.h): the app's function called before every controller state read.
++namespace {
++std::atomic<ReadHook> g_read_hook{nullptr};
++}  // namespace
++
++void SetReadHook(ReadHook hook) { g_read_hook.store(hook, std::memory_order_release); }
++
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   SCOPE_profile_cpu_f("hid");
++  if (const ReadHook hook = g_read_hook.load(std::memory_order_acquire))
++    hook();  // sa2-nx (2026-10-20): Renut's late input and latency probe (banjo-nx's input latency set)
++  if (user_index == 0 && !InputScript().empty()) {  // input_script: only the scripted input
++    const ScriptedPress s = ScriptedState();
++    static uint32_t packet = 1;
++    static uint64_t last = 0;
++    const uint64_t now = uint64_t(s.buttons) | uint64_t(s.lt) << 16 | uint64_t(s.rt) << 24 |
++                         uint64_t(uint16_t(s.lx)) << 32 | uint64_t(uint16_t(s.ly)) << 48;
++    if (now != last) {
++      last = now;
++      ++packet;
++    }
++    if (out_state) {
++      std::memset(out_state, 0, sizeof(*out_state));
++      out_state->packet_number = packet;
++      out_state->gamepad.buttons = s.buttons;
++      out_state->gamepad.left_trigger = s.lt;
++      out_state->gamepad.right_trigger = s.rt;
++      out_state->gamepad.thumb_lx = s.lx;
++      out_state->gamepad.thumb_ly = s.ly;
++      out_state->gamepad.thumb_rx = s.rx;
++      out_state->gamepad.thumb_ry = s.ry;
++    }
++    return X_ERROR_SUCCESS;
++  }
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -268,6 +434,12 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
    bool any_synthetic = false;
    bool pad_rumbled = false;
    X_RESULT pad_error = X_ERROR_DEVICE_NOT_CONNECTED;
@@ -21073,7 +21863,38 @@ index 813bb1c993939a7eab44772705367d24fba43f74..79062d77b7dba274862e6eedaa538574
    for (DeviceId id : ids) {
      auto* driver = DriverForDevice(id);
      const DeviceInfo* info = DeviceInfoFor(id);
-@@ -334,12 +378,21 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
+@@ -295,6 +467,30 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
+ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+                                    X_INPUT_KEYSTROKE* out_keystroke) {
+   SCOPE_profile_cpu_f("hid");
++  if ((user_index == 0 || user_index == 0xFF) && !InputScript().empty()) {
++    // input_script: menus read key events; one down / up event per change of the scripted buttons.
++    static uint16_t reported = 0;
++    const uint16_t buttons = ScriptedState().buttons;
++    const uint16_t changed = uint16_t(buttons ^ reported);
++    if (!changed) return X_ERROR_EMPTY;
++    static const std::pair<uint16_t, uint16_t> kKeys[] = {
++        {0x1000, 0x5800}, {0x2000, 0x5801}, {0x4000, 0x5802}, {0x8000, 0x5803}, {0x0200, 0x5804},
++        {0x0100, 0x5805}, {0x0001, 0x5810}, {0x0002, 0x5811}, {0x0004, 0x5812}, {0x0008, 0x5813},
++        {0x0010, 0x5814}, {0x0020, 0x5815}};
++    for (const auto& [bit, virtual_key] : kKeys) {
++      if (!(changed & bit)) continue;
++      reported = uint16_t(reported ^ bit);
++      if (out_keystroke) {
++        std::memset(out_keystroke, 0, sizeof(*out_keystroke));
++        out_keystroke->virtual_key = virtual_key;
++        out_keystroke->flags = (buttons & bit) ? 0x0001 : 0x0002;  // XINPUT_KEYSTROKE_KEYDOWN / KEYUP
++        out_keystroke->user_index = 0;
++      }
++      return X_ERROR_SUCCESS;
++    }
++    reported = buttons;
++    return X_ERROR_EMPTY;
++  }
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -334,12 +530,21 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
      }
  #endif
  
@@ -24358,7 +25179,7 @@ index 4179e8b279d0f17f00e5b289a4daf383d3e82401..49e374a0fe060e8b26ce86171c594354
  
  void XFile::RegisterIOCompletionPort(uint32_t key, object_ref<XIOCompletion> port) {
 diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
-index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353205c63d5 100644
+index 76cc87766d34672914d99a6ea7644f549b8b3e85..f05375a1e9a44332607d44966290b5dadb842a88 100644
 --- a/src/system/xmemory.cpp
 +++ b/src/system/xmemory.cpp
 @@ -27,11 +27,13 @@
@@ -24375,7 +25196,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353
  
  REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
      .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-@@ -131,6 +133,31 @@ Memory::~Memory() {
+@@ -131,6 +133,33 @@ Memory::~Memory() {
    physical_membase_ = nullptr;
  }
  
@@ -24404,10 +25225,12 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353
 +}  // namespace
 +#endif
 +
++u8* g_store_cards = nullptr;  // sa2-nx (2026-10-20, banjo-nx): the store cards (xmemory.h)
++
  bool Memory::Initialize() {
    file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
  
-@@ -157,6 +184,19 @@ bool Memory::Initialize() {
+@@ -157,6 +186,19 @@ bool Memory::Initialize() {
      return false;
    }
    mapping_base_ = views_.all_views[0];
@@ -24427,7 +25250,25 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353
  #else
    // Attempt to create our views. This may fail at the first address
    // we pick, so try a few times.
-@@ -218,9 +258,22 @@ bool Memory::Initialize() {
+@@ -202,11 +244,13 @@ bool Memory::Initialize() {
+                               0x1FD00000, 4096, &heaps_.physical);
+ 
+   // Protect the first and last 64kb of memory.
+-  heaps_.v00000000.AllocFixed(0x00000000, 0x10000, 0x10000,
++  // sa2-nx (2026-10-20, banjo-nx): the first MB holds the store cards (xmemory.h: g_store_cards), which every guest
++  // store outside the stack writes: readable and writable whatever protect_zero says (a guest access there would have
++  // faulted before, so the game makes none).
++  heaps_.v00000000.AllocFixed(0x00000000, 0x100000, 0x10000,
+                               memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+-                              !REXCVAR_GET(protect_zero)
+-                                  ? memory::kMemoryProtectRead | memory::kMemoryProtectWrite
+-                                  : memory::kMemoryProtectNoAccess);
++                              memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
++  g_store_cards = virtual_membase_;
+   heaps_.physical.AllocFixed(0x1FFF0000, 0x10000, 0x10000, memory::kMemoryAllocationReserve,
+                              memory::kMemoryProtectNoAccess);
+ 
+@@ -218,9 +262,22 @@ bool Memory::Initialize() {
  
    // Pre-commit the physical memory range so the GPU can access it
    // without page faults. Reference: xenia-canary 5f5be0668.
@@ -24450,7 +25291,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353
  
    // Install MMIO handler for physical address translation and MMIO ranges
    mmio_handler_ = runtime::MMIOHandler::Install(
-@@ -395,6 +448,7 @@ void Memory::Reset() {
+@@ -395,6 +452,7 @@ void Memory::Reset() {
  }
  
  const BaseHeap* Memory::LookupHeap(uint32_t address) const {
@@ -24458,7 +25299,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353
    if (address < 0x40000000) {
      return &heaps_.v00000000;
    } else if (address < 0x7F000000) {
-@@ -531,6 +585,96 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
+@@ -531,6 +589,96 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
    return mmio_handler_->LookupRange(virtual_address);
  }
  
@@ -24555,7 +25396,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353
  bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
                                       void* host_address, bool is_write) {
    // Access via physical_membase_ is special, when need to bypass everything
-@@ -547,6 +691,9 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+@@ -547,6 +695,9 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
          "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
          is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
          rex::thread::current_thread_id());
@@ -24565,7 +25406,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353
      return false;
    }
  
-@@ -882,6 +1029,29 @@ rex::memory::PageAccess ToPageAccess(uint32_t protect) {
+@@ -882,6 +1033,29 @@ rex::memory::PageAccess ToPageAccess(uint32_t protect) {
    }
  }
  
@@ -24595,7 +25436,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353
  uint32_t FromPageAccess(rex::memory::PageAccess protect) {
    switch (protect) {
      case memory::PageAccess::kNoAccess:
-@@ -952,7 +1122,8 @@ bool BaseHeap::SyncHostPageAccess(uint32_t start_page_number, uint32_t end_page_
+@@ -952,7 +1126,8 @@ bool BaseHeap::SyncHostPageAccess(uint32_t start_page_number, uint32_t end_page_
          continue;
        }
        has_committed = true;
@@ -24605,7 +25446,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353
        if (page_access == rex::memory::PageAccess::kReadWrite) {
          has_read = true;
          has_write = true;
-@@ -1349,7 +1520,8 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
+@@ -1349,7 +1524,8 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
                            : rex::memory::AllocationType::kReserve;
      void* result =
          rex::memory::AllocFixed(TranslateRelative(start_page_number << page_size_shift_),
@@ -24615,7 +25456,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353
      if (!result) {
        REXSYS_ERROR("BaseHeap::AllocFixed failed to alloc range from host");
        return false;
-@@ -1512,7 +1684,8 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t
+@@ -1512,7 +1688,8 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t
                            : rex::memory::AllocationType::kReserve;
      void* result =
          rex::memory::AllocFixed(TranslateRelative(start_page_number << page_size_shift_),
@@ -24625,7 +25466,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353
      if (!result) {
        REXSYS_ERROR("BaseHeap::Alloc failed to alloc range from host");
        return false;
-@@ -1704,14 +1877,19 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
+@@ -1704,14 +1881,19 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
      const uint32_t page_count = end_page_number - start_page_number + 1;
      memory::PageAccess old_protect_access;
      if (!rex::memory::Protect(TranslateRelative(start_page_number << page_size_shift_),
@@ -24646,7 +25487,7 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353
      }
    } else {
      if (old_protect) {
-@@ -1878,6 +2056,13 @@ void PhysicalHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType
+@@ -1878,6 +2060,13 @@ void PhysicalHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType
    } else {
      host_address_offset = 0;
    }
@@ -24660,11 +25501,21 @@ index 76cc87766d34672914d99a6ea7644f549b8b3e85..e2ce6cad57502fd320c803b22cea5353
  
    BaseHeap::Initialize(memory, membase, heap_type, heap_base, heap_size, page_size,
                         host_address_offset);
+@@ -2193,6 +2382,9 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
+     return false;
+   }
+   length = std::min(length, heap_size_ - heap_relative_address);
++  // sa2-nx (2026-10-20, banjo-nx): a host write of physical memory (a file read into it, a decommit or release) marks
++  // its store cards as a guest store would.
++  MarkStoreCards(virtual_address, length);
+   if (length == 0) {
+     return false;
+   }
 diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
-index d358f399d84f196be91eafc620a7e6d4242d2f5d..9ea9354e8eaf8dcdd72177a70ef242757be9d103 100644
+index d358f399d84f196be91eafc620a7e6d4242d2f5d..73a59818a605313528d84a252e9174e6308a0722 100644
 --- a/src/system/xobject.cpp
 +++ b/src/system/xobject.cpp
-@@ -26,6 +26,9 @@
+@@ -26,9 +26,14 @@
  #include <rex/system/xsemaphore.h>
  #include <rex/system/xsymboliclink.h>
  #include <rex/system/xthread.h>
@@ -24674,7 +25525,12 @@ index d358f399d84f196be91eafc620a7e6d4242d2f5d..9ea9354e8eaf8dcdd72177a70ef24275
  
  namespace rex::system {
  
-@@ -88,16 +91,6 @@ bool XObject::ReleaseHandle() {
++void ApplyGuestCoreLayoutAtWait();  // sa2-nx (2026-10-20): xthread.cpp, RexSetGuestThreadCoreLayout
++
+ XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
+   handles_.reserve(10);
+ }
+@@ -88,16 +93,6 @@ bool XObject::ReleaseHandle() {
    return kernel_state_->object_table()->ReleaseHandle(handles_[0]) == X_STATUS_SUCCESS;
  }
  
@@ -24691,15 +25547,32 @@ index d358f399d84f196be91eafc620a7e6d4242d2f5d..9ea9354e8eaf8dcdd72177a70ef24275
  X_STATUS XObject::Delete() {
    if (kernel_state_ == nullptr) {
      // Fake return value for api-scanner
-@@ -202,6 +195,7 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
+@@ -202,6 +197,8 @@ uint32_t XObject::TimeoutTicksToMs(int64_t timeout_ticks) {
  
  X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
                         uint64_t* opt_timeout) {
++  ApplyGuestCoreLayoutAtWait();  // sa2-nx (2026-10-20)
 +  REX_SYS_CENSUS(rex::syscount::kCensusWait, 1);
    auto wait_handle = GetWaitHandle();
    if (!wait_handle) {
      // Object doesn't support waiting.
-@@ -370,6 +364,7 @@ void XObject::SetNativePointer(uint32_t native_ptr, bool uninitialized) {
+@@ -235,6 +232,7 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
+ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, uint32_t wait_reason,
+                                 uint32_t processor_mode, uint32_t alertable,
+                                 uint64_t* opt_timeout) {
++  ApplyGuestCoreLayoutAtWait();  // sa2-nx (2026-10-20)
+   auto timeout_ms = opt_timeout ? std::chrono::milliseconds(chrono::Clock::ScaleGuestDurationMillis(
+                                       TimeoutTicksToMs(*opt_timeout)))
+                                 : std::chrono::milliseconds::max();
+@@ -262,6 +260,7 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
+ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_type,
+                                uint32_t wait_reason, uint32_t processor_mode, uint32_t alertable,
+                                uint64_t* opt_timeout) {
++  ApplyGuestCoreLayoutAtWait();  // sa2-nx (2026-10-20)
+   std::vector<rex::thread::WaitHandle*> wait_handles(count);
+   for (size_t i = 0; i < count; ++i) {
+     wait_handles[i] = objects[i]->GetWaitHandle();
+@@ -370,6 +369,7 @@ void XObject::SetNativePointer(uint32_t native_ptr, bool uninitialized) {
  object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* native_ptr,
                                               int32_t as_type) {
    assert_not_null(native_ptr);
@@ -24707,7 +25580,7 @@ index d358f399d84f196be91eafc620a7e6d4242d2f5d..9ea9354e8eaf8dcdd72177a70ef24275
  
    // Unfortunately the XDK seems to inline some KeInitialize calls, meaning
    // we never see it and just randomly start getting passed events/timers/etc.
-@@ -380,7 +375,7 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
+@@ -380,7 +380,7 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
    // We identify this by setting wait_list_flink to a magic value. When set,
    // wait_list_blink will hold a handle to our object.
  
@@ -24737,10 +25610,10 @@ index db830e48ebf7053eff3dd500cf65d41eb83ea850..8884e1dc06de58eb5437c1532ca54c58
    bool success = semaphore_->Release(release_count, &previous_count);
    if (out_previous_count) {
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
-index 77bce2561bfd97d229f9348bb91b17d1154cf0b9..c2903c030359fe3c55386d1b2a78b71a4bbb92c4 100644
+index 77bce2561bfd97d229f9348bb91b17d1154cf0b9..9c3309024f1169c371b4ddd03d5e2cd3542b50ed 100644
 --- a/src/system/xthread.cpp
 +++ b/src/system/xthread.cpp
-@@ -37,6 +37,12 @@
+@@ -37,14 +37,53 @@
  #include <rex/thread.h>
  #include <rex/vec128.h>
  
@@ -24753,7 +25626,48 @@ index 77bce2561bfd97d229f9348bb91b17d1154cf0b9..c2903c030359fe3c55386d1b2a78b71a
  REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
                      "Ignores game-specified thread priorities");
  
-@@ -326,6 +332,34 @@ void XThread::FreeStack() {
+ REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
+                     "Ignores game-specified thread affinities");
+ 
++#if REX_PLATFORM_SWITCH
++namespace {
++// sa2-nx (2026-10-20, RexSetGuestThreadCoreLayout): the guest threads' cores besides the main thread's (0: the
++// process's, as before), and the preferred one among them, for the threads created from then on.
++std::atomic<uint32_t> g_guest_core_mask{0};
++std::atomic<int32_t> g_guest_core_preferred{-1};
++// sa2-nx (2026-10-20): each guest thread applies the layout itself (RexSetGuestThreadCoreLayout below): the layout's
++// generation (0: none set), the main thread's core, and per thread the generation it applied and what it is (0 not a
++// guest thread, 1 the main thread, 2 another guest thread).
++std::atomic<uint32_t> g_guest_layout_gen{0};
++std::atomic<int32_t> g_guest_main_core{0};
++thread_local uint32_t t_layout_applied = 0;
++thread_local uint8_t t_guest_kind = 0;
++}  // namespace
++#endif
++
+ namespace rex::system {
+ 
++// sa2-nx (2026-10-20): RexSetGuestThreadCoreLayout's layout applied by the calling thread to itself, once per layout
++// (a guest thread's own svcSetThreadCoreMask: it never waits for another thread). Called at every guest wait.
++void ApplyGuestCoreLayoutAtWait() {
++#if REX_PLATFORM_SWITCH
++  const uint32_t gen = g_guest_layout_gen.load(std::memory_order_acquire);
++  if (gen == 0 || gen == t_layout_applied) return;
++  t_layout_applied = gen;
++  if (t_guest_kind == 1) {
++    const int core = g_guest_main_core.load(std::memory_order_relaxed);
++    RexSwitchSetCurrentThreadMask(core, 1ull << core);
++  } else if (t_guest_kind == 2) {
++    const uint32_t mask = g_guest_core_mask.load(std::memory_order_relaxed);
++    if (mask) RexSwitchSetCurrentThreadMask(g_guest_core_preferred.load(std::memory_order_relaxed), mask);
++  }
++#endif
++}
++
+ const uint32_t XAPC::kSize;
+ const uint32_t XAPC::kDummyKernelRoutine;
+ const uint32_t XAPC::kDummyRundownRoutine;
+@@ -326,6 +365,34 @@ void XThread::FreeStack() {
    }
  }
  
@@ -24788,17 +25702,39 @@ index 77bce2561bfd97d229f9348bb91b17d1154cf0b9..c2903c030359fe3c55386d1b2a78b71a
  X_STATUS XThread::Create() {
    // Thread kernel object.
    if (!CreateNative<X_KTHREAD>()) {
-@@ -434,6 +468,9 @@ X_STATUS XThread::Create() {
+@@ -434,6 +501,20 @@ X_STATUS XThread::Create() {
    params.create_suspended = true;
    thread_ = rex::thread::Thread::Create(params, [this]() {
      rex::initialize_seh_thread();
 +#if REX_PLATFORM_SWITCH
 +    RexSwitchSetCurrentThreadPriority(SwitchPriorityFor(guest_thread_, thread_name_));
++    // sa2-nx (2026-10-20): known to the pthread layer by its kernel handle, so another thread can set its cores
++    // (RexSetGuestThreadCoreLayout: the registry was empty, and setting another thread's mask failed quietly).
++    RexSwitchRegisterCurrentThread();
++    // sa2-nx (2026-10-20): a guest thread made after the layout was set takes the other guest threads' cores.
++    if (guest_thread_ && !main_thread_) {
++      t_layout_applied = g_guest_layout_gen.load(std::memory_order_acquire);
++      const uint32_t mask = g_guest_core_mask.load(std::memory_order_acquire);
++      if (mask)
++        RexSwitchSetCurrentThreadMask(g_guest_core_preferred.load(std::memory_order_relaxed), mask);
++    }
++    t_guest_kind = guest_thread_ ? (main_thread_ ? 1 : 2) : 0;  // sa2-nx: ApplyGuestCoreLayoutAtWait
 +#endif
      runtime::ThreadState::Bind(thread_state_.get());
  
      // Set thread ID override. This is used by logging.
-@@ -470,9 +507,13 @@ X_STATUS XThread::Create() {
+@@ -455,6 +536,10 @@ X_STATUS XThread::Create() {
+     PROFILE_THREAD_EXITED();
+     PROFILE_THREAD_EXIT();
+ 
++#if REX_PLATFORM_SWITCH
++    RexSwitchUnregisterCurrentThread();  // sa2-nx (2026-10-20): see RexSwitchRegisterCurrentThread above
++#endif
++
+     // Release the self-reference to the thread.
+     ReleaseHandle();
+   });
+@@ -470,9 +555,13 @@ X_STATUS XThread::Create() {
      set_name(fmt::format("XThread{:04X}", thread_->system_id()));
    }
  
@@ -24812,7 +25748,7 @@ index 77bce2561bfd97d229f9348bb91b17d1154cf0b9..c2903c030359fe3c55386d1b2a78b71a
  
    // Assign the newly created thread to the logical processor, and also set up
    // the current CPU in KPCR and KTHREAD.
-@@ -899,7 +940,13 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+@@ -899,7 +988,13 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
        thread_->set_affinity_mask(uint64_t(1) << cpu_index);
      }
    } else {
@@ -24827,6 +25763,52 @@ index 77bce2561bfd97d229f9348bb91b17d1154cf0b9..c2903c030359fe3c55386d1b2a78b71a
    }
  }
  
+@@ -998,6 +1093,7 @@ uint32_t XThread::SelfSuspend() {
+ #endif
+ 
+ X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
++  ApplyGuestCoreLayoutAtWait();  // sa2-nx (2026-10-20)
+   int64_t timeout_ticks = interval;
+   uint32_t timeout_ms;
+   if (timeout_ticks > 0) {
+@@ -1456,3 +1552,37 @@ void XHostThread::Execute() {
+ }
+ 
+ }  // namespace rex::system
++
++// sa2-nx (2026-10-20): the Switch's core layout for a game whose main thread does the game's work and its drawing (SA2
++// with Renut's renderer: sa2_renut_core_layout). The guest main thread is pinned to 'main_core', every other guest
++// thread, now and to come, gets 'others_mask' (preferring 'others_preferred'), so none of them shares the main
++// thread's core: at the game threads' priority (0x3B) Horizon time-slices threads of a core in 10 ms slices. The host
++// threads keep their own placement (the render thread on core 1). Returns the threads moved. A no-op elsewhere.
++//
++// sa2-nx (2026-10-20, after banjo-nx's Ryujinx runs: 4 of 10 froze at the first Swap with the layout on, none with it
++// off): no thread's cores are set by another thread any more (svcSetThreadCoreMask on a thread running elsewhere waits
++// for it to leave its core, and the game's loader threads were busy). The layout is recorded with a new generation;
++// the calling thread (the main thread, at its Swap) applies its own at once, every other guest thread its own at its
++// next wait (ApplyGuestCoreLayoutAtWait, from XObject::Wait / SignalAndWait / WaitMultiple and XThread::Delay), and
++// threads made later at their start. Returns the guest threads that will move.
++extern "C" uint32_t RexSetGuestThreadCoreLayout(int main_core, uint32_t others_mask, int others_preferred) {
++#if REX_PLATFORM_SWITCH
++  using rex::system::XThread;
++  g_guest_core_preferred.store(others_preferred, std::memory_order_relaxed);
++  g_guest_core_mask.store(others_mask, std::memory_order_relaxed);
++  g_guest_main_core.store(main_core, std::memory_order_relaxed);
++  g_guest_layout_gen.fetch_add(1, std::memory_order_acq_rel);
++  rex::system::ApplyGuestCoreLayoutAtWait();  // the caller's own, now
++  auto* kernel = rex::system::kernel_state();
++  if (!kernel) return 0;
++  uint32_t moved = 0;
++  for (auto& thread : kernel->object_table()->GetObjectsByType<XThread>())
++    if (thread && thread->is_guest_thread() && thread->thread()) ++moved;
++  return moved;
++#else
++  (void)main_core;
++  (void)others_mask;
++  (void)others_preferred;
++  return 0;
++#endif
++}
 diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
 index 5bd3dc55ea3024e69422356e99f560042892d238..af5de0076470e06a058503d1044e8da4876b6a89 100644
 --- a/src/ui/CMakeLists.txt
@@ -25917,10 +26899,10 @@ index b94fe9e4814b7e66305d3b983732aebdfb0bced4..68281e2569adeceee5108d5019259557
  bool ReXApp::OnCloseRequested(ui::UIEvent& e) {
 diff --git a/src/ui/runtime_switch.cpp b/src/ui/runtime_switch.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..51e5e823e1e9f617520ac56e603a83ac2d1fd7c7
+index 0000000000000000000000000000000000000000..c2c061394b8c44891d14c066d493c04892f93641
 --- /dev/null
 +++ b/src/ui/runtime_switch.cpp
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,139 @@
 +/**
 + * @file        rex/os/switch/runtime_switch.cpp
 + * @brief       libnx startup constants for the Switch executable
@@ -26018,6 +27000,38 @@ index 0000000000000000000000000000000000000000..51e5e823e1e9f617520ac56e603a83ac
 + * (textures, buffers and compiled shaders) does not come from here.
 + */
 +size_t __nx_heap_size = 1024ull * 1024 * 1024;  /* see below */
++
++/*
++ * sa2-nx (2026-10-20, from banjo-nx 2026-10-17): libnx's heap setup (4.12, the same steps), but without a loader the heap is the larger of
++ * __nx_heap_size and all the memory available (what libnx takes when __nx_heap_size is 0). A console always starts the
++ * NRO through hbloader (title takeover or a forwarder), whose heap override is taken as before. An emulator (Ryujinx)
++ * starts it without a loader, and 1 GB ran out (guest backing, thread stacks and the GPU driver's memory share it)
++ * where hbloader would have given about 3 GB.
++ */
++void __libnx_initheap(void) {
++  void* addr = nullptr;
++  size_t size = 0;
++  if (envHasHeapOverride()) {
++    addr = envGetHeapOverrideAddr();
++    size = envGetHeapOverrideSize();
++  } else {
++    u64 available = 0, used = 0;
++    svcGetInfo(&available, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
++    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
++    if (available > used + 0x200000) size = (available - used - 0x200000) & ~size_t(0x1FFFFF);
++    if (size < __nx_heap_size) size = __nx_heap_size;
++    Result rc = svcSetHeapSize(&addr, size);
++    if (R_FAILED(rc) && size != __nx_heap_size) {
++      size = __nx_heap_size;
++      rc = svcSetHeapSize(&addr, size);
++    }
++    if (R_FAILED(rc)) diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_HeapAllocFailed));
++  }
++  extern char* fake_heap_start;
++  extern char* fake_heap_end;
++  fake_heap_start = static_cast<char*>(addr);
++  fake_heap_end = static_cast<char*>(addr) + size;
++}
 +
 +/*
 + * The exception handler stack is no longer declared here.
@@ -26549,10 +27563,10 @@ index 0000000000000000000000000000000000000000..087e736b8df58944caaff2578fb425e0
 +const char *elf_errmsg(int err) { (void)err; return "libelf is not available on Switch"; }
 diff --git a/src/ui/switch_perf.cpp b/src/ui/switch_perf.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..8c719656665b0ebf800ae582381b4b9ee3a8af7e
+index 0000000000000000000000000000000000000000..3f969159a4a3335da251eb4d2b941c15d012396b
 --- /dev/null
 +++ b/src/ui/switch_perf.cpp
-@@ -0,0 +1,1308 @@
+@@ -0,0 +1,1311 @@
 +/**
 + * @file        switch_perf.cpp
 + * @brief       Performance measurement on the console, without a debugger
@@ -27613,7 +28627,10 @@ index 0000000000000000000000000000000000000000..8c719656665b0ebf800ae582381b4b9e
 +        if (R_SUCCEEDED(svcQueryMemory(&smi, &spi, ctx.sp)) && (smi.perm & Perm_R)) {
 +          const u64 lo = smi.addr, hi = smi.addr + smi.size;
 +          u64 fp = ctx.fp;
-+          for (size_t k = 0; k < kFrames && fp >= lo && fp + 16 <= hi && (fp & 7) == 0; ++k) {
++          // sa2-nx (2026-10-20, from sasrt-nx): "fp + 16 <= hi" wrapped for a frame pointer near the top of the
++          // address space (recompiled code uses x29 as a general register: 0xFFFFFFFFFFFFFFF0 + 16 = 0 passed, and
++          // [fp + 8] faulted on this thread). The distance to the region's end, which cannot wrap.
++          for (size_t k = 0; k < kFrames && fp >= lo && fp < hi && hi - fp >= 16 && (fp & 7) == 0; ++k) {
 +            out.frames[k] = reinterpret_cast<const u64*>(fp)[1];
 +            const u64 next = reinterpret_cast<const u64*>(fp)[0];
 +            if (next <= fp) {
@@ -32700,3 +33717,155 @@ index 8f32113fe065879f941efb43d4ba09faf6a747f8..5b7c172f6890c74299d5f4f1e3048548
 +    &ff_wmv3_decoder,
  #endif
      NULL};
+diff --git a/src/kernel/crt/memory.cpp b/src/kernel/crt/memory.cpp
+index 31c53846384be172aaf78d985f6075ff552e2b47..ca013bb1c69d87f2f4e9c259cba8f7f82e46d0ee 100644
+--- a/src/kernel/crt/memory.cpp
++++ b/src/kernel/crt/memory.cpp
+@@ -10,6 +10,7 @@
+ #include <cstring>
+ 
+ #include <rex/hook.h>
++#include <rex/system/xmemory.h>
+ 
+ namespace rex::kernel::crt {
+ 
+@@ -17,15 +18,22 @@ namespace rex::kernel::crt {
+ // Standard memory operations
+ // ---------------------------------------------------------------------------
+ 
++// sa2-nx (2026-10-20, from banjo-nx): every write of guest memory here marks its store cards (rex/system/xmemory.h), as the guest
++// routines' stores would have.
++using rex::memory::MarkStoreCardsHost;
++
+ static void* native_memcpy(void* dst, const void* src, size_t n) {
++  MarkStoreCardsHost(dst, n);
+   return std::memcpy(dst, src, n);
+ }
+ 
+ static void* native_memmove(void* dst, const void* src, size_t n) {
++  MarkStoreCardsHost(dst, n);
+   return std::memmove(dst, src, n);
+ }
+ 
+ static void* native_memset(void* dst, int val, size_t n) {
++  MarkStoreCardsHost(dst, n);
+   return std::memset(dst, val, n);
+ }
+ 
+@@ -38,18 +46,22 @@ static void* native_memchr(const void* ptr, int val, size_t n) {
+ // ---------------------------------------------------------------------------
+ 
+ static void* native_XMemCpy(void* dst, const void* src, size_t n) {
++  MarkStoreCardsHost(dst, n);
+   return std::memcpy(dst, src, n);
+ }
+ 
+ static void* native_XMemSet(void* dst, int val, size_t n) {
++  MarkStoreCardsHost(dst, n);
+   return std::memset(dst, val, n);
+ }
+ 
+ static void* native_XMemSet128(void* dst, int val, size_t n) {
++  MarkStoreCardsHost(dst, n);
+   return std::memset(dst, val, n);
+ }
+ 
+ static void* native_memset_vmx(void* dst, int val, size_t n) {
++  MarkStoreCardsHost(dst, n);
+   return std::memset(dst, val, n);
+ }
+ 
+@@ -60,6 +72,7 @@ static void* native_memset_vmx(void* dst, int val, size_t n) {
+ static int native_memcpy_s(void* dst, size_t dstsz, const void* src, size_t count) {
+   if (!dst || !src || count > dstsz)
+     return 22;  // EINVAL
++  MarkStoreCardsHost(dst, count);
+   std::memcpy(dst, src, count);
+   return 0;
+ }
+@@ -67,6 +80,7 @@ static int native_memcpy_s(void* dst, size_t dstsz, const void* src, size_t coun
+ static int native_memmove_s(void* dst, size_t dstsz, const void* src, size_t count) {
+   if (!dst || !src || count > dstsz)
+     return 22;  // EINVAL
++  MarkStoreCardsHost(dst, count);
+   std::memmove(dst, src, count);
+   return 0;
+ }
+diff --git a/src/ui/switch_no_vulkan.c b/src/ui/switch_no_vulkan.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c947905d65939ae3da4fb017479fdbe9ac47c21
+--- /dev/null
++++ b/src/ui/switch_no_vulkan.c
+@@ -0,0 +1,52 @@
++/*
++ * sa2-nx (2026-10-20): the Vulkan entry points of a Switch build without Mesa's
++ * NVK driver (REXGLUE_SWITCH_NO_NVK, rexglue_switch.cmake).
++ *
++ * Only four driver symbols are linked by name: vkGetInstanceProcAddr and
++ * vkDestroyInstance (ui/vulkan/vulkan_instance.cpp) and the loader-interface
++ * pair plume's Vulkan back end starts from (vk_icdNegotiateLoaderICDInterfaceVersion,
++ * vk_icdGetInstanceProcAddr). Every other Vulkan call goes through the function
++ * pointers those return. Here they find nothing, so creating a Vulkan instance
++ * fails cleanly, and libvulkan.a (the whole driver) stays out of the NRO. Such a
++ * build draws with a renderer that does not use Vulkan (the title's own, e.g.
++ * deko3d); the SDK's Vulkan presenter and GPU plugin are left unusable.
++ */
++#include <errno.h>
++#include <malloc.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/* The static driver also brought posix_memalign, which newlib declares and does
++ * not define; FFmpeg's av_malloc needs it. memalign's blocks are freed with free. */
++int posix_memalign(void **out, size_t alignment, size_t size) {
++  if (alignment < sizeof(void *) || (alignment & (alignment - 1)) != 0) return EINVAL;
++  void *p = memalign(alignment, size);
++  if (!p && size) return ENOMEM;
++  *out = p;
++  return 0;
++}
++
++typedef void (*rex_vk_void_function)(void);
++
++rex_vk_void_function vkGetInstanceProcAddr(void *instance, const char *name) {
++  (void)instance;
++  (void)name;
++  return NULL;
++}
++
++void vkDestroyInstance(void *instance, const void *allocator) {
++  (void)instance;
++  (void)allocator;
++}
++
++rex_vk_void_function vk_icdGetInstanceProcAddr(void *instance, const char *name) {
++  (void)instance;
++  (void)name;
++  return NULL;
++}
++
++/* VK_ERROR_INCOMPATIBLE_DRIVER: no driver to negotiate with. */
++int32_t vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *version) {
++  (void)version;
++  return -9;
++}
+diff --git a/include/rex/input/read_hook.h b/include/rex/input/read_hook.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..2ad34a15e79d4c217586a24cec2185b13b03109b
+--- /dev/null
++++ b/include/rex/input/read_hook.h
+@@ -0,0 +1,14 @@
++/**
++ * sa2-nx (2026-10-20): a function the input system calls at every controller state read (InputSystem::GetState),
++ * before the read: Renut's late input delays the frame's first read there and its latency probe notes the read
++ * (rex::latency::BeforeInputRead / NoteInputRead, app/src/renut_engine/sa2_compat/frame_latency.cpp; banjo-nx calls
++ * them from its SDK directly). None by default.
++ */
++#pragma once
++
++namespace rex::input {
++
++using ReadHook = void (*)();
++void SetReadHook(ReadHook hook);
++
++}  // namespace rex::input

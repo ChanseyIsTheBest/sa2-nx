@@ -17,6 +17,14 @@
 // The generated code's macros and helpers (the localized copies are made of generated code) ...
 #include "../../generated/default/sa2_pch.h"
 
+// sa2-nx (2026-10-20, as banjo-nx): whether the generated code marks the store cards (tools/store_cards.py ran and
+// REX_STORE_CARDS_OFF is not set): Renut proves its cached copies by them only then (banjo_renut_store_cards).
+#if defined(REX_CARD) && !defined(REX_STORE_CARDS_OFF)
+extern "C" const bool g_banjo_store_cards = true;
+#else
+extern "C" const bool g_banjo_store_cards = false;
+#endif
+
 // ... with plain guest memory: the recompiled code's accesses are volatile, which keeps GCC from pairing and
 // scheduling them; a native replacement does not need that (a racing write from another thread is a race either way).
 #undef REX_LOAD_U8

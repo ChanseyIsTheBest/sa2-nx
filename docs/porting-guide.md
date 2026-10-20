@@ -291,6 +291,13 @@ These cost days on the ports before this one:
 
 - **Thread handles leak** until Horizon's limit and the game cannot create threads (the SDK's `switch_reaper` closes
   them).
+- **Guest thread stacks fragment the heap.** Every guest thread gets a 16 MB stack from the malloc heap; a 16 MB block
+  given back is soon split by small allocations, and the next one comes from fresh heap. 2026-10-07 the console failed
+  thread creations ("no 16448 KB block") with 1.0-1.5 GB free in ~10,800 pieces; the reaper then kept 4 stacks for
+  reuse. 2026-10-20, Ryujinx with the heap report of Renut's renderer: SA2 has up to 55 guest threads at once around a
+  stage load, so with 4 kept every load still took new blocks: 1.4 GB more heap taken in 9 minutes of attract demos,
+  the memory in use flat. `switch_thread_stack_pool` (default 64; `sdk/src/core/threading_posix.cpp`) keeps them all:
+  the heap stays flat after the first load (+28 MB in the next 6 minutes). Both renderers run on this code.
 - **Short reads from the asset pack** on large requests (`pack_storage_switch.cpp`, `ReadAt` loops until done).
 - **SD writes stall the thread that logs.** A long log line was an SD write of its own, made by whichever thread
   logged it; the log writer thread (`log_file_writer`) writes once a second instead.
@@ -306,7 +313,11 @@ You cannot optimise what you have not measured, and the PC's measurements mislea
 - per-second counts of the libnx calls that cost IPC (fence queries, submissions, mappings, cache cleans);
 - **stack samples** (`switch_profile_stacks = true`): every millisecond one busy thread is paused, its pc, lr and
   frame chain read, and resumed. Addresses come out as `image+0x...`, translated with addr2line on the build's ELF.
-  Archive the ELF of every NRO you test (`out/nx/elf/`).
+  Archive the ELF of every NRO you test (`out/nx/elf/`). The frame walk must not trust the frame pointer: recompiled
+  code uses x29 as an ordinary register, and before 2026-10-20 a value near the top of the address space
+  (0xFFFFFFFFFFFFFFF0) passed the `fp + 16 <= hi` bound by wrapping and the profiler thread faulted reading
+  `[fp + 8]` (found by sasrt-nx in Ryujinx; a console would fault too). `sdk/src/ui/switch_perf.cpp` now tests
+  `fp < hi && hi - fp >= 16`.
 
 `tools/switch_profile_report.py` and `tools/cpu_profile_report.py` turn the samples into per-function shares. Things
 that misled us:

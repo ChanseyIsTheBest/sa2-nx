@@ -45,6 +45,14 @@ PROMOTED = re.compile(r'\bREX_PROMOTED_CALL\(0x[0-9A-F]{8}, (sub_[0-9A-F]{8})\)'
 ALL = None  # "reach unknown": full sync
 INDEX = os.path.join(ROOT, 'out', 'localize_index.json')
 DEF = re.compile(r'^DEFINE_REX_FUNC\((\w+)\) \{$')
+# tools/inline_memcalls.py wraps a constant-size memcpy / memset call as REX_MEMCPY_CONST(n, sub_X(ctx, base)); (the
+# helper runs the call when it must, reading the arguments from ctx). A localized copy keeps the plain call (banjo-nx's
+# rule): its registers are locals, synced around calls only.
+MEMCALL_WRAP = re.compile(r'\bREX_MEM(?:CPY|SET)_CONST\(\d+, ((?:__imp__)?sub_[0-9A-F]{8}\(ctx, base\))\);')
+
+
+def plain_calls(text):
+    return MEMCALL_WRAP.sub(r'\1;', text) if 'REX_MEM' in text else text
 
 
 def build_index(gen):
@@ -63,6 +71,7 @@ def build_index(gen):
     for path in files:
         name = None
         for line in open(path, encoding='utf-8', errors='replace'):
+            line = plain_calls(line)
             m = DEF.match(line.rstrip('\n'))
             if m:
                 name = m.group(1)
@@ -212,7 +221,7 @@ def find_body(gen, name):
         text = open(path, encoding='utf-8', errors='replace').read()
         m = re.search(r'^DEFINE_REX_FUNC\(' + name + r'\) \{\n(.*?)^\}\n', text, re.S | re.M)
         if m:
-            return unleaf(m.group(1)), path
+            return unleaf(plain_calls(m.group(1))), path
     return None, None
 
 
@@ -226,9 +235,11 @@ def unleaf(body):
     names = re.compile(r'\bl_(%s)\b' % '|'.join(re.escape(r) for r in regs))
     out = []
     for l in body.split('\n'):
-        if re.match(r'\tREX_LEAF_LOCAL\(', l) or re.match(r'\t(?:REX_LEAF_STORE\(l_\w+, \w+\);\s?)+$', l):
+        # REX_LEAF_DEAD_R / _F (tools/leaf_dead_stores.py) are write-backs no caller reads: in the ctx form every
+        # register is written where the function writes it, so they go like the stores (banjo-nx).
+        if re.match(r'\tREX_LEAF_LOCAL\(', l) or re.match(r'\t(?:REX_LEAF_(?:STORE|DEAD_R|DEAD_F)\(l_\w+, \w+\);\s?)+$', l):
             continue
-        l = re.sub(r'\{ (?:REX_LEAF_STORE\(l_\w+, \w+\); )+return; \}', 'return;', l)
+        l = re.sub(r'\{ (?:REX_LEAF_(?:STORE|DEAD_R|DEAD_F)\(l_\w+, \w+\); )+return; \}', 'return;', l)
         out.append(names.sub(lambda m: 'ctx.' + m.group(1), l))
     if 'REX_LEAF_' in '\n'.join(out):
         sys.exit('localize_native: a leaf-local form this tool does not know (tools/leaf_locals.py changed?)')

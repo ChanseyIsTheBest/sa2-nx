@@ -40,12 +40,16 @@ extern "C" {
 volatile unsigned long long g_rex_ro_checked = 0;      // plain lossy counts: "at least this many"
 volatile unsigned long long g_rex_promoted_calls = 0;
 unsigned char g_rex_indirect_census = 0;
+// tools/lr_preserve.py --rewrite (from banjo-nx, 2026-10-19): link-register write-backs proven redundant, checked on the
+// PC (REX_LR_WRITE_SAME_CHECK).
+volatile unsigned long long g_rex_lr_write_checked = 0;
 }
 
 namespace {
 
 std::atomic<uint64_t> g_ro_mismatches{0};
 std::atomic<uint64_t> g_promoted_mismatches{0};
+std::atomic<uint64_t> g_lr_write_mismatches{0};
 
 // One call site: (function address << 32) | ordinal. Up to four targets are told apart; the rest is "other".
 struct Site {
@@ -69,6 +73,16 @@ extern "C" void RexRoMismatch(unsigned address) noexcept {
     REXLOG_ERROR("[enh] DIFFERENCE: read-only constants: guest memory at {:08X} does not hold the constant the "
                  "generated code uses",
                  address);
+  }
+}
+
+// tools/lr_preserve.py --rewrite: a link-register write-back proven to store the value ctx.lr already holds did not.
+extern "C" void RexLrWriteMismatch(unsigned long long held, unsigned long long written) noexcept {
+  sa2::enh::VerifyDifference();
+  if (g_lr_write_mismatches.fetch_add(1, std::memory_order_relaxed) < 16) {
+    REXLOG_ERROR("[enh] DIFFERENCE: link-register write-back proven redundant: ctx.lr {:#x}, the epilogue writes {:#x} "
+                 "(return address {})",
+                 held, written, static_cast<const void*>(__builtin_return_address(0)));
   }
 }
 
@@ -115,15 +129,18 @@ void CodegenChecksReport(int seconds) {
   const uint64_t ro_wrong = g_ro_mismatches.load(std::memory_order_relaxed);
   const uint64_t promoted_wrong = g_promoted_mismatches.load(std::memory_order_relaxed);
   const uint64_t pcr_wrong = rex::syscount::CensusRead(rex::syscount::kCensusCritSecOwnerMismatch);
-  if (ro || promoted || pcr) {
-    if (ro_wrong || promoted_wrong || pcr_wrong) {
+  const uint64_t lr = g_rex_lr_write_checked, lr_wrong = g_lr_write_mismatches.load(std::memory_order_relaxed);
+  if (ro || promoted || pcr || lr) {
+    if (ro_wrong || promoted_wrong || pcr_wrong || lr_wrong) {
       REXLOG_ERROR("[enh] DIFFERENCE: generated-code self-checks (cumulative): read-only constants {} of {} wrong, "
-                   "promoted indirect calls {} of {} wrong, critical section owners from the PCR {} of {} wrong",
-                   ro_wrong, ro, promoted_wrong, promoted, pcr_wrong, pcr);
+                   "promoted indirect calls {} of {} wrong, critical section owners from the PCR {} of {} wrong, "
+                   "link-register write-backs proven redundant {} of {} wrong",
+                   ro_wrong, ro, promoted_wrong, promoted, pcr_wrong, pcr, lr_wrong, lr);
     } else {
       REXLOG_INFO("[verify] generated-code self-checks so far: {} loads folded to read-only constants, {} promoted "
-                  "indirect calls, {} critical section owners from the PCR; 0 differences",
-                  ro, promoted, pcr);
+                  "indirect calls, {} critical section owners from the PCR, {} link-register write-backs proven "
+                  "redundant; 0 differences",
+                  ro, promoted, pcr, lr);
     }
   }
   if (!g_rex_indirect_census) return;

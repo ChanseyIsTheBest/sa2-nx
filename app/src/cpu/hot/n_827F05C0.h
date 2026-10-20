@@ -76,6 +76,7 @@ inline bool Native(PPCContext& ctx, uint8_t* base) {
   const uint8_t* s = Raw(base, src);
   if (n <= 64) {
     detail::CopySmall(d, s, n);
+    Card(base, dst, n);  // sa2-nx (2026-10-20): the store cards (sa2_hot_common.h)
     return true;
   }
   if (uint64_t(dst) + n > 0x100000000ull || uint64_t(src) + n > 0x100000000ull) return false;
@@ -83,6 +84,7 @@ inline bool Native(PPCContext& ctx, uint8_t* base) {
     std::memmove(d, s, n);  // dst < src (or equal), overlapping: forward copy == memmove
   else
     std::memcpy(d, s, n);
+  Card(base, dst, n);
   return true;
 }
 

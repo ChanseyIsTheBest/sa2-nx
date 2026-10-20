@@ -28,6 +28,7 @@ inline void StF(uint8_t* base, uint32_t a, double d) {  // stfs
   std::memcpy(&v, &f, 4);
   v = __builtin_bswap32(v);
   std::memcpy(Raw(base, a), &v, 4);
+  Card(base, a, 4);  // sa2-nx (2026-10-20): the store cards (sa2_hot_common.h)
 }
 inline double R(double d) { return double(float(d)); }  // the single-precision rounding of fmuls / fmadds / fadds
 

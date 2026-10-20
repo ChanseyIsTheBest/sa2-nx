@@ -6,6 +6,10 @@
 # Game and paths
 license_mask = 1
 sa2_renderer_native = true
+# The renderer (1.0.3): Renut's Direct3D-level renderer on deko3d. The NRO has no Vulkan driver, so it runs whatever
+# these say; its game shaders come from deko3d_glsl.bin beside the NRO, which the web installer makes.
+sa2_renderer = "renut"
+renut_gpu_backend = "deko3d"
 sa2_render_height_handheld = 720
 sa2_render_height_docked = 1080
 sa2_shader_misses = ""
@@ -17,6 +21,8 @@ log_level = "off"
 log_to_file = false
 switch_profile_stacks = false
 switch_profile_report = false
+sa2_enhancements_report_s = 0
+renut_memory_report = 0.0
 sa2_gpu_marks_categories = false
 
 # CPU enhancements (docs/enhancements.md)

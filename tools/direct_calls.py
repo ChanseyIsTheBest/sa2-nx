@@ -54,8 +54,20 @@ def hooked():
                 text = open(path, encoding='utf-8', errors='ignore').read()
             except OSError:
                 continue
+            if os.path.join('src', 'renut_engine') in path:
+                # sa2-nx (2026-10-20): Renut's renderer (app/src/renut_engine) names N&B's addresses in constants and
+                # in files the build leaves out; only its hook macros at SA2's addresses hook (BANJO_RENUT_HOOK*).
+                for m in re.findall(r'BANJO_RENUT_HOOK[A-Z_]*\(sub_([0-9A-Fa-f]{8})', CodeOnly(text)):
+                    names.add('sub_' + m.upper())
+                continue
             if path.endswith(CODE_SUFFIXES):
                 text = CodeOnly(text)
+            elif path.endswith('.toml') or os.path.basename(path) == 'CMakeLists.txt':
+                # From banjo-nx (2026-10-19): a # comment names addresses for the reader, not hooks, and
+                # non_argument_as_local's keep list names functions that keep r11/r12 in ctx. Both kept their
+                # functions on the weak alias (not inlinable).
+                text = re.sub(r'(?m)(^|[ \t])#[^\n]*', ' ', text)
+                text = re.sub(r'non_argument_as_local_keep\s*=\s*\[.*?\]', ' ', text, flags=re.S)
             for m in re.findall(r'(?<![0-9A-Fa-f])(82[0-9A-Fa-f]{6})(?![0-9A-Fa-f])', text):
                 names.add('sub_' + m.upper())
     return names

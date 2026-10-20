@@ -49,6 +49,7 @@
 #include "me/me_native_system.h"
 #include "me/sa2_api.h"
 #include "me/sa2_d3d_api.h"
+#include "renut_engine/gpu/sa2_renut_yield.h"  // sa2_renderer = "renut"
 
 REXCVAR_DEFINE_BOOL(sa2_dump_shaders, false, "SA2",
                     "Write every shader container the game creates to shaders/ next to the executable "
@@ -106,6 +107,7 @@ void DumpShaderBlob(const uint8_t* base, uint32_t blob_address, bool vertex) {
 // Draw-time shader load (FlushState's shader part, called from every Draw*).
 REX_EXTERN(__imp__sub_82556A60);
 REX_HOOK_RAW(sub_82556A60) {
+  SA2_RENUT_YIELD(sub_82556A60)
   const uint32_t device = ctx.r3.u32;
   if (device >= 0x40000000 && device < 0x7F000000) {
     const uint32_t vs = Load32(base, device + kDeviceVertexShader), ps = Load32(base, device + kDevicePixelShader);
@@ -121,6 +123,7 @@ REX_HOOK_RAW(sub_82556A60) {
 // (sa2_cpu_direct_state: BeginDrawDirect before the original, EndDrawDirect right after it).
 REX_EXTERN(__imp__sub_82565C60);
 REX_HOOK_RAW(sub_82565C60) {  // D3DDevice_DrawVertices
+  SA2_RENUT_YIELD_SHARED(sub_82565C60)
   // sa2_api_draws: the native draw (no PM4 for the draw); false when it does not apply (the old path below).
   if (!sa2::d3d::CensusOn() && sa2::api::DrawVertices(ctx, base)) return;
   const bool census = sa2::d3d::CensusOn();
@@ -138,6 +141,7 @@ REX_HOOK_RAW(sub_82565C60) {  // D3DDevice_DrawVertices
 
 REX_EXTERN(__imp__sub_82566078);
 REX_HOOK_RAW(sub_82566078) {  // D3DDevice_DrawIndexedVertices
+  SA2_RENUT_YIELD_SHARED(sub_82566078)
   const bool census = sa2::d3d::CensusOn();
   if (census) [[unlikely]] {
     sa2::d3d::NoteDevice(ctx.r3.u32);
@@ -153,6 +157,7 @@ REX_HOOK_RAW(sub_82566078) {  // D3DDevice_DrawIndexedVertices
 
 REX_EXTERN(__imp__sub_82565C18);
 REX_HOOK_RAW(sub_82565C18) {  // D3DDevice_DrawVerticesUP
+  SA2_RENUT_YIELD_SHARED(sub_82565C18)
   if (!sa2::d3d::CensusOn() && sa2::api::DrawVerticesUP(ctx, base)) return;  // sa2_api_draws
   const bool census = sa2::d3d::CensusOn();
   if (census) [[unlikely]] {
@@ -174,6 +179,7 @@ REX_HOOK_RAW(sub_82565C18) {  // D3DDevice_DrawVerticesUP
 // first register, r6 = the shadow in the device (the fetch flush has its own: device+1152, registers 0x4800).
 REX_EXTERN(__imp__sub_82555CC8);
 REX_HOOK_RAW(sub_82555CC8) {  // shader constants: 16 registers a bit (r5 = 0x4000 VS / 0x4400 PS)
+  SA2_RENUT_YIELD(sub_82555CC8)
   if (me::native::FlushRunsDirect(ctx, base, ctx.r3.u32, ctx.r4.u64, ctx.r5.u32, ctx.r6.u32,
                                   me::native::FlushKind::kConstants, &__imp__sub_82555CC8))
     return;
@@ -182,6 +188,7 @@ REX_HOOK_RAW(sub_82555CC8) {  // shader constants: 16 registers a bit (r5 = 0x40
 
 REX_EXTERN(__imp__sub_82555B70);
 REX_HOOK_RAW(sub_82555B70) {  // fetch constants: 6 registers a bit from 0x4800, then the 0x5000 end packet
+  SA2_RENUT_YIELD(sub_82555B70)
   if (me::native::FlushRunsDirect(ctx, base, ctx.r3.u32, ctx.r4.u64, 0x4800, ctx.r3.u32 + 1152,
                                   me::native::FlushKind::kFetch, &__imp__sub_82555B70))
     return;
@@ -190,6 +197,7 @@ REX_HOOK_RAW(sub_82555B70) {  // fetch constants: 6 registers a bit from 0x4800,
 
 REX_EXTERN(__imp__sub_82555930);
 REX_HOOK_RAW(sub_82555930) {  // register groups: 1 register a bit
+  SA2_RENUT_YIELD(sub_82555930)
   if (me::native::FlushRunsDirect(ctx, base, ctx.r3.u32, ctx.r4.u64, ctx.r5.u32, ctx.r6.u32,
                                   me::native::FlushKind::kGroups, &__imp__sub_82555930))
     return;
@@ -199,6 +207,7 @@ REX_HOOK_RAW(sub_82555930) {  // register groups: 1 register a bit
 // sa2_api_draws, verify mode: Direct3D's inline-data allocator answers at once inside a shadow run of the original.
 REX_EXTERN(__imp__sub_8254D9A8);
 REX_HOOK_RAW(sub_8254D9A8) {
+  SA2_RENUT_YIELD_SHARED(sub_8254D9A8)
   if (sa2::api::ShadowInlineAlloc(ctx, base)) return;
   __imp__sub_8254D9A8(ctx, base);
 }
@@ -206,6 +215,7 @@ REX_HOOK_RAW(sub_8254D9A8) {
 // sa2_api_clears: D3DDevice_Clear as a record.
 REX_EXTERN(__imp__sub_82563AB0);
 REX_HOOK_RAW(sub_82563AB0) {
+  SA2_RENUT_YIELD(sub_82563AB0)
   if (sa2::api::Clear(ctx, base)) return;
   __imp__sub_82563AB0(ctx, base);
 }
@@ -213,6 +223,7 @@ REX_HOOK_RAW(sub_82563AB0) {
 // sa2_api_resolves: Direct3D's resolve core (its wrapper and the present path call it) as a record.
 REX_EXTERN(__imp__sub_825645A0);
 REX_HOOK_RAW(sub_825645A0) {
+  SA2_RENUT_YIELD(sub_825645A0)
   if (sa2::api::Resolve(ctx, base)) return;
   __imp__sub_825645A0(ctx, base);
 }
@@ -220,6 +231,24 @@ REX_HOOK_RAW(sub_825645A0) {
 // sa2_api_draws: Direct3D's window offset/scissor writer (registers 0x2080-0x2082) as a record.
 REX_EXTERN(__imp__sub_8254FCE8);
 REX_HOOK_RAW(sub_8254FCE8) {
+#if SA2_RENUT_RENDERER
+  // sa2_renderer = "renut" (2026-10-20): Renut's draws take the window offset and scissor from the device's window
+  // packet (+0x28C0, registers 0x2080-0x2082), but SA2's Direct3D writes them only into the command buffer (it keeps
+  // no shadow of them; N&B's, which Renut was written for, does). The shadow gets what the original writes in the
+  // untiled case (offset 0, then x / y of the two corners), then the original runs (its packets go to the ring sink).
+  if (::banjo::renut_gpu::Active()) {
+    const uint32_t d = ctx.r3.u32;
+    const uint32_t x0 = ctx.r4.u32, y0 = ctx.r5.u32, x1 = ctx.r6.u32, y1 = ctx.r7.u32;
+    const uint32_t words[3] = {0u, ((y0 << 16) & 0x3FFF0000u) | (x0 & 0x3FFFu),
+                               ((y1 << 16) & 0x3FFF0000u) | (x1 & 0x3FFFu)};
+    for (uint32_t i = 0; i < 3; ++i) {
+      const uint32_t v = __builtin_bswap32(words[i]);
+      std::memcpy(base + d + 0x28C0 + 4 * i, &v, 4);
+    }
+    __imp__sub_8254FCE8(ctx, base);
+    return;
+  }
+#endif
   if (sa2::api::WindowScissor(ctx, base)) return;
   __imp__sub_8254FCE8(ctx, base);
 }

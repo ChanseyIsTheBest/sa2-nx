@@ -41,11 +41,13 @@ inline bool Upload(PPCContext& ctx, uint8_t* base, uint32_t first, uint32_t mask
       return false;
     if (p.src < p.dst + p.bytes && p.dst < p.src + p.bytes) return false;
     std::memcpy(Raw(base, p.dst), Raw(base, p.src), size_t(p.bytes));
+    Card(base, p.dst, uint32_t(p.bytes));  // sa2-nx (2026-10-20): the store cards (sa2_hot_common.h)
   }
   uint64_t m;
   std::memcpy(&m, Raw(base, p.mask), 8);
   m = __builtin_bswap64(__builtin_bswap64(m) | ctx.r7.u64);
   std::memcpy(Raw(base, p.mask), &m, 8);
+  Card(base, p.mask, 8);
   return true;
 }
 

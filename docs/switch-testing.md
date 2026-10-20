@@ -17,7 +17,21 @@ card as `switch\sa2-nx`. With a loose `game_root/` folder instead of the pack (`
 the pack on the card (a few minutes, logged as `[pack] packing N %`); the folder can be deleted afterwards. When a pack
 exists it is always used, so an old `game_root/` folder from earlier tests is no longer read and can be deleted.
 
-## This build (version 1.0.2.1; pre-release 2026-10-14, full release and installer page 2026-10-19)
+## This build (version 1.0.3, 2026-10-20)
+
+- **A new renderer:** Renut's Direct3D-level renderer (from reNut, as banjo-nx carries it) on deko3d, the Switch's own
+  graphics API. The NRO has no Vulkan driver any more (58 MB -> 47 MB) and draws the game's Direct3D calls natively:
+  no GPU emulation. `docs/renut-renderer.md` has the whole story and the console measurements.
+- **The shaders come from the installer:** the page makes `deko3d_glsl.bin` from your own game files (the NRO carries no
+  translated game shader); the console compiles each shader the first time it is drawn and keeps it in
+  `deko3d_shaders.bin`, so new places can stutter once.
+- **New settings in sa2.toml:** `sa2_renut_msaa` (0, 2 = default, 4, 8) and `sa2_renut_double_buffer` (off by default:
+  less input lag, but a frame that misses a refresh waits for the next one).
+- **Input latency:** late input (the controller read as late as the frame allows), the frame pacing on the display's own
+  refresh, and the frame sent to the GPU in smaller parts.
+- **Logging and the profiler are off**, as in every release; a new PGO profile from a console session.
+
+## Version 1.0.2.1 (pre-release 2026-10-14, full release and installer page 2026-10-19)
 
 - **Long sessions, second fix:** 1.0.2 did not cure them. After three to four hours of play textures were black and
   geometry was missing again until the game was closed. The cause found since: the renderer has 4,096 slots for 2D
@@ -193,6 +207,26 @@ Everything is on by default in `sa2.toml` (the same as `configs/sa2_all_on.toml`
 
 Start it with a title takeover (hold R while starting a game, then open the Homebrew Menu), or with a forwarder that
 has full memory. From the Album applet there is not enough memory.
+
+## Scripted pad input (`input_script`, test runs)
+
+From banjo-nx's SDK (2026-10-20), with the stick and hold times of the PC's `SA2_AUTO_INPUT`: a key read from
+`sa2.toml` at boot (at the top of the file, above the input tables), so it works on the Switch and in Ryujinx:
+
+    input_script = "26:START,31:A,33:LEFT,35:A,40:A,46:A,50:RIGHT:0.3,52:A"
+
+`seconds:button[:hold seconds]`, separated by commas (or semicolons), counted in wall time from the game's first pad
+read (an emulator that runs slower reaches a screen later). Buttons `A B X Y START BACK UP DOWN LEFT RIGHT LB RB LT RT`,
+sticks `LX+ LX- LY+ LY- RX+ RX- RY+ RY-`; held 0.2 s unless a hold is given. While it is set, player 1 always has a pad
+(minimized, no controller) and reads only the script. The example opens the save, 1P PLAY, STORY, DARK story (the
+first event, with its Sofdec overlays); `46:RIGHT:0.5,48:A` in place of the story steps opens the stage map.
+Checked on the PC (2026-10-20: the save, the menus, the stage map and City Escape played with `70:LY-:30`). In
+Ryujinx also set `headless = true`: after opening the save SA2 shows a message box (`XamShowMessageBoxUI`), which
+the SDK draws as an overlay dialog waiting for real input; headless picks its focused button (the PC test runs are
+headless too). Without it the game waits on the title for good. With it the route above runs on deko3d in the
+emulator: the file select, the menus, the stage map and City Escape played. From a
+PowerShell script, pass the value as a TOML literal string (`input_script = '...'`): PowerShell 5.1 drops embedded
+double quotes from arguments, and a key with an unquoted value makes the whole `sa2.toml` unreadable.
 
 ## What to send back after a run
 

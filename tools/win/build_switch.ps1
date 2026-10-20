@@ -2,16 +2,21 @@
 # The generated code must already exist (tools\codegen.ps1 with the PC SDK): a cross build cannot run rexglue.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools\win\build_switch.ps1 [-Jobs 8] [-LtoJobs 8] [-Reconfigure]
-#       [-Pgo none|generate|use]
+#       [-Pgo none|generate|use] [-NoNvk] [-ReleaseShaders]
 # NVK_SDK (environment) overrides the Mesa SDK folder (it must contain lib\libvulkan.a).
 # -Pgo (profile-guided optimisation, 2026-10-08): generate = the instrumented NRO that collects counts on the console
 # (app/src/sa2_pgo.cpp); use = the optimised NRO from the counts tools\win\pgo_merge.ps1 merged; none = neither.
 # Without -Pgo the build keeps the setting it had.
+# 1.0.3 on (Renut's renderer on deko3d): -NoNvk links no Vulkan driver (REXGLUE_SWITCH_NO_NVK) and -ReleaseShaders builds
+# no translated game shader in (SA2_RENUT_RELEASE_SHADERS: run tools\renut_release_shaders.py first; the game's shaders
+# come from deko3d_glsl.bin beside the NRO, which the web installer makes). The release: -Pgo use -NoNvk -ReleaseShaders.
 param(
     [int]$Jobs = 8,
     [int]$LtoJobs = 8,
     [switch]$Reconfigure,
-    [ValidateSet('', 'none', 'generate', 'use')][string]$Pgo = ''
+    [ValidateSet('', 'none', 'generate', 'use')][string]$Pgo = '',
+    [switch]$NoNvk,
+    [switch]$ReleaseShaders
 )
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 . (Join-Path $PSScriptRoot 'env.ps1')  # VS CMake and Ninja on PATH (the compilers come from the toolchain file)
@@ -41,6 +46,8 @@ if (-not (Test-Path (Join-Path $make 'make.exe'))) {
 $env:PATH = "$make;$env:PATH"
 $pgoArgs = @()
 if ($Pgo) { $pgoArgs = @("-DSA2_PGO=$(if ($Pgo -eq 'none') { '' } else { $Pgo })") }
+$pgoArgs += @("-DREXGLUE_SWITCH_NO_NVK=$(if ($NoNvk) { 'ON' } else { 'OFF' })",
+              "-DSA2_RENUT_RELEASE_SHADERS=$(if ($ReleaseShaders) { 'ON' } else { 'OFF' })")
 & cmake $build "-DSA2_SWITCH_LTO_JOBS=$LtoJobs" @pgoArgs | Out-Null
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 & cmake --build $build -j $Jobs

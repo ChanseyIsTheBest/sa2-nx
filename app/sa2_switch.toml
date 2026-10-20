@@ -3,11 +3,15 @@
 # Language: auto (the Switch's language), english, japanese, french, german, spanish or italian.
 language = "auto"
 
-# Anti-aliasing: 0 = off, 2 = 2x, 4 = 4x. Smoother edges, more GPU work.
-sa2_msaa = 0
+# Anti-aliasing: 0 = off, 2 = 2x, 4 = 4x, 8 = 8x. Smoother edges, more GPU work.
+sa2_renut_msaa = 2
 
 # true: a frame that misses 60 fps is shown as soon as it is ready (50-59 fps) instead of dropping to 30.
 sa2_vsync_relaxed = true
+
+# true: double buffering (two images instead of three): a finished frame reaches the screen sooner (less input lag),
+# but a frame that misses a refresh waits for the next one, so busy scenes (2-player) can drop frames.
+sa2_renut_double_buffer = false
 
 # Face buttons by position, as on an Xbox pad (bottom = A). false = by letter.
 input_xbox_layout = true

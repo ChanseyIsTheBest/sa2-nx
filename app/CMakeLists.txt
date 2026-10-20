@@ -15,6 +15,19 @@ project(sa2 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# -mearly-ra=none for everything compiled for the console (2026-10-19, with banjo-nx's codegen round; peggle2-nx,
+# sasrt-nx and banjo-nx build this way). devkitA64 GCC 16.1 runs an AArch64 "early register allocation" pass at -O2
+# and above (-mearly-ra=all). In Peggle 2's console build it dropped table lookups of the XDK's streaming copy (the
+# two-register lookup of the NEON vperm helper) and large textures came out as garbage on the console only; a
+# standalone compile of SA2's copy of that routine shows the same damage, while SA2's released ELFs had come out whole.
+# Here, before the SDK is added, so its libraries and the LTO link get it too. SA2_SWITCH_EARLY_RA=ON puts the
+# compiler's default back.
+option(SA2_SWITCH_EARLY_RA "Leave GCC's AArch64 early register allocation pass on (Switch; miscompiles, see above)" OFF)
+if(REXGLUE_PLATFORM_SWITCH AND NOT SA2_SWITCH_EARLY_RA)
+    add_compile_options(-mearly-ra=none)
+    add_link_options(-mearly-ra=none)
+endif()
+
 # The SDK is built from source in this repository unless another tree is given.
 set(REXSDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../sdk" CACHE PATH "Path to the ReXGlue SDK source tree")
 
@@ -116,6 +129,19 @@ endif()
 
 # Link the SDK. Stage 1 draws with ReXGlue's Xenos GPU emulation; the native renderer replaces it later.
 rexglue_setup_target(sa2 GPU_PLUGINS xenos)
+# An emulator (Ryujinx) starts NROs without argv[0]: the SDK then takes the NRO's usual place on the SD for its folder
+# (sdk/src/core/filesystem_posix.cpp, from banjo-nx). hbloader on the console always passes argv[0].
+if(REXGLUE_PLATFORM_SWITCH AND TARGET rexcore)
+    target_compile_definitions(rexcore PRIVATE REX_SWITCH_FALLBACK_EXE="/switch/sa2-nx/sa2.nro")
+endif()
+
+# Renut's Direct3D-level renderer (reNut by masterspike52, through banjo-nx; docs/renut-renderer.md): no PM4 ring, no
+# EDRAM; plume's Vulkan / D3D12 back ends on the PC and banjo-nx's deko3d back end on the Switch. Linked in with this
+# option, chosen at boot with sa2_renderer = "renut".
+option(SA2_RENUT_RENDERER "Link Renut's Direct3D-level renderer (sa2_renderer = renut)" ON)
+if(SA2_RENUT_RENDERER)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/sa2_renut_gpu.cmake")
+endif()
 
 # SPIR-V initializers of the native renderer's EDRAM transfer / utility shaders (src/me/native/shaders), compiled
 # on the host with glslangValidator (tools/win/build_glslang.ps1 builds it from the SDK's glslang). The Switch build
@@ -257,6 +283,58 @@ if(NOT SA2_GEN_COLD_TRAPS)
 endif()
 if(NOT SA2_GEN_PROMOTED_CALLS)
     list(APPEND _sa2_round2_definitions REX_PROMOTED_CALLS_OFF)
+endif()
+# banjo-nx's codegen round, ported on 2026-10-19 (docs/enhancements.md, "banjo-nx's codegen round"): one switch back
+# per post-codegen step (tools/post_codegen.py), each compiling its statements as they were before the step.
+option(SA2_GEN_NARROW_LOOP_BARRIER "Loop barriers clobber the guest window only, not all memory (tools/loop_barriers.py)" ON)
+option(SA2_GEN_DCBT_PREFETCH "The guest's dcbt / dcbtst hints as host prefetches (generator dcbt_prefetch)" ON)
+option(SA2_GEN_VPERM1 "A vperm of one vector as a one-register lookup (tools/vperm_one_source.py)" ON)
+option(SA2_GEN_FP_SIGN_OPS "fneg / fabs / fnabs as float operations (tools/fp_sign_ops.py)" ON)
+option(SA2_GEN_LEAF_DEAD "Leaf write-backs no caller can read are skipped (tools/leaf_dead_stores.py)" ON)
+# The PC test of SA2_GEN_LEAF_DEAD / SA2_GEN_DEAD_DEFS: a skipped register gets a poison value instead (0xDEADBEEF...,
+# a signalling NaN), so a reader the analysis missed breaks the picture. Never for a build that ships.
+option(SA2_GEN_LEAF_DEAD_POISON "PC test: poison the leaf write-backs SA2_GEN_LEAF_DEAD skips" OFF)
+option(SA2_GEN_DEAD_DEFS "Guest register writes no instruction can read are left out (tools/dead_ctx_defs.py)" ON)
+option(SA2_GEN_DEAD_DEFS_POISON "PC test: poison the register writes SA2_GEN_DEAD_DEFS leaves out" OFF)
+option(SA2_GEN_SINGLE_FLOATS "Single-precision arithmetic in float where the inputs are proven singles (tools/single_floats.py)" ON)
+option(SA2_GEN_INLINE_MEMCALLS "memcpy / memset of a constant size up to 64 bytes inline (tools/inline_memcalls.py)" ON)
+option(SA2_GEN_VEC_UNALIGNED "stvlx / stvrx as a few stores instead of byte loops (tools/vec_unaligned_stores.py)" ON)
+option(SA2_GEN_RO_CFG "Read-only constants followed over the control-flow graph (tools/ro_constants_cfg.py)" ON)
+option(SA2_GEN_FLUSH_HOIST "Loop-header flush-mode checks in front of the loop (tools/flush_hoist.py)" ON)
+option(SA2_GEN_LR_WRITE_SAME "Link-register write-backs proven redundant compile to nothing (tools/lr_preserve.py)" ON)
+option(SA2_GEN_VSEL_NEON "VMX vsel as one NEON bit select (tools/vsel_neon.py)" ON)
+option(SA2_GEN_INLINE_LEAVES "Inline copies of the tiny leaf functions each file calls in another (tools/inline_leaves.py)" ON)
+# 2026-10-20 (banjo-nx's CPU proposal 1 of 2026-10-19): every guest store outside the stack marks its page's store card
+# (tools/store_cards.py); Renut's renderer proves its cached vertex, index and texture copies by them instead of hashing
+# them (banjo_renut_store_cards). OFF compiles the marks out (Renut then hashes as before: src/cpu/sa2_hot_guest.cpp
+# tells it).
+option(SA2_GEN_STORE_CARDS "Guest stores outside the stack mark their page's store card (tools/store_cards.py)" ON)
+foreach(_sa2_pair
+        "SA2_GEN_VPERM1;REX_VPERM1_OFF" "SA2_GEN_FP_SIGN_OPS;REX_FP_SIGN_INTEGER" "SA2_GEN_LEAF_DEAD;REX_LEAF_DEAD_KEEP"
+        "SA2_GEN_DEAD_DEFS;REX_DEAD_DEFS_KEEP" "SA2_GEN_SINGLE_FLOATS;REX_SINGLE_FLOATS_OFF"
+        "SA2_GEN_INLINE_MEMCALLS;REX_INLINE_MEMCALLS_OFF" "SA2_GEN_VEC_UNALIGNED;REX_VEC_UNALIGNED_LOOPS"
+        "SA2_GEN_RO_CFG;REX_RO_CFG_OFF" "SA2_GEN_FLUSH_HOIST;REX_FLUSH_HOIST_OFF"
+        "SA2_GEN_LR_WRITE_SAME;REX_LR_WRITE_SAME_OFF" "SA2_GEN_VSEL_NEON;REX_VSEL_OFF"
+        "SA2_GEN_INLINE_LEAVES;REX_INLINE_LEAVES_OFF" "SA2_GEN_NARROW_LOOP_BARRIER;REX_LOOP_BARRIER_FULL"
+        "SA2_GEN_STORE_CARDS;REX_STORE_CARDS_OFF")
+    list(GET _sa2_pair 0 _sa2_option)
+    list(GET _sa2_pair 1 _sa2_define)
+    if(NOT ${_sa2_option})
+        list(APPEND _sa2_round2_definitions ${_sa2_define})
+    endif()
+endforeach()
+if(NOT SA2_GEN_DCBT_PREFETCH)
+    list(APPEND _sa2_round2_definitions "REX_PREFETCH(x,write)=")
+endif()
+if(SA2_GEN_LEAF_DEAD_POISON)
+    list(APPEND _sa2_round2_definitions REX_LEAF_DEAD_POISON)
+endif()
+if(SA2_GEN_DEAD_DEFS_POISON)
+    list(APPEND _sa2_round2_definitions REX_DEAD_DEFS_POISON)
+endif()
+if(NOT REXGLUE_PLATFORM_SWITCH)
+    # The PC build checks every link-register write-back proven redundant (the [verify] line).
+    list(APPEND _sa2_round2_definitions REX_LR_WRITE_SAME_CHECK)
 endif()
 # The game code, the stage module and the app (whose localized copies are the same generated statements).
 foreach(target sa2_recomp sa2_Data_DLL sa2)
@@ -508,7 +586,9 @@ if(REXGLUE_PLATFORM_SWITCH)
         message(FATAL_ERROR "SA2_PGO must be empty, generate or use (got ${SA2_PGO})")
     endif()
     if(SA2_PGO)
-        foreach(target sa2_recomp sa2)
+        # sa2-nx (2026-10-20): Renut's renderer (sa2_renut_gpu: the hooks, the capture, the render thread) and plume
+        # (its deko3d back end) too: with Renut they are a large part of the game thread and all of the render thread.
+        foreach(target sa2_recomp sa2 sa2_renut_gpu plume)
             if(TARGET ${target})
                 target_compile_options(${target} PRIVATE ${_sa2_pgo})
             endif()
@@ -538,6 +618,6 @@ if(REXGLUE_PLATFORM_SWITCH)
     rexglue_switch_add_nro(sa2
         NAME "Sonic Adventure 2"
         AUTHOR "ChanseyIsTheBest"
-        VERSION "1.0.2.1"
+        VERSION "1.0.3"
         ICON "${CMAKE_CURRENT_SOURCE_DIR}/icon.jpg")
 endif()

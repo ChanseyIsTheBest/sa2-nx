@@ -34,6 +34,7 @@
 
 #include "cpu/sa2_enhancements.h"
 #include "me/me_native_system.h"
+#include "renut_engine/gpu/sa2_renut_yield.h"
 
 SA2_ENHANCEMENT(g_gpu_wait_sleep, sa2_cpu_gpu_wait_sleep, sa2::enh::kCpu, true,
                 "The game's Direct3D GPU wait (sub_8254F400) sleeps until the ring thread makes progress instead of "
@@ -79,6 +80,7 @@ std::atomic<int> g_state{0};  // 0 unknown, 1 on, -1 off (code check failed or k
 
 REX_EXTERN(__imp__sub_8254F400);
 REX_HOOK_RAW(sub_8254F400) {
+  SA2_RENUT_YIELD_SHARED(sub_8254F400)  // sa2_renderer = "renut": Renut's fence waits
   int state = g_state.load(std::memory_order_relaxed);
   if (state == 0) {
     state = (g_gpu_wait_sleep.active &&

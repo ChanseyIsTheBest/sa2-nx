@@ -7,8 +7,9 @@ The 360's compiler keeps every float literal in .rdata and loads it through an a
     lfs f31,-21952(r11)          temp.u32 = REX_LOAD_D_U32(r11.u32, -21952);  f31.f64 = double(temp.f32);
 The recompiled code really loads it from guest memory every time: a load, a byte swap, a move to the vector unit and
 a conversion (about 15 cycles on the Cortex-A57 before the value can be used), for a number that never changes:
-.rdata is read-only in the executable (the section's flags say so; the import slots the loader fills are in .idata,
-which is writable and is never folded).
+.rdata is read-only in the executable (the section's flags say so). One kind of word in it is not constant all the
+same: the XEX's import records, which stand at the start of .rdata and get, for an imported kernel variable, the
+address the loader's kernel gave it. With --xex they are read from the XEX header and a load of one stays a load.
 
 This step follows the constants `lis` / `addi` / `ori` put in registers along each straight line of a function (a
 label forgets everything, a call forgets the registers that live in ctx, any other write to a register forgets it)
@@ -125,13 +126,47 @@ def read_only_ranges(image):
     return ranges, base
 
 
+def import_records(xex):
+    """The addresses of a XEX's import records (optional header 0x000103FF): words inside the image, in these
+    executables at the start of .rdata, that the loader writes at run time: for an imported kernel VARIABLE the
+    address the kernel gave it in that process (sdk/src/system/xex_module.cpp). The image dump holds what the code
+    generator's own process got, so such a word is no constant of the game (found by the futari-nx session,
+    2026-10-14: sa2-nx's and banjo-nx's trees had 86 and 77 such loads folded, this one 79)."""
+    d = open(xex, 'rb').read()
+    if d[:4] != b'XEX2':
+        sys.exit('ERROR (post-codegen patch): ro_constants: %s is not a XEX2 file' % xex)
+    out = set()
+    for i in range(struct.unpack_from('>I', d, 20)[0]):
+        key, value = struct.unpack_from('>II', d, 24 + 8 * i)
+        if key != 0x000103FF:
+            continue
+        _, strings, libraries = struct.unpack_from('>III', d, value)
+        p = value + 12 + strings
+        for _ in range(libraries):
+            size = struct.unpack_from('>I', d, p)[0]
+            count = struct.unpack_from('>H', d, p + 38)[0]
+            out.update(struct.unpack_from('>%dI' % count, d, p + 40))
+            p += size
+    return out
+
+
+RO_USE = re.compile(r'REX_RO_(U8|U16|U32|U64)\(0x([0-9A-Fa-f]{8}), 0x[0-9A-Fa-f]+(?:ull|u)\)')
+RO_VECTOR = re.compile(r'REX_RO_V128\(0x([0-9A-Fa-f]{8}), ')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--gen', required=True, help='generated folder (*_recomp.N.cpp and *_pch.h)')
     ap.add_argument('--image', required=True, help="the code generator's image dump (REXGLUE_DUMP_IMAGE)")
+    ap.add_argument('--xex', help="the module's XEX: loads of its import records stay loads (and a tree folded "
+                                  "without this option gets them back)")
     ap.add_argument('--check', action='store_true')
     ap.add_argument('--no-ints', action='store_true', help='fold float and double loads only')
     a = ap.parse_args()
+    records = import_records(a.xex) if a.xex else set()
+
+    def on_record(address, size):
+        return any(((address + k) & ~3) in records for k in range(size))
     files = sorted(f for f in os.listdir(a.gen) if re.match(r'\w+_recomp\.\d+\.cpp$', f))
     pchs = [f for f in os.listdir(a.gen) if f.endswith('_pch.h')]
     if not files or len(pchs) != 1:
@@ -150,12 +185,21 @@ def main():
 
     def constant(address, size):
         address &= 0xFFFFFFFF
+        if on_record(address, size):
+            return None
         for start, end in ranges:
             if start <= address and address + size <= end:
                 return address, int.from_bytes(image[address - base:address - base + size], 'big')
         return None
 
-    stats = dict(floats=0, doubles=0, ints=0, vectors=0, already=0, changed=0)
+    stats = dict(floats=0, doubles=0, ints=0, vectors=0, already=0, changed=0, records=0)
+
+    def unfold(m):
+        if not on_record(int(m.group(2), 16), SIZE[m.group(1)]):
+            return m.group(0)
+        stats['records'] += 1
+        return 'REX_LOAD_%s(0x%s)' % (m.group(1), m.group(2))
+
     for f in files:
         path = os.path.join(a.gen, f)
         lines = open(path, encoding='utf-8').read().split('\n')
@@ -169,6 +213,16 @@ def main():
                 continue
             if line.startswith('\t//'):
                 continue
+            if records and 'REX_RO_' in line:
+                # A tree folded before --xex existed: a load of an import record goes back to a load.
+                new = RO_USE.sub(unfold, line)
+                m = RO_VECTOR.search(new)
+                if m and on_record(int(m.group(1), 16), 16):
+                    sys.exit('ERROR (post-codegen patch): ro_constants: a folded vector load at %s covers an import '
+                             'record (%s): regenerate the code' % (m.group(1), f))
+                if new != line:
+                    lines[i] = line = new
+                    dirty = True
             if 'REX_RO_U' in line or 'REX_RO_V128' in line:
                 stats['already'] += 1
             if line.startswith('\tea = '):
@@ -261,6 +315,12 @@ def main():
           'already folded), %d files changed' %
           (' (check only)' if a.check else '', stats['floats'], stats['doubles'], stats['ints'], stats['vectors'],
            ', '.join('%08X-%08X' % r for r in ranges), stats['already'], stats['changed']))
+    if a.xex:
+        print('ro_constants: %d import records in %s; %d folded loads of one put back as loads' %
+              (len(records), os.path.basename(a.xex), stats['records']))
+    else:
+        print('ro_constants: WARNING: no --xex: loads of import records (kernel variables, whose addresses the '
+              'loader writes at run time) are folded like constants')
 
 
 if __name__ == '__main__':

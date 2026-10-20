@@ -336,6 +336,9 @@ inline bool Run(PPCContext& ctx, uint8_t* base, bool normals) {
     }
     at = at + 4 + len * 4;
   }
+  // sa2-nx (2026-10-20): the store cards (sa2_hot_common.h) of what was written: the scan's range, and the flags word.
+  if (p.hi > p.lo) Card(base, p.lo, p.hi - p.lo);
+  if (flags_read) Card(base, kFlagsWord, 4);
   ctx.r3.u64 = 0;
   return true;
 }

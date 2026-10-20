@@ -26,6 +26,7 @@ inline bool Native(PPCContext& ctx, uint8_t* base) {
     if (forward != (dst < src)) return false;  // signed and unsigned order disagree
   }
   std::memmove(Raw(base, dst), Raw(base, src), n);
+  Card(base, dst, n);  // sa2-nx (2026-10-20): the store cards (sa2_hot_common.h)
   return true;
 }
 

@@ -38,6 +38,7 @@
 #include "cpu/sa2_hot_copies.h"
 #include "me/sa2_api.h"
 #include "me/sa2_d3d_api.h"
+#include "renut_engine/gpu/sa2_renut_yield.h"
 
 REXCVAR_DEFINE_BOOL(sa2_diag_d3d_census, false, "SA2",
                     "Diagnostic: count the Direct3D functions the game calls, with the PM4 packets each call writes "
@@ -259,6 +260,7 @@ void CensusSegmentAfter(const uint8_t* base) {
 // The draw path with inline vertices (a localized copy, SA2_COPY_FOR_HOOK in cpu/sa2_hot_guest.cpp).
 REX_EXTERN(__imp__sub_82565758);
 REX_HOOK_RAW(sub_82565758) {
+  SA2_RENUT_YIELD_SHARED(sub_82565758)  // sa2_renderer = "renut"
   if (!sa2::d3d::CensusOn()) [[likely]] {
     if (sa2::api::BeginVertices(ctx, base)) return;  // sa2_api_draws
     sa2::hot::Copy_82565758(ctx, base);

@@ -9,13 +9,17 @@ license of the folder it is in (see below).
 | Project | Used for | License |
 |---|---|---|
 | [masseffect-nx](https://github.com/nebadasSwifty/masseffect-nx) by NebadasSwifty | The tree this port started from: the native renderer (`app/src/me`), the structure of `app/`, the shader library tools (`shaders/tools`), the CPU enhancement framework and many scripts in `tools/` | GPL-3.0 |
-| [nfsmw-nx](https://github.com/StevensND/nfsmw-nx) by StevensND | The Horizon (Switch) layer of the SDK, the NVK driver build the NRO links, the profiling and PGO method | GPL-3.0; BSD-3-Clause for the SDK parts |
+| [nfsmw-nx](https://github.com/StevensND/nfsmw-nx) by StevensND | The Horizon (Switch) layer of the SDK, the NVK driver build the NRO linked up to 1.0.2.1, the profiling and PGO method | GPL-3.0; BSD-3-Clause for the SDK parts |
 | [NFSMW Recompiled](https://github.com/madelrandel-blip/NFSMW-Recompiled) by madelrandel-blip | The recompilation project the ports above started from: the structure of `app/` (application hooks, configuration, code generator setup) and the build and analysis scripts in `tools/` | GPL-3.0 |
 | [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) v0.10.0 by Tom Clay, with portions from [Xenia](https://xenia.jp) (Ben Vanik and the Xenia contributors) | `sdk/`: code generator, Xbox 360 kernel and runtime, GPU command processing, XMA audio, virtual file system | BSD-3-Clause (`sdk/LICENSE`) |
 | Horizon (Switch) layer of the SDK by StevensND | `sdk/src/**/*_switch.*`, `sdk/src/ui/switch_*.cpp`, `sdk/src/input/switch/`, `sdk/src/audio/switch/`, `sdk/cmake/rexglue_switch.cmake`, `sdk/switch_compat/`: guest memory, exception handling, threading, input, audio, presentation, clocks | BSD-3-Clause (as part of the SDK) |
 | Scripts and toolchain file by StevensND | `tools/find_gaps.py`, `tools/read_before_write.py`, `tools/direct_calls.py`, `tools/fetch_thirdparty.py`, `tools/switch/cmake/switch-devkitA64.cmake`, adapted for this game | GPL-3.0 |
 | [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) by hedge-dev and contributors, with the changes of nfsmw-nx, masseffect-nx and this port | `shaders/XenosRecomp`: Xenos microcode to HLSL translator | MIT (`shaders/LICENSE.md`) |
-| [mesa-switch](https://github.com/danfromtico/mesa-switch) by danfromtico (with NaGaa95's updates), on top of [Mesa](https://mesa3d.org) | The Vulkan driver (NVK) and shader compiler (NAK) linked into the NRO: nfsmw-nx's build, which this port does not change (`mesa/README.md`) | MIT (Mesa's licenses per file) |
+| [mesa-switch](https://github.com/danfromtico/mesa-switch) by danfromtico (with NaGaa95's updates), on top of [Mesa](https://mesa3d.org) | The Vulkan driver (NVK) and shader compiler (NAK) linked into the NRO up to 1.0.2.1: nfsmw-nx's build, which this port does not change (`mesa/README.md`). From 1.0.3 the NRO draws with deko3d and links no Vulkan driver | MIT (Mesa's licenses per file) |
+| [reNut](https://github.com/masterspike52/reNut) by masterspike52, as banjo-nx (ChanseyIsTheBest's Banjo-Kazooie: Nuts & Bolts port) carries it | `app/src/renut_engine`: Renut's Direct3D-level renderer (`sa2_renderer = "renut"`, `docs/renut-renderer.md`), retargeted to SA2's Direct3D, with banjo-nx's tuning around it (`banjo_renut_*`, `display_sync.cpp`, `perf/`) and the frame latency probe from futari-nx | reNut has no license file; its author permits the user's ports to reuse it. banjo-nx's and this port's parts: GPL-3.0 |
+| [plume](https://github.com/renderbag/plume) by renderbag and contributors, with banjo-nx's deko3d back end (`plume_deko3d*`) and UnleashedRecomp-NX's Switch changes | `app/thirdparty/plume`: the graphics API layer Renut's renderer draws through (D3D12 and Vulkan on the PC, deko3d on the Switch), with this port's changes (`patches/plume-banjo-nx-c319b29.patch`) | MIT (`app/thirdparty/plume/LICENSE`) |
+| [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) (reblue fork, with reNut's and banjo-nx's changes) | `app/thirdparty/reblue-XenosRecomp`: the translator Renut's shader cache is built with (a build tool; DXC, zstd, smol-v and xxHash ship with it) | MIT (`app/thirdparty/reblue-XenosRecomp/LICENSE.md`) and the licenses of its `thirdparty/` |
+| [uam](https://github.com/devkitPro/uam) by fincs, with SwitchWakerHD's and banjo-nx's patches (`app/thirdparty/uam/PATCHES.md`) | `app/thirdparty/uam`: the deko3d shader compiler (Mesa's nouveau code generator), in the NRO and as a PC tool | zlib (uam), MIT (Mesa's files), MPL-2.0 (SwitchWakerHD's patches) |
 
 The Horizon (Switch) layer added to `sdk/` is under the SDK's BSD-3-Clause license, and the changes in `shaders/`
 under XenosRecomp's MIT license, so they can be reused by other ports. The rest of this repository (`app/`, `tools/`,
@@ -28,7 +32,14 @@ from (`patches/README.md` names each base and how to apply it):
 
 - **ReXGlue SDK** (`sdk/`): the whole fork against v0.10.0;
 - **FFmpeg** and the SDK's FFmpeg build files (`sdk/thirdparty`): the files listed below;
-- **XenosRecomp** (`shaders/XenosRecomp`): against the upstream commit it was taken from.
+- **XenosRecomp** (`shaders/XenosRecomp`): against the upstream commit it was taken from;
+- **reNut, as banjo-nx carries it** (`app/src/renut_engine`): against banjo-nx's commit it was taken from;
+- **plume** (`app/thirdparty/plume`): against banjo-nx's commit it was taken from (banjo-nx's deko3d back end changes
+  taken ahead of its commit, and the build without the NVK driver);
+- **reblue-XenosRecomp, uam and Dear ImGui** under `app/thirdparty` (Renut's renderer): taken as banjo-nx carries
+  them, with banjo-nx's changes (`app/thirdparty/uam/PATCHES.md` lists uam's); this port changes none of them.
+  `tools/renut_hlsl_frontend.cpp` and `tools/renut_hlsl_pch.h` (the translator's front end the installer page runs)
+  are peggle2-nx's, unchanged.
 
 The changed files themselves are in the repository too, so it builds without applying anything. The Mesa driver is
 not changed by this port.
@@ -58,7 +69,7 @@ submodules into `sdk/thirdparty`.
 | [aes_128](https://github.com/openluopworld/aes_128) by LuoPeng, [tiny-AES-c](https://github.com/kokke/tiny-AES-c) | see the license file of each in the fetched tree (`sdk/thirdparty/aes_128`, `sdk/thirdparty/tiny-aes-c`) |
 | disruptorplus, the RenderDoc API header and the PowerPC disassembler (`disasm`) as shipped with ReXGlue SDK v0.10.0 | see the license file of each in the fetched tree |
 | [libnx](https://github.com/switchbrew/libnx) and the devkitA64 runtime (newlib, libstdc++) | ISC; newlib and GCC runtime licenses |
-| zlib, Zstandard and Expat, from devkitPro's Switch portlibs (linked for Mesa) | zlib License; BSD-3-Clause; MIT |
+| Zstandard, from devkitPro's Switch portlibs (the shader packages); zlib and Expat were linked for Mesa up to 1.0.2.1 | BSD-3-Clause; zlib License; MIT |
 
 Only for builds on a computer or for the tests, never in the Switch NRO: SDL3 (zlib), MoltenVK and the Vulkan loader
 (Apache-2.0), Catch2 (BSL-1.0).

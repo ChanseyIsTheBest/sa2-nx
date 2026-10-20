@@ -1,8 +1,9 @@
 # PGO profile
 
-The profile-guided optimisation profile of this code: one console session played on the instrumented NRO of
-2026-10-12 (the three CPU rounds; the profile of the released 1.0.0 is in the `v1.0.0` tag), merged with
-`tools/win/pgo_merge.ps1`. Each `.gcda` file holds the branch and call counts of one
+The profile-guided optimisation profile of this code (version 1.0.3): one console session played on the instrumented
+NRO of 2026-10-20 (Renut's renderer on deko3d, no Vulkan driver; the counts cover the game's code, the app, Renut's
+renderer and plume), merged with `tools/win/pgo_merge.ps1`. The profiles of earlier releases are in their tags
+(`v1.0.0`, `v1.0.2.1`). Each `.gcda` file holds the branch and call counts of one
 object of the build. They are counts only: no game code or data.
 
 `tools/win/build_switch.ps1 -Pgo use` builds with it (the build reads this folder: `SA2_PGO_DIR` in

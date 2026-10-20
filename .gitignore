@@ -62,3 +62,6 @@ __pycache__/
 .vscode/
 .claude/
 .DS_Store
+
+# --- Third-party binaries that come with vendored sources (sample programs), never needed to build --------------
+/app/thirdparty/plume/contrib/*/bin/*.exe

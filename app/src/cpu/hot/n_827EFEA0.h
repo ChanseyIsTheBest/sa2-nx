@@ -21,6 +21,7 @@ inline bool Native(PPCContext& ctx, uint8_t* base) {
   if (n == 0) return true;
   if (uint64_t(dst) + n > 0x100000000ull) return false;
   std::memset(Raw(base, dst), int(ctx.r4.u8), n);
+  Card(base, dst, n);  // sa2-nx (2026-10-20): the store cards (sa2_hot_common.h)
   return true;
 }
 

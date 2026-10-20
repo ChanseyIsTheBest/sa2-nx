@@ -40,6 +40,23 @@ inline uint32_t PhysOff(uint32_t a) {
 }
 inline uint8_t* Raw(uint8_t* base, uint32_t a) { return base + a + PhysOff(a); }
 inline const uint8_t* Raw(const uint8_t* base, uint32_t a) { return base + a + PhysOff(a); }
+// sa2-nx (2026-10-20): the store cards (rex/system/xmemory.h, tools/store_cards.py): a native's write of guest
+// memory zeroes the cards of its pages, as the generated stores do (REX_CARD), so Renut never proves a cached copy whose
+// bytes a native changed. The cards are the first MB of the guest window: 'base' itself.
+inline void Card(uint8_t* base, uint32_t a, uint32_t len) {
+  if (!len) return;
+  const uint64_t end = uint64_t(a) + len - 1;
+  const uint32_t last = end > 0xFFFFFFFFull ? 0xFFFFFu : uint32_t(end >> 12);
+  // sa2-nx (2026-10-20): up to a page long, the range touches at most two pages, its first and its last: two byte
+  // stores. GCC made the loop below a call of memset, which njCalcPoint paid three times a call and njMultiMatrix
+  // twelve (a float store each), where the generated code stores one byte.
+  if (len <= 4096) {
+    base[a >> 12] = 0;
+    base[last] = 0;
+    return;
+  }
+  for (uint32_t page = a >> 12; page <= last; ++page) base[page] = 0;
+}
 inline uint32_t Ld32(const uint8_t* base, uint32_t a) {
   uint32_t v;
   std::memcpy(&v, Raw(base, a), 4);

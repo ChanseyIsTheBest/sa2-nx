@@ -24,6 +24,15 @@ iteration of a loop that has one; two kinds of loop can do without:
     cannot read keeps a barrier at every header.
 --all restores a barrier at every header. Idempotent: barriers no longer wanted are removed.
 
+Since 2026-10-16 (marathon-nx's PPC_LOOP_BARRIER, proposed for Banjo) the barrier clobbers the 4 GB guest window only,
+not "memory": every guest load in the loop is still issued again after it, which is all it is for, while ctx (thread-
+private host memory; a call already makes the compiler reload it) and the host stack keep their registers. Marathon
+kept the full form in floating-point functions only because of its -ffp-contract=fast; Banjo compiles with
+-ffp-contract=off. The window is 4 GB + 4 KB (from peggle2-nx, 2026-10-19): on the PC an address from 0xE0000000 up
+lies 4 KB higher (REX_PHYS_HOST_OFFSET), so the top page of the guest's space is covered there too.
+-DREX_LOOP_BARRIER_FULL (CMake BANJO_GEN_NARROW_LOOP_BARRIER=OFF) gives the full form back. An
+older pch macro is replaced.
+
   python tools/loop_barriers.py app/generated/default [app/generated/data_dll ...] [--check] [--all]
 """
 import os
@@ -38,8 +47,14 @@ IF_GOTO = re.compile(r'^\tif \(.*\) goto (loc_[0-9A-F]{8});$')
 RETURN = re.compile(r'^\t(?:\{ (?:REX_LEAF_STORE\(\w+, \w+\); )+)?return\b[^;]*;(?: \})?$')
 BARRIER = '\tREX_LOOP_BARRIER();'
 MARKER = '// sa2-nx optimised codegen: loop barrier (tools/loop_barriers.py)'
+MACRO_OLD = (MARKER + '\n#ifndef REX_LOOP_BARRIER\n'
+             '#define REX_LOOP_BARRIER() __asm__ __volatile__("" ::: "memory")\n#endif\n')
 MACRO = (MARKER + '\n#ifndef REX_LOOP_BARRIER\n'
-         '#define REX_LOOP_BARRIER() __asm__ __volatile__("" ::: "memory")\n#endif\n')
+         '#if defined(REX_LOOP_BARRIER_FULL)\n'
+         '#define REX_LOOP_BARRIER() __asm__ __volatile__("" ::: "memory")\n'
+         '#else  // the guest window only (marathon-nx): ctx and the host stack keep their registers\n'
+         '#define REX_LOOP_BARRIER() __asm__ __volatile__("" : "+m"(*(uint8_t (*)[0x100001000ull])base))\n'
+         '#endif\n#endif\n')
 # A read of guest memory, or anything that could hide one: a load, a raw address, a call of any kind.
 # REX_RO_: a load tools/ro_constants.py folded to a constant still counts, so that a second run of this script on
 # processed text decides as the first one did.
@@ -160,6 +175,13 @@ def process(folder, check, everywhere):
         sys.exit(f'loop barriers: no *_pch.h in {folder}')
     text = open(pch, encoding='utf-8').read()
     pch_changed = False
+    # The older forms: the full barrier, and the 4 GB window before peggle2-nx's 4 KB of slack (2026-10-19).
+    for older in (MACRO_OLD, MACRO.replace('0x100001000ull', '0x100000000ull')):
+        if older in text:
+            text = text.replace(older, MACRO, 1)
+            pch_changed = True
+            if not check:
+                open(pch, 'w', encoding='utf-8', newline='\n').write(text)
     if MARKER not in text:
         if '#define REX_LOAD_U8(x)' not in text:
             sys.exit(f'loop barriers: no REX_LOAD_U8 in {pch}: the generated pch changed')

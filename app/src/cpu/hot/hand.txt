@@ -1,0 +1,9 @@
+# sa2-nx: guest functions with a HAND-WRITTEN native (app/src/cpu/hot/n_*.h, hooked in app/src/cpu/sa2_hot_guest.cpp)
+# whose callers the whole-program analyses (tools/leaf_dead_stores.py, tools/dead_ctx_defs.py) may treat as calls of
+# the original: the native reads the original's arguments, and its guard compares the return and non-volatile
+# registers of the two. Every other hooked call stays unknown (everything live). One address per line.
+827F05C0 memcpy (n_827F05C0.h)
+827EFEA0 memset (n_827EFEA0.h)
+827EF8B0 memmove (n_827EF8B0.h)
+8255D990 Direct3D shader constants, vertex (n_d3d_constants.h)
+8255D8B8 Direct3D shader constants, pixel (n_d3d_constants.h)
