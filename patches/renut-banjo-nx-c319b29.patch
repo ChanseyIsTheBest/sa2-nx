@@ -1,5 +1,5 @@
 diff --git a/app/src/renut_engine/display_sync.cpp b/app/src/renut_engine/display_sync.cpp
-index 6857f03..e08baaf 100644
+index 6857f03..5ac028a 100644
 --- a/app/src/renut_engine/display_sync.cpp
 +++ b/app/src/renut_engine/display_sync.cpp
 @@ -24,7 +24,9 @@
@@ -13,10 +13,21 @@ index 6857f03..e08baaf 100644
                      "OFF by default (2026-10-19): in Ryujinx every run with the thread active stalled or hung (runs 65, "
                      "67, 68), the runs without it did not; to be tried on the console with configs/"
                      "banjo_display_sync_on.toml. Latency batch 3 (2026-10-19, the Switch): a thread follows the display's refresh (its vsync "
-@@ -45,6 +47,56 @@ REXCVAR_DEFINE_INT32(banjo_display_phase_us, 0, "Banjo/Enhancements",
+@@ -44,6 +46,66 @@ REXCVAR_DEFINE_INT32(banjo_display_phase_us, 0, "Banjo/Enhancements",
+                      "banjo_display_sync with banjo_display_phase_auto off: the release this long after the refresh "
                       "(microseconds)")
      .range(0, 16000);
- 
++// sa2-nx (2026-10-28, the user: "I want double buffer as an option in the toml so please fix it"): display_sync.h.
++REXCVAR_DEFINE_BOOL(sa2_renut_queue_drain, true, "SA2/Renderer",
++                    "With sa2_renut_double_buffer (two swapchain images): when every new image misses its refresh for "
++                    "a second (the display queue stuck one image deep: each image waits for the one the display gives "
++                    "back at that same refresh), the game's next frame is released one refresh later, once; the queue "
++                    "empties and every image after it is shown a refresh sooner (about 17 ms less input lag). Again at "
++                    "the earliest 5 s later, doubled up to 5 minutes while the queue keeps filling again soon after. "
++                    "Also keeps late input from pushing the frames back into it (1 ms more margin a late image)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DECLARE(bool, sa2_renut_double_buffer);  // gpu/backend/video.cpp
++
 +#if REX_PLATFORM_SWITCH
 +// banjo-nx (2026-10-20): libnx's default window (default_window.o: __nx_win_init, __nx_win_exit, nwindowGetDefault)
 +// done here, the same calls in the same order (from its disassembly), so its display gives the refresh thread below
@@ -66,11 +77,62 @@ index 6857f03..e08baaf 100644
 +}
 +}  // extern "C"
 +#endif
-+
+ 
  namespace banjo::display_sync {
  namespace {
+@@ -107,6 +169,51 @@ uint64_t g_refreshes_with_image = 0;
+ // and the longest release wait asked for since the last report.
+ std::atomic<uint64_t> g_fence_test_max_ns{0}, g_release_wait_max_ns{0}, g_release_clamped{0};
  
-@@ -212,15 +264,24 @@ void Run() {
++// sa2-nx (2026-10-28, sa2_renut_queue_drain): the hold the next release takes (TakeHold), the late input's margin, and
++// the display thread's count of new images in a row not finished at their refresh, the last drain and the least time
++// to the next one; the report's late images and the drains so far.
++std::atomic<bool> g_hold{false};
++std::atomic<uint32_t> g_guard_us{0};
++constexpr uint32_t kDrainAfter = 60;  // a second of new images all late
++constexpr uint64_t kDrainGapNs = 5'000'000'000ull, kDrainGapMaxNs = 300'000'000'000ull;
++constexpr uint32_t kGuardStepUs = 1000, kGuardBackUs = 250, kGuardGood = 180, kGuardMaxUs = 8000;
++uint64_t g_presented_at_vsync = 0;
++uint32_t g_late_run = 0, g_guard_good = 0;
++uint64_t g_last_drain = 0, g_drain_gap = kDrainGapNs;
++uint64_t g_late_images = 0, g_drains = 0;
++
++// At a refresh, the newest image: 1 finished, 0 not (shown a refresh late), -1 no new image since the last refresh or
++// not known. Double buffering only (with three images a late image does not hold the next one back).
++void QueueDrainAtRefresh(int ready, uint64_t now) {
++  static const bool on = REXCVAR_GET(sa2_renut_queue_drain) && REXCVAR_GET(sa2_renut_double_buffer);
++  if (!on || ready < 0)
++    return;
++  if (ready == 0) {
++    ++g_late_images;
++    g_guard_good = 0;
++    g_guard_us.store(std::min(g_guard_us.load(std::memory_order_relaxed) + kGuardStepUs, kGuardMaxUs),
++                     std::memory_order_relaxed);
++    // A second of new images all late is the queue one image deep (one late image fills it, and with two images
++    // nothing empties it while the game keeps up): the next release a refresh later. A queue that fills again within
++    // twice the gap is real lateness, which a drain does not help: the gap doubles; else it starts again at 5 s.
++    if (++g_late_run >= kDrainAfter && (!g_last_drain || now - g_last_drain >= g_drain_gap)) {
++      g_drain_gap = g_last_drain && now - g_last_drain < 2 * g_drain_gap ? std::min(g_drain_gap * 2, kDrainGapMaxNs)
++                                                                         : kDrainGapNs;
++      g_last_drain = now;
++      g_hold.store(true, std::memory_order_release);
++      ++g_drains;
++      g_late_run = 0;
++    }
++    return;
++  }
++  g_late_run = 0;
++  if (++g_guard_good >= kGuardGood) {
++    g_guard_good = 0;
++    const uint32_t guard = g_guard_us.load(std::memory_order_relaxed);
++    g_guard_us.store(guard > kGuardBackUs ? guard - kGuardBackUs : 0, std::memory_order_relaxed);
++  }
++}
++
+ // The phase (the display thread's).
+ uint32_t g_floor[kFloorFrames];
+ uint32_t g_floor_next = 0, g_floor_count = 0;
+@@ -212,15 +319,24 @@ void Run() {
  #if REX_PLATFORM_SWITCH
    const bool priority_ok = RexSwitchSetCurrentThreadPriorityOk(kVsyncThreadPriority);
    const bool core_ok = RexSwitchPinCurrentThreadToCore(kVsyncThreadCore);
@@ -102,6 +164,74 @@ index 6857f03..e08baaf 100644
      return;
    }
    g_phase.store(REXCVAR_GET(banjo_display_phase_auto) ? 0 : uint64_t(REXCVAR_GET(banjo_display_phase_us)) * 1000,
+@@ -253,6 +369,13 @@ void Run() {
+     last = now;
+     g_period.store(uint64_t(period), std::memory_order_relaxed);
+     g_last_vsync.store(now, std::memory_order_release);
++    // sa2-nx (2026-10-28, sa2_renut_queue_drain): the newest image at this refresh, before AtRefresh's own fence tests.
++    {
++      const uint64_t presented = renut::gpu::Video::PresentCount();
++      const bool new_image = presented != g_presented_at_vsync;
++      g_presented_at_vsync = presented;
++      QueueDrainAtRefresh(new_image ? renut::gpu::Video::PresentDone(presented) : -1, now);
++    }
+     AtRefresh(now, uint64_t(period));
+   }
+ #endif
+@@ -303,6 +426,16 @@ uint64_t NextRelease(uint64_t now, uint64_t previous, uint64_t frame_ns, bool *a
+   return release;
+ }
+ 
++bool TakeHold() {
++  if (!g_hold.load(std::memory_order_relaxed))
++    return false;
++  return g_hold.exchange(false, std::memory_order_acquire);
++}
++
++uint32_t LateInputGuardUs() {
++  return g_guard_us.load(std::memory_order_relaxed);
++}
++
+ void NoteRelease(uint64_t at, bool anchored) {
+   if (!g_running.load(std::memory_order_acquire))
+     return;
+@@ -354,6 +487,14 @@ std::string Report() {
+       g_misses_total, g_phase_ups, double(g_fence_test_max_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
+       double(g_release_wait_max_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
+       g_release_clamped.exchange(0, std::memory_order_relaxed));
++  // sa2-nx (2026-10-28): with double buffering, the queue drain's counts (sa2_renut_queue_drain).
++  static const bool drain_on = REXCVAR_GET(sa2_renut_queue_drain) && REXCVAR_GET(sa2_renut_double_buffer);
++  if (drain_on) {
++    line += fmt::format("; double buffering: {} new images not finished at their refresh, {} queue drains in all, late "
++                        "input margin +{:.2f} ms (sa2_renut_queue_drain)",
++                        g_late_images, g_drains, double(g_guard_us.load(std::memory_order_relaxed)) / 1000.0);
++    g_late_images = 0;  // (the display thread's counts, read here without its lock: a report's worth of drift at most)
++  }
+   g_present_display = g_input_display = g_release_display = Sum{};
+   g_refreshes = g_refreshes_with_image = g_superseded = g_misses = g_phase_ups = 0;
+   return line;
+diff --git a/app/src/renut_engine/display_sync.h b/app/src/renut_engine/display_sync.h
+index a7f1183..d7ca3cf 100644
+--- a/app/src/renut_engine/display_sync.h
++++ b/app/src/renut_engine/display_sync.h
+@@ -32,4 +32,17 @@ void NotePresented(uint64_t swap);
+ // One line for the 10 s report; empty when the thread does not run.
+ std::string Report();
+ 
++// sa2-nx (2026-10-28, sa2_renut_queue_drain; ketsui-nx's ketsui_renut_queue_drain, passed on by futari-nx): with two
++// swapchain images (sa2_renut_double_buffer) a frame's present waits for the image the display still shows, which it
++// gives back only at the refresh the frame was meant for: one late image (a load, a slow frame) and every image after it
++// is shown a refresh late (about 17 ms more input lag, still 60 fps), for as long as the game keeps up. The display
++// thread counts the new images not finished at their refresh; after a second of them it asks for the game's next frame
++// to be released one refresh later, once: the image before it makes its refresh, the queue empties. TakeHold: the
++// frame pacing (gpu/sa2_renut_pacing.cpp) takes that request at a Swap's release.
++bool TakeHold();
++// The late input's extra margin (render_thread.cpp LateInputDelay), in microseconds: 1 ms more at each image late at its
++// refresh, 0.25 ms less after 180 in time (with sa2_renut_queue_drain), so late input cannot push the frames back into
++// the late queue.
++uint32_t LateInputGuardUs();
++
+ }  // namespace banjo::display_sync
 diff --git a/app/src/renut_engine/gpu/backend/backend.cpp b/app/src/renut_engine/gpu/backend/backend.cpp
 index dce23fd..b7287b4 100644
 --- a/app/src/renut_engine/gpu/backend/backend.cpp
@@ -348,10 +478,10 @@ index 42f433b..b3e2234 100644
 +
  } // namespace renut::gpu
 diff --git a/app/src/renut_engine/gpu/backend/queued.cpp b/app/src/renut_engine/gpu/backend/queued.cpp
-index cf17239..d990901 100644
+index cf17239..60ef641 100644
 --- a/app/src/renut_engine/gpu/backend/queued.cpp
 +++ b/app/src/renut_engine/gpu/backend/queued.cpp
-@@ -3,27 +3,94 @@
+@@ -3,27 +3,166 @@
   */
  #include "renut_engine/gpu/backend/queued.h"
  
@@ -364,6 +494,7 @@ index cf17239..d990901 100644
  #include <memory>
  #include <mutex>
 +#include <string>
++#include <thread>
  #include <unordered_map>
 +#include <utility>
  #include <vector>
@@ -379,6 +510,10 @@ index cf17239..d990901 100644
  #include "renut_engine/gpu/backend/render_thread.h"
  #include "renut_engine/gpu/banjo_renut_tuning.h"
 +#include "renut_engine/gpu/sa2_line_compare.h"
++#include "renut_engine/gpu/sa2_setter_marks.h"
++#if defined(SA2_D3D_CENSUS_BUILD)
++#include "me/sa2_d3d_api.h"  // sa2-nx (2026-10-28): the setter census (census builds only)
++#endif
 +
 +// sa2-nx (2026-10-20): see SnapshotKind below.
 +REXCVAR_DEFINE_BOOL(sa2_renut_snapshot_deltas, true, "SA2/Renderer",
@@ -420,11 +555,78 @@ index cf17239..d990901 100644
 +                    "counts the draws whose rebuilt device differs from it in any byte (the 10 s \"[renut] device "
 +                    "snapshots\" line)")
 +    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sa2_renut_setter_marks, true, "SA2/Renderer",
++                    "Renut's renderer (sa2_renut_snapshot_deltas): a draw of the chain compares only the device chunks "
++                    "marked since the previous one (gpu/sa2_setter_marks.h: by the Direct3D setters that store without "
++                    "a dirty tag, by the dirty tags pending, and the vertex declaration's) instead of all 40. Off: all")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sa2_renut_setter_marks_check, true, "SA2/Renderer",
++                    "Renut's renderer (sa2_renut_setter_marks): every 32nd draw of the chain (every draw with "
++                    "sa2_renut_snapshot_deltas_verify) compares all 40 chunks, and a changed chunk no mark named turns "
++                    "the marks off for the session (logged). Off: no check")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sa2_renut_marks_copy, true, "SA2/Renderer",
++                    "Renut's renderer (sa2_renut_setter_marks): a draw of the chain copies its marked chunks as they "
++                    "are, without comparing them with the chain's shadow first (the compare's loads were most of "
++                    "CaptureDelta on the console); the render thread, whose copy of the device is in its cache, finds "
++                    "which of them changed as it applies them. The every-32nd-draw check still compares all 40. Off: "
++                    "the marked chunks compared on the game thread")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sa2_renut_setters_precise, false, "SA2/Renderer",
++                    "Renut's renderer (sa2_renut_setter_marks; banjo-nx's setter rewrite): SetTexture, SetStreamSource, "
++                    "the fetch word setters and the float constant uploads mark only the chunks whose bytes they "
++                    "changed, and the dirty bits they add go apart from the device until a function that reads them "
++                    "runs (me/sa2_setter_marks.h), so a draw takes only what changed. The every-32nd-draw check also "
++                    "compares the float constants with the render thread's. Off by default (the user's call, "
++                    "2026-10-28): on the console the setters' own work cost about 2 ms a frame more than the draws "
++                    "saved (SA2's setters were native already). Off: their marks and dirty bits as before")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DECLARE(bool, sa2_renut_lockfree_queue);  // backend/render_thread.cpp
  
  namespace renut::gpu {
  
  namespace {
  
++// sa2-nx (2026-10-28, the ARM audit after the console's second run): the keys every draw reads (a dozen: the chain's,
++// the pool's, the lock's), latched once into plain bools. Each had been a function-local static, whose guard is an
++// ldar and a branch on AArch64 at every call (the ldar can wait for the stores before it). The latch is made on the
++// thread of the first capture, before the render thread exists (its creation orders the latch before it), with the
++// fields stored before 'ready'; the keys are init-only.
++struct QueuedKeys {
++  bool ready = false;
++  bool deltas = false, constants = false, batches = false, neon = false, deferred = false, narrow = false;
++  bool verify = false, marks = false, check = false, copy = false, precise = false, spin = false;
++};
++QueuedKeys g_keys;
++[[gnu::noinline]] void LatchKeys() {
++  QueuedKeys k;
++  k.deltas = REXCVAR_GET(sa2_renut_snapshot_deltas);
++  k.constants = k.deltas && REXCVAR_GET(sa2_renut_snapshot_deltas_constants);
++  k.batches = REXCVAR_GET(sa2_renut_capture_batches);
++  k.neon = REXCVAR_GET(sa2_renut_neon_compare);
++  k.deferred = REXCVAR_GET(sa2_renut_deferred_chain);
++  k.narrow = REXCVAR_GET(sa2_renut_snapshot_deltas_narrow);
++  k.verify = k.deltas && REXCVAR_GET(sa2_renut_snapshot_deltas_verify);
++#if defined(SA2_D3D_CENSUS_BUILD)
++  k.marks = false;  // the census compares every chunk
++#else
++  k.marks = k.deltas && REXCVAR_GET(sa2_renut_setter_marks);
++#endif
++  k.check = REXCVAR_GET(sa2_renut_setter_marks_check);
++  k.copy = k.marks && REXCVAR_GET(sa2_renut_marks_copy);
++  k.precise = k.marks && REXCVAR_GET(sa2_renut_setters_precise);
++  k.spin = REXCVAR_GET(sa2_renut_lockfree_queue);
++  k.ready = false;
++  g_keys = k;
++  std::atomic_thread_fence(std::memory_order_release);
++  g_keys.ready = true;
++}
++[[gnu::always_inline]] inline const QueuedKeys &Keys() {
++  if (!g_keys.ready) [[unlikely]]
++    LatchKeys();
++  return g_keys;
++}
++
 +// sa2-nx (2026-10-20, sa2_renut_snapshot_deltas): how a queued draw holds its device.
 +//   Whole:  DrawCapture::state is the device's first kDeviceSnapshotSize bytes (every draw before; the Begin*Vertices
 +//           draws, which are queued later than they are captured, still).
@@ -447,7 +649,7 @@ index cf17239..d990901 100644
    DrawCall call;
    // banjo-nx (2026-10-19, CPU proposal 23): a queued clear's or resolve's arguments. They come from the same pool as
    // the draws' captures: each made three heap allocations on the game thread (its arguments, a device snapshot, a
-@@ -44,9 +111,32 @@ struct DrawCapture {
+@@ -44,9 +183,32 @@ struct DrawCapture {
  // the queued closure) and freed them on the render thread: about 2,000 a frame through the Switch's one malloc lock.
  // A pooled capture keeps its snapshot's storage, and the closure holds a plain pointer, which std::function stores
  // without allocating. Off: every capture is deleted after use, as before (a new one per draw).
@@ -481,11 +683,30 @@ index cf17239..d990901 100644
      {
        std::lock_guard lock(mutex_);
        if (!free_.empty()) {
-@@ -57,12 +147,29 @@ public:
+@@ -57,12 +219,48 @@ public:
      }
      return new DrawCapture();
    }
 -  void Give(DrawCapture *capture) {
++  // sa2-nx (2026-10-28, the ARM audit of the console's second profile): the chain's next captures, whose lines the
++  // render thread had last (it drew them and gave them back): the one after next's own lines, and the next one's delta
++  // buffer (its first lines: the header and a few chunks), into the game thread's cache for writing while this draw is
++  // made. CaptureDelta's samples were spread over its first stores into a capture (its call, its header, the pooled
++  // vector's lines). Under g_delta.mutex, as Take(true).
++  void PrefetchChainNext() const {
++    const size_t n = chain_taken_.size();
++    if (n >= 1) {
++      if (const u8 *s = chain_taken_[n - 1]->state.data()) {
++        for (u32 k = 0; k < 8; ++k)
++          __builtin_prefetch(s + 64 * k, 1);
++      }
++    }
++    if (n >= 2) {
++      const char *c = reinterpret_cast<const char *>(chain_taken_[n - 2]);
++      for (size_t k = 0; k < sizeof(DrawCapture); k += 64)
++        __builtin_prefetch(c + k, 1);
++    }
++  }
 +  // sa2-nx (2026-10-20): 'render_thread' from the render thread's items (only that thread then touches its batch; a
 +  // queue run inline at shutdown has the render thread gone).
 +  void Give(DrawCapture *capture, bool render_thread = false) {
@@ -512,7 +733,7 @@ index cf17239..d990901 100644
        std::lock_guard lock(mutex_);
        if (free_.size() < kMaxFree) {
          free_.push_back(capture);
-@@ -74,8 +181,11 @@ public:
+@@ -74,8 +272,11 @@ public:
  
  private:
    static constexpr size_t kMaxFree = 2048;  // more than a frame's draws in flight
@@ -524,7 +745,7 @@ index cf17239..d990901 100644
  };
  CapturePool g_capture_pool;
  
-@@ -87,24 +197,261 @@ struct DeferredDraw {
+@@ -87,24 +288,341 @@ struct DeferredDraw {
  };
  std::mutex g_deferred_mutex;
  std::unordered_map<u32, DeferredDraw> g_deferred;
@@ -589,6 +810,20 @@ index cf17239..d990901 100644
 +constexpr DeltaChunkList kDeltaAllChunks = MakeDeltaChunkList(false);
 +constexpr DeltaChunkList kDeltaReadChunks = MakeDeltaChunkList(true);
 +static_assert(kDeltaReadChunks.count == 40);
++// sa2-nx (2026-10-28, sa2_renut_setter_marks): the same lists as chunk masks (bit i % 64 of word i / 64), and the
++// chunks every draw compares whatever the marks say: the vertex declaration's (0x2FC0, set inline without a tag).
++constexpr sa2::renut::ChunkBits MakeDeltaChunkMask(const DeltaChunkList &l) {
++  sa2::renut::ChunkBits b{};
++  for (u32 k = 0; k < l.count; ++k)
++    b.w[l.index[k] / 64] |= uint64_t(1) << (l.index[k] % 64);
++  return b;
++}
++constexpr sa2::renut::ChunkBits kDeltaAllMask = MakeDeltaChunkMask(kDeltaAllChunks);
++constexpr sa2::renut::ChunkBits kDeltaReadMask = MakeDeltaChunkMask(kDeltaReadChunks);
++constexpr sa2::renut::ChunkBits kMarksAlways = sa2::renut::MarkBits(d3d::kDeviceOffsetVertexDeclaration, 4);
++static_assert(sa2::renut::kMarkHeadChunks == kDeltaHeadChunks && sa2::renut::kMarkTailBegin == kDeltaTailBegin &&
++              sa2::renut::kMarkSnapshotEnd == d3d::kDeviceSnapshotSize);
++static_assert(kMarksAlways.w[0] == uint64_t(1) << 63 && kMarksAlways.w[1] == 0);  // chunk 63: 0x2FC0
 +// Whether device byte 'at' is one the render thread reads (the verify mode compares those).
 +constexpr bool DeltaByteRead(u32 at) {
 +  return !(at < kDeltaUnreadEnd || (at >= kDeltaPrivateUnreadBegin && at < kDeltaPrivateUnreadEnd));
@@ -624,14 +859,64 @@ index cf17239..d990901 100644
 +  return diff != 0;
 +}
 +
++// sa2-nx (2026-10-28, sa2_renut_lockfree_queue): the chain's lock. The game thread takes it for every draw (making and
++// queueing its delta), and nothing else but the frame's start and the 10 s report: an uncontended std::mutex there was
++// a call into newlib and libnx each way (mutexLock / mutexUnlock / pthread_mutex_lock: 2 % of the game thread in the 2P
++// console profile, with the queue's). With the key on, an exclusive load/store pair takes it and a release store gives
++// it back; a thread that finds it held yields until it is free (the holders keep it for a few hundred instructions).
++// Off: the std::mutex.
++bool ChainSpinOn() {
++  return Keys().spin;
++}
++class ChainLock {
++public:
++  void lock() {
++    if (!ChainSpinOn()) {
++      mutex_.lock();
++      return;
++    }
++    while (held_.exchange(true, std::memory_order_acquire)) {
++      while (held_.load(std::memory_order_relaxed))
++        std::this_thread::yield();
++    }
++  }
++  bool try_lock() {
++    if (!ChainSpinOn())
++      return mutex_.try_lock();
++    return !held_.exchange(true, std::memory_order_acquire);
++  }
++  void unlock() {
++    if (!ChainSpinOn()) {
++      mutex_.unlock();
++      return;
++    }
++    held_.store(false, std::memory_order_release);
++  }
++
++private:
++  std::atomic<bool> held_{false};
++  std::mutex mutex_;
++};
++using ChainGuard = std::unique_lock<ChainLock>;
++
 +// The game threads' side of the chain.
 +struct DeltaChain {
-+  std::mutex mutex;                     // the chain's draws are made and queued in one order
++  ChainLock mutex;                      // the chain's draws are made and queued in one order
 +  const d3d::Device *device = nullptr;  // the device it follows; none: the next draw rebases
 +  uint64_t vs = 0, ps = 0;              // groups whole captures consumed since its last draw: they follow
 +  uint64_t deltas = 0, rebases = 0, bytes = 0, chunks = 0, groups = 0;  // the 10 s report's
 +  uint64_t whole = 0;  // sa2-nx: whole captures outside the chain (Begin*Vertices draws), under the lock too
++  // sa2-nx (2026-10-28, sa2_renut_setter_marks): chunks compared (the report's), the chain's draws (every 32nd
++  // checks), checks and misses (a changed chunk no mark named).
++  uint64_t compared = 0, mark_draws = 0, checks = 0, misses = 0;
++  bool marks_off = false;  // the first miss turns the marks off for the session
++  // sa2-nx (2026-10-28, sa2_renut_setters_precise): the checks' float constant misses (a group that differs from the
++  // render thread's with no dirty bit: the precise setters go off for the session), and the chunks a delta copied as
++  // marked (sa2_renut_marks_copy, the report's).
++  uint64_t const_misses = 0, copied = 0;
++  u32 const_check_next = 0;  // the first of the 16 groups the next check compares
 +  alignas(64) u8 shadow[d3d::kDeviceSnapshotSize];  // the device at its last draw (the chunks)
++  alignas(64) u8 const_shadow[512 * 16];  // sa2-nx: the float constants the render thread's device has (precise)
 +};
 +DeltaChain g_delta;
 +
@@ -646,35 +931,21 @@ index cf17239..d990901 100644
 +// sa2_renut_chain_reuse: the number of the chain's last draw (draw.h ChainHint::seq; from 2).
 +uint64_t g_chain_seq = 1;
 +
-+bool DeltasOn() {
-+  static const bool on = REXCVAR_GET(sa2_renut_snapshot_deltas);
-+  return on;
-+}
-+bool ChainConstantsOn() {
-+  static const bool on = DeltasOn() && REXCVAR_GET(sa2_renut_snapshot_deltas_constants);
-+  return on;
-+}
-+bool CaptureBatchesOn() {
-+  static const bool on = REXCVAR_GET(sa2_renut_capture_batches);
-+  return on;
-+}
-+bool NeonCompareOn() {
-+  static const bool on = REXCVAR_GET(sa2_renut_neon_compare);
-+  return on;
-+}
++// sa2-nx (2026-10-28): the keys, latched (QueuedKeys above).
++bool DeltasOn() { return Keys().deltas; }
++bool ChainConstantsOn() { return Keys().constants; }
++bool CaptureBatchesOn() { return Keys().batches; }
++bool NeonCompareOn() { return Keys().neon; }
 +// sa2-nx (2026-10-20, from futari-nx via peggle2-nx): sa2_renut_deferred_chain (QueueDeferredDraw).
-+bool DeferredChainOn() {
-+  static const bool on = REXCVAR_GET(sa2_renut_deferred_chain);
-+  return on;
-+}
-+bool DeltasNarrowOn() {
-+  static const bool on = REXCVAR_GET(sa2_renut_snapshot_deltas_narrow);
-+  return on;
-+}
-+bool DeltasVerifyOn() {
-+  static const bool on = DeltasOn() && REXCVAR_GET(sa2_renut_snapshot_deltas_verify);
-+  return on;
-+}
++bool DeferredChainOn() { return Keys().deferred; }
++bool DeltasNarrowOn() { return Keys().narrow; }
++bool DeltasVerifyOn() { return Keys().verify; }
++// sa2-nx (2026-10-28): sa2_renut_setter_marks (not in census builds, whose census compares every chunk).
++bool SetterMarksOn() { return Keys().marks; }
++bool SetterMarksCheckOn() { return Keys().check; }
++// sa2-nx (2026-10-28): sa2_renut_marks_copy and sa2_renut_setters_precise (both with the marks only).
++bool MarksCopyOn() { return Keys().copy; }
++bool SettersPreciseOn() { return Keys().precise; }
  
  // The original draw calls consume the device's dirty masks as they write
  // their packets; a snapshot taken after this has them clear, as the command
@@ -685,7 +956,16 @@ index cf17239..d990901 100644
 +  if (device == g_delta.device) {
 +    g_delta.vs |= uint64_t(device->m_Pending[0]);
 +    g_delta.ps |= uint64_t(device->m_Pending[1]);
++    // sa2-nx (2026-10-28, sa2_renut_setter_marks): and the chunks of the dirty tags it consumes.
++    if (SetterMarksOn())
++      sa2::renut::Mark(sa2::renut::MarkedDevice(),
++                       sa2::renut::TagChunks(uint64_t(device->m_Pending[2]), uint64_t(device->m_Pending[3]),
++                                             uint64_t(device->m_Pending[4])));
 +  }
++  // sa2-nx (sa2_renut_setters_precise): the bits held apart for this device are consumed with its own (their state is
++  // the render thread's already: nothing to carry).
++  if (const u32 marked = sa2::renut::MarkedDevice(); marked && GuestPtr<d3d::Device>(marked) == device)
++    sa2::renut::DropApart();
    for (auto &mask : device->m_Pending)
      mask = 0;
  }
@@ -712,16 +992,37 @@ index cf17239..d990901 100644
 +    g_chain_hint.changed[1] = h.chunks[1];
 +    g_chain_vs_dirty |= h.vs;
 +    g_chain_ps_dirty |= h.ps;
-+    for (u32 word = 0; word < 2; ++word) {
-+      for (uint64_t bits = h.chunks[word]; bits; bits &= bits - 1) {
-+        const u32 i = word * 64 + u32(std::countr_zero(bits));
-+        const u32 size = DeltaChunkSize(i);
-+        // Whole chunks as a fixed-size copy, which stays inline.
-+        if (size == kDeltaUnitBytes)
-+          std::memcpy(g_delta_device + DeltaChunkOffset(i), from, kDeltaUnitBytes);
-+        else
-+          std::memcpy(g_delta_device + DeltaChunkOffset(i), from, size);
-+        from += size;
++    if (MarksCopyOn()) {
++      // sa2-nx (2026-10-28, sa2_renut_marks_copy): the game thread copied its marked chunks without comparing them:
++      // a chunk is applied, and named changed for the reuse of derived state (sa2_renut_chain_reuse), only when it
++      // differs from this device's (in this thread's cache).
++      uint64_t changed[2] = {0, 0};
++      for (u32 word = 0; word < 2; ++word) {
++        for (uint64_t bits = h.chunks[word]; bits; bits &= bits - 1) {
++          const u32 i = word * 64 + u32(std::countr_zero(bits));
++          const u32 size = DeltaChunkSize(i);
++          u8 *const to = g_delta_device + DeltaChunkOffset(i);
++          if (size == kDeltaUnitBytes ? DeltaChunkDiffers(to, from) : std::memcmp(to, from, size) != 0) {
++            std::memcpy(to, from, size);
++            changed[word] |= uint64_t(1) << (i % 64);
++          }
++          from += size;
++        }
++      }
++      g_chain_hint.changed[0] = changed[0];
++      g_chain_hint.changed[1] = changed[1];
++    } else {
++      for (u32 word = 0; word < 2; ++word) {
++        for (uint64_t bits = h.chunks[word]; bits; bits &= bits - 1) {
++          const u32 i = word * 64 + u32(std::countr_zero(bits));
++          const u32 size = DeltaChunkSize(i);
++          // Whole chunks as a fixed-size copy, which stays inline.
++          if (size == kDeltaUnitBytes)
++            std::memcpy(g_delta_device + DeltaChunkOffset(i), from, kDeltaUnitBytes);
++          else
++            std::memcpy(g_delta_device + DeltaChunkOffset(i), from, size);
++          from += size;
++        }
 +      }
 +    }
 +    for (const auto [dirty, base] : {std::pair{h.vs, kDeltaVertexF}, std::pair{h.ps, kDeltaPixelF}}) {
@@ -789,7 +1090,7 @@ index cf17239..d990901 100644
    });
  }
  
-@@ -117,18 +464,144 @@ DrawCapture *Capture(u32 device_va, const DrawCall &call) {
+@@ -117,18 +635,303 @@ DrawCapture *Capture(u32 device_va, const DrawCall &call) {
    // assign() keeps a pooled capture's storage (Snapshot() made a new vector each time).
    const auto *bytes = reinterpret_cast<const u8 *>(device);
    capture->state.assign(bytes, bytes + d3d::kDeviceSnapshotSize);
@@ -809,6 +1110,8 @@ index cf17239..d990901 100644
 +    return nullptr;
 +  DeltaChain &c = g_delta;
 +  DrawCapture *capture = g_capture_pool.Take(true);
++  if (MarksCopyOn())
++    g_capture_pool.PrefetchChainNext();  // sa2-nx (2026-10-28): the next draws' captures, for writing
 +  capture->call = call;
 +  capture->call.up_vertices = nullptr;
 +  capture->call.up_indices = nullptr;
@@ -821,12 +1124,43 @@ index cf17239..d990901 100644
 +    std::memcpy(c.shadow, bytes, d3d::kDeviceSnapshotSize);
 +    c.device = device;
 +    c.vs = c.ps = 0;
++    if (SetterMarksOn()) {  // sa2-nx (sa2_renut_setter_marks): marks from here on, for this device
++      sa2::renut::g_setter_marks.device = device_va;
++      sa2::renut::TakeMarks();
++      // sa2-nx (2026-10-28, sa2_renut_setters_precise): the bits held apart go with the device's, and the precise
++      // setters run from here on while no check has found a miss; the render thread's float constants are these.
++      sa2::renut::DropApart();
++      sa2::renut::g_setters_precise =
++          SettersPreciseOn() && !c.marks_off && (c.const_misses == 0 || DeltasVerifyOn());
++      if (sa2::renut::g_setters_precise) {
++        std::memcpy(c.const_shadow, bytes + kDeltaVertexF, sizeof(c.const_shadow));
++        sa2::renut::g_const_shadow = c.const_shadow;
++      }
++    }
 +    capture->snapshot = SnapshotKind::Rebase;
 +    ++c.rebases;
 +    c.bytes += d3d::kDeviceSnapshotSize;
 +  } else {
-+    const uint64_t vs = c.vs | uint64_t(device->m_Pending[0]);
-+    const uint64_t ps = c.ps | uint64_t(device->m_Pending[1]);
++    uint64_t vs = c.vs | uint64_t(device->m_Pending[0]);
++    uint64_t ps = c.ps | uint64_t(device->m_Pending[1]);
++#if defined(SA2_D3D_CENSUS_BUILD)
++    sa2::d3d::CensusDrawTags(uint64_t(device->m_Pending[2]), uint64_t(device->m_Pending[3]),
++                             uint64_t(device->m_Pending[4]));
++#endif
++    // sa2-nx (2026-10-28, sa2_renut_setter_marks): the chunks to compare, from the marks and the dirty tags pending
++    // (before they are cleared below).
++    const bool marks = SetterMarksOn() && !c.marks_off;
++    sa2::renut::ChunkBits marked{};
++    if (marks) {
++      marked = sa2::renut::TakeMarks() |
++               sa2::renut::TagChunks(uint64_t(device->m_Pending[2]), uint64_t(device->m_Pending[3]),
++                                     uint64_t(device->m_Pending[4])) |
++               kMarksAlways;
++    }
++    // sa2-nx (2026-10-28, sa2_renut_setters_precise): the bits held apart need nothing (the precise setters marked
++    // the bytes they changed; their constant groups did not change) and are consumed with the device's.
++    const bool precise = sa2::renut::g_setters_precise;
++    sa2::renut::DropApart();
 +    c.vs = c.ps = 0;
 +    for (auto &mask : device->m_Pending)
 +      mask = 0;
@@ -837,26 +1171,130 @@ index cf17239..d990901 100644
 +    u8 *to = begin + sizeof(DeltaHeader);
 +    DeltaHeader h{};
 +    u32 chunks = 0;
-+    const DeltaChunkList &list = DeltasNarrowOn() ? kDeltaReadChunks : kDeltaAllChunks;
++    const bool narrow = DeltasNarrowOn();
 +    const bool neon = NeonCompareOn();  // sa2-nx (sa2_renut_neon_compare)
-+    for (u32 k = 0; k < list.count; ++k) {
-+      const u32 i = list.index[k];
++    // Chunk i: compared with the shadow, and kept (in the shadow and the delta) when it differs.
++    const auto compare = [&](u32 i) {
 +      const u32 at = DeltaChunkOffset(i), size = DeltaChunkSize(i);
 +      const bool differs = size == kDeltaUnitBytes ? sa2::renut::Line64Differs(bytes + at, c.shadow + at, neon)
 +                                                   : std::memcmp(bytes + at, c.shadow + at, size) != 0;
 +      if (!differs)
-+        continue;
++        return false;
 +      std::memcpy(c.shadow + at, bytes + at, size);
 +      std::memcpy(to, bytes + at, size);
 +      to += size;
 +      h.chunks[i / 64] |= uint64_t(1) << (i % 64);
 +      ++chunks;
++#if defined(SA2_D3D_CENSUS_BUILD)
++      sa2::d3d::CensusDrawChunk(at, size);
++#endif
++      return true;
++    };
++    // sa2-nx (2026-10-28): the verify mode checks every other draw, so that the draws between take the marks' path
++    // (sa2_renut_marks_copy, the precise setters) and the render thread's compare of every rebuilt device covers it.
++    const bool check = marks && SetterMarksCheckOn() &&
++                       (DeltasVerifyOn() ? (++c.mark_draws & 1) == 0 : (++c.mark_draws & 31) == 0);
++    if (marks && !check) {
++      // The marked chunks, in order (the render thread reads the delta's chunks in index order). Their lines are all
++      // known first: prefetched together, the device's and the shadow's L2 misses overlap instead of each waiting on
++      // the compare before it (the full compare's stall was on those loads, 47 % of CaptureDelta on the console).
++      const sa2::renut::ChunkBits &mask = narrow ? kDeltaReadMask : kDeltaAllMask;
++      const uint64_t todo[2] = {marked.w[0] & mask.w[0], marked.w[1] & mask.w[1]};
++      const u32 marked_count = u32(std::popcount(todo[0]) + std::popcount(todo[1]));
++      if (MarksCopyOn()) {
++        // sa2-nx (2026-10-28, sa2_renut_marks_copy): the marked chunks as they are, into the delta and the shadow
++        // (which the checks compare with), without loading the shadow's first: the render thread finds which of them
++        // changed (DeviceForDraw). A marked chunk that did not change costs it a compare of a line in its cache.
++        for (u32 word = 0; word < 2; ++word) {
++          for (uint64_t bits = todo[word]; bits; bits &= bits - 1) {
++            const u32 at = DeltaChunkOffset(word * 64 + u32(std::countr_zero(bits)));
++            __builtin_prefetch(bytes + at);
++            __builtin_prefetch(c.shadow + at, 1);
++          }
++        }
++        for (u32 word = 0; word < 2; ++word) {
++          for (uint64_t bits = todo[word]; bits; bits &= bits - 1) {
++            const u32 i = word * 64 + u32(std::countr_zero(bits));
++            const u32 at = DeltaChunkOffset(i), size = DeltaChunkSize(i);
++            if (size == kDeltaUnitBytes) {
++              std::memcpy(c.shadow + at, bytes + at, kDeltaUnitBytes);
++              std::memcpy(to, bytes + at, kDeltaUnitBytes);
++            } else {
++              std::memcpy(c.shadow + at, bytes + at, size);
++              std::memcpy(to, bytes + at, size);
++            }
++            to += size;
++          }
++        }
++        h.chunks[0] = todo[0];
++        h.chunks[1] = todo[1];
++        chunks = marked_count;
++        c.copied += marked_count;
++      } else {
++        for (u32 word = 0; word < 2; ++word) {
++          for (uint64_t bits = todo[word]; bits; bits &= bits - 1) {
++            const u32 at = DeltaChunkOffset(word * 64 + u32(std::countr_zero(bits)));
++            __builtin_prefetch(bytes + at);
++            __builtin_prefetch(c.shadow + at);
++          }
++        }
++        for (u32 word = 0; word < 2; ++word)
++          for (uint64_t bits = todo[word]; bits; bits &= bits - 1)
++            compare(word * 64 + u32(std::countr_zero(bits)));
++        c.compared += marked_count;
++      }
++    } else {
++      const DeltaChunkList &list = narrow ? kDeltaReadChunks : kDeltaAllChunks;
++      for (u32 k = 0; k < list.count; ++k) {
++        const u32 i = list.index[k];
++        if (compare(i) && check && !(marked.w[i / 64] >> (i % 64) & 1)) {
++          // A change no mark named: the marks are off from here on (this draw keeps it, as every draw will). The
++          // verify mode, which checks every draw and so never uses them, keeps counting instead.
++          ++c.misses;
++          c.marks_off = !DeltasVerifyOn();
++          if (c.marks_off)
++            sa2::renut::g_setters_precise = false;  // sa2-nx (sa2_renut_setters_precise): with the marks
++          if (c.misses <= 32)
++            RGPU_WARN("Setter marks: device chunk +{} (0x{:X}) changed with no mark{} (sa2_renut_setter_marks)",
++                      DeltaChunkOffset(i), DeltaChunkOffset(i), c.marks_off ? "; the marks are off" : "");
++        }
++      }
++      c.compared += list.count;
++      c.checks += check;
++      // sa2-nx (2026-10-28, sa2_renut_setters_precise): the check compares float constant groups no dirty bit names
++      // with the render thread's (the shadow): 16 of the 128 at each check, in turn (all 8 KB at every 32nd draw was
++      // about 0.1 us a draw on the console), all of them in the verify mode. One that differs is taken by this draw,
++      // and the precise setters go off for the session (logged), as a chunk's miss turns the marks off.
++      if (check && precise) {
++        const u32 first = DeltasVerifyOn() ? 0 : c.const_check_next;
++        const u32 count = DeltasVerifyOn() ? 128 : 16;
++        c.const_check_next = (c.const_check_next + 16) & 127;
++        for (u32 k = 0; k < count; ++k) {
++          const u32 side = ((first + k) & 127) >> 6, g = (first + k) & 63;
++          uint64_t &dirty = side ? ps : vs;
++          const uint64_t bit = uint64_t(1) << (63 - g);
++          const u32 at = (side ? kDeltaPixelF : kDeltaVertexF) + g * kDeltaUnitBytes;
++          if ((dirty & bit) || !DeltaChunkDiffers(bytes + at, c.const_shadow + (at - kDeltaVertexF)))
++            continue;
++          dirty |= bit;
++          ++c.const_misses;
++          sa2::renut::g_setters_precise = DeltasVerifyOn();  // the verify mode keeps counting
++          if (c.const_misses <= 32)
++            RGPU_WARN("Setter marks: float constant group {} of the {} shader changed with no dirty bit{} "
++                      "(sa2_renut_setters_precise)",
++                      g, side ? "pixel" : "vertex", DeltasVerifyOn() ? "" : "; the precise setters are off");
++        }
++      }
 +    }
 +    for (const auto [dirty, base] : {std::pair{vs, kDeltaVertexF}, std::pair{ps, kDeltaPixelF}}) {
 +      ForEachGroupRun(dirty, [&](u32 first, u32 count) {
 +        const u32 group_bytes = count * kDeltaUnitBytes;
 +        std::memcpy(to, bytes + base + first * kDeltaUnitBytes, group_bytes);
 +        to += group_bytes;
++        // sa2-nx (sa2_renut_setters_precise): the render thread's constants, for the checks.
++        if (precise)
++          std::memcpy(c.const_shadow + (base - kDeltaVertexF) + first * kDeltaUnitBytes,
++                      bytes + base + first * kDeltaUnitBytes, group_bytes);
 +      });
 +    }
 +    h.vs = vs;
@@ -872,6 +1310,9 @@ index cf17239..d990901 100644
 +    capture->verify.assign(bytes, bytes + d3d::kDeviceSnapshotSize);
 +  else
 +    capture->verify.clear();
++#if defined(SA2_D3D_CENSUS_BUILD)
++  sa2::d3d::CensusDrawDone(device_va);
++#endif
 +  return capture;
 +}
 +
@@ -894,7 +1335,8 @@ index cf17239..d990901 100644
 +std::string SnapshotDeltaReport() {
 +  if (!DeltasOn())
 +    return {};
-+  uint64_t deltas, rebases, bytes, chunks, groups, whole;
++  uint64_t deltas, rebases, bytes, chunks, groups, whole, compared, checks, misses, copied, const_misses;
++  bool marks_off, precise;
 +  {
 +    std::lock_guard lock(g_delta.mutex);
 +    whole = g_delta.whole;
@@ -904,7 +1346,15 @@ index cf17239..d990901 100644
 +    bytes = g_delta.bytes;
 +    chunks = g_delta.chunks;
 +    groups = g_delta.groups;
++    compared = g_delta.compared;
++    checks = g_delta.checks;
++    misses = g_delta.misses;  // the session's
++    marks_off = g_delta.marks_off;
++    copied = g_delta.copied;              // sa2-nx (sa2_renut_marks_copy)
++    const_misses = g_delta.const_misses;  // sa2-nx (sa2_renut_setters_precise): the session's
++    precise = sa2::renut::g_setters_precise;
 +    g_delta.deltas = g_delta.rebases = g_delta.bytes = g_delta.chunks = g_delta.groups = 0;
++    g_delta.compared = g_delta.checks = g_delta.copied = 0;
 +  }
 +  const uint64_t draws = deltas + rebases;
 +  if (!draws)
@@ -916,6 +1366,16 @@ index cf17239..d990901 100644
 +      "Begin*Vertices draws as whole copies",
 +      draws, double(bytes) / double(draws), d3d::kDeviceSnapshotSize, double(chunks) / per_delta,
 +      double(groups) / per_delta, rebases, whole);
++  if (SetterMarksOn()) {  // sa2-nx (2026-10-28)
++    line += fmt::format("; setter marks (sa2_renut_setter_marks): {:.1f} chunks compared and {:.1f} copied as "
++                        "marked (sa2_renut_marks_copy) a delta, {} checks, {} unmarked changes this session{}",
++                        double(compared) / per_delta, double(copied) / per_delta, checks, misses,
++                        marks_off ? " (the marks are off)" : "");
++    if (SettersPreciseOn())
++      line += fmt::format("; precise setters (sa2_renut_setters_precise) {}, {} float constant groups changed "
++                          "without a dirty bit this session",
++                          precise ? "on" : "off", const_misses);
++  }
 +  if (DeltasVerifyOn()) {
 +    line += fmt::format("; verify: {} draws checked, {} differ", g_delta_verified.exchange(0, std::memory_order_relaxed),
 +                        g_delta_differ.exchange(0, std::memory_order_relaxed));
@@ -928,14 +1388,14 @@ index cf17239..d990901 100644
    RunReadyCallbacks();
 -  DrawCapture *capture = Capture(device_va, call);
 +  // sa2-nx (2026-10-20, sa2_renut_snapshot_deltas): made and queued under the chain's lock.
-+  std::unique_lock<std::mutex> chain;
++  ChainGuard chain;
 +  if (DeltasOn())
-+    chain = std::unique_lock<std::mutex>(g_delta.mutex);
++    chain = ChainGuard(g_delta.mutex);
 +  DrawCapture *capture = DeltasOn() ? CaptureDelta(device_va, call) : Capture(device_va, call);
    if (!capture)
      return;
    if (call.up_vertices)
-@@ -141,7 +614,43 @@ void QueueDraw(u32 device_va, const DrawCall &call, u32 up_vertex_bytes, u32 up_
+@@ -141,7 +944,43 @@ void QueueDraw(u32 device_va, const DrawCall &call, u32 up_vertex_bytes, u32 up_
  void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u32 bytes) {
    FlushDeferredVertices(device_va);
    RunReadyCallbacks();
@@ -945,7 +1405,7 @@ index cf17239..d990901 100644
 +  // device is made (every hook flushes its device's deferred draw first), so the render thread still applies the chain
 +  // in order. A draw that will not be queued (no scratch) stays a whole capture outside the chain, as before.
 +  if (DeltasOn() && DeferredChainOn() && scratch) {
-+    std::unique_lock<std::mutex> chain(g_delta.mutex);
++    ChainGuard chain(g_delta.mutex);
 +    {
 +      std::lock_guard lock(g_deferred_mutex);
 +      auto it = g_deferred.find(device_va);
@@ -970,9 +1430,9 @@ index cf17239..d990901 100644
 +  {
 +    // sa2-nx (sa2_renut_snapshot_deltas): a whole capture (queued later than made: outside the chain), whose dirty
 +    // constant groups ClearPending hands to the chain's next delta.
-+    std::unique_lock<std::mutex> chain;
++    ChainGuard chain;
 +    if (DeltasOn())
-+      chain = std::unique_lock<std::mutex>(g_delta.mutex);
++      chain = ChainGuard(g_delta.mutex);
 +    capture = Capture(device_va, call);
 +    if (DeltasOn())
 +      ++g_delta.whole;
@@ -980,7 +1440,7 @@ index cf17239..d990901 100644
    if (!capture)
      return;
    if (!scratch) {
-@@ -152,10 +661,18 @@ void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u
+@@ -152,10 +991,18 @@ void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u
    DeferredDraw &slot = g_deferred[device_va];
    g_capture_pool.Give(slot.capture);  // one not flushed (the original replaced it the same way)
    slot = {capture, scratch, bytes};
@@ -993,13 +1453,13 @@ index cf17239..d990901 100644
 +    return;  // sa2-nx (2026-10-20): none waiting, no lock
 +  // sa2-nx (2026-10-20, sa2_renut_deferred_chain): a chain draw is queued under the chain's lock (taken before the
 +  // deferred map's, as QueueDeferredDraw takes them), so no draw of the chain is made or queued between.
-+  std::unique_lock<std::mutex> chain;
++  ChainGuard chain;
 +  if (DeltasOn() && DeferredChainOn())
-+    chain = std::unique_lock<std::mutex>(g_delta.mutex);
++    chain = ChainGuard(g_delta.mutex);
    DeferredDraw deferred;
    {
      std::lock_guard lock(g_deferred_mutex);
-@@ -164,6 +681,7 @@ void FlushDeferredVertices(u32 device_va) {
+@@ -164,6 +1011,7 @@ void FlushDeferredVertices(u32 device_va) {
        return;
      deferred = std::move(it->second);
      g_deferred.erase(it);
@@ -1007,7 +1467,7 @@ index cf17239..d990901 100644
    }
    deferred.capture->vertices.assign(deferred.scratch, deferred.scratch + deferred.bytes);
    QueueCapture(deferred.capture);
-@@ -187,7 +705,7 @@ void QueueClear(u32 device_va, u32 flags, const ClearRect *rect, const float col
+@@ -187,7 +1035,7 @@ void QueueClear(u32 device_va, u32 flags, const ClearRect *rect, const float col
    render_thread::Queue([args] {
      ClearStateLocked(args->state.data(), args->flags, args->has_rect ? &args->rect : nullptr, args->color,
                       args->depth, args->stencil);
@@ -1016,7 +1476,7 @@ index cf17239..d990901 100644
    });
  }
  
-@@ -225,7 +743,7 @@ void QueueResolve(u32 device_va, u32 flags, const ClearRect *source_rect, u32 de
+@@ -225,7 +1073,7 @@ void QueueResolve(u32 device_va, u32 flags, const ClearRect *source_rect, u32 de
                         args->dest_texture_va, args->has_dest_format ? &args->dest_format : nullptr,
                         args->dest_x, args->dest_y, args->dest_level, args->dest_slice,
                         args->has_color ? args->color : nullptr, args->depth, args->stencil);
@@ -1053,18 +1513,20 @@ index 7a6a4e6..fb833ce 100644
  // call.up_indices, copied now.
  void QueueDraw(u32 device_va, const DrawCall &call, u32 up_vertex_bytes, u32 up_index_bytes);
 diff --git a/app/src/renut_engine/gpu/backend/render_thread.cpp b/app/src/renut_engine/gpu/backend/render_thread.cpp
-index 8ba80b8..54f916b 100644
+index 8ba80b8..35e8abb 100644
 --- a/app/src/renut_engine/gpu/backend/render_thread.cpp
 +++ b/app/src/renut_engine/gpu/backend/render_thread.cpp
-@@ -12,6 +12,7 @@
+@@ -12,14 +12,45 @@
  #include <fmt/format.h>
  #include <string>
  #include <rex/frame_latency.h>
 +#include <rex/input/read_hook.h>  // sa2-nx (2026-10-20): late input on SA2's reads
  #include <vector>
  
++#include "renut_engine/display_sync.h"  // sa2-nx (2026-10-28): the late input's margin (sa2_renut_queue_drain)
  #include "renut_engine/perf/frame_stats.h"
-@@ -20,6 +21,29 @@
+ #include "renut_engine/gpu/guest/guest_memory.h"
+ #include "renut_engine/gpu/log.h"
  #include "renut_engine/gpu/backend/video.h"
  #include "renut_engine/gpu/banjo_renut_tuning.h"
  
@@ -1090,11 +1552,17 @@ index 8ba80b8..54f916b 100644
 +                    "Renut's render thread reads the clock once per batch of work instead of once per item (about "
 +                    "1,800 items a frame in City Escape); its busy time per frame is the same sum")
 +    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sa2_renut_lockfree_queue, true, "SA2/Renderer",
++                    "Renut's render thread takes its work from a lock-free ring (one compare-and-swap a push) instead "
++                    "of a vector under the queue's mutex, which every draw of the game thread took and the render "
++                    "thread took back (two lock round trips a draw on two cores, and the wake decision under the lock). "
++                    "Same order, same wakes. Off: the mutex and the vector")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 +
  #if defined(_WIN32)
  #ifndef NOMINMAX
  #define NOMINMAX
-@@ -39,8 +63,23 @@ using Clock = std::chrono::steady_clock;
+@@ -39,8 +70,23 @@ using Clock = std::chrono::steady_clock;
  struct Item {
    std::function<void()> work;
    bool locked = true;  // run with State().mutex held
@@ -1118,7 +1586,7 @@ index 8ba80b8..54f916b 100644
  std::mutex g_mutex;
  std::condition_variable g_work_cv;  // work queued, or stopping
  // banjo-nx (banjo_renut_queue_notify_idle): the render thread is in g_work_cv.wait (under g_mutex). A push notifies only
-@@ -49,6 +88,19 @@ std::condition_variable g_work_cv;  // work queued, or stopping
+@@ -49,7 +95,66 @@ std::condition_variable g_work_cv;  // work queued, or stopping
  // it has not seen is never missed.
  bool g_render_waiting = false;
  std::condition_variable g_done_cv;  // work done: frames, fences, drains; or stopped
@@ -1136,9 +1604,149 @@ index 8ba80b8..54f916b 100644
 +  return n;
 +}
  std::vector<Item> g_queue;
++
++// sa2-nx (2026-10-28, sa2_renut_lockfree_queue): the queue as a bounded ring of kRingSlots items (D. Vyukov's bounded
++// MPMC queue, with the render thread its one consumer). A push claims the next position with a compare-and-swap, moves
++// its item into the slot and publishes it by the slot's sequence (release); the render thread takes the positions in
++// order (acquire), runs each item in its slot and gives the slot back for the push kRingSlots positions later. The
++// order is the order of the claims, as it was the order of the lock. The 2P console profile had the queue's mutex and
++// vector at 1.4 % of the game thread and its share of the locks (2.5 %) besides, with the render thread on the same
++// lock's cache line at every batch. A full ring (kRingSlots items queued, more than the game thread can be ahead by
++// with one frame queued) would make a pusher wait for the render thread; the render thread itself would run its own item
++// at once instead (logged: never expected).
++// Latched by Start before the thread is made and before g_started's release, which every Push reads first: a plain
++// load (a function-local static's guard is an ldar a call on AArch64; the ARM audit).
++bool g_lockfree = false;
++bool LockfreeOn() {
++  return g_lockfree;
++}
++// The same for the two PushRing reads at every push (banjo-nx's latch is an acquire load each, WakeBatch's static a
++// guard): QueueNotifyIdleOn and WakeBatch, latched by Start.
++bool g_notify_idle = true;
++size_t g_wake_batch = 16;
++// sa2-nx (2026-10-28, the console's first run of the ring): with 32,768 slots (2 MB) every push's slot was a line from
++// memory (a slot came round again nine frames later, long out of the caches): 30 of PushRing's 86 samples were the
++// load of its sequence. A push now prefetches the slot kRingAhead positions on for writing, a few draws before it
++// needs it, and the ring is 16,384 slots (1 MB): still more than two frames of the two-player race's items (about
++// 3,500 a frame), so that a pusher never waits on a full ring while it may hold a lock the render thread's item needs.
++constexpr uint64_t kRingSlots = uint64_t(1) << 14;
++constexpr uint64_t kRingAhead = 8;
++struct alignas(64) RingSlot {
++  std::atomic<uint64_t> seq{0};
++  Item item;
++};
++RingSlot *g_ring = nullptr;                       // made by Start, before the thread runs
++alignas(64) std::atomic<uint64_t> g_enqueue{0};   // the next position a push claims (the items queued)
++alignas(64) std::atomic<uint64_t> g_dequeue{0};   // the next position the render thread takes (its own)
++std::atomic<bool> g_waiting{false};               // the render thread is going to sleep, or asleep, in g_work_cv
++std::atomic<bool> g_accepting{false};             // started and not stopping: pushes go to the ring
++// The slot at 'pos' holds a published item.
++inline bool RingReady(uint64_t pos) {
++  return g_ring[pos & (kRingSlots - 1)].seq.load(std::memory_order_acquire) == pos + 1;
++}
++// The same as the sleeping side's last look: sequentially consistent, so that it is ordered after its store of
++// g_waiting (an ldar after an stlr on AArch64, which needs no barrier between them; a push publishes the same way).
++inline bool RingReadySc(uint64_t pos) {
++  return g_ring[pos & (kRingSlots - 1)].seq.load(std::memory_order_seq_cst) == pos + 1;
++}
++
  std::once_flag g_start_once;
  std::thread::id g_thread_id;
-@@ -108,7 +160,13 @@ void Run() {
+ bool g_running = false;   // the thread takes work
+@@ -92,6 +197,83 @@ void Execute(Item &item) {
+   }
+ }
+ 
++// sa2-nx (2026-10-28, sa2_renut_lockfree_queue): Run with the ring. The items are taken in order as long as they are
++// published, at most kRingRun before the done bookkeeping (Drain's count, the done waiters); with none ready the thread
++// says it is going to sleep (g_waiting), looks once more, and sleeps in g_work_cv under g_mutex: a push that read
++// g_waiting false after publishing (both sides store, then load, sequentially consistent: no store-load reordering) is
++// seen by that last look, and one that read it true takes g_mutex before it notifies, so it cannot notify between the
++// look and the wait.
++constexpr size_t kRingRun = 256;
++void RunRing() {
++  static const bool batch_clock = REXCVAR_GET(sa2_renut_batch_clock);
++  static const bool prefetch = REXCVAR_GET(sa2_renut_prefetch_next);
++  uint64_t pos = g_dequeue.load(std::memory_order_relaxed);
++  for (;;) {
++    if (!RingReady(pos)) {
++      g_waiting.store(true, std::memory_order_seq_cst);
++      bool stopping = false;
++      if (!RingReadySc(pos)) {
++        std::unique_lock lock(g_mutex);
++        g_render_waiting = true;
++        if (WakeBatch() > 1) {
++          // sa2-nx (sa2_renut_wake_batch): draws queued without a wake are taken within 2 ms at the latest.
++          while (!RingReady(pos) && !g_stopping)
++            g_work_cv.wait_for(lock, std::chrono::milliseconds(2));
++        } else {
++          g_work_cv.wait(lock, [pos] { return RingReady(pos) || g_stopping; });
++        }
++        g_render_waiting = false;
++        stopping = g_stopping;
++      }
++      g_waiting.store(false, std::memory_order_relaxed);
++      if (!RingReady(pos)) {
++        if (stopping)
++          break;
++        continue;
++      }
++    }
++    const Clock::time_point start = Clock::now();
++    if (batch_clock)
++      g_item_start = start;
++    size_t n = 0;
++    Clock::time_point item_start = start;
++    do {
++      RingSlot &slot = g_ring[pos & (kRingSlots - 1)];
++      if (prefetch && RingReady(pos + 1))
++        PrefetchItem(g_ring[(pos + 1) & (kRingSlots - 1)].item);
++      if (!batch_clock)
++        g_item_start = item_start;
++      Execute(slot.item);
++      slot.item.work = nullptr;  // the closure's captures go now, as the batch's cleared vector freed them
++      slot.seq.store(pos + kRingSlots, std::memory_order_release);
++      ++pos;
++      g_dequeue.store(pos, std::memory_order_relaxed);
++      ++n;
++      if (!batch_clock) {
++        const Clock::time_point end = Clock::now();
++        g_busy += end - item_start;
++        item_start = end;
++      }
++    } while (n < kRingRun && RingReady(pos));
++    if (batch_clock)
++      g_busy += Clock::now() - start;
++    bool wake;
++    {
++      std::lock_guard lock(g_mutex);
++      g_items_done += n;
++      wake = g_done_waiters > 0 || DoneNotifyAll();
++    }
++    if (wake)
++      g_done_cv.notify_all();
++  }
++  {
++    std::lock_guard lock(g_mutex);
++    g_running = false;
++  }
++  g_accepting.store(false, std::memory_order_release);
++  g_done_cv.notify_all();
++}
++
+ void Run() {
+   {
+     // banjo-nx: the thread may be a plain pthread on the Switch (Start), so it records its own id.
+@@ -103,12 +285,22 @@ void Run() {
+ #endif
+   banjo::renut_gpu::OnRenderThreadStart();  // banjo-nx: its core and priority on the Switch
+   t_render_thread = true;
++  if (LockfreeOn()) {
++    RunRing();
++    return;
++  }
+   std::vector<Item> batch;
+   for (;;) {
      {
        std::unique_lock lock(g_mutex);
        g_render_waiting = true;
@@ -1153,7 +1761,7 @@ index 8ba80b8..54f916b 100644
        g_render_waiting = false;
        if (g_queue.empty())
          break;
-@@ -119,18 +177,36 @@ void Run() {
+@@ -119,18 +311,36 @@ void Run() {
      // first loading screen (a game thread's hook waits on the lock while the render thread's next item waits on it):
      // each item takes the lock on its own, as before.
      Clock::time_point start = Clock::now();
@@ -1196,7 +1804,39 @@ index 8ba80b8..54f916b 100644
      batch.clear();
    }
    {
-@@ -155,15 +231,25 @@ void Start() {
+@@ -140,11 +350,31 @@ void Run() {
+   g_done_cv.notify_all();
+ }
+ 
++// sa2-nx (2026-10-28): set once the thread is started; every Push calls Start, and std::call_once was a libc
++// pthread_once call per draw (0.7 % of the game thread in the 2P console profile). The flag is set after call_once
++// returns (release), so a thread that sees it (acquire) also sees the start's effects, as call_once's return does.
++std::atomic<bool> g_started{false};
++
+ void Start() {
++  if (g_started.load(std::memory_order_acquire)) [[likely]]
++    return;
++  struct SetStarted {
++    ~SetStarted() { g_started.store(true, std::memory_order_release); }
++  };
++  const SetStarted set_started;
+   std::call_once(g_start_once, [] {
+     InstallLateInput();  // banjo-nx (2026-10-19, banjo_late_input): the delay function (it reads the key per frame)
+     std::lock_guard lock(g_mutex);
+     g_running = true;
++    g_lockfree = REXCVAR_GET(sa2_renut_lockfree_queue);
++    g_notify_idle = banjo::renut_gpu::QueueNotifyIdleOn();
++    g_wake_batch = WakeBatch();
++    if (LockfreeOn()) {  // sa2-nx (2026-10-28, sa2_renut_lockfree_queue): the ring, each slot free for its position
++      g_ring = new RingSlot[kRingSlots];
++      for (uint64_t i = 0; i < kRingSlots; ++i)
++        g_ring[i].seq.store(i, std::memory_order_relaxed);
++      g_accepting.store(true, std::memory_order_release);
++    }
+     // Never joined or destroyed: the renderer's objects are left at exit too
+     // (Video::BeginShutdown), and a joinable std::thread destroyed at exit
+     // would terminate the process.
+@@ -155,15 +385,90 @@ void Start() {
    });
  }
  
@@ -1204,13 +1844,78 @@ index 8ba80b8..54f916b 100644
 +// sa2-nx (2026-10-20, sa2_renut_wake_batch): before a thread waits for the render thread, the draws queued without a
 +// wake are handed over. Requires g_mutex.
 +void WakeForWaitLocked() {
++  if (LockfreeOn()) {  // sa2-nx (sa2_renut_lockfree_queue)
++    if (g_render_waiting && g_ring && RingReady(g_dequeue.load(std::memory_order_relaxed)))
++      g_work_cv.notify_one();
++    return;
++  }
 +  if (g_render_waiting && !g_queue.empty())
 +    g_work_cv.notify_one();
++}
++
++// sa2-nx (2026-10-28, sa2_renut_lockfree_queue): Push with the ring; false when the item was not queued (the ring is
++// full and this is the render thread, which cannot wait for itself). The wake decision is Push's: a non-draw item, or
++// WakeBatch draws not yet taken, wakes a render thread that is going to sleep (RunRing says why no wake is lost).
++bool PushRing(Item &&item, bool draw) {
++  uint64_t pos = g_enqueue.load(std::memory_order_relaxed);
++  RingSlot *slot;
++  for (;;) {
++    slot = &g_ring[pos & (kRingSlots - 1)];
++    const uint64_t seq = slot->seq.load(std::memory_order_acquire);
++    const int64_t diff = int64_t(seq - pos);
++    if (diff == 0) {
++      if (g_enqueue.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed))
++        break;
++    } else if (diff < 0) {
++      // Full: the render thread is kRingSlots items behind.
++      if (t_render_thread) {
++        static std::atomic<bool> logged{false};
++        if (!logged.exchange(true))
++          RGPU_WARN("Render thread queue full ({} items): the render thread's own item ran at once "
++                    "(sa2_renut_lockfree_queue)", kRingSlots);
++        return false;
++      }
++      if (g_waiting.load(std::memory_order_seq_cst)) {  // (a signal is a kernel call on the Switch: only to a sleeper)
++        {
++          std::lock_guard lock(g_mutex);
++        }
++        g_work_cv.notify_one();
++      }
++      std::this_thread::yield();
++      pos = g_enqueue.load(std::memory_order_relaxed);
++    } else {
++      pos = g_enqueue.load(std::memory_order_relaxed);
++    }
++  }
++  // The slot kRingAhead positions on, into this core's cache for writing while this one is filled (its line was last
++  // the render thread's).
++  __builtin_prefetch(&g_ring[(pos + kRingAhead) & (kRingSlots - 1)], 1);
++  slot->item = std::move(item);
++  // Published, then g_waiting read: a sequentially consistent store and load (stlr, ldar: no dmb), RunRing's order.
++  slot->seq.store(pos + 1, std::memory_order_seq_cst);
++  const bool wake = (g_waiting.load(std::memory_order_seq_cst) &&
++                     (!draw || pos + 1 - g_dequeue.load(std::memory_order_relaxed) >= g_wake_batch)) ||
++                    !g_notify_idle;
++  if (wake) {
++    {
++      std::lock_guard lock(g_mutex);
++    }
++    g_work_cv.notify_one();
++  }
++  return true;
 +}
 +
 +void Push(std::function<void()> work, bool locked, const void *prefetch0 = nullptr,
 +          const void *prefetch1 = nullptr, bool draw = false) {
    Start();
++  if (LockfreeOn()) {  // sa2-nx (sa2_renut_lockfree_queue)
++    Item item{std::move(work), locked, {prefetch0, prefetch1}};
++    if (g_accepting.load(std::memory_order_acquire) && PushRing(std::move(item), draw))
++      return;
++    // Stopping, or the render thread's own item in a full ring: run here, as a push while stopping did.
++    Execute(item);
++    return;
++  }
    {
      std::unique_lock lock(g_mutex);
      // (Work queued by the render thread's own work runs after it.)
@@ -1225,7 +1930,7 @@ index 8ba80b8..54f916b 100644
        lock.unlock();
        if (wake)
          g_work_cv.notify_one();
-@@ -171,7 +257,7 @@ void Push(std::function<void()> work, bool locked) {
+@@ -171,7 +476,7 @@ void Push(std::function<void()> work, bool locked) {
      }
    }
    // Shutting down: nothing takes work any more, so run it here.
@@ -1234,7 +1939,7 @@ index 8ba80b8..54f916b 100644
    Execute(item);
  }
  
-@@ -185,8 +271,13 @@ void QueueUnlocked(std::function<void()> work) {
+@@ -185,8 +490,13 @@ void QueueUnlocked(std::function<void()> work) {
    Push(std::move(work), false);
  }
  
@@ -1248,7 +1953,7 @@ index 8ba80b8..54f916b 100644
      {
        std::lock_guard lock(g_mutex);
        // Fences complete in order: behind one still waiting, this one waits too.
-@@ -194,19 +285,24 @@ void QueueFenceCompletion(u32 completion_va, u32 fence, uint64_t after_callback)
+@@ -194,19 +504,24 @@ void QueueFenceCompletion(u32 completion_va, u32 fence, uint64_t after_callback)
          WriteFence(completion_va, fence);
        else
          g_pending_fences.push_back({completion_va, fence, after_callback});
@@ -1275,7 +1980,7 @@ index 8ba80b8..54f916b 100644
    });
  }
  
-@@ -216,6 +312,7 @@ uint64_t CallbacksReached() {
+@@ -216,6 +531,7 @@ uint64_t CallbacksReached() {
  }
  
  void CallbacksRun(uint64_t seq) {
@@ -1283,7 +1988,7 @@ index 8ba80b8..54f916b 100644
    {
      std::lock_guard lock(g_mutex);
      g_callbacks_run = std::max(g_callbacks_run, seq);
-@@ -227,8 +324,10 @@ void CallbacksRun(uint64_t seq) {
+@@ -227,8 +543,10 @@ void CallbacksRun(uint64_t seq) {
        WriteFence(p.completion_va, p.fence);
      }
      g_pending_fences.erase(g_pending_fences.begin(), g_pending_fences.begin() + written);
@@ -1295,7 +2000,7 @@ index 8ba80b8..54f916b 100644
  }
  
  bool WaitForFenceProgress(std::chrono::milliseconds timeout) {
-@@ -236,8 +335,11 @@ bool WaitForFenceProgress(std::chrono::milliseconds timeout) {
+@@ -236,8 +554,11 @@ bool WaitForFenceProgress(std::chrono::milliseconds timeout) {
    if (!g_running || g_stopping)
      return false;
    const uint64_t seen = g_fences_done;
@@ -1307,7 +2012,20 @@ index 8ba80b8..54f916b 100644
    return g_running && !g_stopping;
  }
  
-@@ -283,6 +385,12 @@ uint32_t LateInputDelay() {
+@@ -273,7 +594,11 @@ uint32_t LateInputDelay() {
+     least = std::min(least, s);
+   const uint64_t interval = g_frame_interval_us.load(std::memory_order_relaxed);
+   const uint64_t ceiling = std::min(kLateInputCeilingUs, interval * 4 / 5);
+-  const uint64_t delay = least > kLateInputMarginUs ? std::min(least - kLateInputMarginUs, ceiling) : 0;
++  // sa2-nx (2026-10-28, sa2_renut_queue_drain, after ketsui-nx's display guard): with double buffering, 1 ms more margin
++  // at each image late at its refresh (0.25 ms back after 180 in time), so a delayed read cannot push the frames back
++  // into the late queue; 0 otherwise.
++  const uint64_t margin = kLateInputMarginUs + banjo::display_sync::LateInputGuardUs();
++  const uint64_t delay = least > margin ? std::min(least - margin, ceiling) : 0;
+   g_applied_delay_us.store(uint32_t(delay), std::memory_order_relaxed);
+   g_delay_total_us.fetch_add(delay, std::memory_order_relaxed);
+   g_delay_frames.fetch_add(1, std::memory_order_relaxed);
+@@ -283,6 +608,12 @@ uint32_t LateInputDelay() {
  
  void InstallLateInput() {
    rex::latency::SetFrameReadDelayFunction(&LateInputDelay);
@@ -1320,7 +2038,7 @@ index 8ba80b8..54f916b 100644
  }
  
  std::string LateInputReport() {
-@@ -309,17 +417,23 @@ uint64_t QueueFrame(std::function<void()> work) {
+@@ -309,17 +640,23 @@ uint64_t QueueFrame(std::function<void()> work) {
      g_busy = -so_far;
      g_waited = {};
      frame_stats::OnRenderThreadFrame(busy_ms);
@@ -1345,10 +2063,13 @@ index 8ba80b8..54f916b 100644
    const uint64_t done = g_frames_done;
    lock.unlock();
    const auto waited = std::chrono::steady_clock::now() - waiting;
-@@ -355,7 +469,10 @@ void Drain() {
+@@ -354,8 +691,12 @@ void Drain() {
+   std::unique_lock lock(g_mutex);
    if (!g_running || std::this_thread::get_id() == g_thread_id)
      return;
-   const uint64_t target = g_items_queued;
+-  const uint64_t target = g_items_queued;
++  // sa2-nx (sa2_renut_lockfree_queue): with the ring, the items queued are its claimed positions.
++  const uint64_t target = LockfreeOn() ? g_enqueue.load(std::memory_order_acquire) : g_items_queued;
 +  WakeForWaitLocked();  // sa2-nx (sa2_renut_wake_batch)
 +  ++g_done_waiters;  // sa2-nx (sa2_renut_done_notify_waiters)
    g_done_cv.wait(lock, [target] { return !g_running || g_items_done >= target; });
@@ -1356,6 +2077,14 @@ index 8ba80b8..54f916b 100644
  }
  
  WaitScope::WaitScope() : start_(Clock::now()), counted_(t_render_thread) {}
+@@ -372,6 +713,7 @@ void Stop() {
+       return;
+     g_stopping = true;
+   }
++  g_accepting.store(false, std::memory_order_release);  // sa2-nx (sa2_renut_lockfree_queue): later pushes run inline
+   g_work_cv.notify_all();
+   g_done_cv.notify_all();
+ }
 diff --git a/app/src/renut_engine/gpu/backend/render_thread.h b/app/src/renut_engine/gpu/backend/render_thread.h
 index d912a2c..93094c8 100644
 --- a/app/src/renut_engine/gpu/backend/render_thread.h
@@ -3598,7 +4327,7 @@ index 2adaac2..dd7308c 100644
  
    struct Frame;
 diff --git a/app/src/renut_engine/gpu/render/draw.cpp b/app/src/renut_engine/gpu/render/draw.cpp
-index 97120ed..004f797 100644
+index 97120ed..eb62a62 100644
 --- a/app/src/renut_engine/gpu/render/draw.cpp
 +++ b/app/src/renut_engine/gpu/render/draw.cpp
 @@ -35,6 +35,7 @@
@@ -3609,7 +4338,7 @@ index 97120ed..004f797 100644
  #include "renut_engine/gpu/guest/guest_records.h"
  #include "renut_engine/gpu/log.h"
  #include "renut_engine/gpu/render/pipeline.h"
-@@ -66,10 +67,65 @@ REXCVAR_DEFINE_INT32(banjo_renut_diag_draw_log_s, 0, "Banjo/Renut",
+@@ -66,10 +67,116 @@ REXCVAR_DEFINE_INT32(banjo_renut_diag_draw_log_s, 0, "Banjo/Renut",
  REXCVAR_DEFINE_STRING(banjo_renut_diag_blend_skip_exclude, "", "Banjo/Renut",
                        "Diagnostic: pixel shader hashes (hex, comma separated) banjo_gpu_blend_skip leaves alone");
  
@@ -3651,6 +4380,36 @@ index 97120ed..004f797 100644
 +                    "alignment census) are kept only while those lines are logged (log_level info or lower), and the "
 +                    "draw and stream dumps' checks are made once instead of a call per draw")
 +    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sa2_renut_lazy_resolve_mips, true, "SA2/Renderer",
++                    "Renut's renderer at a render scale above 1 (docked 1080p): a colour resolve leaves its "
++                    "destination's host mip levels to be made when a draw first samples it (or before anything else "
++                    "writes it), not at every resolve: the front buffer, which only the present reads (level 0, 1:1), "
++                    "and copies nothing samples no longer make them each frame (a draw and, on deko3d, a copy-engine "
++                    "copy with a full barrier each side, per resolve). The same levels where they are read. Off: at "
++                    "every resolve")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sa2_renut_clear_repeat, true, "SA2/Renderer",
++                    "Renut's renderer: a whole clear of a target that holds exactly that clear already (its last whole "
++                    "clear had the same values, and nothing has drawn into it or replaced its image since) is not sent "
++                    "to the GPU (SA2 clears its scene target whole twice at the start of each frame). The same pixels. "
++                    "Off: every clear sent")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sa2_renut_direct_resolve_mips, true, "SA2/Renderer",
++                    "Renut's renderer on deko3d at a render scale above 1 (docked 1080p): a resolve destination's host "
++                    "mip levels are drawn straight into the texture's own levels (render/textures.cpp "
++                    "UpdateResolveMipsDirectLocked) instead of into a scratch target copied into the level on the copy "
++                    "engine, which plume fences with a full barrier on each side. The same texels. Off: the scratch "
++                    "target and the copy")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(sa2_renut_colour_handover, true, "SA2/Renderer",
++                    "Renut's renderer: a resolve of a whole single-sampled colour target into a destination of its "
++                    "size is not copied: the destination's content stays in the target's image (the present and the "
++                    "draws that sample it read it there), and at the target's next whole clear the destinations take "
++                    "that image and the target gets their previous one (render/draw.cpp, \"Colour hand-over\"). The "
++                    "frame's two copies of the scene (the front buffer and its copy) and the 512x512 passes' copies "
++                    "are swaps of images. A draw into the target before then, or a sample that needs the copy's own "
++                    "texture, copies it as before. The same pixels. Off: every resolve copied")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 +
 +REXCVAR_DECLARE(bool, sa2_renut_neon_compare);  // sa2-nx (2026-10-20): backend/queued.cpp
 +
@@ -3672,10 +4431,31 @@ index 97120ed..004f797 100644
 +  return on;
 +}
 +
++// sa2-nx (2026-10-28): sa2_renut_lazy_resolve_mips, once.
++bool LazyResolveMipsOn() {
++  static const bool on = REXCVAR_GET(sa2_renut_lazy_resolve_mips);
++  return on;
++}
++// sa2-nx (2026-10-28): sa2_renut_colour_handover, once.
++bool ColourHandOverOn() {
++  static const bool on = REXCVAR_GET(sa2_renut_colour_handover);
++  return on;
++}
++// sa2-nx (2026-10-28): sa2_renut_clear_repeat, once, and its count (render thread), logged every 3,000.
++bool ClearRepeatOn() {
++  static const bool on = REXCVAR_GET(sa2_renut_clear_repeat);
++  return on;
++}
++void CountRepeatedClear() {
++  static uint64_t count = 0;
++  if (++count % 3000 == 1)
++    RGPU_INFO("[renut] clears of a target that held that clear already, not sent: {} (sa2_renut_clear_repeat)", count);
++}
++
  // banjo_renut_diag_blend_skip_exclude: the pixel shader's hash is in the list (read once).
  bool BlendSkipExcluded(const void *pixel_shader) {
    static const std::unordered_set<uint64_t> excluded = [] {
-@@ -1097,6 +1153,15 @@ bool GatherTargets(const GuestDevice &device, Targets &t) {
+@@ -1097,6 +1204,15 @@ bool GatherTargets(const GuestDevice &device, Targets &t) {
    }
    t.guest_width = d3d::SurfaceWidth(first->size_word);
    t.guest_height = d3d::SurfaceHeight(first->size_word);
@@ -3691,7 +4471,18 @@ index 97120ed..004f797 100644
    return true;
  }
  
-@@ -1141,7 +1206,48 @@ bool BindTargets(const Targets &t) {
+@@ -1133,6 +1249,10 @@ uint32_t ShaderProfileLabel(const Targets &t, const ShaderRecord *ps, const Pipe
+ bool BindTargets(const Targets &t) {
+   if (t.depth && t.depth->handed)
+     DepthHandOverBeforeBindLocked(t.depth, nullptr, 0);  // banjo-nx (2026-10-19, banjo_deko3d_depth_handover)
++  for (uint32_t i = 0; i < t.color_count; ++i) {  // sa2-nx (2026-10-28, sa2_renut_colour_handover)
++    if (t.colors[i] && t.colors[i]->handed)
++      ColourHandOverBeforeBindLocked(t.colors[i], false);
++  }
+   // banjo-nx: with banjo_renut_diag_gpu_shaders the draw marks its own label (ShaderProfileLabel), the pass's name
+   // in it, which saves a timestamp a draw.
+   if (!banjo::renut_gpu::DiagGpuShadersOn() && gpu_profile::Timed())
+@@ -1141,7 +1261,48 @@ bool BindTargets(const Targets &t) {
      TransitionSurfaceLocked(t.colors[i], plume::RenderTextureLayout::COLOR_WRITE);
    if (t.depth)
      TransitionSurfaceLocked(t.depth, plume::RenderTextureLayout::DEPTH_WRITE);
@@ -3741,7 +4532,7 @@ index 97120ed..004f797 100644
    if (!framebuffer)
      return false;
    if (banjo::renut_gpu::ResolveTraceOn() && g_bound.framebuffer != framebuffer) {
-@@ -1633,7 +1739,13 @@ void PushFloatConstants(plume::RenderCommandList *cmd, const FloatConstants &con
+@@ -1633,7 +1794,13 @@ void PushFloatConstants(plume::RenderCommandList *cmd, const FloatConstants &con
    const uint64_t dirty = tracked ? *constants.dirty : ~uint64_t(0);
    // The groups to update (bit 63 - group, as UsedGroups).
    uint64_t push = 0;
@@ -3756,7 +4547,7 @@ index 97120ed..004f797 100644
      const u32 bit = u32(std::countr_zero(check));
      const u32 group = 63 - bit;
      const u32 lits = own_literals ? (own_literals[group / 8] >> (group % 8 * 4)) & 0xFu : 0u;
-@@ -1714,7 +1826,8 @@ void PushFloatConstants(plume::RenderCommandList *cmd, const FloatConstants &con
+@@ -1714,7 +1881,8 @@ void PushFloatConstants(plume::RenderCommandList *cmd, const FloatConstants &con
    // of the draws read one stale).
    if (constants.replay) {
      const uint64_t unsure = (tracked ? dirty : ~uint64_t(0)) & ~push;
@@ -3766,7 +4557,7 @@ index 97120ed..004f797 100644
        last.valid[word] &= ~kGroupByteRegisters[u32(unsure >> (56 - word * 8)) & 0xFFu] | used[word];
      last.replay = constants.replay;
      *constants.dirty = 0;
-@@ -1750,9 +1863,31 @@ void PushFloatConstants(plume::RenderCommandList *cmd, const FloatConstants &con
+@@ -1750,9 +1918,31 @@ void PushFloatConstants(plume::RenderCommandList *cmd, const FloatConstants &con
  }
  
  // SharedConstants: the lines that differ from what the buffer holds.
@@ -3799,7 +4590,7 @@ index 97120ed..004f797 100644
    const uint64_t ubo = g_pushed_buffers.address + kPushedSharedOffset;
    const u8 *now = reinterpret_cast<const u8 *>(&sc);
    u8 *held = reinterpret_cast<u8 *>(&g_bound.pushed_shared);
-@@ -1765,7 +1900,7 @@ void PushSharedConstants(plume::RenderCommandList *cmd, const SharedConstants &s
+@@ -1765,7 +1955,7 @@ void PushSharedConstants(plume::RenderCommandList *cmd, const SharedConstants &s
    } else {
      for (u32 at = 0; at < kSize;) {
        const u32 n = std::min(kLine, kSize - at);
@@ -3808,7 +4599,7 @@ index 97120ed..004f797 100644
          at += n;
          continue;
        }
-@@ -1773,7 +1908,7 @@ void PushSharedConstants(plume::RenderCommandList *cmd, const SharedConstants &s
+@@ -1773,7 +1963,7 @@ void PushSharedConstants(plume::RenderCommandList *cmd, const SharedConstants &s
        u32 end = at + n;
        while (end < kSize) {
          const u32 m = std::min(kLine, kSize - end);
@@ -3817,7 +4608,7 @@ index 97120ed..004f797 100644
            break;
          end += m;
        }
-@@ -1817,12 +1952,40 @@ struct TextureSlotMemo {
+@@ -1817,12 +2007,40 @@ struct TextureSlotMemo {
  constexpr uint32_t kTextureMemoEntries = 512;
  TextureSlotMemo g_texture_slot_memo[kTextureMemoEntries];
  
@@ -3864,7 +4655,7 @@ index 97120ed..004f797 100644
    }
    const d3d::Device &dev = device.dev();
    for (u32 r = 0; r < d3d::kTextureFetchSlots; ++r) {
-@@ -1834,6 +1997,8 @@ void FillTextures(const GuestDevice &device, u32 fetch_mask, SharedConstants &sc
+@@ -1834,6 +2052,8 @@ void FillTextures(const GuestDevice &device, u32 fetch_mask, SharedConstants &sc
      TextureSlotMemo &m =
          g_texture_slot_memo[((texture_va ^ (fetch.dword[0] * 0x85EBCA6Bu) ^ fetch.dword[1]) * 0x9E3779B1u) >> 23];
      const bool memo = banjo::renut_gpu::CpuMemosOn() && header;
@@ -3873,7 +4664,7 @@ index 97120ed..004f797 100644
      if (memo && m.frame == TextureFrameLocked() && m.epoch == g_texture_epoch && m.va == texture_va &&
          (!m.fx.depth_source || m.depth_epoch == g_depth_epoch) &&
          std::memcmp(m.device, fetch.dword, sizeof(m.device)) == 0 &&
-@@ -1853,10 +2018,14 @@ void FillTextures(const GuestDevice &device, u32 fetch_mask, SharedConstants &sc
+@@ -1853,10 +2073,14 @@ void FillTextures(const GuestDevice &device, u32 fetch_mask, SharedConstants &sc
          banjo::renut_gpu::CountDepthWords(true);
        sc.texture_indices[m.dim][r] = m.index;
        sc.sampler_indices[r] = m.sampler;
@@ -3888,7 +4679,7 @@ index 97120ed..004f797 100644
      const uint32_t dim = binding.dimension == TextureDimension::Tex3D  ? 1
                           : binding.dimension == TextureDimension::Cube ? 2
                                                                         : 0;
-@@ -2431,7 +2600,11 @@ bool BindStreams(const GuestDevice &device, const DrawCall &call, const ShaderRe
+@@ -2431,7 +2655,11 @@ bool BindStreams(const GuestDevice &device, const DrawCall &call, const ShaderRe
                   const u32 *shader_strides, const HostVertexLayout &layout, uint64_t layout_hash,
                   const Geometry &g, const GpuStreams &gpu_streams) {
    plume::RenderCommandList *cmd = State().command_list;
@@ -3901,7 +4692,7 @@ index 97120ed..004f797 100644
      const HostVertexStream &hs = layout.streams[stream];
      if (!hs.used)
        continue;
-@@ -2468,7 +2641,10 @@ bool BindStreams(const GuestDevice &device, const DrawCall &call, const ShaderRe
+@@ -2468,7 +2696,10 @@ bool BindStreams(const GuestDevice &device, const DrawCall &call, const ShaderRe
      const u8 *guest = fills ? src.data + size_t(first) * src.stride : nullptr;
      const bool queued = fills && !(stream == 0 && call.up_vertices);
      const StreamKey key{guest, layout_hash, stream, src.stride, count, src.endian};
@@ -3913,7 +4704,7 @@ index 97120ed..004f797 100644
      CachedStream *cached = nullptr;
      if (queued && src.stride) {
        cached = &g_stream_memo.Get(g_stream_cache, key, true)->second;
-@@ -2919,6 +3095,16 @@ PipelineKey MakeKey(const GuestDevice &device, const ShaderRecord *vs, const Sha
+@@ -2919,6 +3150,16 @@ PipelineKey MakeKey(const GuestDevice &device, const ShaderRecord *vs, const Sha
    // without the test (7) no compare and no discard, and the GPU tests depth before the pixel shader.
    if (ps && banjo::renut_gpu::AlphaSpecOn())
      key.alpha_func = alpha_test_func + 1;
@@ -3930,7 +4721,7 @@ index 97120ed..004f797 100644
    return key;
  }
  
-@@ -3758,6 +3944,12 @@ u32 SetReplayPredicationLocked(u32 mask) {
+@@ -3758,6 +3999,12 @@ u32 SetReplayPredicationLocked(u32 mask) {
  bool DrawsWithoutPixelShader(const GuestDevice &device, const Targets &t, const ShaderRecord &ps) {
    if (!t.depth || !ps.entry || !banjo::renut_gpu::DepthOnlyOn())
      return false;
@@ -3943,7 +4734,7 @@ index 97120ed..004f797 100644
    const ShaderCacheEntry &e = *ps.entry;
    if (e.shaderFlags & (kShaderFlagPixelKill | kShaderFlagPixelDepth))
      return false;
-@@ -3765,10 +3957,6 @@ bool DrawsWithoutPixelShader(const GuestDevice &device, const Targets &t, const
+@@ -3765,10 +4012,6 @@ bool DrawsWithoutPixelShader(const GuestDevice &device, const Targets &t, const
      if (m)
        return false;
    }
@@ -3954,7 +4745,7 @@ index 97120ed..004f797 100644
    const u32 color_control = dev.m_ControlPacket.ColorControl;
    if ((color_control & 8) && (color_control & 7) != 7)  // the alpha test, as sc.alpha_test_func
      return false;
-@@ -3809,6 +3997,44 @@ void DrawLog(const DrawCall &call, const Geometry &geometry, const ShaderRecord
+@@ -3809,6 +4052,44 @@ void DrawLog(const DrawCall &call, const Geometry &geometry, const ShaderRecord
              export_count);
  }
  
@@ -3999,7 +4790,7 @@ index 97120ed..004f797 100644
  bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayConstants *replay) {
    ++g_trace_draws;
    auto &s = State();
-@@ -3828,6 +4054,9 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
+@@ -3828,6 +4109,9 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
      if (declaration_va != g_last_declaration_va) {
        g_last_declaration =
            FindRecord<VertexDeclarationRecord>(declaration_va, RecordKind::VertexDeclaration);
@@ -4009,7 +4800,7 @@ index 97120ed..004f797 100644
        g_last_declaration_va = g_last_declaration ? declaration_va : 0;
      }
      declaration = g_last_declaration_va == declaration_va ? g_last_declaration : nullptr;
-@@ -3863,7 +4092,6 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
+@@ -3863,7 +4147,6 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
      }
      return false;
    }
@@ -4017,7 +4808,7 @@ index 97120ed..004f797 100644
    // Earlier memexport results reach guest memory before this draw reads them
    // (WaitForExportsLocked may submit the list: before anything is recorded).
    const FloatConstants vs_constants = DrawFloatConstants(device_state, replay, false);
-@@ -3902,9 +4130,102 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
+@@ -3902,9 +4185,102 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
    if (!host_vs || (ps && !host_ps))
      return false;  // missing from the shader cache (captured for the next build)
  
@@ -4122,7 +4913,7 @@ index 97120ed..004f797 100644
    // banjo-nx (banjo_gpu_depth_only): before anything of the pixel shader is set up.
    if (ps && DrawsWithoutPixelShader(device, targets, *ps)) {
      ps = nullptr;
-@@ -3914,12 +4235,108 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
+@@ -3914,12 +4290,108 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
  
    // Everything that records copies or barriers comes before the framebuffer.
    SharedConstants sc;
@@ -4233,7 +5024,7 @@ index 97120ed..004f797 100644
    g_handover_targets = nullptr;
  
    const d3d::Device &dev = device.dev();
-@@ -3943,7 +4360,43 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
+@@ -3943,7 +4415,43 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
        sc.alpha_threshold = 0.5f;
      }
    }
@@ -4278,7 +5069,7 @@ index 97120ed..004f797 100644
    sc.screen_space = viewport.screen_space ? 1 : 0;
    std::memcpy(sc.screen_scale, viewport.screen_scale, sizeof(sc.screen_scale));
    std::memcpy(sc.screen_offset, viewport.screen_offset, sizeof(sc.screen_offset));
-@@ -4005,11 +4458,26 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
+@@ -4005,11 +4513,26 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
    // indexed by the address's low word (shader_common.h, g_DkAddressWindow): the binding starts at the address rounded
    // down to 256 bytes, and the word becomes the offset from there. One binding over every buffer (runs 14-15) cost
    // Ryujinx ~12 s a frame: it brings a storage binding's whole range up to date with guest memory at each draw.
@@ -4306,7 +5097,7 @@ index 97120ed..004f797 100644
    }
  #endif
    static constexpr u32 kAllRegisters[8] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
-@@ -4059,7 +4527,22 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
+@@ -4059,7 +4582,22 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
    UploadAllocation sc_alloc;
    if (pushed) {
  #if defined(PLUME_DEKO3D)
@@ -4330,7 +5121,7 @@ index 97120ed..004f797 100644
  #endif
      // The 10 s line's draw count is the uploads plus the reuses: a pushed draw counts as an upload (package 35 logged
      // about 2,800 draws where there were 250,000).
-@@ -4080,10 +4563,73 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
+@@ -4080,10 +4618,73 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
    if (!fetch_alloc || (!pushed && (!vs_alloc || !ps_alloc || !sc_alloc)) || !memexport)
      return false;
  
@@ -4408,7 +5199,7 @@ index 97120ed..004f797 100644
      // banjo-nx (package 28, a census): draws that write no colour, nothing at all, or part of a target's channels.
      const u32 used_mask = key.color_count ? key.color_mask & ((1u << (4 * key.color_count)) - 1u) : 0u;
      const bool no_colour = used_mask == 0;
-@@ -4103,8 +4649,35 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
+@@ -4103,8 +4704,35 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
                                      !key.alpha_to_coverage && ps != nullptr,
                                      no_colour && !depth_writes && !stencil_writes && !exports, partial);
    }
@@ -4446,7 +5237,7 @@ index 97120ed..004f797 100644
    if (!pipeline || !BindTargets(targets))
      return false;
    plume::RenderCommandList *cmd = s.command_list;
-@@ -4200,7 +4773,11 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
+@@ -4200,7 +4828,11 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
        gpu_profile::Mark(s, label);
      gpu_profile::CountDraw(s, label);
    }
@@ -4459,7 +5250,7 @@ index 97120ed..004f797 100644
    // banjo-nx (2026-10-19, banjo_renut_resolve_skip): the targets this draw can write.
    for (u32 i = 0; i < targets.color_count && i < key.color_count; ++i)
      if ((key.color_mask >> (4 * i)) & 0xF)
-@@ -4245,7 +4822,8 @@ void CompleteMemExportsLocked(uint32_t slot) {
+@@ -4245,7 +4877,8 @@ void CompleteMemExportsLocked(uint32_t slot) {
      for (const PendingExport &p : exports.pending) {
        if (u8 *guest = GuestPhysicalPtr<u8>(p.base)) {
          std::memcpy(guest, data + p.offset, p.size);
@@ -4469,7 +5260,535 @@ index 97120ed..004f797 100644
        }
      }
      readback->unmap();
-@@ -5179,6 +5757,11 @@ bool ReadRenderTargetLocked(const u8 *device_state, u32 source, u32 &width, u32
+@@ -4389,14 +5022,21 @@ namespace {
+ void ClearTargets(const Targets &t, u32 flags, const plume::RenderRect &rect, const float color[4],
+                   float depth, u32 stencil) {
+   if (banjo::renut_gpu::ResolveTraceOn()) {
+-    RGPU_INFO("[trace] clear {:X} rect ({},{})-({},{}) of {}x{}", flags, rect.left, rect.top, rect.right, rect.bottom,
+-              t.width, t.height);
++    RGPU_INFO("[trace] clear {:X} rect ({},{})-({},{}) of {}x{}, colour {} {} {} {}, depth {}, stencil {}", flags,
++              rect.left, rect.top, rect.right, rect.bottom, t.width, t.height, color[0], color[1], color[2], color[3],
++              depth, stencil);  // sa2-nx (2026-10-28): the values too
+   }
+   if (rect.right <= rect.left || rect.bottom <= rect.top)
+     return;
+   // banjo-nx (2026-10-19, banjo_deko3d_depth_handover): before the target is bound for the clear.
+   if (t.depth && t.depth->handed)
+     DepthHandOverBeforeBindLocked(t.depth, &rect, flags);
++  // sa2-nx (2026-10-28, sa2_renut_colour_handover): a clear of a target's whole colour: its destinations take the image.
++  for (uint32_t i = 0; i < t.color_count; ++i) {
++    if (t.colors[i] && t.colors[i]->handed && (flags & (1u << i)) && rect.left <= 0 && rect.top <= 0 &&
++        rect.right >= int32_t(t.colors[i]->width) && rect.bottom >= int32_t(t.colors[i]->height))
++      ColourHandOverBeforeBindLocked(t.colors[i], true);
++  }
+   if (t.depth && (flags & 0x20))
+     t.depth->stencil_used = true;
+   if (!BindTargets(t))
+@@ -4408,11 +5048,30 @@ void ClearTargets(const Targets &t, u32 flags, const plume::RenderRect &rect, co
+   static std::vector<HostSurface *> aliases;
+   static std::vector<HostSurface *> found;
+   aliases.clear();
++  // sa2-nx (2026-10-28, sa2_renut_clear_repeat): a whole clear of a target that holds exactly that clear already (its
++  // last whole clear had the same values, and neither a write nor a new image since: writes and generation as that
++  // clear left them) is not sent; everything else about it is as before. SA2 clears its scene target whole twice at
++  // the start of a frame. Draws and clears are what count a target's writes; a hand-over or a rebuild changes its
++  // generation.
++  const bool repeat_on = ClearRepeatOn();
++  const auto whole = [&](const HostSurface *s) {
++    return rect.left <= 0 && rect.top <= 0 && rect.right >= int32_t(s->width) && rect.bottom >= int32_t(s->height);
++  };
+   for (uint32_t i = 0; i < t.color_count; ++i) {
+     if (!(flags & (1u << i)))
+       continue;
+-    ++t.colors[i]->writes;  // banjo-nx (banjo_renut_resolve_skip)
+-    cmd->clearColor(i, clear_color, &host_rect, 1);
++    HostSurface *c = t.colors[i];
++    const bool repeat = repeat_on && whole(c) && c->clear_known && c->clear_generation == c->generation &&
++                        c->clear_writes == c->writes && std::memcmp(c->clear_color, color, sizeof(c->clear_color)) == 0;
++    ++c->writes;  // banjo-nx (banjo_renut_resolve_skip)
++    if (repeat)
++      CountRepeatedClear();
++    else
++      cmd->clearColor(i, clear_color, &host_rect, 1);
++    c->clear_known = whole(c);
++    c->clear_generation = c->generation;
++    c->clear_writes = c->writes;
++    std::memcpy(c->clear_color, color, sizeof(c->clear_color));
+     ColorAliasesLocked(t.colors[i], found);
+     for (HostSurface *alias : found) {
+       if (std::find(aliases.begin(), aliases.end(), alias) == aliases.end() &&
+@@ -4421,9 +5080,35 @@ void ClearTargets(const Targets &t, u32 flags, const plume::RenderRect &rect, co
+     }
+   }
+   if (t.depth && (flags & 0x30)) {
+-    ++t.depth->writes;  // banjo-nx (banjo_renut_resolve_skip)
+-    cmd->clearDepthStencil((flags & 0x10) != 0, (flags & 0x20) != 0, depth, stencil & 0xFF,
+-                           &host_rect, 1);
++    HostSurface *d = t.depth;
++    const bool zc = (flags & 0x10) != 0, sc = (flags & 0x20) != 0;
++    const bool same = whole(d) && d->clear_generation == d->generation && d->clear_writes == d->writes;
++    const bool repeat = repeat_on && same &&
++                        (!zc || (d->clear_depth_known && std::memcmp(&d->clear_depth, &depth, sizeof(depth)) == 0)) &&
++                        (!sc || (d->clear_stencil_known && d->clear_stencil == (stencil & 0xFF)));
++    ++d->writes;  // banjo-nx (banjo_renut_resolve_skip)
++    if (repeat)
++      CountRepeatedClear();
++    else
++      cmd->clearDepthStencil(zc, sc, depth, stencil & 0xFF, &host_rect, 1);
++    // sa2-nx (sa2_renut_clear_repeat): what the target holds now; a part it did not clear keeps what was known of it
++    // only while the image and its writes are the ones that knowledge was of.
++    if (!whole(d)) {
++      d->clear_depth_known = d->clear_stencil_known = false;
++    } else {
++      if (!same)
++        d->clear_depth_known = d->clear_stencil_known = false;
++      if (zc) {
++        d->clear_depth_known = true;
++        d->clear_depth = depth;
++      }
++      if (sc) {
++        d->clear_stencil_known = true;
++        d->clear_stencil = stencil & 0xFF;
++      }
++    }
++    d->clear_generation = d->generation;
++    d->clear_writes = d->writes;
+   }
+   for (HostSurface *alias : aliases) {
+     Targets a;
+@@ -4438,6 +5123,7 @@ void ClearTargets(const Targets &t, u32 flags, const plume::RenderRect &rect, co
+       continue;
+     const plume::RenderRect alias_host = ScaleRect(alias_rect, a.scale);
+     ++alias->writes;  // banjo-nx (banjo_renut_resolve_skip)
++    alias->clear_known = false;  // sa2-nx (sa2_renut_clear_repeat): not followed through aliases
+     cmd->clearColor(0, clear_color, &alias_host, 1);
+   }
+ }
+@@ -4850,6 +5536,23 @@ uint32_t DepthHandOverSlotLocked(HostTexture &d, const plume::RenderComponentMap
+   return slot;
+ }
+ 
++// sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips): the levels the resolves since the last ones left, from level 0 as
++// it is now: the same as at those resolves, since only resolves (each widening the region) wrote level 0 since; an
++// upload or words copy into it makes them first. The union of the regions is made: outside the resolves' rectangles
++// level 0 is unchanged since the levels there were last made, so those come out as they were. Every draw that samples
++// the texture binds it first (BindTextureLocked); the present reads the front buffer's level 0 only (1:1 scan-out).
++void FlushResolveMipsLocked(HostTexture &t) {
++  if (!t.mips_pending)
++    return;
++  t.mips_pending = false;
++  UpdateResolveMipsLocked(&t, t.mips_rect);
++  // The draw path binds its own targets, layout, pipeline and viewport again.
++  g_bound.framebuffer = nullptr;
++  g_bound.pipeline = nullptr;
++  g_bound.layout = false;
++  g_bound.viewport_set = false;
++}
++
+ void DepthHandOverForgetLocked(HostTexture &d) {
+   UnhandLocked(d);
+   d.held_current = false;
+@@ -4877,6 +5580,294 @@ void DepthHandOverBeforeRetireLocked(HostSurface *surface) {
+   }
+ }
+ 
++// ---------------------------------------------------------------------------
++// Colour hand-over (sa2-nx, 2026-10-28, sa2_renut_colour_handover; after banjo-nx's depth hand-over above)
++// ---------------------------------------------------------------------------
++// A resolve of a whole single-sampled colour target into a 2D destination of its size, format and scale (one level,
++// at (0, 0)) is not copied: the destination's content stays in the target's image (colour_from, with the target's
++// generation and writes then). The present scans the front buffer out of that image (FrontBufferImageLocked), and a
++// draw that samples the destination reads it through a view with the destination's component mapping. Before the
++// target is bound for draws (or goes, or is a target of a draw that samples the destination, or the destination has
++// host levels a sample may read), the copy is made after all (ColourMaterialiseLocked), from the image still
++// unchanged, as the resolve would have made it. A clear of the target's whole colour instead hands the image to every
++// destination still holding it (one image object they share: colour_held, colour_current) and gives the target the
++// image those destinations held before (when none of them holds content in it any more) or a new one; the clear then
++// fills that. SA2 resolves its scene twice at the end of each frame (the front buffer and a copy) and clears the
++// target whole at the start of the next, and its 512x512 passes resolve twice each and clear whole before the next:
++// the copies become swaps of images, and nothing is copied that nothing reads.
++
++std::vector<HostTexture *> g_colour_handed;  // destinations whose content is a target's current image
++
++void ColourUnhandLocked(HostTexture &d) {
++  if (!d.colour_from)
++    return;
++  if (d.colour_from->handed)
++    --d.colour_from->handed;
++  d.colour_from = nullptr;
++  std::erase(g_colour_handed, &d);
++}
++
++// The destination's content is no longer the held image (the image object stays, to be swapped in later).
++void ColourDropHeldLocked(HostTexture &d) {
++  if (!d.colour_current)
++    return;
++  d.colour_current = false;
++  if (d.colour_held && d.colour_held->current_holders)
++    --d.colour_held->current_holders;
++}
++
++// Lets go of the held image object (retired with its last holder).
++void ColourReleaseHeldLocked(HostTexture &d) {
++  ColourDropHeldLocked(d);
++  if (d.colour_held && d.colour_held.use_count() == 1)
++    RetireColourImageLocked(*d.colour_held);
++  d.colour_held.reset();
++}
++
++// The resolve's copy as ResolveStateLocked makes it for a single-sampled source, 'rect' of the source (host pixels) to
++// (host_x, host_y) of level 0: drawn (deko3d) or copied, then the destination's host levels.
++void CopyColourResolveLocked(HostSurface *surface, HostTexture *dest, const plume::RenderRect &rect, uint32_t host_x,
++                             uint32_t host_y, uint32_t slice, uint32_t z) {
++  plume::RenderCommandList *cmd = State().command_list;
++  g_bound.framebuffer = nullptr;
++  if (IsDeko3D() && banjo::renut_gpu::DrawResolvesOn() && slice == 0 && z == 0 &&
++      DrawResolveCopy(surface, dest, rect, host_x, host_y)) {
++    // banjo-nx (2026-10-18): drawn, not copied (deko3d).
++  } else {
++    TransitionSurfaceLocked(surface, plume::RenderTextureLayout::COPY_SOURCE);
++    TransitionTextureLocked(dest, plume::RenderTextureLayout::COPY_DEST);
++    const plume::RenderBox box(rect.left, rect.top, rect.right, rect.bottom);
++    cmd->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(dest->texture.get(), 0, slice),
++                           plume::RenderTextureCopyLocation::Subresource(surface->texture.get()), host_x, host_y, z,
++                           &box);
++  }
++  TransitionTextureLocked(dest, plume::RenderTextureLayout::SHADER_READ);
++  if (!dest->extra_levels)
++    return;
++  const plume::RenderRect dest_rect(int32_t(host_x), int32_t(host_y), int32_t(host_x) + (rect.right - rect.left),
++                                    int32_t(host_y) + (rect.bottom - rect.top));
++  if (LazyResolveMipsOn()) {
++    // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips): made where they are read (FlushResolveMipsLocked). The
++    // texture memos and the chain's reused texture words skip BindTextureLocked while g_texture_epoch holds: the first
++    // pending region bumps it, so the next draw that samples the texture binds it (any bind since makes the levels,
++    // so one still pending has had none).
++    const plume::RenderRect &p = dest->mips_rect;
++    if (dest->mips_pending) {
++      dest->mips_rect = plume::RenderRect(std::min(p.left, dest_rect.left), std::min(p.top, dest_rect.top),
++                                          std::max(p.right, dest_rect.right), std::max(p.bottom, dest_rect.bottom));
++    } else {
++      dest->mips_rect = dest_rect;
++      dest->mips_pending = true;
++      ++g_texture_epoch;
++    }
++  } else {
++    UpdateResolveMipsLocked(dest, dest_rect);
++    // The draw path binds its own layout, pipeline and viewport again.
++    g_bound.pipeline = nullptr;
++    g_bound.layout = false;
++    g_bound.viewport_set = false;
++  }
++}
++
++// The whole source as the hand-over resolve read it, in host pixels of the destination's level 0.
++plume::RenderRect WholeHostRect(const HostSurface &s, const HostTexture &d) {
++  plume::RenderRect rect = ScaleRect(plume::RenderRect(0, 0, int32_t(s.width), int32_t(s.height)), s.scale);
++  rect.right = std::min(rect.right, rect.left + int32_t(d.alloc_width));
++  rect.bottom = std::min(rect.bottom, rect.top + int32_t(d.alloc_height));
++  return rect;
++}
++
++// The copy left out, into the destination's own texture, from where its content is (the target's image, unchanged,
++// or the held image).
++bool ColourMaterialiseLocked(HostTexture &d) {
++  ++g_texture_epoch;
++  if (HostSurface *source = d.colour_from) {
++    const bool same = source->texture && source->generation == d.colour_generation &&
++                      source->writes == d.colour_writes;
++    ColourUnhandLocked(d);
++    if (!same) {
++      banjo::renut_gpu::CountHandOver(5);  // lost: the target changed without a bind (none expected)
++      return false;
++    }
++    CopyColourResolveLocked(source, &d, WholeHostRect(*source, d), 0, 0, 0, 0);
++    return true;
++  }
++  if (!d.colour_held || !d.colour_current)
++    return false;
++  // The held image as the target it was taken from, for the copy.
++  DepthImage &held = *d.colour_held;
++  HostSurface image;
++  image.width = d.width;
++  image.height = d.height;
++  image.scale = d.scale;
++  image.depth = false;
++  image.format = held.format;
++  image.samples = held.samples;
++  image.format_word = held.format_word;
++  SwapDepthImageLocked(image, held);
++  CopyColourResolveLocked(&image, &d, WholeHostRect(image, d), 0, 0, 0, 0);
++  SwapDepthImageLocked(image, held);
++  ColourDropHeldLocked(d);
++  return true;
++}
++
++// A resolve into 'd' left in the target's image when it can be (true). Otherwise (false: the caller copies) a
++// destination still holding other content gets it first when the resolve does not cover it.
++bool ColourHandOverResolveLocked(HostSurface *s, HostTexture *d, const ClearRect &src, i32 dest_x, i32 dest_y,
++                                 u32 slice, u32 z) {
++  const bool whole = src.x1 == 0 && src.y1 == 0 && src.x2 == int32_t(s->width) && src.y2 == int32_t(s->height) &&
++                     dest_x == 0 && dest_y == 0;
++  const bool can = ColourHandOverOn() && whole && slice == 0 && z == 0 && s->texture && !s->depth &&
++                   s->samples == plume::RenderSampleCount::COUNT_1 && d->texture && d->width == s->width &&
++                   d->height == s->height && d->scale == s->scale && d->alloc_width == s->scale.Size(s->width) &&
++                   d->alloc_height == s->scale.Size(s->height) && d->host_format == s->format &&
++                   d->view_desc.format == s->format && d->dimension == TextureDimension::Tex2D && !d->stacked &&
++                   d->mip_levels == 1 + d->extra_levels && !d->words;  // one guest level (and its host levels)
++  if (!can) {
++    if (d->colour_from || d->colour_current) {
++      const bool covers = dest_x == 0 && dest_y == 0 && slice == 0 && z == 0 &&
++                          src.x2 - src.x1 >= int32_t(d->width) && src.y2 - src.y1 >= int32_t(d->height);
++      if (covers) {
++        ColourUnhandLocked(*d);
++        ColourDropHeldLocked(*d);
++      } else {
++        ColourMaterialiseLocked(*d);
++      }
++    }
++    return false;
++  }
++  ColourUnhandLocked(*d);  // what it held is overwritten
++  ColourDropHeldLocked(*d);
++  d->mips_pending = false;  // its own texture's levels are of content it no longer has; the copy, if made, makes them
++  d->colour_from = s;
++  d->colour_generation = s->generation;
++  d->colour_writes = s->writes;
++  ++s->handed;
++  g_colour_handed.push_back(d);
++  ++g_texture_epoch;
++  banjo::renut_gpu::CountHandOver(0);
++  return true;
++}
++
++void ColourHandOverBeforeBindLocked(HostSurface *surface, bool take) {
++  if (!surface || !surface->handed)
++    return;
++  std::vector<HostTexture *> holders;
++  for (HostTexture *d : g_colour_handed)
++    if (d->colour_from == surface)
++      holders.push_back(d);
++  if (take) {
++    // The destinations whose content is the image as it is: they take it. The image swapped in for the target: one
++    // they held before that none holds content in now, else a new one.
++    std::vector<HostTexture *> current;
++    for (HostTexture *d : holders)
++      if (surface->texture && surface->generation == d->colour_generation && surface->writes == d->colour_writes)
++        current.push_back(d);
++    std::shared_ptr<DepthImage> image;
++    const uint32_t w = surface->scale.Size(surface->width), h = surface->scale.Size(surface->height);
++    for (HostTexture *d : current) {
++      const std::shared_ptr<DepthImage> &x = d->colour_held;
++      if (x && x->current_holders == 0 && x->texture && x->host_width == w && x->host_height == h &&
++          x->format == surface->format && x->samples == surface->samples) {
++        image = x;
++        break;
++      }
++    }
++    if (!image && !current.empty()) {
++      image = std::make_shared<DepthImage>();
++      if (!MakeColourImageLocked(*surface, *image))
++        image.reset();
++    }
++    if (image) {
++      SwapDepthImageLocked(*surface, *image);
++      for (HostTexture *d : current) {
++        ColourUnhandLocked(*d);
++        ColourDropHeldLocked(*d);
++        if (d->colour_held != image) {
++          ColourReleaseHeldLocked(*d);
++          d->colour_held = image;
++        }
++        d->colour_current = true;
++        ++image->current_holders;
++      }
++      ++g_texture_epoch;
++      banjo::renut_gpu::CountHandOver(2);
++    }
++  }
++  // Any other (or all, for a bind for draws): copied now, from the image still unchanged.
++  for (HostTexture *d : holders)
++    if (d->colour_from == surface)
++      ColourMaterialiseLocked(*d);
++}
++
++void ColourHandOverBeforeRetireLocked(HostSurface *surface) {
++  if (!surface || !surface->handed)
++    return;
++  const bool list = Video::EnsureCommandListLocked();
++  std::vector<HostTexture *> holders;
++  for (HostTexture *d : g_colour_handed)
++    if (d->colour_from == surface)
++      holders.push_back(d);
++  for (HostTexture *d : holders) {
++    if (list) {
++      ColourMaterialiseLocked(*d);
++    } else {
++      ColourUnhandLocked(*d);
++      banjo::renut_gpu::CountHandOver(5);
++    }
++  }
++}
++
++void ColourHandOverBeforeReadLocked(HostTexture &d) {
++  if (!d.colour_from && !d.colour_current)
++    return;
++  // Its host levels are made from its own texture's level 0; a draw into the target cannot sample its image.
++  bool copy = d.extra_levels != 0;
++  if (d.colour_from && g_handover_targets) {
++    for (uint32_t i = 0; i < g_handover_targets->color_count; ++i)
++      copy |= g_handover_targets->colors[i] == d.colour_from;
++  }
++  if (d.colour_from && (!d.colour_from->texture || d.colour_from->generation != d.colour_generation ||
++                        d.colour_from->writes != d.colour_writes))
++    copy = true;  // counted as lost by the materialise
++  if (copy)
++    ColourMaterialiseLocked(d);
++}
++
++uint32_t ColourHandOverSlotLocked(HostTexture &d, const plume::RenderComponentMapping &mapping, BindEffects *fx) {
++  if (HostSurface *source = d.colour_from) {
++    const uint32_t slot =
++        DepthImageViewSlotLocked(source->texture.get(), source->format, source->handover_views, mapping);
++    if (slot == kInvalidDescriptor) {
++      ColourMaterialiseLocked(d);
++      return UINT32_MAX;
++    }
++    TransitionSurfaceLocked(source, plume::RenderTextureLayout::SHADER_READ);
++    if (fx)
++      fx->handover_surface = source;
++    banjo::renut_gpu::CountHandOver(1);
++    return slot;
++  }
++  if (!d.colour_held || !d.colour_current)
++    return UINT32_MAX;
++  DepthImage &image = *d.colour_held;
++  const uint32_t slot = DepthImageViewSlotLocked(image.texture.get(), image.format, image.views, mapping);
++  if (slot == kInvalidDescriptor) {
++    ColourMaterialiseLocked(d);
++    return UINT32_MAX;
++  }
++  TransitionDepthImageLocked(image, plume::RenderTextureLayout::SHADER_READ);
++  if (fx)
++    fx->handover_image = &image;
++  banjo::renut_gpu::CountHandOver(1);
++  return slot;
++}
++
++void ColourHandOverForgetLocked(HostTexture &d) {
++  ColourUnhandLocked(d);
++  ColourReleaseHeldLocked(d);
++}
++
+ // banjo-nx (2026-10-19, banjo_renut_resolve_skip): what a resolve wrote into its destination: the source surface (its
+ // identity, rebuilds and writes), the rectangle and the place. Never 0.
+ static uint64_t ResolveSignature(const HostSurface *surface, const ClearRect &src, i32 dest_x, i32 dest_y,
+@@ -5013,50 +6004,62 @@ void ResolveStateLocked(const u8 *device_state, u32 flags, const ClearRect *sour
+                                           int32_t(host_x) + (rect.right - rect.left),
+                                           int32_t(host_y) + (rect.bottom - rect.top));
+         const bool multisampled = surface->samples != plume::RenderSampleCount::COUNT_1;
+-        if (multisampled && dest->extra_levels && IsVulkan()) {
+-          // A destination with host levels takes it through a single-level
+-          // target (ResolveStagingLocked): plume's Vulkan resolve writes every
+-          // level of its destination (D3D12's writes level 0 only, and
+-          // resolves in place below). Without one (device lost) nothing of
+-          // the resolve lands.
+-          if (HostTexture *staging = ResolveStagingLocked(dest)) {
++        // sa2-nx (2026-10-28, sa2_renut_colour_handover): left in the target's image, or (single-sampled)
++        // copied as before (CopyColourResolveLocked: drawn or copied, then the host levels).
++        if (ColourHandOverResolveLocked(surface, dest, src, dest_x, dest_y, slice, z)) {
++          // banjo::renut_gpu::CountHandOver(0) counted it
++        } else if (!multisampled) {
++          CopyColourResolveLocked(surface, dest, rect, host_x, host_y, slice, z);
++        } else {
++          if (dest->extra_levels && IsVulkan()) {
++            // A destination with host levels takes it through a single-level
++            // target (ResolveStagingLocked): plume's Vulkan resolve writes every
++            // level of its destination (D3D12's writes level 0 only, and
++            // resolves in place below). Without one (device lost) nothing of
++            // the resolve lands.
++            if (HostTexture *staging = ResolveStagingLocked(dest)) {
++              TransitionSurfaceLocked(surface, plume::RenderTextureLayout::RESOLVE_SOURCE);
++              TransitionTextureLocked(staging, plume::RenderTextureLayout::RESOLVE_DEST);
++              cmd->resolveTextureRegion(staging->texture.get(), host_x, host_y,
++                                        surface->texture.get(), &rect);
++              TransitionTextureLocked(staging, plume::RenderTextureLayout::COPY_SOURCE);
++              TransitionTextureLocked(dest, plume::RenderTextureLayout::COPY_DEST);
++              const plume::RenderBox box(dest_rect.left, dest_rect.top, dest_rect.right,
++                                         dest_rect.bottom);
++              cmd->copyTextureRegion(
++                  plume::RenderTextureCopyLocation::Subresource(dest->texture.get(), 0, slice),
++                  plume::RenderTextureCopyLocation::Subresource(staging->texture.get()), host_x,
++                  host_y, z, &box);
++            }
++          } else {
+             TransitionSurfaceLocked(surface, plume::RenderTextureLayout::RESOLVE_SOURCE);
+-            TransitionTextureLocked(staging, plume::RenderTextureLayout::RESOLVE_DEST);
+-            cmd->resolveTextureRegion(staging->texture.get(), host_x, host_y,
+-                                      surface->texture.get(), &rect);
+-            TransitionTextureLocked(staging, plume::RenderTextureLayout::COPY_SOURCE);
+-            TransitionTextureLocked(dest, plume::RenderTextureLayout::COPY_DEST);
+-            const plume::RenderBox box(dest_rect.left, dest_rect.top, dest_rect.right,
+-                                       dest_rect.bottom);
+-            cmd->copyTextureRegion(
+-                plume::RenderTextureCopyLocation::Subresource(dest->texture.get(), 0, slice),
+-                plume::RenderTextureCopyLocation::Subresource(staging->texture.get()), host_x,
+-                host_y, z, &box);
++            TransitionTextureLocked(dest, plume::RenderTextureLayout::RESOLVE_DEST);
++            cmd->resolveTextureRegion(dest->texture.get(), host_x, host_y, surface->texture.get(),
++                                      &rect);
++          }
++          TransitionTextureLocked(dest, plume::RenderTextureLayout::SHADER_READ);
++          if (dest->extra_levels && LazyResolveMipsOn()) {
++            // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips): made where they are read (FlushResolveMipsLocked). The
++            // texture memos and the chain's reused texture words skip BindTextureLocked while g_texture_epoch holds: the
++            // first pending region bumps it, so the next draw that samples the texture binds it (any bind since makes
++            // the levels, so one still pending has had none).
++            const plume::RenderRect &p = dest->mips_rect;
++            if (dest->mips_pending) {
++              dest->mips_rect = plume::RenderRect(std::min(p.left, dest_rect.left), std::min(p.top, dest_rect.top),
++                                                  std::max(p.right, dest_rect.right),
++                                                  std::max(p.bottom, dest_rect.bottom));
++            } else {
++              dest->mips_rect = dest_rect;
++              dest->mips_pending = true;
++              ++g_texture_epoch;
++            }
++          } else if (dest->extra_levels) {
++            UpdateResolveMipsLocked(dest, dest_rect);
++            // The draw path binds its own layout, pipeline and viewport again.
++            g_bound.pipeline = nullptr;
++            g_bound.layout = false;
++            g_bound.viewport_set = false;
+           }
+-        } else if (multisampled) {
+-          TransitionSurfaceLocked(surface, plume::RenderTextureLayout::RESOLVE_SOURCE);
+-          TransitionTextureLocked(dest, plume::RenderTextureLayout::RESOLVE_DEST);
+-          cmd->resolveTextureRegion(dest->texture.get(), host_x, host_y, surface->texture.get(),
+-                                    &rect);
+-        } else if (IsDeko3D() && banjo::renut_gpu::DrawResolvesOn() && slice == 0 && z == 0 &&
+-                   DrawResolveCopy(surface, dest, rect, host_x, host_y)) {
+-          // banjo-nx (2026-10-18): drawn, not copied (deko3d).
+-        } else {
+-          TransitionSurfaceLocked(surface, plume::RenderTextureLayout::COPY_SOURCE);
+-          TransitionTextureLocked(dest, plume::RenderTextureLayout::COPY_DEST);
+-          const plume::RenderBox box(rect.left, rect.top, rect.right, rect.bottom);
+-          cmd->copyTextureRegion(
+-              plume::RenderTextureCopyLocation::Subresource(dest->texture.get(), 0, slice),
+-              plume::RenderTextureCopyLocation::Subresource(surface->texture.get()), host_x,
+-              host_y, z, &box);
+-        }
+-        TransitionTextureLocked(dest, plume::RenderTextureLayout::SHADER_READ);
+-        if (dest->extra_levels) {
+-          UpdateResolveMipsLocked(dest, dest_rect);
+-          // The draw path binds its own layout, pipeline and viewport again.
+-          g_bound.pipeline = nullptr;
+-          g_bound.layout = false;
+-          g_bound.viewport_set = false;
+         }
+       }
+     }
+@@ -5179,6 +6182,11 @@ bool ReadRenderTargetLocked(const u8 *device_state, u32 source, u32 &width, u32
    return read_back;
  }
  
@@ -4481,6 +5800,42 @@ index 97120ed..004f797 100644
  PresentImage FrontBufferImageLocked(u32 texture_va) {
    PresentImage image;
    HostTexture *texture = FindHostTextureLocked(texture_va);
+@@ -5191,6 +6199,35 @@ PresentImage FrontBufferImageLocked(u32 texture_va) {
+   image.height = texture->alloc_height;
+   image.source_width = texture->scale.Size(texture->width);
+   image.source_height = texture->scale.Size(texture->height);
++  // sa2-nx (2026-10-28, sa2_renut_colour_handover): its content where it is: the target's image (unchanged since the
++  // resolve) or the image it took, through a view with its own view's mapping. Its level 0, 1:1, as from its own.
++  HostTexture &t = *texture;
++  if (HostSurface *source = t.colour_from) {
++    if (source->texture && source->generation == t.colour_generation && source->writes == t.colour_writes) {
++      const uint32_t slot = DepthImageViewSlotLocked(source->texture.get(), source->format, source->handover_views,
++                                                     t.view_desc.componentMapping);
++      if (slot != kInvalidDescriptor) {
++        image.texture = source->texture.get();
++        image.layout = &source->layout;
++        image.descriptor = slot;
++        return image;
++      }
++    }
++    if (Video::EnsureCommandListLocked())
++      ColourMaterialiseLocked(t);
++  } else if (t.colour_current && t.colour_held && t.colour_held->texture) {
++    DepthImage &held = *t.colour_held;
++    const uint32_t slot =
++        DepthImageViewSlotLocked(held.texture.get(), held.format, held.views, t.view_desc.componentMapping);
++    if (slot != kInvalidDescriptor) {
++      image.texture = held.texture.get();
++      image.layout = &held.layout;
++      image.descriptor = slot;
++      return image;
++    }
++    if (Video::EnsureCommandListLocked())
++      ColourMaterialiseLocked(t);
++  }
+   return image;
+ }
+ 
 diff --git a/app/src/renut_engine/gpu/render/draw.h b/app/src/renut_engine/gpu/render/draw.h
 index 79960fd..a9339a1 100644
 --- a/app/src/renut_engine/gpu/render/draw.h
@@ -4746,7 +6101,7 @@ index a946565..9bac515 100644
  // The pipeline list: every pipeline a draw needed is written to a file
  // (renut_pipeline_list), and at the next start worker threads build the ones
 diff --git a/app/src/renut_engine/gpu/render/surfaces.cpp b/app/src/renut_engine/gpu/render/surfaces.cpp
-index a09792b..3001af1 100644
+index a09792b..bc4297d 100644
 --- a/app/src/renut_engine/gpu/render/surfaces.cpp
 +++ b/app/src/renut_engine/gpu/render/surfaces.cpp
 @@ -20,11 +20,37 @@
@@ -4787,7 +6142,16 @@ index a09792b..3001af1 100644
  
  namespace renut::gpu {
  
-@@ -180,6 +206,17 @@ bool BuildTarget(HostSurface &surface, const d3d::SurfaceDesc &desc, uint32_t mi
+@@ -140,6 +166,8 @@ void FreeDepthViews(std::vector<DepthImage::View> &views) {
+ void RetireTarget(HostSurface &surface) {
+   if (surface.depth && surface.handed)
+     DepthHandOverBeforeRetireLocked(&surface);  // banjo-nx (2026-10-19, banjo_deko3d_depth_handover)
++  if (!surface.depth && surface.handed)
++    ColourHandOverBeforeRetireLocked(&surface);  // sa2-nx (2026-10-28, sa2_renut_colour_handover)
+   FreeDepthViews(surface.handover_views);
+   surface.stencil_used = false;
+   ++g_surface_epoch;
+@@ -180,6 +208,17 @@ bool BuildTarget(HostSurface &surface, const d3d::SurfaceDesc &desc, uint32_t mi
    const uint32_t host_height = surface.scale.Size(surface.height);
    surface.depth = d3d::IsDepthFormat(surface.format_word);
    surface.samples = SampleCount(surface.info_word);
@@ -4805,7 +6169,7 @@ index a09792b..3001af1 100644
    if (surface.depth) {
      surface.format = DepthTargetFormat(surface.format_word);  // banjo-nx (2026-10-19, banjo_deko3d_depth24)
      if (banjo::renut_gpu::Depth24On()) {
-@@ -227,6 +264,9 @@ bool BuildTarget(HostSurface &surface, const d3d::SurfaceDesc &desc, uint32_t mi
+@@ -227,6 +266,9 @@ bool BuildTarget(HostSurface &surface, const d3d::SurfaceDesc &desc, uint32_t mi
  
  } // namespace
  
@@ -4815,7 +6179,7 @@ index a09792b..3001af1 100644
  RenderScale ResolutionScale() {
    return g_resolution_scale;
  }
-@@ -240,16 +280,50 @@ void LatchResolutionScaleLocked() {
+@@ -240,16 +282,50 @@ void LatchResolutionScaleLocked() {
                      : resolution == "1440p" ? 3u
                      : resolution == "4K"    ? 4u
                                              : 0u};
@@ -4873,11 +6237,87 @@ index a09792b..3001af1 100644
    if (!g_resolution_latched || scale != g_resolution_scale) {
      RGPU_INFO("Render resolution {}x{} ({:.3g}x)", scale.Size(GuestScreenWidth()), scale.Size(720),
                scale.Factor());
+@@ -567,6 +643,50 @@ void RetireDepthImageLocked(DepthImage &image) {
+   Video::RetireLocked(std::move(image.texture));
+ }
+ 
++// sa2-nx (2026-10-28, sa2_renut_colour_handover): MakeDepthImageLocked and RetireDepthImageLocked for colour targets.
++bool MakeColourImageLocked(const HostSurface &surface, DepthImage &image) {
++  plume::RenderDevice *device = Video::Device();
++  const uint32_t w = surface.scale.Size(surface.width), h = surface.scale.Size(surface.height);
++  image.texture = device->createTexture(
++      plume::RenderTextureDesc::ColorTarget(w, h, surface.format, plume::RenderMultisampling(surface.samples)));
++  if (!TextureCreated(image.texture.get())) {
++    image.texture.reset();
++    ReportDeviceLost(device);
++    return false;
++  }
++  image.texture->setName("renut color surface (hand-over)");
++  image.layout = plume::RenderTextureLayout::UNKNOWN;
++  image.generation = g_next_generation++;
++  image.host_width = w;
++  image.host_height = h;
++  image.format = surface.format;
++  image.samples = surface.samples;
++  image.format_word = surface.format_word;
++  return true;
++}
++
++void RetireColourImageLocked(DepthImage &image) {
++  for (size_t i = 0; i < g_framebuffers.size();) {
++    bool over = false;
++    for (uint32_t c = 0; c < d3d::kMaxRenderTargets; ++c)
++      over |= g_framebuffers[i].key.colors[c] && g_framebuffers[i].key.color_generations[c] == image.generation;
++    if (over) {
++      Video::RetireLocked(std::move(g_framebuffers[i].framebuffer));
++      g_framebuffers[i] = std::move(g_framebuffers.back());
++      g_framebuffers.pop_back();
++      ++g_framebuffer_epoch;
++    } else {
++      ++i;
++    }
++  }
++  FreeDepthViews(image.views);
++  if (image.sample_slot != UINT32_MAX && image.sample_slot != kInvalidDescriptor)
++    Video::FreeTextureSlotLocked(image.sample_slot);
++  image.sample_slot = UINT32_MAX;
++  Video::RetireLocked(std::move(image.sample_view));
++  Video::RetireLocked(std::move(image.texture));
++}
++
+ void TransitionDepthImageLocked(DepthImage &image, plume::RenderTextureLayout layout) {
+   if (!image.texture || image.layout == layout)
+     return;
 diff --git a/app/src/renut_engine/gpu/render/surfaces.h b/app/src/renut_engine/gpu/render/surfaces.h
-index cd64578..9d8742b 100644
+index cd64578..472abc1 100644
 --- a/app/src/renut_engine/gpu/render/surfaces.h
 +++ b/app/src/renut_engine/gpu/render/surfaces.h
-@@ -108,6 +108,11 @@ void LatchResolutionScaleLocked();
+@@ -48,6 +48,9 @@ struct DepthImage {
+   plume::RenderFormat format = plume::RenderFormat::UNKNOWN;
+   plume::RenderSampleCounts samples = plume::RenderSampleCount::COUNT_1;
+   u32 format_word = 0;
++  // sa2-nx (2026-10-28, sa2_renut_colour_handover): a colour target's image the same way (render/draw.cpp, "Colour
++  // hand-over"), shared by every destination that took it at one clear; the destinations whose content it is now.
++  uint32_t current_holders = 0;
+ };
+ 
+ struct HostSurface {
+@@ -86,6 +89,14 @@ struct HostSurface {
+   // only when nothing has. A stencil nothing writes is undefined either way (a depth resolve's words read it as is).
+   std::vector<DepthImage::View> handover_views;
+   uint32_t handed = 0;
++  // sa2-nx (2026-10-28, sa2_renut_clear_repeat; render/draw.cpp ClearTargets): the last whole clear's values and the
++  // image (generation) and writes it left; a whole clear of the same values while these still hold writes nothing new.
++  bool clear_known = false;
++  uint64_t clear_generation = 0, clear_writes = 0;
++  float clear_color[4] = {};
++  bool clear_depth_known = false, clear_stencil_known = false;
++  float clear_depth = 0.0f;
++  uint32_t clear_stencil = 0;
+   bool stencil_used = false;
+ 
+   // gpu_profile labels of draws with it as the first target: color only,
+@@ -108,6 +119,11 @@ void LatchResolutionScaleLocked();
  // The host target for the D3DSurface at 'surface_va', created or rebuilt as
  // needed. nullptr for 0 or when the target cannot be created.
  HostSurface *GetHostSurfaceLocked(u32 surface_va);
@@ -4889,11 +6329,83 @@ index cd64578..9d8742b 100644
  
  // Only if one exists already.
  HostSurface *FindHostSurfaceLocked(u32 surface_va);
+@@ -161,6 +177,13 @@ uint32_t DepthImageViewSlotLocked(plume::RenderTexture *texture, plume::RenderFo
+                                   std::vector<DepthImage::View> &views, const plume::RenderComponentMapping &mapping);
+ // render/draw.cpp: a depth target is about to go; the destinations that still hold its content get it first.
+ void DepthHandOverBeforeRetireLocked(HostSurface *surface);
++// sa2-nx (2026-10-28, sa2_renut_colour_handover): the same for colour targets and their images (a colour target's
++// image of the surface's size, format and samples; retired with the framebuffers made over it).
++bool MakeColourImageLocked(const HostSurface &surface, DepthImage &image);
++void RetireColourImageLocked(DepthImage &image);
++void ColourHandOverBeforeRetireLocked(HostSurface *surface);
++// Before a colour target is bound for draws (take = false) or for a clear of its whole colour (take = true).
++void ColourHandOverBeforeBindLocked(HostSurface *surface, bool take);
+ 
+ // Framebuffer over up to 4 color targets plus depth; cached per target set.
+ plume::RenderFramebuffer *GetFramebufferLocked(HostSurface *const *colors, uint32_t color_count,
 diff --git a/app/src/renut_engine/gpu/render/textures.cpp b/app/src/renut_engine/gpu/render/textures.cpp
-index 2914a63..276a080 100644
+index 2914a63..6e7110f 100644
 --- a/app/src/renut_engine/gpu/render/textures.cpp
 +++ b/app/src/renut_engine/gpu/render/textures.cpp
-@@ -1103,8 +1103,37 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
+@@ -24,6 +24,10 @@
+ #include "renut_engine/gpu/render/graphics_options.h"
+ #include "renut_engine/gpu/backend/video.h"
+ 
++#include <rex/cvar.h>
++
++REXCVAR_DECLARE(bool, sa2_renut_direct_resolve_mips);  // sa2-nx (2026-10-28): render/draw.cpp
++
+ namespace renut::gpu {
+ 
+ namespace {
+@@ -404,6 +408,8 @@ std::vector<PendingFill> g_pending_fills;
+ // Records the copies of every level into 't'. The guest data is read now, or
+ // when the command list is submitted if 'defer_read'.
+ bool Upload(HostTexture &t, const TextureFetch &fetch, bool defer_read) {
++  FlushResolveMipsLocked(t);  // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips): from the level 0 the resolves left
++  ColourHandOverForgetLocked(t);  // sa2-nx (2026-10-28, sa2_renut_colour_handover): its content is the upload's now
+   // banjo-nx (2026-10-19, render-thread proposal 1): the interval the guest bytes are read in: now, or at the next
+   // kick's flush (FlushTextureFillsLocked, right after FlushVertexFillsLocked starts a new interval; a later one is
+   // only more cautious).
+@@ -617,6 +623,8 @@ void MaskedDesc(const TextureFetch &fetch, u32 out[6]) {
+ void Retire(HostTexture &t) {
+   ++g_texture_epoch;  // banjo-nx (CPU proposal 2)
+   DepthHandOverForgetLocked(t);  // banjo-nx (2026-10-19, banjo_deko3d_depth_handover)
++  ColourHandOverForgetLocked(t);  // sa2-nx (2026-10-28, sa2_renut_colour_handover)
++  t.mips_pending = false;  // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips): nothing reads them now
+   if (t.slot != UINT32_MAX && t.slot != kInvalidDescriptor)
+     Video::FreeTextureSlotLocked(t.slot);
+   t.slot = UINT32_MAX;
+@@ -629,6 +637,20 @@ void Retire(HostTexture &t) {
+     Video::FreeTextureSlotLocked(t.level0_slot);
+   t.level0_slot = UINT32_MAX;
+   Video::RetireLocked(std::move(t.level0_view));
++  // sa2-nx (2026-10-28, sa2_renut_direct_resolve_mips): the levels' own views and framebuffers.
++  for (uint32_t slot : t.level_sample_slots)
++    if (slot != UINT32_MAX && slot != kInvalidDescriptor)
++      Video::FreeTextureSlotLocked(slot);
++  t.level_sample_slots.clear();
++  for (auto &v : t.level_sample_views)
++    Video::RetireLocked(std::move(v));
++  t.level_sample_views.clear();
++  for (auto &f : t.level_framebuffers)
++    Video::RetireLocked(std::move(f));
++  t.level_framebuffers.clear();
++  for (auto &v : t.level_target_views)
++    Video::RetireLocked(std::move(v));
++  t.level_target_views.clear();
+   Video::RetireLocked(std::move(t.copy_framebuffer));  // banjo-nx (2026-10-18)
+   Video::RetireLocked(std::move(t.view));
+   Video::RetireLocked(std::move(t.texture));
+@@ -724,6 +746,7 @@ uint32_t WordsViewSlot(HostTexture &t, HostTexture &source, u32 swizzle) {
+ void CopyDepthWords(HostTexture &t, HostTexture &source) {
+   if (t.copied_resolve == source.resolves)
+     return;
++  FlushResolveMipsLocked(t);  // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips)
+   ++g_texture_epoch;  // banjo-nx (CPU proposal 2)
+   plume::RenderCommandList *cmd = State().command_list;
+   TransitionTextureLocked(source.words.get(), plume::RenderTextureLayout::COPY_SOURCE);
+@@ -1103,23 +1126,60 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
                    g_frame, texture_va, desc[1], desc[2], desc[5], device_desc[1], device_desc[2], device_desc[5]);
        fetch = device_fetch;
        std::memcpy(desc, device_desc, sizeof(desc));
@@ -4931,7 +6443,12 @@ index 2914a63..276a080 100644
    if (HostTexture *resolved = ResolvedAlias(texture_va, fetch, desc)) {
      resolved->used_frame = g_frame;
      if (resolved->words)
-@@ -1115,11 +1144,11 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
+       banjo::renut_gpu::CountDepthFloatSampled();  // banjo-nx (2026-10-18): a depth resolve's float target sampled
++    ColourHandOverBeforeReadLocked(*resolved);  // sa2-nx (2026-10-28, sa2_renut_colour_handover)
++    FlushResolveMipsLocked(*resolved);  // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips)
+     TransitionTextureLocked(resolved, plume::RenderTextureLayout::SHADER_READ);
+     if (fx) {
+       fx->transition[0] = resolved;
        fx->float_sampled = resolved->words != nullptr;
      }
      binding.dimension = resolved->dimension;
@@ -4942,10 +6459,16 @@ index 2914a63..276a080 100644
        const uint32_t handed = DepthHandOverSlotLocked(
 -          *resolved, SwizzleMapping(fetch.Swizzle(), resolved->view_swap_red_blue, resolved->host_format), fx);
 +          *resolved, SwizzleMapping(swizzle, resolved->view_swap_red_blue, resolved->host_format), fx);
++      if (handed != UINT32_MAX)
++        binding.slot = handed;
++    }
++    if (resolved->colour_from || resolved->colour_current) {  // sa2-nx (2026-10-28, sa2_renut_colour_handover)
++      const uint32_t handed = ColourHandOverSlotLocked(
++          *resolved, SwizzleMapping(swizzle, resolved->view_swap_red_blue, resolved->host_format), fx);
        if (handed != UINT32_MAX)
          binding.slot = handed;
      }
-@@ -1205,7 +1234,7 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
+@@ -1205,7 +1265,7 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
  
    if (depth_source && !t.gpu_written) {
      // banjo-nx (banjo_gpu_depth_words_view, package 28): the resolve's words themselves, not a copy.
@@ -4954,7 +6477,7 @@ index 2914a63..276a080 100644
        t.copied_resolve = 0;  // its own texture has not got them: copied in full if the view is not used later
        TransitionTextureLocked(depth_source->words.get(), plume::RenderTextureLayout::SHADER_READ);
        banjo::renut_gpu::CountDepthWords(true);
-@@ -1243,6 +1272,15 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
+@@ -1243,7 +1303,18 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
          t.uploaded = Upload(t, fetch, false);
        }
      }
@@ -4968,9 +6491,12 @@ index 2914a63..276a080 100644
 +                  g_frame, texture_va, t.width, t.height, u32(fetch.Format()), fetch.Tiled() ? ", tiled" : "");
 +    }
    }
++  ColourHandOverBeforeReadLocked(t);  // sa2-nx (2026-10-28, sa2_renut_colour_handover)
++  FlushResolveMipsLocked(t);  // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips)
    TransitionTextureLocked(&t, plume::RenderTextureLayout::SHADER_READ);
    if (t.words)
-@@ -1252,11 +1290,11 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
+     banjo::renut_gpu::CountDepthFloatSampled();  // banjo-nx (2026-10-18): a depth resolve's float target sampled
+@@ -1252,11 +1323,17 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
      fx->float_sampled = t.words != nullptr;
    }
    binding.dimension = t.dimension;
@@ -4981,9 +6507,185 @@ index 2914a63..276a080 100644
      const uint32_t handed = DepthHandOverSlotLocked(
 -        t, SwizzleMapping(fetch.Swizzle(), t.view_swap_red_blue, t.host_format), fx);
 +        t, SwizzleMapping(swizzle, t.view_swap_red_blue, t.host_format), fx);
++    if (handed != UINT32_MAX)
++      binding.slot = handed;
++  }
++  if (t.colour_from || t.colour_current) {  // sa2-nx (2026-10-28, sa2_renut_colour_handover)
++    const uint32_t handed = ColourHandOverSlotLocked(
++        t, SwizzleMapping(swizzle, t.view_swap_red_blue, t.host_format), fx);
      if (handed != UINT32_MAX)
        binding.slot = handed;
    }
+@@ -1465,6 +1542,111 @@ uint32_t Level0Slot(HostTexture &t) {
+   return t.level0_slot;
+ }
+ 
++// sa2-nx (2026-10-28): sa2_renut_direct_resolve_mips, once.
++bool DirectResolveMipsOn() {
++  static const bool on = REXCVAR_GET(sa2_renut_direct_resolve_mips);
++  return on;
++}
++
++// sa2-nx (2026-10-28, sa2_renut_direct_resolve_mips): UpdateResolveMipsLocked on deko3d with each level drawn into
++// the texture's own level (a view of it as the target) from the level above (Level0Slot, or a view of that level),
++// instead of into a scratch target copied into the level after on the copy engine, which plume_deko3d fences with a
++// full barrier on each side (the 3D engine idle for the copy). The same shader, push constants, viewport and region as
++// the scratch path: each level's region gets the same texels; nothing outside it is written. A fragment barrier
++// (the texture's transition into the read layout) before each level reads the one drawn just before it. False (the
++// scratch path runs) when a view or framebuffer cannot be made; nothing has been drawn then.
++bool UpdateResolveMipsDirectLocked(HostTexture &t, const plume::RenderRect &rect, plume::RenderPipeline *pipeline,
++                                   uint32_t source_slot) {
++  auto &s = State();
++  plume::RenderCommandList *cmd = Video::CommandListLocked();
++  const uint32_t count = std::min(t.extra_levels, kMaxExtraLevels);
++  if (t.level_target_views.size() < count) {
++    t.level_target_views.resize(count);
++    t.level_framebuffers.resize(count);
++    t.level_sample_views.resize(count);
++    t.level_sample_slots.resize(count, UINT32_MAX);
++  }
++  // The views, framebuffers and sample slots first: nothing is drawn unless all of them are there.
++  for (uint32_t i = 0; i < count; ++i) {
++    const uint32_t level = i + 1;
++    if (!t.level_framebuffers[i]) {
++      plume::RenderTextureViewDesc desc = t.view_desc;
++      desc.mipSlice = level;
++      desc.mipLevels = 1;
++      desc.componentMapping = plume::RenderComponentMapping();
++      t.level_target_views[i] = t.texture->createTextureView(desc);
++      if (!t.level_target_views[i])
++        return false;
++      const plume::RenderTexture *targets[] = {t.texture.get()};
++      const plume::RenderTextureView *views[] = {t.level_target_views[i].get()};
++      plume::RenderFramebufferDesc fb(targets, 1);
++      fb.colorAttachmentViews = views;
++      t.level_framebuffers[i] = s.device->createFramebuffer(fb);
++      if (!t.level_framebuffers[i])
++        return false;
++    }
++    if (level < count && t.level_sample_slots[i] == UINT32_MAX) {  // a deeper level is made from this one
++      plume::RenderTextureViewDesc desc = t.view_desc;
++      desc.mipSlice = level;
++      desc.mipLevels = 1;
++      desc.componentMapping = plume::RenderComponentMapping();
++      t.level_sample_views[i] = t.texture->createTextureView(desc);
++      if (!t.level_sample_views[i])
++        return false;
++      const uint32_t slot = Video::AllocateTextureSlotLocked();
++      if (slot == kInvalidDescriptor)
++        return false;
++      Video::SetTextureSlotLocked(slot, t.texture.get(), t.level_sample_views[i].get());
++      t.level_sample_slots[i] = slot;
++    }
++  }
++  // As the scratch path: the rect widened to whole texels of the smallest level.
++  const int32_t align = 1 << count;
++  const plume::RenderRect aligned(rect.left & ~(align - 1), rect.top & ~(align - 1),
++                                  (rect.right + align - 1) & ~(align - 1),
++                                  (rect.bottom + align - 1) & ~(align - 1));
++  TransitionTextureLocked(&t, plume::RenderTextureLayout::SHADER_READ);  // level 0 as written: read
++  uint32_t source = source_slot;
++  for (uint32_t i = 0; i < count; ++i) {
++    const uint32_t level = i + 1;
++    const int32_t span = 1 << level;
++    const uint32_t width = std::max(1u, t.alloc_width >> level);
++    const uint32_t height = std::max(1u, t.alloc_height >> level);
++    const plume::RenderRect region(std::min(aligned.left >> level, int32_t(width)),
++                                   std::min(aligned.top >> level, int32_t(height)),
++                                   std::min((aligned.right + span - 1) >> level, int32_t(width)),
++                                   std::min((aligned.bottom + span - 1) >> level, int32_t(height)));
++    if (region.right <= region.left || region.bottom <= region.top)
++      break;
++    if (i > 0) {
++      // The level drawn just before is read: written, then into the read layout (the barrier).
++      t.layout = plume::RenderTextureLayout::COLOR_WRITE;
++      TransitionTextureLocked(&t, plume::RenderTextureLayout::SHADER_READ);
++    }
++    cmd->setFramebuffer(t.level_framebuffers[i].get());
++    cmd->setGraphicsPipelineLayout(s.utility_layout.get());
++    cmd->setPipeline(pipeline);
++    cmd->setGraphicsDescriptorSet(s.texture_set.get(), 0);
++    cmd->setGraphicsDescriptorSet(s.sampler_set.get(), 1);
++    // Pixel coordinates are texels of the level.
++    cmd->setViewports(plume::RenderViewport(0.0f, 0.0f, float(width), float(height)));
++    cmd->setScissors(region);
++    UtilityPush push{};
++    push.scale[0] = push.scale[1] = 1.0f;
++    push.texture_index = source;
++    push.sampler_index = kPointClampSamplerSlot;
++    push.param0 = 2.0f;
++    cmd->setGraphicsPushConstants(0, &push, 0, sizeof(push));
++    cmd->drawInstanced(3, 1, 0, 0);
++    if (level < count)
++      source = t.level_sample_slots[i];
++  }
++  // The last level drawn: into the read layout for the draws that sample the texture.
++  t.layout = plume::RenderTextureLayout::COLOR_WRITE;
++  TransitionTextureLocked(&t, plume::RenderTextureLayout::SHADER_READ);
++  return true;
++}
++
+ } // namespace
+ 
+ HostTexture *ResolveStagingLocked(const HostTexture *dest) {
+@@ -1484,6 +1666,8 @@ void UpdateResolveMipsLocked(HostTexture *texture, const plume::RenderRect &rect
+     return;
+   static const uint32_t kProfileLabel = gpu_profile::Label("resolve host mip levels");
+   gpu_profile::Mark(s, kProfileLabel);
++  if (IsDeko3D() && t.render_target && DirectResolveMipsOn() && UpdateResolveMipsDirectLocked(t, rect, pipeline, source_slot))
++    return;
+ 
+   // Each level is the 2x2 box of the one above: level 1 of level 0, the rest
+   // of the previous level's scratch target. The rect is first widened to
+diff --git a/app/src/renut_engine/gpu/render/textures.h b/app/src/renut_engine/gpu/render/textures.h
+index 4be539c..813cc30 100644
+--- a/app/src/renut_engine/gpu/render/textures.h
++++ b/app/src/renut_engine/gpu/render/textures.h
+@@ -148,6 +148,27 @@ struct HostTexture {
+   uint64_t handed_writes = 0;
+   std::shared_ptr<DepthImage> held;
+   bool held_current = false;
++  // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips; render/draw.cpp FlushResolveMipsLocked): the region of the host
++  // levels (extra_levels) still to be made from level 0: the resolves since they were last made leave it, the first
++  // read of the levels (a bind) or other write of level 0 (an upload, a words copy) makes it.
++  bool mips_pending = false;
++  plume::RenderRect mips_rect;
++  // sa2-nx (2026-10-28, sa2_renut_direct_resolve_mips; textures.cpp UpdateResolveMipsLocked): the host levels drawn in
++  // place on deko3d: per level k >= 1 a view of it as a target and the framebuffer over that, and per level k >= 1
++  // that a deeper one is made from, a view to sample it (made on first use; [k - 1]).
++  std::vector<std::unique_ptr<plume::RenderTextureView>> level_target_views;
++  std::vector<std::unique_ptr<plume::RenderFramebuffer>> level_framebuffers;
++  std::vector<std::unique_ptr<plume::RenderTextureView>> level_sample_views;
++  std::vector<uint32_t> level_sample_slots;
++  // sa2-nx (2026-10-28, sa2_renut_colour_handover; render/draw.cpp, "Colour hand-over"): a colour resolve
++  // destination whose content is the image of the target it was resolved from (colour_from, with that target's
++  // generation and writes then), or colour_held (that image, taken at the target's next whole clear and shared with
++  // every destination that took it there; colour_current). colour_held stays as an image to swap in at a later take.
++  HostSurface *colour_from = nullptr;
++  uint64_t colour_generation = 0;
++  uint64_t colour_writes = 0;
++  std::shared_ptr<DepthImage> colour_held;
++  bool colour_current = false;
+ };
+ 
+ struct TextureBinding {
+@@ -219,6 +240,16 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
+ // (its own texture); and a destination that goes stops holding anything.
+ uint32_t DepthHandOverSlotLocked(HostTexture &dest, const plume::RenderComponentMapping &mapping, BindEffects *fx);
+ void DepthHandOverForgetLocked(HostTexture &dest);
++// sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips; render/draw.cpp): makes a resolve destination's pending host
++// levels (before a read of them or another write of its level 0; outside a draw's framebuffer).
++void FlushResolveMipsLocked(HostTexture &t);
++// sa2-nx (2026-10-28, sa2_renut_colour_handover; render/draw.cpp): before a bind samples 'dest' (its content drawn
++// into its own texture first where the image cannot be sampled for it); the slot it is then sampled through while its
++// content is a target's image ('mapping' as for DepthHandOverSlotLocked), or UINT32_MAX (its own texture); its
++// content overwritten (an upload) or the texture going.
++void ColourHandOverBeforeReadLocked(HostTexture &dest);
++uint32_t ColourHandOverSlotLocked(HostTexture &dest, const plume::RenderComponentMapping &mapping, BindEffects *fx);
++void ColourHandOverForgetLocked(HostTexture &dest);
+ 
+ // The guest memory a texture's data spans: pages[0]/sizes[0] its base level,
+ // pages[1]/sizes[1] its mip chain (a page is 4 KiB of physical memory; a zero
 diff --git a/app/src/renut_engine/gpu/render/vertex_format.cpp b/app/src/renut_engine/gpu/render/vertex_format.cpp
 index 97dad47..fd72097 100644
 --- a/app/src/renut_engine/gpu/render/vertex_format.cpp
@@ -5058,10 +6760,10 @@ index 0000000..f7f08fc
 +}  // namespace sa2::renut
 diff --git a/app/src/renut_engine/gpu/sa2_renut_pacing.cpp b/app/src/renut_engine/gpu/sa2_renut_pacing.cpp
 new file mode 100644
-index 0000000..f5bf8c4
+index 0000000..a6a2809
 --- /dev/null
 +++ b/app/src/renut_engine/gpu/sa2_renut_pacing.cpp
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,238 @@
 +// sa2-nx (2026-10-20): the game's frame pacing with Renut's renderer (sa2_renderer = "renut").
 +//
 +// On the console SA2's frames are paced by the vertical blank: after each Swap the GPU waits for the flip (a flag the
@@ -5094,6 +6796,7 @@ index 0000000..f5bf8c4
 +#endif
 +#endif
 +
++#include <fmt/format.h>
 +#include <rex/cvar.h>
 +#include <rex/logging.h>
 +
@@ -5106,6 +6809,13 @@ index 0000000..f5bf8c4
 +                    "Renut's renderer (sa2_renderer = renut): each Swap is released at the game's presentation interval "
 +                    "(60 Hz refreshes), as the console's vertical blank paces the game; SA2's game speed follows its "
 +                    "frame rate. Off: the game runs as fast as the host renders (tests only)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++// sa2-nx (2026-10-28, sa2_renut_queue_drain's test where there is no display: the PC): a release a refresh later every
++// this many seconds, as a queue drain does.
++REXCVAR_DEFINE_INT32(sa2_diag_swap_hold_every_s, 0, "SA2/Diagnostics",
++                     "Tests (sa2_renut_queue_drain): release the game's next frame one refresh later every this many "
++                     "seconds, as a queue drain does; 0 = off")
++    .range(0, 3600)
 +    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 +
 +// The native renderer's relaxed vsync key (src/me/me_native_system.cpp), the player's setting.
@@ -5145,6 +6855,7 @@ index 0000000..f5bf8c4
 +  Clock::time_point since{};
 +  Clock::time_point released{};  // the last Swap's release
 +  uint64_t frames = 0, late = 0;
++  uint64_t held = 0;  // sa2-nx (2026-10-28, sa2_renut_queue_drain): releases a refresh later
 +  double work_ms = 0.0, work_max_ms = 0.0, sleep_ms = 0.0;
 +};
 +Stats g_stats;
@@ -5167,9 +6878,10 @@ index 0000000..f5bf8c4
 +  if (released - s.since < std::chrono::seconds(10)) return;
 +  if (s.frames)
 +    REXLOG_INFO("[renut] game thread, {:.1f} s: {} frames, {:.2f} ms a frame from Swap to Swap (most {:.2f} ms), "
-+                "{:.2f} ms a frame paced; {} frames late (sa2_renut_vblank_pacing)",
++                "{:.2f} ms a frame paced; {} frames late (sa2_renut_vblank_pacing){}",
 +                Ms(released - s.since) / 1000.0, s.frames, s.work_ms / double(s.frames), s.work_max_ms,
-+                s.sleep_ms / double(s.frames), s.late);
++                s.sleep_ms / double(s.frames), s.late,
++                s.held ? fmt::format("; {} released a refresh later (sa2_renut_queue_drain)", s.held) : std::string());
 +  // The game thread's other measure: what its draws keep of the device (backend/queued.cpp).
 +  if (const std::string deltas = ::renut::gpu::SnapshotDeltaReport(); !deltas.empty())
 +    REXLOG_INFO("[renut] {}", deltas);
@@ -5217,6 +6929,19 @@ index 0000000..f5bf8c4
 +  const auto *interval_word = ::renut::gpu::GuestPtr<const be_u32>(device_va + kDeviceOffsetPresentationInterval);
 +  const uint32_t refreshes = RefreshesPerFrame(interval_word ? uint32_t(*interval_word) : 1);
 +  const auto now = Clock::now();
++  // sa2-nx (2026-10-28, sa2_renut_queue_drain): this release a refresh later, once, when the display thread asks
++  // (double buffering's queue stuck one image deep: display_sync.h), or the test's timer does. The game's frame starts a
++  // refresh later; its speed follows its frames, so it loses that one refresh, as at one slow frame.
++  bool hold = ::banjo::display_sync::TakeHold();
++  if (static const int32_t every_s = REXCVAR_GET(sa2_diag_swap_hold_every_s); every_s > 0) [[unlikely]] {
++    static Clock::time_point next = now + std::chrono::seconds(every_s);
++    if (now >= next) {
++      hold = true;
++      next = now + std::chrono::seconds(every_s);
++    }
++  }
++  if (hold) [[unlikely]]
++    ++g_stats.held;
 +  // sa2-nx (2026-10-20, banjo_display_sync, Banjo's latency set): on the Switch the release follows the display's own
 +  // refresh (its vsync event) plus a measured phase, as late as the frame's image still makes the refresh, instead of
 +  // this clock's 60 Hz grid, which drifts against the display's. A late frame goes at once (as relaxed vsync); fixed
@@ -5227,7 +6952,12 @@ index 0000000..f5bf8c4
 +    const uint64_t now_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
 +    const uint64_t period_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(period).count());
 +    bool anchored = false;
-+    const uint64_t release = ::banjo::display_sync::NextRelease(now_ns, g_display_previous_ns, period_ns, &anchored);
++    uint64_t release = ::banjo::display_sync::NextRelease(now_ns, g_display_previous_ns, period_ns, &anchored);
++    if (release && hold) {
++      // One refresh later: on the display's grid when the release was anchored to it, after 'now' when it was a late
++      // frame's (at once).
++      release += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(kRefresh).count());
++    }
 +    if (release) {
 +      const auto at = Clock::time_point(std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(release)));
 +      if (release > now_ns) SleepUntil(at);
@@ -5246,6 +6976,8 @@ index 0000000..f5bf8c4
 +    return;
 +  }
 +  const auto period = kRefresh * refreshes;
++  if (hold)
++    g_due = std::max(g_due, now) + kRefresh;  // sa2-nx (sa2_renut_queue_drain): this release a refresh later
 +  if (now <= g_due) {
 +    // On time: released at the due refresh; the next is due a period after it (a fixed grid, so the sleep's own
 +    // lateness does not add up).
@@ -5309,6 +7041,369 @@ index 0000000..7448d2f
 +#define SA2_RENUT_YIELD_SHARED(subroutine)
 +#define SA2_RENUT_YIELD(subroutine)
 +#endif
+diff --git a/app/src/renut_engine/gpu/sa2_setter_marks.h b/app/src/renut_engine/gpu/sa2_setter_marks.h
+new file mode 100644
+index 0000000..267d3ff
+--- /dev/null
++++ b/app/src/renut_engine/gpu/sa2_setter_marks.h
+@@ -0,0 +1,145 @@
++// sa2-nx (2026-10-28, sa2_renut_setter_marks): the device chunks SA2's Direct3D setters may have written since the
++// delta chain's last draw, so that the chain's next draw compares those (backend/queued.cpp CaptureDelta) instead of all
++// 40 it reads (the compare was 74 % of CaptureDelta and 10 % of the game thread in the two-player console profile).
++//
++// A chunk can change three ways between two draws, and each leaves a mark:
++//   - a setter hooked for it (me/sa2_setter_marks.h, the Direct3D functions that store pointers and other fields
++//     without a dirty tag: stream sources, textures, shaders, viewport, scissor, render targets, depth) marks the chunks
++//     its arguments say it wrote;
++//   - any write under a dirty tag (m_Pending words 2-4: the out-of-line setters' and the game's own inline ones, or the
++//     GPU would never get the state) leaves the tag pending until the draw, which takes the tag's chunks
++//     (sa2_setter_marks_tags.h); the setters that consume tags before a draw (the clear) mark the chunks of the tags
++//     they found;
++//   - the vertex declaration's chunk (0x2FC0), which the game sets inline without a tag, is compared at every draw.
++// The census build (sa2_diag_d3d_census, me/sa2_d3d_api.cpp) found no other writer of a compared chunk on the draw
++// thread; every 32nd draw still compares all 40 (sa2_renut_setter_marks_check), and the first change it finds that no
++// mark had named turns the marks off for the session (the full compare, as before).
++//
++// The marks are the draw thread's: the hooks mark only for the chain's device (another thread's device, or a call
++// with another first argument, marks nothing), as banjo-nx's touch slots do, with plain loads and stores (one ldp, two
++// orr, one stp on the A57; atomics would keep the two words apart). The only other writer is a whole mark from a rare
++// setter on another thread, a store of all ones, which can lose none of the draw thread's bits.
++#pragma once
++
++#include <cstdint>
++
++#include "renut_engine/gpu/sa2_setter_marks_tags.h"
++
++namespace sa2::renut {
++
++// The delta chain's chunks (queued.cpp, which asserts the same): the device's first 0x780 bytes in 30 chunks of 64,
++// then the tail from 0x2780 to the snapshot's end; chunk i is bit i % 64 of word i / 64.
++constexpr uint32_t kMarkHeadEnd = 0x780, kMarkTailBegin = 0x2780, kMarkSnapshotEnd = 13088;
++constexpr uint32_t kMarkHeadChunks = kMarkHeadEnd / 64;
++
++struct ChunkBits {
++  uint64_t w[2] = {0, 0};
++};
++// The chunks of device bytes [offset, offset + size) (none for the float constants between the head and the tail).
++constexpr ChunkBits MarkBits(uint32_t offset, uint32_t size) {
++  ChunkBits b{};
++  for (uint32_t at = offset & ~63u; at < offset + size; at += 64) {
++    uint32_t i;
++    if (at < kMarkHeadEnd)
++      i = at / 64;
++    else if (at >= kMarkTailBegin && at < kMarkSnapshotEnd)
++      i = kMarkHeadChunks + (at - kMarkTailBegin) / 64;
++    else
++      continue;
++    b.w[i / 64] |= uint64_t(1) << (i % 64);
++  }
++  return b;
++}
++constexpr ChunkBits operator|(ChunkBits a, ChunkBits b) { return {{a.w[0] | b.w[0], a.w[1] | b.w[1]}}; }
++
++// One cache line: the device and both words, reached from one adrp.
++struct alignas(64) SetterMarks {
++  uint64_t chunks[2] = {0, 0};
++  uint32_t device = 0;  // the chain's device (its guest address); 0: none, nothing is marked
++  // sa2-nx (2026-10-28, sa2_renut_setters_precise): the bits of m_Pending words 0-4 (native values) the precise
++  // setters (me/sa2_setter_marks.h) added and hold apart from the device until a function that reads them runs, and
++  // whether any word has one.
++  uint32_t apart_any = 0;
++  uint64_t apart[5] = {0, 0, 0, 0, 0};
++};
++static_assert(sizeof(SetterMarks) == 64);
++inline SetterMarks g_setter_marks;
++// sa2-nx (2026-10-28, sa2_renut_setters_precise): banjo-nx's setter rewrite (banjo_renut_touch_compare and
++// banjo_renut_tags_apart) for SA2's hot setters, set by the chain (backend/queued.cpp) while its marks are on. The
++// setters it names mark only the chunks whose bytes they changed, and keep the dirty bits they add out of the device:
++// a bit in the device makes the draw take every chunk the tag may stand for, or a float constant group that did not
++// change. The bits go back into the device before any function that reads m_Pending runs, and are dropped at a draw,
++// whose capture consumes the device's (as the original draw's packets did).
++inline bool g_setters_precise = false;
++// The guest thread (its context) whose precise setters hold the bits apart: only that thread gives them back to the
++// device (the Direct3D heap functions, for one, also run on loading threads, which must not touch the draw thread's
++// words), as only it adds them.
++inline const void *g_apart_owner = nullptr;
++// The float constants the render thread's device has (device bytes 0x780-0x277F: the vertex shader's 256, then the
++// pixel shader's), the chain's copy on the game thread (backend/queued.cpp; set while the precise setters are on). A
++// constant upload compares its source with these (in this core's cache), not with the device's lines it is about to
++// store (a load miss for each before the copy: the console's second run had the uploads at four times their cost).
++inline const uint8_t *g_const_shadow = nullptr;
++// The delta chain's chunk of device byte 'offset' (0x780-0x277F, the float constants, have none: ~0u).
++constexpr uint32_t ChunkOf(uint32_t offset) {
++  return offset < kMarkHeadEnd ? offset / 64
++                               : (offset >= kMarkTailBegin && offset < kMarkSnapshotEnd
++                                      ? kMarkHeadChunks + (offset - kMarkTailBegin) / 64
++                                      : ~0u);
++}
++// Marks the one chunk of device byte 'offset' (a field within a chunk) for the chain's device.
++inline void MarkChunkOf(uint32_t device, uint32_t offset) {
++  const uint32_t i = ChunkOf(offset);
++  if (device != g_setter_marks.device || i == ~0u) return;
++  g_setter_marks.chunks[i >> 6] |= uint64_t(1) << (i & 63);
++}
++// The bits held apart, dropped (the draw thread, where a capture clears m_Pending).
++inline void DropApart() {
++  if (g_setter_marks.apart_any) {
++    for (uint64_t &w : g_setter_marks.apart)
++      w = 0;
++    g_setter_marks.apart_any = 0;
++  }
++}
++
++inline uint32_t MarkedDevice() { return g_setter_marks.device; }
++// Marks from a table (both words, unconditionally: the stream and texture entries have bits in both).
++inline void Mark(uint32_t device, ChunkBits bits) {
++  if (device != g_setter_marks.device) return;
++  g_setter_marks.chunks[0] |= bits.w[0];
++  g_setter_marks.chunks[1] |= bits.w[1];
++}
++// Fixed marks: only the words with bits are touched.
++template <uint64_t W0, uint64_t W1>
++inline void MarkFixed(uint32_t device) {
++  if (device != g_setter_marks.device) return;
++  if constexpr (W0 != 0) g_setter_marks.chunks[0] |= W0;
++  if constexpr (W1 != 0) g_setter_marks.chunks[1] |= W1;
++}
++// Every chunk: the setters whose writes are not followed.
++inline void MarkAll() {
++  g_setter_marks.chunks[0] = ~uint64_t(0);
++  g_setter_marks.chunks[1] = ~uint64_t(0);
++}
++// The marks so far, cleared (the draw thread, at a draw).
++inline ChunkBits TakeMarks() {
++  const ChunkBits b{{g_setter_marks.chunks[0], g_setter_marks.chunks[1]}};
++  g_setter_marks.chunks[0] = g_setter_marks.chunks[1] = 0;
++  return b;
++}
++
++// The chunks of the dirty tags in m_Pending words 2-4 (native values).
++inline ChunkBits TagChunks(uint64_t states, uint64_t fetch, uint64_t misc) {
++  ChunkBits b{};
++  const uint64_t words[3] = {states, fetch, misc};
++  for (uint32_t w = 0; w < 3; ++w) {
++    for (uint64_t bits = words[w]; bits; bits &= bits - 1) {
++      const uint64_t(&t)[2] = kTagChunks[w * 64 + uint32_t(__builtin_ctzll(bits))];
++      b.w[0] |= t[0];
++      b.w[1] |= t[1];
++    }
++  }
++  return b;
++}
++
++}  // namespace sa2::renut
+diff --git a/app/src/renut_engine/gpu/sa2_setter_marks_tags.h b/app/src/renut_engine/gpu/sa2_setter_marks_tags.h
+new file mode 100644
+index 0000000..6993c85
+--- /dev/null
++++ b/app/src/renut_engine/gpu/sa2_setter_marks_tags.h
+@@ -0,0 +1,206 @@
++// Generated by tools/d3d/setter_marks_tags.py (do not edit): per dirty tag (m_Pending words 2-4, the bit
++// from the least significant), the delta chain's chunks a write under it may have changed (chunk index i:
++// bit i % 64 of word i / 64; sa2_setter_marks.h). A tag the Direct3D range's setters never name stands for
++// every render state chunk.
++#pragma once
++
++#include <cstdint>
++
++namespace sa2::renut {
++
++inline constexpr uint64_t kTagChunks[3 * 64][2] = {
++    {0x8000003000000000ull, 0x0000000000000000ull},  // word 2 bit 0: 0x2900 0x2940 0x2FC0
++    {0x8000003000000000ull, 0x0000000000000000ull},  // word 2 bit 1: 0x2900 0x2940 0x2FC0
++    {0x8000003000000000ull, 0x0000000000000000ull},  // word 2 bit 2: 0x2900 0x2940 0x2FC0
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 3: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 4: unknown: the render state
++    {0x0000002000000000ull, 0x0000000000000000ull},  // word 2 bit 5: 0x2940
++    {0x0000022000000000ull, 0x0000000000000000ull},  // word 2 bit 6: 0x2940 0x2A40
++    {0x0000002400000000ull, 0x0000000000000000ull},  // word 2 bit 7: 0x2880 0x2940
++    {0x8000003400000000ull, 0x0000000000000101ull},  // word 2 bit 8: 0x2880 0x2900 0x2940 0x2FC0 0x3000 0x3200
++    {0x0000001000000000ull, 0x0000000000000000ull},  // word 2 bit 9: 0x2900
++    {0x8000003000000000ull, 0x0000000000000000ull},  // word 2 bit 10: 0x2900 0x2940 0x2FC0
++    {0x0000003400000000ull, 0x0000000000000101ull},  // word 2 bit 11: 0x2880 0x2900 0x2940 0x3000 0x3200
++    {0x0000001000000000ull, 0x0000000000000000ull},  // word 2 bit 12: 0x2900
++    {0x0000001000000000ull, 0x0000000000000000ull},  // word 2 bit 13: 0x2900
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 14: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 15: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 16: unknown: the render state
++    {0x8000003400000000ull, 0x0000000000001101ull},  // word 2 bit 17: 0x2880 0x2900 0x2940 0x2FC0 0x3000 0x3200 0x3300
++    {0x0000001000000000ull, 0x0000000000000000ull},  // word 2 bit 18: 0x2900
++    {0x8000000000000000ull, 0x0000000000001300ull},  // word 2 bit 19: 0x2FC0 0x3200 0x3240 0x3300
++    {0x0000000C00000000ull, 0x0000000000001001ull},  // word 2 bit 20: 0x2880 0x28C0 0x3000 0x3300
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 21: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 22: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 23: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 24: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 25: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 26: unknown: the render state
++    {0x0000001000000000ull, 0x0000000000000000ull},  // word 2 bit 27: 0x2900
++    {0x0000001000000000ull, 0x0000000000000000ull},  // word 2 bit 28: 0x2900
++    {0x0000000800000000ull, 0x0000000000000000ull},  // word 2 bit 29: 0x28C0
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 30: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 31: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 32: unknown: the render state
++    {0x0000000800000000ull, 0x0000000000000000ull},  // word 2 bit 33: 0x28C0
++    {0x0000000800000000ull, 0x0000000000000000ull},  // word 2 bit 34: 0x28C0
++    {0x0000000800000000ull, 0x0000000000000000ull},  // word 2 bit 35: 0x28C0
++    {0x0000000800000000ull, 0x0000000000000000ull},  // word 2 bit 36: 0x28C0
++    {0x0000000C00000000ull, 0x0000000000000001ull},  // word 2 bit 37: 0x2880 0x28C0 0x3000
++    {0x0000000800000000ull, 0x0000000000000000ull},  // word 2 bit 38: 0x28C0
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 39: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 40: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 41: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 42: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 43: unknown: the render state
++    {0x0000002400000000ull, 0x0000000000000000ull},  // word 2 bit 44: 0x2880 0x2940
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 45: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 46: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 47: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 48: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 49: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 50: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 51: unknown: the render state
++    {0x0000000400000000ull, 0x0000000000000004ull},  // word 2 bit 52: 0x2880 0x3080
++    {0x0000000400000000ull, 0x0000000000000004ull},  // word 2 bit 53: 0x2880 0x3080
++    {0x0000000400000000ull, 0x0000000000000002ull},  // word 2 bit 54: 0x2880 0x3040
++    {0x0000003400000000ull, 0x0000000000000101ull},  // word 2 bit 55: 0x2880 0x2900 0x2940 0x3000 0x3200
++    {0x0000000C00000000ull, 0x0000000000000003ull},  // word 2 bit 56: 0x2880 0x28C0 0x3000 0x3040
++    {0x0000004400000000ull, 0x0000000000001800ull},  // word 2 bit 57: 0x2880 0x2980 0x32C0 0x3300
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 58: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 59: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 60: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 61: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 62: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 2 bit 63: unknown: the render state
++    {0x0000000020000000ull, 0x0000000000000000ull},  // word 3 bit 0: 0x740
++    {0x0000000020000000ull, 0x0000000000000000ull},  // word 3 bit 1: 0x740
++    {0x0000000030000000ull, 0x0000000000000000ull},  // word 3 bit 2: 0x700 0x740
++    {0x0000000010000000ull, 0x0000000000000000ull},  // word 3 bit 3: 0x700
++    {0x0000000010000000ull, 0x0000000000000000ull},  // word 3 bit 4: 0x700
++    {0x0000000018000000ull, 0x0000000000000000ull},  // word 3 bit 5: 0x6C0 0x700
++    {0x0000000008000000ull, 0x0000000000000000ull},  // word 3 bit 6: 0x6C0
++    {0x0000000008000000ull, 0x0000000000000000ull},  // word 3 bit 7: 0x6C0
++    {0x0000000004000000ull, 0x0000000000000000ull},  // word 3 bit 8: 0x680
++    {0x0000000004000000ull, 0x0000000000000000ull},  // word 3 bit 9: 0x680
++    {0x0000000006000000ull, 0x0000000000000000ull},  // word 3 bit 10: 0x640 0x680
++    {0x0000000002000000ull, 0x0000000000000000ull},  // word 3 bit 11: 0x640
++    {0x0000000002000000ull, 0x0000000000000000ull},  // word 3 bit 12: 0x640
++    {0x0000000003000000ull, 0x0000000000000000ull},  // word 3 bit 13: 0x600 0x640
++    {0x0000000001000000ull, 0x0000000000000000ull},  // word 3 bit 14: 0x600
++    {0x0000000001000000ull, 0x0000000000000000ull},  // word 3 bit 15: 0x600
++    {0x0000000000800000ull, 0x0000000000000000ull},  // word 3 bit 16: 0x5C0
++    {0x0000000000800000ull, 0x0000000000000000ull},  // word 3 bit 17: 0x5C0
++    {0x0000000000C00000ull, 0x0000000000000000ull},  // word 3 bit 18: 0x580 0x5C0
++    {0x0000000000400000ull, 0x0000000000000000ull},  // word 3 bit 19: 0x580
++    {0x0000000000400000ull, 0x0000000000000000ull},  // word 3 bit 20: 0x580
++    {0x0000000000600000ull, 0x0000000000000000ull},  // word 3 bit 21: 0x540 0x580
++    {0x0000000000200000ull, 0x0000000000000000ull},  // word 3 bit 22: 0x540
++    {0x0000000000200000ull, 0x0000000000000000ull},  // word 3 bit 23: 0x540
++    {0x0000000000100000ull, 0x0000000000000000ull},  // word 3 bit 24: 0x500
++    {0x0000000000100000ull, 0x0000000000000000ull},  // word 3 bit 25: 0x500
++    {0x0000000000180000ull, 0x0000000000000000ull},  // word 3 bit 26: 0x4C0 0x500
++    {0x0000000000080000ull, 0x0000000000000000ull},  // word 3 bit 27: 0x4C0
++    {0x0000000000080000ull, 0x0000000000000000ull},  // word 3 bit 28: 0x4C0
++    {0x00000000000C0000ull, 0x0000000000000000ull},  // word 3 bit 29: 0x480 0x4C0
++    {0x0000000000040000ull, 0x0000000000000000ull},  // word 3 bit 30: 0x480
++    {0x0000000000040000ull, 0x0000000000000000ull},  // word 3 bit 31: 0x480
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 32: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 33: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 34: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 35: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 36: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 37: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 38: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 39: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 40: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 41: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 42: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 43: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 44: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 45: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 46: unknown: the render state
++    {0x0000004000000000ull, 0x0000000000000000ull},  // word 3 bit 47: 0x2980
++    {0x0000002000000000ull, 0x0000000000000000ull},  // word 3 bit 48: 0x2940
++    {0x0000002000000000ull, 0x0000000000000000ull},  // word 3 bit 49: 0x2940
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 50: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 51: unknown: the render state
++    {0x0000002000000000ull, 0x0000000000000000ull},  // word 3 bit 52: 0x2940
++    {0x0000002000000000ull, 0x0000000000000001ull},  // word 3 bit 53: 0x2940 0x3000
++    {0x0000002000000000ull, 0x0000000000000001ull},  // word 3 bit 54: 0x2940 0x3000
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 55: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 56: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 57: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 58: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 59: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 60: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 61: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 62: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 3 bit 63: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 0: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 1: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 2: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 3: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 4: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 5: unknown: the render state
++    {0x0000010000000000ull, 0x0000000000000000ull},  // word 4 bit 6: 0x2A00
++    {0x0000010000000000ull, 0x0000000000000000ull},  // word 4 bit 7: 0x2A00
++    {0x0000010000000000ull, 0x0000000000000000ull},  // word 4 bit 8: 0x2A00
++    {0x0000010000000000ull, 0x0000000000000000ull},  // word 4 bit 9: 0x2A00
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 10: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 11: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 12: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 13: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 14: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 15: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 16: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 17: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 18: unknown: the render state
++    {0x0000010000000000ull, 0x0000000000000000ull},  // word 4 bit 19: 0x2A00
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 20: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 21: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 22: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 23: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 24: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 25: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 26: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 27: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 28: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 29: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 30: unknown: the render state
++    {0x0000008000000000ull, 0x0000000000000000ull},  // word 4 bit 31: 0x29C0
++    {0x0000008000000000ull, 0x0000000000000000ull},  // word 4 bit 32: 0x29C0
++    {0x0000008000000000ull, 0x0000000000000000ull},  // word 4 bit 33: 0x29C0
++    {0x0000008000000000ull, 0x0000000000000000ull},  // word 4 bit 34: 0x29C0
++    {0x0000008000000000ull, 0x0000000000000000ull},  // word 4 bit 35: 0x29C0
++    {0x0000004400000000ull, 0x0000000000001800ull},  // word 4 bit 36: 0x2880 0x2980 0x32C0 0x3300
++    {0x0000004000000000ull, 0x0000000000000000ull},  // word 4 bit 37: 0x2980
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 38: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 39: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 40: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 41: unknown: the render state
++    {0x0000022000000000ull, 0x0000000000000000ull},  // word 4 bit 42: 0x2940 0x2A40
++    {0x0000022000000000ull, 0x0000000000000000ull},  // word 4 bit 43: 0x2940 0x2A40
++    {0x0000022000000000ull, 0x0000000000000000ull},  // word 4 bit 44: 0x2940 0x2A40
++    {0x0000022000000000ull, 0x0000000000000000ull},  // word 4 bit 45: 0x2940 0x2A40
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 46: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 47: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 48: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 49: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 50: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 51: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 52: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 53: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 54: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 55: unknown: the render state
++    {0x0000000000000000ull, 0x0000000000001000ull},  // word 4 bit 56: 0x3300
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 57: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 58: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 59: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 60: unknown: the render state
++    {0x00000FFFC0000000ull, 0x00000000000000FFull},  // word 4 bit 61: unknown: the render state
++    {0x0000000000000000ull, 0x0000000000000000ull},  // word 4 bit 62: 
++    {0x0000000000000000ull, 0x0000000000000000ull},  // word 4 bit 63: 
++};
++
++}  // namespace sa2::renut
 diff --git a/app/src/renut_engine/gpu/shaders/host/present_ps.hlsl b/app/src/renut_engine/gpu/shaders/host/present_ps.hlsl
 index 032926c..104b862 100644
 --- a/app/src/renut_engine/gpu/shaders/host/present_ps.hlsl

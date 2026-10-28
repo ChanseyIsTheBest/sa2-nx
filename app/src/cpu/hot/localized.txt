@@ -16,7 +16,7 @@
 8213A4D8 hot game function (4.5 % of the game thread on PC)
 82139DA0 hot game function (3.2 %)
 8214CF10 hot game function (2.7 %)
-8214E130 hot game function (2.4 %)
+8214E130 strips of 24-byte vertices into the vertex buffer (reference of hot/n_vertex24_strips.h)
 82555CC8 Direct3D internal (2.4 %)
 821BC520 hot game function (2.3 %)
 82549178 Direct3D internal (2.0 %)
@@ -54,9 +54,9 @@
 8214ACA8 object transform and draw (inclusive 52.8 %)
 828326F8 float routine of the 0x8283 group, only the save/restore helpers
 82833E20 float routine of the 0x8283 group, calls 82832B78
-828243A0 hot game function, one indirect call
+828243A0 texel span of a compressed texture as RGBA floats (reference of hot/n_texel_span.h)
 821BA890 object draw wrapper (inclusive 59 %)
-82833938 routine of the 0x8283 group, calls 82833568
+82833938 DXT5 block to 16 RGBA float texels (reference of hot/n_alpha_block.h)
 82834458 wrapper of 82833E20
 82816B40 hot game function, indirect calls
 82139930 hot game function, one indirect call
@@ -64,12 +64,12 @@
 821472E0 matrix routine: transpose, VMX matrix and memcpy calls
 82565758 Direct3D draw path (not hooked by the renderer)
 8213E040 hot game function, indirect calls
-82833568 routine of the 0x8283 group, only the save/restore helpers
+82833568 DXT1 colour block to 16 RGBA float texels (reference of hot/n_dxt1_block.h)
 # Round 4: 20 more game-thread functions of the console profile (round-2 NRO, cpu_on, 1020 MHz), ranked by their own
 # samples (a copy speeds up the function's own code, not its callees). 82832298 and 8214B320 are leaves: guarded, the
 # others make calls and run unguarded. 82565C60 and 82556A60 are also hooked by the renderer (src/me/sa2_me_hooks.cpp),
 # whose hooks call the copy in place of the original (SA2_COPY_FOR_HOOK).
-82832298 rescales 16 records of four floats: when the fourth is under a constant limit, the first three are scaled by limit/fourth (or set to the limit) (leaf)
+82832298 rescales 16 records of four floats: when the fourth is under a constant limit, the first three are scaled by limit/fourth (or set to the limit) (leaf; reference of hot/n_alpha_rescale.h)
 8214B320 fills one 20-byte record of a table at 0x83853480 from three table lookups indexed by r3 (leaf)
 82565C60 D3DDevice_DrawVertices: the draw's PM4 packets (the renderer's DrawVertices hook calls this copy)
 82556A60 D3D draw-time shader load, FlushState part (the renderer's shader-load hook calls this copy)
@@ -89,3 +89,18 @@
 82227C98 calls the 0x82227 family, sub_82222B60/82222A08 and sub_82195B08
 8213D5C8 converts a float and dispatches through one indirect call
 82139C90 three memcpy calls
+# sa2-nx (2026-10-28, the optimising guide's batches): references of the hand-written natives that replaced bulk copies
+# (app/src/cpu/hot/n_*.h; the bulk list leaves a function out while sa2_hot_guest.cpp hooks it).
+8214E3F0 strip builder: a model's triangle strips into the vertex buffer (reference of hot/n_strip_builder.h)
+8214E2B0 position strips: triangle strips of positions into the vertex buffer (reference of hot/n_position_strips.h)
+82147628 points by a 3x4 matrix, four a pass (reference of hot/n_point_transform.h)
+8214F028 position strips from a strided index stream (reference of hot/n_strided_strips.h)
+8214EF60 strips of copied 24-byte vertices (reference of hot/n_copied_strips.h)
+82823E08 texel span into a compressed texture's block cache (reference of hot/n_texel_store.h)
+82139750 six flagged 20-byte slot copies (reference of hot/n_slot_copies.h)
+82919200 clears up to 16 float buffers (reference of hot/n_buffer_clear.h)
+8214F120 position and colour strips from a strided index stream (reference of hot/n_colour_strips.h)
+8214B3A0 render-state handler 8 (reference of hot/n_state_handler8.h)
+8214B168 render-state handler 5 (reference of hot/n_state_bytes.h)
+82147340 3x4 matrix transpose (reference of hot/n_matrix_transpose.h)
+8214D9F8 colour clamp and pack (reference of hot/n_colour_pack.h)

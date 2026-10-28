@@ -1418,6 +1418,26 @@ index c8751b7b10677fe595864f4d4749197224f1cacd..3fabbdf9fe5c11a42af453c55866be8f
  
    // Mouse delta tracking. Fractional because relative motion arrives in
    // fractions of a pixel, and truncating each event drops slow movement.
+diff --git a/include/rex/input/read_hook.h b/include/rex/input/read_hook.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..2ad34a15e79d4c217586a24cec2185b13b03109b
+--- /dev/null
++++ b/include/rex/input/read_hook.h
+@@ -0,0 +1,14 @@
++/**
++ * sa2-nx (2026-10-20): a function the input system calls at every controller state read (InputSystem::GetState),
++ * before the read: Renut's late input delays the frame's first read there and its latency probe notes the read
++ * (rex::latency::BeforeInputRead / NoteInputRead, app/src/renut_engine/sa2_compat/frame_latency.cpp; banjo-nx calls
++ * them from its SDK directly). None by default.
++ */
++#pragma once
++
++namespace rex::input {
++
++using ReadHook = void (*)();
++void SetReadHook(ReadHook hook);
++
++}  // namespace rex::input
 diff --git a/include/rex/input/switch/switch_input_driver.h b/include/rex/input/switch/switch_input_driver.h
 new file mode 100644
 index 0000000000000000000000000000000000000000..8e57d795a245f9d96de03dc72da01c4d8c614757
@@ -22086,10 +22106,10 @@ index 3f9422dd46ddbf6e32d163cd54cacf2ef7908ca7..b2e0a258000d762fff0b14cb75da7b72
  }
 diff --git a/src/input/switch/switch_input_driver.cpp b/src/input/switch/switch_input_driver.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..a845744ab19a0bc0240e37b703b6336534711631
+index 0000000000000000000000000000000000000000..11e86d307497c1b663bfcf2fdd35bcc30501c1a8
 --- /dev/null
 +++ b/src/input/switch/switch_input_driver.cpp
-@@ -0,0 +1,1010 @@
+@@ -0,0 +1,1025 @@
 +/**
 + * @file        input/switch/switch_input_driver.cpp
 + * @brief       Input driver for Nintendo Switch pads through libnx HID
@@ -22154,13 +22174,22 @@ index 0000000000000000000000000000000000000000..a845744ab19a0bc0240e37b703b63365
 +REX_INPUT_MAP_CVARS(p2, "Player 2");
 +#undef REX_INPUT_MAP_CVARS
 +
-+// Single Joy-Cons (one per player, for multiplayer) are held sideways: the system is told so (it then turns the
-+// stick for that grip), and the four buttons under the player's right thumb become the face buttons. SL and SR are
-+// the triggers (ZL / ZR: the camera in Sonic Adventure 2), the minus or plus button is Start, the stick is the left
-+// stick. false = held upright (the system's default; no remapping).
++// Single Joy-Cons (one per player, for multiplayer) are held sideways: the system is told so (for its own menus,
++// the applets), the four buttons under the player's right thumb become the face buttons and the stick is turned for
++// the grip (input_joycon_sideways_stick). SL and SR are the triggers (ZL / ZR: the camera in Sonic Adventure 2), the
++// minus or plus button is Start, the stick is the left stick. false = held upright (the system's default; no
++// remapping).
 +REXCVAR_DEFINE_BOOL(input_joycon_sideways, true, "Input",
 +                    "Single Joy-Cons are held sideways, one per player (face buttons, stick and SL/SR turned "
 +                    "accordingly)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++// sa2-nx (2026-10-28, peggle2-nx 1.0.2's fix, from guwange-nx): the horizontal hold type turns the buttons' meaning
++// for the system's own menus, but padGetStickPos still gives the stick as the Joy-Con is built (up = towards its L /
++// R button): held sideways a push to the right read as up. The stick is turned a quarter here.
++REXCVAR_DEFINE_BOOL(input_joycon_sideways_stick, true, "Input",
++                    "With input_joycon_sideways: a single Joy-Con's stick turned a quarter for the sideways grip (left "
++                    "Joy-Con: its top points left; right Joy-Con: its top points right); false = as the Joy-Con "
++                    "reports it")
 +    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 +
 +// Route recording for unattended test runs: the game's own pad input, written and played back here.
@@ -22518,7 +22547,8 @@ index 0000000000000000000000000000000000000000..a845744ab19a0bc0240e37b703b63365
 +    return X_STATUS_UNSUCCESSFUL;
 +  }
 +  padConfigureInput(kPlayerCount, HidNpadStyleSet_NpadStandard);
-+  // Single Joy-Cons are held sideways (input_joycon_sideways): the system then turns their stick for that grip.
++  // Single Joy-Cons are held sideways (input_joycon_sideways): the hold type is for the system's own applets; the
++  // stick still comes as the Joy-Con is built and Poll turns it (input_joycon_sideways_stick).
 +  if (REXCVAR_GET(input_joycon_sideways)) {
 +    hidSetNpadJoyHoldType(HidNpadJoyHoldType_Horizontal);
 +  }
@@ -22667,16 +22697,21 @@ index 0000000000000000000000000000000000000000..a845744ab19a0bc0240e37b703b63365
 +  HidAnalogStickState left = padGetStickPos(&slot.pad, 0);
 +  HidAnalogStickState right = padGetStickPos(&slot.pad, 1);
 +  // A single Joy-Con held sideways (input_joycon_sideways): its presses as a two-handed controller's, and its one
-+  // stick as the left stick (the right Joy-Con reports its stick as stick 1). The system already turned the stick.
++  // stick as the left stick (the right Joy-Con reports its stick as stick 1), turned a quarter for the grip
++  // (input_joycon_sideways_stick; the stick values are -32767..32767, so the negation stays in range).
 +  if (index != 0 && REXCVAR_GET(input_joycon_sideways)) {
 +    const uint32_t style = padGetStyleSet(&slot.pad);
 +    const uint32_t whole = HidNpadStyleTag_NpadJoyDual | HidNpadStyleTag_NpadFullKey | HidNpadStyleTag_NpadHandheld;
++    static const bool turn = REXCVAR_GET(input_joycon_sideways_stick);
 +    if (!(style & whole) && (style & HidNpadStyleTag_NpadJoyLeft)) {
 +      held = SidewaysLeftJoyCon(held);
++      // Its top (the L button) points left: the Joy-Con's up is left, its right (the rail) is up.
++      if (turn) left = HidAnalogStickState{-left.y, left.x};
 +      right = HidAnalogStickState{};
 +    } else if (!(style & whole) && (style & HidNpadStyleTag_NpadJoyRight)) {
 +      held = SidewaysRightJoyCon(held);
-+      left = right;
++      // Its top (the R button) points right: the Joy-Con's up is right, its right (away from the rail) is down.
++      left = turn ? HidAnalogStickState{right.y, -right.x} : right;
 +      right = HidAnalogStickState{};
 +    }
 +  }
@@ -23100,6 +23135,80 @@ index 0000000000000000000000000000000000000000..a845744ab19a0bc0240e37b703b63365
 +}
 +
 +}  // namespace rex::input::nx
+diff --git a/src/kernel/crt/memory.cpp b/src/kernel/crt/memory.cpp
+index 31c53846384be172aaf78d985f6075ff552e2b47..ca013bb1c69d87f2f4e9c259cba8f7f82e46d0ee 100644
+--- a/src/kernel/crt/memory.cpp
++++ b/src/kernel/crt/memory.cpp
+@@ -10,6 +10,7 @@
+ #include <cstring>
+ 
+ #include <rex/hook.h>
++#include <rex/system/xmemory.h>
+ 
+ namespace rex::kernel::crt {
+ 
+@@ -17,15 +18,22 @@ namespace rex::kernel::crt {
+ // Standard memory operations
+ // ---------------------------------------------------------------------------
+ 
++// sa2-nx (2026-10-20, from banjo-nx): every write of guest memory here marks its store cards (rex/system/xmemory.h), as the guest
++// routines' stores would have.
++using rex::memory::MarkStoreCardsHost;
++
+ static void* native_memcpy(void* dst, const void* src, size_t n) {
++  MarkStoreCardsHost(dst, n);
+   return std::memcpy(dst, src, n);
+ }
+ 
+ static void* native_memmove(void* dst, const void* src, size_t n) {
++  MarkStoreCardsHost(dst, n);
+   return std::memmove(dst, src, n);
+ }
+ 
+ static void* native_memset(void* dst, int val, size_t n) {
++  MarkStoreCardsHost(dst, n);
+   return std::memset(dst, val, n);
+ }
+ 
+@@ -38,18 +46,22 @@ static void* native_memchr(const void* ptr, int val, size_t n) {
+ // ---------------------------------------------------------------------------
+ 
+ static void* native_XMemCpy(void* dst, const void* src, size_t n) {
++  MarkStoreCardsHost(dst, n);
+   return std::memcpy(dst, src, n);
+ }
+ 
+ static void* native_XMemSet(void* dst, int val, size_t n) {
++  MarkStoreCardsHost(dst, n);
+   return std::memset(dst, val, n);
+ }
+ 
+ static void* native_XMemSet128(void* dst, int val, size_t n) {
++  MarkStoreCardsHost(dst, n);
+   return std::memset(dst, val, n);
+ }
+ 
+ static void* native_memset_vmx(void* dst, int val, size_t n) {
++  MarkStoreCardsHost(dst, n);
+   return std::memset(dst, val, n);
+ }
+ 
+@@ -60,6 +72,7 @@ static void* native_memset_vmx(void* dst, int val, size_t n) {
+ static int native_memcpy_s(void* dst, size_t dstsz, const void* src, size_t count) {
+   if (!dst || !src || count > dstsz)
+     return 22;  // EINVAL
++  MarkStoreCardsHost(dst, count);
+   std::memcpy(dst, src, count);
+   return 0;
+ }
+@@ -67,6 +80,7 @@ static int native_memcpy_s(void* dst, size_t dstsz, const void* src, size_t coun
+ static int native_memmove_s(void* dst, size_t dstsz, const void* src, size_t count) {
+   if (!dst || !src || count > dstsz)
+     return 22;  // EINVAL
++  MarkStoreCardsHost(dst, count);
+   std::memmove(dst, src, count);
+   return 0;
+ }
 diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
 index 1fb1e16a952e9737260805e1a9fc9cf90d30e74a..e6ad7762b7e01ec745da9b4d70522a86d34a59af 100644
 --- a/src/kernel/xam/xam_content.cpp
@@ -27561,6 +27670,64 @@ index 0000000000000000000000000000000000000000..087e736b8df58944caaff2578fb425e0
 +char *elf_strptr(void *elf, size_t sec, size_t off) { (void)elf; (void)sec; (void)off; return NULL; }
 +int elf_errno(void) { return 0; }
 +const char *elf_errmsg(int err) { (void)err; return "libelf is not available on Switch"; }
+diff --git a/src/ui/switch_no_vulkan.c b/src/ui/switch_no_vulkan.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..9c947905d65939ae3da4fb017479fdbe9ac47c21
+--- /dev/null
++++ b/src/ui/switch_no_vulkan.c
+@@ -0,0 +1,52 @@
++/*
++ * sa2-nx (2026-10-20): the Vulkan entry points of a Switch build without Mesa's
++ * NVK driver (REXGLUE_SWITCH_NO_NVK, rexglue_switch.cmake).
++ *
++ * Only four driver symbols are linked by name: vkGetInstanceProcAddr and
++ * vkDestroyInstance (ui/vulkan/vulkan_instance.cpp) and the loader-interface
++ * pair plume's Vulkan back end starts from (vk_icdNegotiateLoaderICDInterfaceVersion,
++ * vk_icdGetInstanceProcAddr). Every other Vulkan call goes through the function
++ * pointers those return. Here they find nothing, so creating a Vulkan instance
++ * fails cleanly, and libvulkan.a (the whole driver) stays out of the NRO. Such a
++ * build draws with a renderer that does not use Vulkan (the title's own, e.g.
++ * deko3d); the SDK's Vulkan presenter and GPU plugin are left unusable.
++ */
++#include <errno.h>
++#include <malloc.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/* The static driver also brought posix_memalign, which newlib declares and does
++ * not define; FFmpeg's av_malloc needs it. memalign's blocks are freed with free. */
++int posix_memalign(void **out, size_t alignment, size_t size) {
++  if (alignment < sizeof(void *) || (alignment & (alignment - 1)) != 0) return EINVAL;
++  void *p = memalign(alignment, size);
++  if (!p && size) return ENOMEM;
++  *out = p;
++  return 0;
++}
++
++typedef void (*rex_vk_void_function)(void);
++
++rex_vk_void_function vkGetInstanceProcAddr(void *instance, const char *name) {
++  (void)instance;
++  (void)name;
++  return NULL;
++}
++
++void vkDestroyInstance(void *instance, const void *allocator) {
++  (void)instance;
++  (void)allocator;
++}
++
++rex_vk_void_function vk_icdGetInstanceProcAddr(void *instance, const char *name) {
++  (void)instance;
++  (void)name;
++  return NULL;
++}
++
++/* VK_ERROR_INCOMPATIBLE_DRIVER: no driver to negotiate with. */
++int32_t vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *version) {
++  (void)version;
++  return -9;
++}
 diff --git a/src/ui/switch_perf.cpp b/src/ui/switch_perf.cpp
 new file mode 100644
 index 0000000000000000000000000000000000000000..3f969159a4a3335da251eb4d2b941c15d012396b
@@ -33717,155 +33884,3 @@ index 8f32113fe065879f941efb43d4ba09faf6a747f8..5b7c172f6890c74299d5f4f1e3048548
 +    &ff_wmv3_decoder,
  #endif
      NULL};
-diff --git a/src/kernel/crt/memory.cpp b/src/kernel/crt/memory.cpp
-index 31c53846384be172aaf78d985f6075ff552e2b47..ca013bb1c69d87f2f4e9c259cba8f7f82e46d0ee 100644
---- a/src/kernel/crt/memory.cpp
-+++ b/src/kernel/crt/memory.cpp
-@@ -10,6 +10,7 @@
- #include <cstring>
- 
- #include <rex/hook.h>
-+#include <rex/system/xmemory.h>
- 
- namespace rex::kernel::crt {
- 
-@@ -17,15 +18,22 @@ namespace rex::kernel::crt {
- // Standard memory operations
- // ---------------------------------------------------------------------------
- 
-+// sa2-nx (2026-10-20, from banjo-nx): every write of guest memory here marks its store cards (rex/system/xmemory.h), as the guest
-+// routines' stores would have.
-+using rex::memory::MarkStoreCardsHost;
-+
- static void* native_memcpy(void* dst, const void* src, size_t n) {
-+  MarkStoreCardsHost(dst, n);
-   return std::memcpy(dst, src, n);
- }
- 
- static void* native_memmove(void* dst, const void* src, size_t n) {
-+  MarkStoreCardsHost(dst, n);
-   return std::memmove(dst, src, n);
- }
- 
- static void* native_memset(void* dst, int val, size_t n) {
-+  MarkStoreCardsHost(dst, n);
-   return std::memset(dst, val, n);
- }
- 
-@@ -38,18 +46,22 @@ static void* native_memchr(const void* ptr, int val, size_t n) {
- // ---------------------------------------------------------------------------
- 
- static void* native_XMemCpy(void* dst, const void* src, size_t n) {
-+  MarkStoreCardsHost(dst, n);
-   return std::memcpy(dst, src, n);
- }
- 
- static void* native_XMemSet(void* dst, int val, size_t n) {
-+  MarkStoreCardsHost(dst, n);
-   return std::memset(dst, val, n);
- }
- 
- static void* native_XMemSet128(void* dst, int val, size_t n) {
-+  MarkStoreCardsHost(dst, n);
-   return std::memset(dst, val, n);
- }
- 
- static void* native_memset_vmx(void* dst, int val, size_t n) {
-+  MarkStoreCardsHost(dst, n);
-   return std::memset(dst, val, n);
- }
- 
-@@ -60,6 +72,7 @@ static void* native_memset_vmx(void* dst, int val, size_t n) {
- static int native_memcpy_s(void* dst, size_t dstsz, const void* src, size_t count) {
-   if (!dst || !src || count > dstsz)
-     return 22;  // EINVAL
-+  MarkStoreCardsHost(dst, count);
-   std::memcpy(dst, src, count);
-   return 0;
- }
-@@ -67,6 +80,7 @@ static int native_memcpy_s(void* dst, size_t dstsz, const void* src, size_t coun
- static int native_memmove_s(void* dst, size_t dstsz, const void* src, size_t count) {
-   if (!dst || !src || count > dstsz)
-     return 22;  // EINVAL
-+  MarkStoreCardsHost(dst, count);
-   std::memmove(dst, src, count);
-   return 0;
- }
-diff --git a/src/ui/switch_no_vulkan.c b/src/ui/switch_no_vulkan.c
-new file mode 100644
-index 0000000000000000000000000000000000000000..9c947905d65939ae3da4fb017479fdbe9ac47c21
---- /dev/null
-+++ b/src/ui/switch_no_vulkan.c
-@@ -0,0 +1,52 @@
-+/*
-+ * sa2-nx (2026-10-20): the Vulkan entry points of a Switch build without Mesa's
-+ * NVK driver (REXGLUE_SWITCH_NO_NVK, rexglue_switch.cmake).
-+ *
-+ * Only four driver symbols are linked by name: vkGetInstanceProcAddr and
-+ * vkDestroyInstance (ui/vulkan/vulkan_instance.cpp) and the loader-interface
-+ * pair plume's Vulkan back end starts from (vk_icdNegotiateLoaderICDInterfaceVersion,
-+ * vk_icdGetInstanceProcAddr). Every other Vulkan call goes through the function
-+ * pointers those return. Here they find nothing, so creating a Vulkan instance
-+ * fails cleanly, and libvulkan.a (the whole driver) stays out of the NRO. Such a
-+ * build draws with a renderer that does not use Vulkan (the title's own, e.g.
-+ * deko3d); the SDK's Vulkan presenter and GPU plugin are left unusable.
-+ */
-+#include <errno.h>
-+#include <malloc.h>
-+#include <stddef.h>
-+#include <stdint.h>
-+
-+/* The static driver also brought posix_memalign, which newlib declares and does
-+ * not define; FFmpeg's av_malloc needs it. memalign's blocks are freed with free. */
-+int posix_memalign(void **out, size_t alignment, size_t size) {
-+  if (alignment < sizeof(void *) || (alignment & (alignment - 1)) != 0) return EINVAL;
-+  void *p = memalign(alignment, size);
-+  if (!p && size) return ENOMEM;
-+  *out = p;
-+  return 0;
-+}
-+
-+typedef void (*rex_vk_void_function)(void);
-+
-+rex_vk_void_function vkGetInstanceProcAddr(void *instance, const char *name) {
-+  (void)instance;
-+  (void)name;
-+  return NULL;
-+}
-+
-+void vkDestroyInstance(void *instance, const void *allocator) {
-+  (void)instance;
-+  (void)allocator;
-+}
-+
-+rex_vk_void_function vk_icdGetInstanceProcAddr(void *instance, const char *name) {
-+  (void)instance;
-+  (void)name;
-+  return NULL;
-+}
-+
-+/* VK_ERROR_INCOMPATIBLE_DRIVER: no driver to negotiate with. */
-+int32_t vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *version) {
-+  (void)version;
-+  return -9;
-+}
-diff --git a/include/rex/input/read_hook.h b/include/rex/input/read_hook.h
-new file mode 100644
-index 0000000000000000000000000000000000000000..2ad34a15e79d4c217586a24cec2185b13b03109b
---- /dev/null
-+++ b/include/rex/input/read_hook.h
-@@ -0,0 +1,14 @@
-+/**
-+ * sa2-nx (2026-10-20): a function the input system calls at every controller state read (InputSystem::GetState),
-+ * before the read: Renut's late input delays the frame's first read there and its latency probe notes the read
-+ * (rex::latency::BeforeInputRead / NoteInputRead, app/src/renut_engine/sa2_compat/frame_latency.cpp; banjo-nx calls
-+ * them from its SDK directly). None by default.
-+ */
-+#pragma once
-+
-+namespace rex::input {
-+
-+using ReadHook = void (*)();
-+void SetReadHook(ReadHook hook);
-+
-+}  // namespace rex::input

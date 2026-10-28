@@ -17,9 +17,9 @@ for f in glob.glob(GEN + '/sa2_recomp.*.cpp'):
         m = DEF.match(ln)
         if m and 0x82540000 <= int(m.group(1), 16) < 0x82570000: funcs.add(m.group(1))
 # hooks really defined in the sources (not mere mentions)
-HOOK = re.compile(r'(?:REX_HOOK_RAW\(sub_|SA2_HOT_HOOK_COPY\(|SA2_COPY_FOR_HOOK\(|SA2_HOT_HOOK_UNGUARDED\(|SA2_HOT_HOOK\(|SA2_TRACE_HOOK\(\d+, )([0-9A-F]{8})')
+HOOK = re.compile(r'(?:REX_HOOK_RAW\(sub_|BANJO_RENUT_HOOK(?:_RAW)?(?:_SHARED)?\(sub_|SA2_HOT_HOOK_COPY\(|SA2_COPY_FOR_HOOK\(|SA2_HOT_HOOK_UNGUARDED\(|SA2_HOT_HOOK\(|SA2_SETTER_MARK_HOOK\(|SA2_TRACE_HOOK\(\d+, )([0-9A-F]{8})')
 defined = set()
-for d in (ROOT + '/app/src', ROOT + '/sdk/src'):
+for d in (ROOT + '/app/src', ROOT + '/sdk/src', ROOT + '/app/generated/hot'):  # the bulk copies' hooks too (2026-10-28)
     for dp, _, fs in os.walk(d):
         for f in fs:
             if f.endswith(('.cpp', '.h', '.inc')):

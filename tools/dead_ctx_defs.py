@@ -179,6 +179,7 @@ def analysis(gen, image, abi_indirect=False):
     if os.path.exists(hand):
         natives = set(int(m.group(1), 16) for m in re.finditer(r'^([0-9A-Fa-f]{8})\b',
                                                                  open(hand, encoding='utf-8').read(), re.M))
+    natives |= lds.transparent_copies()  # sa2-nx (2026-10-28): the bulk localized copies
     for nodes in parsed.values():
         for node in nodes:
             if node.call and not node.call[1] and node.call[0] in natives:

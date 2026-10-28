@@ -14,8 +14,9 @@
 //   the others are localized copies of the recompiled functions themselves (tools/localize_native.py).
 // RISK: a native that differs only on inputs the guard did not see. KEY: each sa2_cpu_native_* (sa2_cpu_enhancements).
 
-// The generated code's macros and helpers (the localized copies are made of generated code) ...
-#include "../../generated/default/sa2_pch.h"
+// The generated code's macros with plain guest memory, the hooks' macros, the copies' default: shared with the bulk
+// copies' shards (sa2_hot_bulk_N.cpp).
+#include "sa2_hot_prelude.h"
 
 // sa2-nx (2026-10-20, as banjo-nx): whether the generated code marks the store cards (tools/store_cards.py ran and
 // REX_STORE_CARDS_OFF is not set): Renut proves its cached copies by them only then (banjo_renut_store_cards).
@@ -24,28 +25,6 @@ extern "C" const bool g_banjo_store_cards = true;
 #else
 extern "C" const bool g_banjo_store_cards = false;
 #endif
-
-// ... with plain guest memory: the recompiled code's accesses are volatile, which keeps GCC from pairing and
-// scheduling them; a native replacement does not need that (a racing write from another thread is a race either way).
-#undef REX_LOAD_U8
-#undef REX_LOAD_U16
-#undef REX_LOAD_U32
-#undef REX_LOAD_U64
-#undef REX_STORE_U8
-#undef REX_STORE_U16
-#undef REX_STORE_U32
-#undef REX_STORE_U64
-#define REX_LOAD_U8(x) (*(u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
-#define REX_LOAD_U16(x) __builtin_bswap16(*(u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
-#define REX_LOAD_U32(x) __builtin_bswap32(*(u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
-#define REX_LOAD_U64(x) __builtin_bswap64(*(u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)))
-#define REX_STORE_U8(x, y) (*(u8*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = (y))
-#define REX_STORE_U16(x, y) (*(u16*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap16(y))
-#define REX_STORE_U32(x, y) (*(u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
-#define REX_STORE_U64(x, y) (*(u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
-
-#include "sa2_hot_guest.h"
-#include "sa2_hot_copies.h"
 
 #include <algorithm>
 #include <string>
@@ -56,7 +35,8 @@ extern "C" const bool g_banjo_store_cards = false;
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
-#include "../../generated/hot/n_8213EC28.h"  // localized copy (tools/localize_native.py)
+#include "../../generated/hot/n_8213EC28.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_map_lower_bound.h"            // hand-written, sa2-nx 2026-10-28
 #include "../../generated/hot/n_82146ED8.h"  // localized copy (tools/localize_native.py)
 #include "../../generated/hot/n_82146F60.h"  // localized copy (tools/localize_native.py)
 #include "../../generated/hot/n_82147AC0.h"  // localized copy (tools/localize_native.py)
@@ -68,7 +48,8 @@ extern "C" const bool g_banjo_store_cards = false;
 #include "../../generated/hot/n_82139DA0.h"  // localized copy, unguarded (tools/localize_native.py)
 #include "hot/n_vertex_chunks.h"  // hand-written: sub_8214CF10 and sub_8214D0F8 (the chunk-model vertex loaders)
 #include "hot/n_ninja_matrix.h"   // hand-written: njCalcPoint and njMultiMatrix (round 13)
-#include "../../generated/hot/n_8214E130.h"  // localized copy, unguarded (tools/localize_native.py)
+#include "../../generated/hot/n_8214E130.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_vertex24_strips.h"            // hand-written, sa2-nx 2026-10-28
 #include "../../generated/hot/n_82555CC8.h"  // localized copy, unguarded (tools/localize_native.py)
 #include "../../generated/hot/n_821BC520.h"  // localized copy, unguarded (tools/localize_native.py)
 #include "../../generated/hot/n_82549178.h"  // localized copy, unguarded (tools/localize_native.py)
@@ -79,17 +60,31 @@ extern "C" const bool g_banjo_store_cards = false;
 #include "../../generated/hot/n_8295F9C0.h"  // localized copy, unguarded (tools/localize_native.py)
 #include "../../generated/hot/n_82552408.h"  // localized copy, unguarded (tools/localize_native.py)
 #include "../../generated/hot/n_82960808.h"  // localized copy, unguarded (tools/localize_native.py)
-#include "../../generated/hot/n_8214D6D8.h"  // localized copy, unguarded (tools/localize_native.py)
-#include "../../generated/hot/n_8214BBD8.h"  // localized copy (tools/localize_native.py)
+#include "../../generated/hot/n_8214D6D8.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_state_block.h"                // hand-written, sa2-nx 2026-10-28 (batch 3)
+#include "hot/n_state_handler8.h"             // hand-written, sa2-nx 2026-10-28 (batch 3)
+#include "hot/n_state_bytes.h"                // hand-written, sa2-nx 2026-10-28 (batch 3)
+#include "hot/n_matrix_transpose.h"           // hand-written, sa2-nx 2026-10-28 (batch 3)
+#include "hot/n_colour_pack.h"                // hand-written, sa2-nx 2026-10-28 (batch 3)
+#include "../../generated/hot/n_8214BBD8.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_key_search.h"                  // hand-written, sa2-nx 2026-10-28
 #include "../../generated/hot/n_82963658.h"  // localized copy (tools/localize_native.py)
 #include "../../generated/hot/n_82140C98.h"  // localized copy (tools/localize_native.py)
 #include "../../generated/hot/n_82140A90.h"  // localized copy (tools/localize_native.py)
 #include "../../generated/hot/n_8214A208.h"  // localized copy (tools/localize_native.py)
 #include "../../generated/hot/n_8214A050.h"  // localized copy (tools/localize_native.py)
-#include "../../generated/hot/n_82146E48.h"  // localized copy (tools/localize_native.py)
-#include "../../generated/hot/n_82146DD8.h"  // localized copy (tools/localize_native.py)
-#include "../../generated/hot/n_82141700.h"  // localized copy (tools/localize_native.py)
-#include "../../generated/hot/n_82963590.h"  // localized copy (tools/localize_native.py)
+#include "../../generated/hot/n_82146E48.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_mtx34_to_44.h"                 // hand-written, sa2-nx 2026-10-28
+#include "../../generated/hot/n_82146DD8.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_mtx44_to_34.h"                 // hand-written, sa2-nx 2026-10-28
+#include "../../generated/hot/n_82141700.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_store_slot.h"                  // hand-written, sa2-nx 2026-10-28
+#include "../../generated/hot/n_82963590.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_records_copy.h"                // hand-written, sa2-nx 2026-10-28
+#include "../../generated/hot/n_8214E3F0.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_strip_builder.h"               // hand-written, sa2-nx 2026-10-28
+#include "../../generated/hot/n_8214E2B0.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_position_strips.h"             // hand-written, sa2-nx 2026-10-28
 #include "../../generated/hot/n_821BA660.h"  // localized copy (tools/localize_native.py)
 #include "../../generated/hot/n_8214B6C8.h"  // localized copy, unguarded (tools/localize_native.py)
 #include "../../generated/hot/n_8214B520.h"  // localized copy, unguarded (tools/localize_native.py)
@@ -100,9 +95,25 @@ extern "C" const bool g_banjo_store_cards = false;
 #include "../../generated/hot/n_8214ACA8.h"  // localized copy, unguarded (tools/localize_native.py)
 #include "../../generated/hot/n_828326F8.h"  // localized copy, unguarded (tools/localize_native.py)
 #include "../../generated/hot/n_82833E20.h"  // localized copy, unguarded (tools/localize_native.py)
-#include "../../generated/hot/n_828243A0.h"  // localized copy, unguarded (tools/localize_native.py)
+#include "../../generated/hot/n_828243A0.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_texel_span.h"                  // hand-written, sa2-nx 2026-10-28
+#include "../../generated/hot/n_8214F120.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_colour_strips.h"               // hand-written, sa2-nx 2026-10-28
+#include "../../generated/hot/n_82919200.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_buffer_clear.h"                // hand-written, sa2-nx 2026-10-28
+#include "../../generated/hot/n_82139750.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_slot_copies.h"                // hand-written, sa2-nx 2026-10-28
+#include "../../generated/hot/n_82823E08.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_texel_store.h"                // hand-written, sa2-nx 2026-10-28
+#include "../../generated/hot/n_8214EF60.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_copied_strips.h"              // hand-written, sa2-nx 2026-10-28
+#include "../../generated/hot/n_8214F028.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_strided_strips.h"             // hand-written, sa2-nx 2026-10-28
+#include "../../generated/hot/n_82147628.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_point_transform.h"            // hand-written, sa2-nx 2026-10-28
 #include "../../generated/hot/n_821BA890.h"  // localized copy, unguarded (tools/localize_native.py)
-#include "../../generated/hot/n_82833938.h"  // localized copy, unguarded (tools/localize_native.py)
+#include "../../generated/hot/n_82833938.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_alpha_block.h"                // hand-written, sa2-nx 2026-10-28
 #include "../../generated/hot/n_82834458.h"  // localized copy, unguarded (tools/localize_native.py)
 #include "../../generated/hot/n_82816B40.h"  // localized copy, unguarded (tools/localize_native.py)
 #include "../../generated/hot/n_82139930.h"  // localized copy, unguarded (tools/localize_native.py)
@@ -110,9 +121,12 @@ extern "C" const bool g_banjo_store_cards = false;
 #include "../../generated/hot/n_821472E0.h"  // localized copy, unguarded (tools/localize_native.py)
 #include "../../generated/hot/n_82565758.h"  // localized copy, unguarded (tools/localize_native.py)
 #include "../../generated/hot/n_8213E040.h"  // localized copy, unguarded (tools/localize_native.py)
-#include "../../generated/hot/n_82833568.h"  // localized copy, unguarded (tools/localize_native.py)
-#include "../../generated/hot/n_82832298.h"  // localized copy (tools/localize_native.py)
-#include "../../generated/hot/n_8214B320.h"  // localized copy (tools/localize_native.py)
+#include "../../generated/hot/n_82833568.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_dxt1_block.h"                  // hand-written, sa2-nx 2026-10-28
+#include "../../generated/hot/n_82832298.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_alpha_rescale.h"               // hand-written, sa2-nx 2026-10-28
+#include "../../generated/hot/n_8214B320.h"  // localized copy (tools/localize_native.py): the reference of
+#include "hot/n_record_store.h"               // hand-written, sa2-nx 2026-10-28 (batch 3)
 #include "../../generated/hot/n_82565C60.h"  // localized copy, called by the renderer's hook
 #include "../../generated/hot/n_82556A60.h"  // localized copy, called by the renderer's hook
 #include "../../generated/hot/n_82555E18.h"  // localized copy, unguarded (tools/localize_native.py)
@@ -211,7 +225,7 @@ const PPCCRRegister* Cr(const PPCContext& c, int n) { return &c.cr0 + n; }     /
 std::string CompareRegs(Cmp cmp, const PPCContext& a, const PPCContext& b) {
   const bool all = CmpAll(cmp);
   const bool nan = CmpNaN(cmp);
-  const bool ret_fp = cmp != Cmp::kReturnInt;  // f1 / v1: a float return value
+  const bool ret_fp = cmp != Cmp::kReturnInt && cmp != Cmp::kReturnIntNaN;  // f1 / v1: a float return value
   for (int i = 0; i < 32; ++i) {
     const bool want = all || i == 1 || i == 3 || i >= 13;
     if (want && Gpr(a, i)->u64 != Gpr(b, i)->u64)
@@ -369,16 +383,17 @@ SA2_HOT_HOOK(827EF8B0, sa2_cpu_native_memmove, "Native CRT memmove (sub_827EF8B0
 // Round 13: both hand-written, writing only what callers can see (src/cpu/hot/n_ninja_matrix.h; the localized copies
 // moved every register they touch in and out of the context on every call). kReturnInt: callers read no float
 // register after either (tools/call_site_liveness.py); njMultiMatrix's -48(r1) copy (out equal to an input) is the
-// callee's dead scratch, so it is not compared.
+// callee's dead scratch, so it is not compared. Since 2026-10-28 kReturnIntNaN (a NaN equals a NaN in the result,
+// sa2_hot_common.h): njCalcPoint of a garbage matrix in a story stage wrote a NaN of the other sign than the original.
 SA2_HOT_HOOK(82146ED8, sa2_cpu_native_calc_point, "Native njCalcPoint (sub_82146ED8), hand-written: the result only",
              sa2::hot::n_calc_point, +[](const PPC& c, const uint8_t*, Writes& w) { w.Add(c.r5.u32, 12); },
-             sa2::hot::Cmp::kReturnInt, 136, 0x1A5C740F62335800ull)
+             sa2::hot::Cmp::kReturnIntNaN, 136, 0x1A5C740F62335800ull)
 SA2_HOT_HOOK(82146F60, sa2_cpu_native_multi_matrix, "Native njMultiMatrix (sub_82146F60), hand-written: the result only",
              sa2::hot::n_multi_matrix,
              +[](const PPC& c, const uint8_t*, Writes& w) {
                if (c.r3.u32 && c.r4.u32 && c.r5.u32) w.Add(c.r5.u32, 48);
              },
-             sa2::hot::Cmp::kReturnInt, 752, 0x6118F26106826963ull)
+             sa2::hot::Cmp::kReturnIntNaN, 752, 0x6118F26106826963ull)
 SA2_HOT_HOOK(82147AC0, sa2_cpu_native_translate, "Native njTranslate (sub_82147AC0), localized copy",
              sa2::hot::n_82147AC0,
              +[](const PPC& c, const uint8_t*, Writes& w) {
@@ -416,8 +431,10 @@ SA2_HOT_HOOK(82147CD8, sa2_cpu_native_rotate_z, "Native njRotateZ (sub_82147CD8)
              sa2::hot::Cmp::kCalls, 208, 0x3A5DA27104AF59BBull)
 
 // Engine (profile: 3.0 %): an ordered-tree (std::map) lower-bound search by a 32-bit key; result iterator to [r3].
-SA2_HOT_HOOK(8213EC28, sa2_cpu_native_map_lower_bound, "Native std::map lower bound (sub_8213EC28), localized copy",
-             sa2::hot::n_8213EC28,
+// sa2-nx (2026-10-28): hand-written, branchless (hot/n_map_lower_bound.h; the copy n_8213EC28.h is its reference).
+SA2_HOT_HOOK(8213EC28, sa2_cpu_native_map_lower_bound, "Native std::map lower bound (sub_8213EC28), hand-written: "
+             "branchless tree walk",
+             sa2::hot::n_map_lower_bound,
              +[](const PPC& c, const uint8_t*, Writes& w) {
                w.Add(c.r3.u32, 4);
                w.Add(c.r1.u32 - 16, 8);
@@ -440,8 +457,10 @@ SA2_HOT_HOOK_COPY(8213A4D8, sa2_cpu_native_sub_8213A4D8, SA2_COPIES_DEFAULT, "Na
 SA2_HOT_HOOK_COPY(82139DA0, sa2_cpu_native_sub_82139DA0, SA2_COPIES_DEFAULT, "Native localized copy of sub_82139DA0 (3.2 % of the game thread on PC)",
                        sa2::hot::n_82139DA0, 632, 0x06A3E594049A1B65ull)
 // sub_8214CF10: round 13's hand-written version (below) replaced the localized copy.
-SA2_HOT_HOOK_COPY(8214E130, sa2_cpu_native_sub_8214E130, SA2_COPIES_DEFAULT, "Native localized copy of sub_8214E130 (2.4 % of the game thread on PC)",
-                       sa2::hot::n_8214E130, 384, 0x856253660DDC74D0ull)
+// sa2-nx (2026-10-28): hand-written (hot/n_vertex24_strips.h; the copy n_8214E130.h is its reference, and its
+// vertex loop the fallback). Unguarded as the copy was; in verify mode its fast loop checks itself.
+SA2_HOT_HOOK_COPY(8214E130, sa2_cpu_native_vertex24_strips, SA2_COPIES_DEFAULT, "Native 24-byte vertex strips (sub_8214E130, 1.3 % of the game thread in gameplay), hand-written: the vertex buffer's base and cursor in registers",
+                  sa2::hot::n_vertex24_strips, 384, 0x856253660DDC74D0ull)
 SA2_COPY_FOR_HOOK(82555CC8, sa2_cpu_native_sub_82555CC8, SA2_COPIES_DEFAULT, "Native localized copy of sub_82555CC8 (2.4 %, Direct3D of the game thread on PC)",
                        sa2::hot::n_82555CC8, 336, 0x5C91B7E296B6DE66ull)
 SA2_HOT_HOOK_COPY(821BC520, sa2_cpu_native_sub_821BC520, SA2_COPIES_DEFAULT, "Native localized copy of sub_821BC520 (2.3 % of the game thread on PC)",
@@ -462,8 +481,14 @@ SA2_HOT_HOOK_COPY(82552408, sa2_cpu_native_sub_82552408, SA2_COPIES_DEFAULT, "Na
                        sa2::hot::n_82552408, 288, 0xCD2D456D05D4AC56ull)
 SA2_HOT_HOOK_COPY(82960808, sa2_cpu_native_sub_82960808, SA2_COPIES_DEFAULT, "Native localized copy of sub_82960808 (1.3 % of the game thread on PC)",
                        sa2::hot::n_82960808, 288, 0x7C79132A3BE8A43Full)
-SA2_HOT_HOOK_COPY(8214D6D8, sa2_cpu_native_sub_8214D6D8, SA2_COPIES_DEFAULT, "Native localized copy of sub_8214D6D8 (1.3 % of the game thread on PC)",
-                       sa2::hot::n_8214D6D8, 240, 0xA6DE8ACA97828B1Dull)
+// sa2-nx (2026-10-28, batch 3): hand-written (hot/n_state_block.h; the copy n_8214D6D8.h is its reference): the
+// block's cards once. Handler 8 (sub_8214B3A0, hot/n_state_handler8.h) runs this body inline, not through this hook.
+SA2_HOT_HOOK_COPY(8214D6D8, sa2_cpu_native_sub_8214D6D8, SA2_COPIES_DEFAULT, "Native render-state handler 8 body (sub_8214D6D8), hand-written: the block's cards once",
+                       sa2::hot::n_state_block, 240, 0xA6DE8ACA97828B1Dull)
+SA2_HOT_HOOK_COPY(8214B3A0, sa2_cpu_native_state_handler8, SA2_COPIES_DEFAULT, "Native render-state handler 8 (sub_8214B3A0, the game thread's hottest function in the 2P console profile), hand-written: its body inline",
+                       sa2::hot::n_state_handler8, 24, 0x805675BDEF589D59ull)
+SA2_HOT_HOOK_COPY(8214B168, sa2_cpu_native_state_bytes, SA2_COPIES_DEFAULT, "Native render-state handler 5 (sub_8214B168), hand-written: four byte stores' cards once",
+                       sa2::hot::n_state_bytes, 328, 0x7A9EBB8C92253F6Full)
 
 // Round 2: the hottest guardable functions of the CONSOLE profile (cpu_on, 1020 MHz, gameplay under 40 fps,
 // 2026-10-06; tools/switch_profile_report.py). Guarded like the first set and on by default. Percentages are of the
@@ -477,8 +502,10 @@ SA2_HOT_HOOK(8255D990, sa2_cpu_native_d3d_constants_a, "Native Direct3D constant
 SA2_HOT_HOOK(8255D8B8, sa2_cpu_native_d3d_constants_b, "Native Direct3D constant upload (sub_8255D8B8, constants 120+): one copy",
              sa2::hot::n_8255D8B8, &sa2::hot::n_8255D8B8::Writes, sa2::hot::Cmp::kReturn, 216, 0x9C7F63BCBF9EE982ull)
 // Localized copies (tools/localize_native.py), leaves or calling only the save/restore helpers: kAll.
-SA2_HOT_HOOK(8214BBD8, sa2_cpu_native_key_search, "Native keyframe search (sub_8214BBD8), localized copy",
-             sa2::hot::n_8214BBD8,
+// sa2-nx (2026-10-28): hand-written, branchless search loop (hot/n_key_search.h; the copy n_8214BBD8.h is its reference).
+SA2_HOT_HOOK(8214BBD8, sa2_cpu_native_key_search, "Native keyframe search (sub_8214BBD8), hand-written: branchless "
+             "binary search",
+             sa2::hot::n_key_search,
              +[](const PPC& c, const uint8_t*, Writes& w) {
                w.Add(c.r7.u32, 4);  // the lower neighbour
                w.Add(c.r8.u32, 4);  // the upper neighbour
@@ -503,23 +530,31 @@ SA2_HOT_HOOK(8214A208, sa2_cpu_native_cos, "Native njCos (sub_8214A208), localiz
 SA2_HOT_HOOK(8214A050, sa2_cpu_native_sin, "Native njSin (sub_8214A050), localized copy",
              sa2::hot::n_8214A050, +[](const PPC& c, const uint8_t*, Writes& w) { w.Add(c.r1.u32 - 16, 8); },
              sa2::hot::Cmp::kAll, 440, 0xEF455A09F926F7DDull)
-SA2_HOT_HOOK(82146E48, sa2_cpu_native_matrix_4x4, "Native 3x4 to 4x4 matrix (sub_82146E48), localized copy",
-             sa2::hot::n_82146E48,
+// sa2-nx (2026-10-28): hand-written (hot/n_mtx34_to_44.h; the copy n_82146E48.h is its reference and overlap fallback).
+SA2_HOT_HOOK(82146E48, sa2_cpu_native_matrix_4x4, "Native 3x4 to 4x4 matrix (sub_82146E48), hand-written: words, "
+             "one card mark",
+             sa2::hot::n_mtx34_to_44,
              +[](const PPC& c, const uint8_t*, Writes& w) {
                if (c.r4.u32) w.Add(c.r3.u32, 64);
              },
              sa2::hot::Cmp::kAll, 144, 0xC6318134F65E2EDEull)
-SA2_HOT_HOOK(82146DD8, sa2_cpu_native_matrix_3x4, "Native 4x4 to 3x4 matrix (sub_82146DD8), localized copy",
-             sa2::hot::n_82146DD8,
+// sa2-nx (2026-10-28): hand-written (hot/n_mtx44_to_34.h; the copy n_82146DD8.h is its reference and overlap fallback).
+SA2_HOT_HOOK(82146DD8, sa2_cpu_native_matrix_3x4, "Native 4x4 to 3x4 matrix (sub_82146DD8), hand-written: words, "
+             "one card mark",
+             sa2::hot::n_mtx44_to_34,
              +[](const PPC& c, const uint8_t*, Writes& w) {
                if (c.r4.u32) w.Add(c.r4.u32, 48);
              },
              sa2::hot::Cmp::kAll, 112, 0x5A0112B4F25E6F9Bull)
-SA2_HOT_HOOK(82141700, sa2_cpu_native_store_slot, "Native one-of-seven word store (sub_82141700), localized copy",
-             sa2::hot::n_82141700, +[](const PPC& c, const uint8_t*, Writes& w) { w.Add(c.r3.u32 + 1568, 28); },
+// sa2-nx (2026-10-28): hand-written (hot/n_store_slot.h; the copy n_82141700.h is its reference and trap fallback).
+SA2_HOT_HOOK(82141700, sa2_cpu_native_store_slot, "Native one-of-seven word store (sub_82141700), hand-written: "
+             "an offset table",
+             sa2::hot::n_store_slot, +[](const PPC& c, const uint8_t*, Writes& w) { w.Add(c.r3.u32 + 1568, 28); },
              sa2::hot::Cmp::kAll, 184, 0x2480CFD0D6204630ull)
-SA2_HOT_HOOK(82963590, sa2_cpu_native_records_copy, "Native 24-byte record copy (sub_82963590), localized copy",
-             sa2::hot::n_82963590,
+// sa2-nx (2026-10-28): hand-written (hot/n_records_copy.h; the copy n_82963590.h is its reference and fallback).
+SA2_HOT_HOOK(82963590, sa2_cpu_native_records_copy, "Native 24-byte record copy (sub_82963590), hand-written: one "
+             "memcpy",
+             sa2::hot::n_records_copy,
              +[](const PPC& c, const uint8_t*, Writes& w) {
                if (c.r4.u32 && c.r5.s32 > 0) {
                  const uint64_t bytes = 4 + 24 * uint64_t(uint32_t(c.r5.s32));
@@ -528,6 +563,16 @@ SA2_HOT_HOOK(82963590, sa2_cpu_native_records_copy, "Native 24-byte record copy 
                }
              },
              sa2::hot::Cmp::kAll, 80, 0x0C525A39B6BED5B8ull)
+// sa2-nx (2026-10-28): hand-written (hot/n_strip_builder.h; the copy n_8214E3F0.h is its reference, and its inner loop
+// the fallback). It calls other functions, so unguarded; in verify mode its fast loop checks itself against the copy's.
+SA2_HOT_HOOK_COPY(8214E3F0, sa2_cpu_native_strip_builder, SA2_COPIES_DEFAULT, "Native strip builder (sub_8214E3F0, "
+                  "6.1 % of the console session), hand-written: the vertex buffer's base and cursor in registers",
+                  sa2::hot::n_strip_builder, 432, 0x21848FD34265E6D7ull)
+// sa2-nx (2026-10-28): hand-written (hot/n_position_strips.h; the copy n_8214E2B0.h is its reference, and its inner
+// loop the fallback). It calls sub_82139C90, so unguarded; in verify mode its fast loop checks itself.
+SA2_HOT_HOOK_COPY(8214E2B0, sa2_cpu_native_position_strips, SA2_COPIES_DEFAULT, "Native position strips (sub_8214E2B0, "
+                  "1.3 % of the console session), hand-written: the vertex buffer's base and cursor in registers",
+                  sa2::hot::n_position_strips, 232, 0x0B7E0B88E1867F99ull)
 // Calls memcpy and sub_82140A90 (both hooked: a nested call may itself be a checked one), so kCalls.
 SA2_HOT_HOOK(82140C98, sa2_cpu_native_matrix_op, "Native 4x4 matrix routine (sub_82140C98), localized copy",
              sa2::hot::n_82140C98,
@@ -571,12 +616,47 @@ SA2_HOT_HOOK_COPY(828326F8, sa2_cpu_native_sub_828326F8, SA2_COPIES_DEFAULT, "Na
                   sa2::hot::n_828326F8, 1152, 0xBF8AEF4A4FAFB058ull)
 SA2_HOT_HOOK_COPY(82833E20, sa2_cpu_native_sub_82833E20, SA2_COPIES_DEFAULT, "Native localized copy of sub_82833E20 (float routine of the 0x8283 group, calls 82832B78)",
                   sa2::hot::n_82833E20, 1464, 0xDE0E6D2C7FC69E70ull)
-SA2_HOT_HOOK_COPY(828243A0, sa2_cpu_native_sub_828243A0, SA2_COPIES_DEFAULT, "Native localized copy of sub_828243A0 (hot game function, one indirect call)",
-                  sa2::hot::n_828243A0, 744, 0x5AECFD5F6266ABE4ull)
+// sa2-nx (2026-10-28): hand-written (hot/n_texel_span.h; the copy n_828243A0.h is its reference, and its two loops the
+// fallbacks). Unguarded as the copy was; in verify mode its fast loops check themselves against the copy's.
+SA2_HOT_HOOK_COPY(828243A0, sa2_cpu_native_texel_span, SA2_COPIES_DEFAULT, "Native texel span (sub_828243A0, 5.2 % of "
+                  "the game thread in gameplay), hand-written: the texel copy and colour key without reloads",
+                  sa2::hot::n_texel_span, 744, 0x5AECFD5F6266ABE4ull)
+// sa2-nx (2026-10-28): hand-written (hot/n_colour_strips.h; the copy n_8214F120.h is its reference, and its vertex
+// loop the fallback). Unguarded; in verify mode its fast loop checks itself.
+SA2_HOT_HOOK_COPY(8214F120, sa2_cpu_native_colour_strips, SA2_COPIES_DEFAULT, "Native position and colour strips "
+                  "(sub_8214F120), hand-written: the vertex buffer's base and cursor in registers",
+                  sa2::hot::n_colour_strips, 240, 0x5F4744D63E88B207ull)
+// sa2-nx (2026-10-28): hand-written (hot/n_buffer_clear.h; the copy n_82919200.h is its reference, and its fill loop
+// the fallback): the session's top function, off the game thread. Unguarded; in verify mode its fast fill checks itself.
+SA2_HOT_HOOK_COPY(82919200, sa2_cpu_native_buffer_clear, SA2_COPIES_DEFAULT, "Native float buffers clear (sub_82919200, "
+                  "8.2 % of the console session, off the game thread), hand-written: one fill a buffer",
+                  sa2::hot::n_buffer_clear, 144, 0x2F1E5065BC393E90ull)
+// sa2-nx (2026-10-28): hand-written (hot/n_slot_copies.h; the copy n_82139750.h is its reference, and its six
+// word loops the fallbacks). Unguarded as its bulk copy was; in verify mode its fast copies check themselves.
+SA2_HOT_HOOK_COPY(82139750, sa2_cpu_native_slot_copies, SA2_COPIES_DEFAULT, "Native flagged slot copies (sub_82139750), hand-written: one copy a slot",
+                  sa2::hot::n_slot_copies, 480, 0xB5FDE7E1028196D5ull)
+// sa2-nx (2026-10-28): hand-written (hot/n_texel_store.h; the copy n_82823E08.h is its reference, and its
+// scatter loop the fallback). Unguarded as its bulk copy was; in verify mode its fast loop checks itself.
+SA2_HOT_HOOK_COPY(82823E08, sa2_cpu_native_texel_store, SA2_COPIES_DEFAULT, "Native texel span store (sub_82823E08, 0.7 % of the game thread in gameplay), hand-written: the block cache held",
+                  sa2::hot::n_texel_store, 1432, 0xDD4F5389FEEAC424ull)
+// sa2-nx (2026-10-28): hand-written (hot/n_copied_strips.h; the copy n_8214EF60.h is its reference, and its
+// vertex loop the fallback). Unguarded as its bulk copy was; in verify mode its fast loop checks itself.
+SA2_HOT_HOOK_COPY(8214EF60, sa2_cpu_native_copied_strips, SA2_COPIES_DEFAULT, "Native copied-vertex strips (sub_8214EF60), hand-written: the vertex buffer's base and cursor in registers",
+                  sa2::hot::n_copied_strips, 200, 0x72EF078A5DC72F95ull)
+// sa2-nx (2026-10-28): hand-written (hot/n_strided_strips.h; the copy n_8214F028.h is its reference, and its
+// vertex loop the fallback). Unguarded as its bulk copy was; in verify mode its fast loop checks itself.
+SA2_HOT_HOOK_COPY(8214F028, sa2_cpu_native_strided_strips, SA2_COPIES_DEFAULT, "Native strided position strips (sub_8214F028), hand-written: the vertex buffer's base and cursor in registers",
+                  sa2::hot::n_strided_strips, 248, 0x966D8AC3700821FBull)
+// sa2-nx (2026-10-28): hand-written (hot/n_point_transform.h; the copy n_82147628.h is its reference, and its two
+// loops the fallbacks). Unguarded as its bulk copy was; in verify mode its fast loops check themselves.
+SA2_HOT_HOOK_COPY(82147628, sa2_cpu_native_point_transform, SA2_COPIES_DEFAULT, "Native point array by a 3x4 matrix (sub_82147628), hand-written: the matrix held",
+                  sa2::hot::n_point_transform, 712, 0xE698E73597B2B11Cull)
 SA2_HOT_HOOK_COPY(821BA890, sa2_cpu_native_sub_821BA890, SA2_COPIES_DEFAULT, "Native localized copy of sub_821BA890 (object draw wrapper (inclusive 59 %))",
                   sa2::hot::n_821BA890, 128, 0x997B62A9F632926Eull)
-SA2_HOT_HOOK_COPY(82833938, sa2_cpu_native_sub_82833938, SA2_COPIES_DEFAULT, "Native localized copy of sub_82833938 (routine of the 0x8283 group, calls 82833568)",
-                  sa2::hot::n_82833938, 560, 0x1CFEFBE869CCAA91ull)
+// sa2-nx (2026-10-28): hand-written (hot/n_alpha_block.h; the copy n_82833938.h is its reference, and its four
+// loops the fallbacks). Unguarded as the copy was; in verify mode its fast loops check themselves.
+SA2_HOT_HOOK_COPY(82833938, sa2_cpu_native_alpha_block, SA2_COPIES_DEFAULT, "Native DXT5 block decode (sub_82833938, 2.6 % of the game thread in gameplay), hand-written: palette and texels without reloads",
+                  sa2::hot::n_alpha_block, 560, 0x1CFEFBE869CCAA91ull)
 SA2_HOT_HOOK_COPY(82834458, sa2_cpu_native_sub_82834458, SA2_COPIES_DEFAULT, "Native localized copy of sub_82834458 (wrapper of 82833E20)",
                   sa2::hot::n_82834458, 128, 0x34037AF73161CA53ull)
 SA2_HOT_HOOK_COPY(82816B40, sa2_cpu_native_sub_82816B40, SA2_COPIES_DEFAULT, "Native localized copy of sub_82816B40 (hot game function, indirect calls)",
@@ -591,8 +671,11 @@ SA2_COPY_FOR_HOOK(82565758, sa2_cpu_native_sub_82565758, SA2_COPIES_DEFAULT, "Na
                   sa2::hot::n_82565758, 1216, 0x16CE63397DFBCDCBull)
 SA2_HOT_HOOK_COPY(8213E040, sa2_cpu_native_sub_8213E040, SA2_COPIES_DEFAULT, "Native localized copy of sub_8213E040 (hot game function, indirect calls)",
                   sa2::hot::n_8213E040, 256, 0x9FC6BCE3A1354E06ull)
-SA2_HOT_HOOK_COPY(82833568, sa2_cpu_native_sub_82833568, SA2_COPIES_DEFAULT, "Native localized copy of sub_82833568 (routine of the 0x8283 group, only the save/restore helpers)",
-                  sa2::hot::n_82833568, 784, 0x36D820C7E337CEF3ull)
+// sa2-nx (2026-10-28): hand-written (hot/n_dxt1_block.h; the copy n_82833568.h is its reference, and its texel loop the
+// fallback). Unguarded as the copy was; in verify mode its fast loop checks itself against the copy's.
+SA2_HOT_HOOK_COPY(82833568, sa2_cpu_native_dxt1_block, SA2_COPIES_DEFAULT, "Native DXT1 block decode (sub_82833568, "
+                  "8.9 % of the game thread in gameplay), hand-written: a texel is one 16-byte copy",
+                  sa2::hot::n_dxt1_block, 784, 0x36D820C7E337CEF3ull)
 
 // Round 4: 20 more game-thread functions of the console profile (round-2 NRO, cpu_on, 1020 MHz), ranked by their own
 // samples: a copy speeds up the function's own code, not its callees (docs/enhancements.md, "Round 4").
@@ -601,18 +684,37 @@ SA2_HOT_HOOK_COPY(82833568, sa2_cpu_native_sub_82833568, SA2_COPIES_DEFAULT, "Na
 //  - sub_82832298 multiplies floats: NaN-tolerant compare (round 2: the sign of a NaN depends on the compilation);
 //  - sub_8214B320 saves r30/r31 below r1 and writes one record of a table: (entry - 9) * 20 bytes after 0x83853480,
 //    entry = the word at 0x83850768 + ((r3 >> 14) & 0x3FC), the same loads the function makes.
-SA2_HOT_HOOK(82832298, sa2_cpu_native_sub_82832298, "Native localized copy of sub_82832298 (rescales 16 records of four floats by a limit over the fourth; leaf)",
-             sa2::hot::n_82832298,
+// sa2-nx (2026-10-28): hand-written (hot/n_alpha_rescale.h; the copy n_82832298.h is its reference): selects for the
+// per-component branches, a record's cards once. Guarded as the copy was.
+SA2_HOT_HOOK(82832298, sa2_cpu_native_alpha_rescale, "Native alpha rescale of 16 texels (sub_82832298, 2.0 % of the "
+             "game thread in gameplay), hand-written: selects, a record's cards once",
+             sa2::hot::n_alpha_rescale,
              +[](const PPC& c, const uint8_t*, Writes& w) { w.Add(c.r3.u32, 256); },
              sa2::hot::Cmp::kAllNaN, 168, 0x2F043BAEA9B4C012ull)
-SA2_HOT_HOOK(8214B320, sa2_cpu_native_sub_8214B320, "Native localized copy of sub_8214B320 (fills one record of a table at 0x83853480 from three lookups indexed by r3; leaf)",
-             sa2::hot::n_8214B320,
+// sa2-nx (2026-10-28, batch 3): hand-written (hot/n_record_store.h; the copy n_8214B320.h is its reference): the
+// record's cards once. Guarded as the copy was. The two leaves after it likewise (batch 3).
+SA2_HOT_HOOK(8214B320, sa2_cpu_native_sub_8214B320, "Native render-state handler 0 (sub_8214B320, fills one record of a table at 0x83853480 from three lookups indexed by r3; leaf), hand-written: the record's cards once",
+             sa2::hot::n_record_store,
              +[](const PPC& c, const uint8_t* base, Writes& w) {
                w.Add(c.r1.u32 - 16, 16);  // r30 and r31 (no frame of its own)
                const uint32_t entry = Ld32(base, 0x83850768u + ((c.r3.u32 >> 14) & 0x3FCu));
                w.Add(0x83853480u + (entry - 9u) * 20u, 17);  // +0..+16: four words and the byte of r3
              },
              sa2::hot::Cmp::kAll, 128, 0x757EF8F6C1A7A575ull)
+SA2_HOT_HOOK(82147340, sa2_cpu_native_matrix_transpose, "Native 3x4 matrix transpose (sub_82147340), hand-written: "
+             "the matrix's cards once",
+             sa2::hot::n_matrix_transpose,
+             +[](const PPC& c, const uint8_t*, Writes& w) { w.Add(c.r4.u32, 48); },
+             sa2::hot::Cmp::kAllNaN, 168, 0xEFAD9A3A2B25854Bull)
+SA2_HOT_HOOK(8214D9F8, sa2_cpu_native_colour_pack, "Native colour clamp and pack (sub_8214D9F8), hand-written: the "
+             "floats' and the bytes' cards once each",
+             sa2::hot::n_colour_pack,
+             +[](const PPC& c, const uint8_t*, Writes& w) {
+               w.Add(c.r3.u32, 16);       // the four clamped floats
+               w.Add(c.r4.u32, 4);        // the packed bytes
+               w.Add(c.r1.u32 - 32, 24);  // the conversions' words below r1 (no frame of its own)
+             },
+             sa2::hot::Cmp::kAllNaN, 208, 0x0F7DB10A30C0DAF3ull)
 // The Direct3D draw and its shader load are hooked by the renderer (src/me/sa2_me_hooks.cpp, NoteDrawCall /
 // NoteShaderObject): the hooks call these copies in place of the originals (sub_82565C60 was the largest function
 // of the game thread without a native: 1.7 % self, 7.5 % with what it calls).

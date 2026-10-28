@@ -17,7 +17,18 @@ card as `switch\sa2-nx`. With a loose `game_root/` folder instead of the pack (`
 the pack on the card (a few minutes, logged as `[pack] packing N %`); the folder can be deleted afterwards. When a pack
 exists it is always used, so an old `game_root/` folder from earlier tests is no longer read and can be deleted.
 
-## This build (version 1.0.3.1, 2026-10-20)
+## This build (version 1.0.4, 2026-10-28)
+
+- **Faster:** a CPU round (the hottest game functions as native code, the renderer's per-draw work on the game thread
+  cut, a lock-free queue to the render thread) and a GPU round (the frame's resolve copies handed over as images, the
+  docked resolve mip levels made only where read and drawn in place, repeated clears not sent), with a new PGO profile
+  from a console session of this build. Every change was checked frame for frame against the original on the PC.
+- **Double buffering** (`sa2_renut_double_buffer = true`, still off by default) no longer gets stuck showing every
+  image a refresh late after one slow frame (`sa2_renut_queue_drain`).
+- **Single Joy-Cons held sideways:** the stick is turned for the sideways grip (`input_joycon_sideways_stick`).
+- Update: replacing `sa2.nro` is enough (the shaders are 1.0.3.1's); the installer page's update zip works too.
+
+## Version 1.0.3.1 (2026-10-20)
 
 - **1920x1080 docked** again, as up to 1.0.2.1: the game draws 1920x1080 when docked and 1280x720 in handheld mode,
   and switches when you dock or undock. 1.0.3 drew 1280x720 docked too.

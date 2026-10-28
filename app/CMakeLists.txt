@@ -80,6 +80,8 @@ set(SA2_SOURCES
     # SA2's D3D addresses (draw-time shader load, Draw*) and the shader container dump (sa2_dump_shaders).
     src/me/sa2_me_hooks.cpp
     src/me/sa2_d3d_api.cpp
+    # The Direct3D setters' marks for Renut's delta capture (sa2_renut_setter_marks): the setters without a hook.
+    src/me/sa2_setter_marks.cpp
     # The native Direct3D layer (docs/api-renderer.md): Direct3D entry points as native code writing the ring's records.
     src/me/sa2_api_draw.cpp
     src/me/sa2_api_clear.cpp
@@ -97,9 +99,22 @@ set(SA2_SOURCES
     src/cpu/sa2_gpu_boost.cpp
     # Native replacements of hot guest functions (src/cpu/hot), each with a self-check guard and its own key.
     src/cpu/sa2_hot_guest.cpp
+    # sa2-nx (2026-10-28): the bulk localized copies (app/src/cpu/hot/localized_bulk.txt), in four shards so they
+    # compile in parallel (tools/localize_native.py --bulk writes their hook files).
+    src/cpu/sa2_hot_bulk_0.cpp
+    src/cpu/sa2_hot_bulk_1.cpp
+    src/cpu/sa2_hot_bulk_2.cpp
+    src/cpu/sa2_hot_bulk_3.cpp
 )
+# The files of localized copies and natives: the game code's compile rules apply to all of them (below).
+set(SA2_HOT_SOURCES src/cpu/sa2_hot_guest.cpp src/cpu/sa2_hot_bulk_0.cpp src/cpu/sa2_hot_bulk_1.cpp
+    src/cpu/sa2_hot_bulk_2.cpp src/cpu/sa2_hot_bulk_3.cpp)
 # Diagnostic builds only (e.g. the Direct3D census: out/census/sa2_d3d_census_all.cpp): extra sources, empty by default.
 set(SA2_EXTRA_SOURCES "" CACHE STRING "Extra source files for diagnostic builds (empty for normal builds)")
+if(SA2_EXTRA_SOURCES MATCHES "census")
+    # sa2-nx (2026-10-28): the setter census (sa2_d3d_api.cpp): the natives' hooks and the delta capture report to it.
+    add_compile_definitions(SA2_D3D_CENSUS_BUILD=1)
+endif()
 if(SA2_EXTRA_SOURCES)
     list(APPEND SA2_SOURCES ${SA2_EXTRA_SOURCES})
 endif()
@@ -467,7 +482,7 @@ if(REXGLUE_PLATFORM_SWITCH)
             if(TARGET sa2_recomp)
                 target_compile_options(sa2_recomp PRIVATE ${_sa2_inline_options})
             endif()
-            set_property(SOURCE src/cpu/sa2_hot_guest.cpp APPEND PROPERTY COMPILE_OPTIONS ${_sa2_inline_options})
+            set_property(SOURCE ${SA2_HOT_SOURCES} APPEND PROPERTY COMPILE_OPTIONS ${_sa2_inline_options})
         endif()
         if(SA2_SWITCH_LTO_PARTITIONS)
             list(APPEND _sa2_lto_link --param=lto-partitions=${SA2_SWITCH_LTO_PARTITIONS})
@@ -531,13 +546,13 @@ if(REXGLUE_PLATFORM_SWITCH)
     # The localized copies (app/generated/hot, all compiled in one file of the app) are game code too, and the
     # hottest of it: the same rule for that file. It only frees x29; the profile is not touched.
     if(SA2_SWITCH_OMIT_FRAME_POINTER)
-        set_property(SOURCE src/cpu/sa2_hot_guest.cpp APPEND PROPERTY COMPILE_OPTIONS -fomit-frame-pointer)
+        set_property(SOURCE ${SA2_HOT_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -fomit-frame-pointer)
     endif()
     # And the game code's errno rule: GCC does not inline between two functions that both compute with floats and
     # differ in -fmath-errno, which kept the native replacements (this file) and the game functions that call them
     # apart at the link: 25 call sites with 47 million calls in the profile's session.
     if(SA2_GAME_NO_MATH_ERRNO)
-        set_property(SOURCE src/cpu/sa2_hot_guest.cpp APPEND PROPERTY COMPILE_OPTIONS -fno-math-errno)
+        set_property(SOURCE ${SA2_HOT_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -fno-math-errno)
     endif()
     message(STATUS "sa2: CPU round 2026-10-12: omit frame pointer ${SA2_SWITCH_OMIT_FRAME_POINTER}, flush flow "
                    "${SA2_SWITCH_FLUSH_FLOW}, guest CAS ${SA2_SWITCH_GUEST_CAS}, vector byteswap "
@@ -618,6 +633,6 @@ if(REXGLUE_PLATFORM_SWITCH)
     rexglue_switch_add_nro(sa2
         NAME "Sonic Adventure 2"
         AUTHOR "ChanseyIsTheBest"
-        VERSION "1.0.3.1"
+        VERSION "1.0.4"
         ICON "${CMAKE_CURRENT_SOURCE_DIR}/icon.jpg")
 endif()

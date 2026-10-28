@@ -64,6 +64,11 @@ bool NonCpuMaster();
 // Starts the 10-second use report (a small background thread). Called once by the app after setup.
 void StartReport();
 
+// sa2-nx (2026-10-28, bejeweled3-nx's direct dispatch): whether anything reads the use counts (the 10 s report,
+// sa2_enhancements_report_s > 0). Off (a release: the report is 0), the unguarded localized copies' hooks skip their
+// per-call counting: a hook is then the state test and the call. Set once by StartReport.
+inline std::atomic<bool> g_count_uses{true};
+
 // Verify counters (sa2_cpu_verify; '[verify]' line of the 10 s report): every comparison of an enhancement with the
 // original path counts a check, every mismatch a difference (which must stay 0).
 void VerifyCheck(uint64_t n = 1);

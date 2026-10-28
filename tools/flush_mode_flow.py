@@ -81,7 +81,38 @@ GOTO = re.compile(r'^goto (loc_[0-9A-Fa-f]+);$')
 IFGOTO = re.compile(r'^if \(.*\) goto (loc_[0-9A-Fa-f]+);$')
 # Also the return of a leaf function after tools/leaf_locals.py: `{ REX_LEAF_STORE(l_r3, r3); return; }`.
 RETURN = re.compile(r'^(?:\{ (?:REX_LEAF_STORE\(\w+, \w+\); )+)?return\b[^;]*;(?: \})?$')
-DIRECT_CALL = re.compile(r'^__imp__(sub_[0-9A-F]{8})\(ctx, base\);$')
+_IMP_CALL = re.compile(r'^__imp__(sub_[0-9A-F]{8})\(ctx, base\);$')
+_HOOKED_CALL = re.compile(r'^(sub_[0-9A-F]{8})\(ctx, base\);$')
+
+
+def _transparent_copies():
+    """sa2-nx (2026-10-28): the bulk localized copies (app/src/cpu/hot/localized_bulk.txt). A copy runs its original's
+    own statements (tools/localize_native.py), its flush-mode statements included, and its hook runs the original when
+    the copy is off: a call through such a hook leaves the mode the original leaves, as a direct call does."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'app', 'src', 'cpu', 'hot',
+                        'localized_bulk.txt')
+    if not os.path.exists(path):
+        return frozenset()
+    return frozenset(m.group(1).upper() for m in re.finditer(r'^([0-9A-Fa-f]{8})\b', open(path, encoding='utf-8').read(),
+                                                              re.M))
+
+
+TRANSPARENT = _transparent_copies()
+
+
+class _DirectCall:
+    """DIRECT_CALL.match(s): a direct call of a recompiled function, or a call through a transparent copy's hook."""
+
+    @staticmethod
+    def match(s):
+        m = _IMP_CALL.match(s)
+        if m:
+            return m
+        m = _HOOKED_CALL.match(s)
+        return m if m and m.group(1)[4:] in TRANSPARENT else None
+
+
+DIRECT_CALL = _DirectCall()
 TRAILING_COMMENT = re.compile(r'^(.*?[;{}:])\s*//.*$')
 # Hands ctx to other code, or touches the mode word some other way.
 RESET = re.compile(r'\bctx\s*[,)]|REX_CALL_INDIRECT_FUNC|fpscr|setjmp|longjmp|FlushMode|REX_FLUSH_')

@@ -15,6 +15,8 @@
 
 #include "cpu/sa2_enhancements.h"
 #include "cpu/sa2_hot_common.h"
+#include "me/sa2_d3d_api.h"  // SA2_D3D_CENSUS_SCOPE: nothing outside census builds
+#include "me/sa2_setter_marks.h"  // SA2_SETTER_MARKS: nothing for the functions without marks
 
 namespace sa2::hot {
 
@@ -144,6 +146,8 @@ inline uint32_t CountCopyCall(uint8_t slot, std::atomic<uint32_t>& shared, PPCCo
   SA2_ENHANCEMENT(g_enh_##ADDR, KEY, sa2::enh::kCpu, true, DESC);                                          \
   REX_EXTERN(__imp__sub_##ADDR);                                                                           \
   REX_HOOK_RAW(sub_##ADDR) {                                                                               \
+    SA2_D3D_CENSUS_SCOPE(ADDR);                                                                            \
+    SA2_SETTER_MARKS(ADDR);                                                                                \
     static sa2::hot::Hook h{"sub_" #ADDR, &__imp__sub_##ADDR, &sa2::hot::NativeB<&NS::Native>, WRITES, CMP, \
                             &g_enh_##ADDR, 0x##ADDR##u, BYTES, HASH};                                       \
     uint8_t st = h.state.load(std::memory_order_relaxed);                                                  \
@@ -179,6 +183,8 @@ inline uint32_t CountCopyCall(uint8_t slot, std::atomic<uint32_t>& shared, PPCCo
   SA2_ENHANCEMENT(g_enh_##ADDR, KEY, sa2::enh::kCpu, DEFAULT, DESC);                            \
   REX_EXTERN(__imp__sub_##ADDR);                                                                \
   REX_HOOK_RAW(sub_##ADDR) {                                                                    \
+    SA2_D3D_CENSUS_SCOPE(ADDR);                                                                 \
+    SA2_SETTER_MARKS(ADDR);                                                                     \
     static std::atomic<uint8_t> state{sa2::hot::kUninit};                                       \
     static std::atomic<uint32_t> n_calls; /* the use report only: a lossy relaxed count, no TLS */ \
     static std::atomic<uint8_t> slot{sa2::hot::kNoSlot}; /* sa2_cpu_hook_counter_ctx */         \
@@ -191,9 +197,12 @@ inline uint32_t CountCopyCall(uint8_t slot, std::atomic<uint32_t>& shared, PPCCo
       state.store(st, std::memory_order_relaxed);                                               \
     }                                                                                           \
     if (st == sa2::hot::kOn) [[likely]] {                                                       \
-      const uint32_t c =                                                                        \
-          sa2::hot::CountCopyCall(slot.load(std::memory_order_relaxed), n_calls, ctx);          \
-      if ((c & 255) == 0) g_enh_##ADDR.Use(256);                                                \
+      /* sa2-nx (2026-10-28): counted only while the use report reads it (g_count_uses) */      \
+      if (sa2::enh::g_count_uses.load(std::memory_order_relaxed)) {                             \
+        const uint32_t c =                                                                      \
+            sa2::hot::CountCopyCall(slot.load(std::memory_order_relaxed), n_calls, ctx);        \
+        if ((c & 255) == 0) g_enh_##ADDR.Use(256);                                              \
+      }                                                                                         \
       NS::Native(ctx, base);                                                                    \
       return;                                                                                   \
     }                                                                                           \
@@ -208,6 +217,8 @@ inline uint32_t CountCopyCall(uint8_t slot, std::atomic<uint32_t>& shared, PPCCo
   SA2_ENHANCEMENT(g_enh_##ADDR, KEY, sa2::enh::kCpu, DEFAULT, DESC);                            \
   REX_EXTERN(__imp__sub_##ADDR);                                                                \
   void sa2::hot::Copy_##ADDR(PPCContext& ctx, uint8_t* base) {                                  \
+    SA2_D3D_CENSUS_SCOPE(ADDR);                                                                 \
+    SA2_SETTER_MARKS(ADDR);                                                                     \
     static std::atomic<uint8_t> state{sa2::hot::kUninit};                                       \
     static std::atomic<uint32_t> n_calls; /* the use report only: a lossy relaxed count, no TLS */ \
     static std::atomic<uint8_t> slot{sa2::hot::kNoSlot}; /* sa2_cpu_hook_counter_ctx */         \
@@ -220,9 +231,12 @@ inline uint32_t CountCopyCall(uint8_t slot, std::atomic<uint32_t>& shared, PPCCo
       state.store(st, std::memory_order_relaxed);                                               \
     }                                                                                           \
     if (st == sa2::hot::kOn) [[likely]] {                                                       \
-      const uint32_t c =                                                                        \
-          sa2::hot::CountCopyCall(slot.load(std::memory_order_relaxed), n_calls, ctx);          \
-      if ((c & 255) == 0) g_enh_##ADDR.Use(256);                                                \
+      /* sa2-nx (2026-10-28): counted only while the use report reads it (g_count_uses) */      \
+      if (sa2::enh::g_count_uses.load(std::memory_order_relaxed)) {                             \
+        const uint32_t c =                                                                      \
+            sa2::hot::CountCopyCall(slot.load(std::memory_order_relaxed), n_calls, ctx);        \
+        if ((c & 255) == 0) g_enh_##ADDR.Use(256);                                              \
+      }                                                                                         \
       NS::Native(ctx, base);                                                                    \
       return;                                                                                   \
     }                                                                                           \

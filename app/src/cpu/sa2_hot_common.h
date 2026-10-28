@@ -100,9 +100,12 @@ struct Writes {
 // kReturnInt (2026-10-07): as kReturn without f1 / v1, for integer-returning natives whose originals leave a float
 // scratch value in f1 (sub_8214CF10 / sub_8214D0F8 through njCalcPoint, and sub_821BA660 that calls njCalcPoint):
 // their callers treat f1 as clobbered.
-enum class Cmp : uint8_t { kReturn, kAll, kCalls, kAllNaN, kCallsNaN, kReturnInt };
+// kReturnIntNaN (sa2-nx 2026-10-28): as kReturnInt, with kAllNaN's NaN rule, for float natives that write their
+// result to memory: njCalcPoint of a garbage matrix (a story stage, a scripted PC run in verify mode: r3 = 0x4155C714,
+// a float's bits) wrote a NaN whose sign differed from the original's (0xFF... natively, 0x7F... in the original).
+enum class Cmp : uint8_t { kReturn, kAll, kCalls, kAllNaN, kCallsNaN, kReturnInt, kReturnIntNaN };
 inline bool CmpAll(Cmp c) { return c == Cmp::kAll || c == Cmp::kAllNaN; }
-inline bool CmpNaN(Cmp c) { return c == Cmp::kAllNaN || c == Cmp::kCallsNaN; }
+inline bool CmpNaN(Cmp c) { return c == Cmp::kAllNaN || c == Cmp::kCallsNaN || c == Cmp::kReturnIntNaN; }
 inline bool IsNaN32(uint32_t bits) { return (bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu); }
 inline bool IsNaN64(uint64_t bits) {
   return (bits & 0x7FF0000000000000ull) == 0x7FF0000000000000ull && (bits & 0x000FFFFFFFFFFFFFull);

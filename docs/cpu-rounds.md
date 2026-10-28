@@ -694,3 +694,183 @@ replaced `.compare`); renamed, and reported to banjo-nx.
 Most of these change the generated text, many of them the branching of their functions (inline memcpy / memset, the
 unaligned stores, the hoisted checks), so the committed profile no longer fits the functions they touch. A release
 built from this branch needs a new instrumented console session first (`build_switch.ps1 -Pgo generate`).
+
+## The optimising guide's two batches (2026-10-28): 20 hand-written natives, 200 bulk copies, changed-only write-backs
+
+Following `optimising-functions.md` (the user's guide): the top game functions by measured cost, each made a native
+replacement in two ways. Machine: the localized copy (`tools/localize_native.py`: the recompiled function's own
+statements with its guest registers in C++ locals), 100 more a batch. Hand: a native written against its copy, ten a
+batch. And the register write-backs of every copy limited to the registers that may differ (the "register write back
+stuff").
+
+### How the functions were ranked
+
+- **The console session's executed guest instructions** (`tools/pgo_function_counts.py`, new): the committed PGO
+  profile is a console session (`pgo/*.gcda`); the tool recompiles each generated file with the profile-generate flags
+  plus `-ftest-coverage`, copies the `.gcno` stamp into the `.gcda` and asks `gcov -j` for every function's executed
+  statements (one guest instruction each, near enough). `out/pgo_counts/functions.tsv`.
+- **The thread**: the PC profile's stacks (`out/hot_work/thread_attr.py`): the batches' bulk copies are game-thread
+  functions ("main"), the hand natives the hottest of the console's gameplay profile (round-6 renut,
+  `out/renut_test_pkg6/profile_game_thread_lt59.txt`) and of the session, where a hand version can do better than the
+  copy.
+
+### Machine: the bulk copies (`app/src/cpu/hot/localized_bulk.txt`)
+
+- 100 functions a batch, `tools/localize_native.py --bulk` (from `tools/post_codegen.py`): each copy unguarded, exact by
+  construction (the localizer's transformation, verified by the guard on the guarded copies), with its own key
+  (`sa2_cpu_native_sub_<addr>`), its code hash (a copy engages only on the code it was made from), in four hook files
+  (`app/generated/hot/localized_bulk_hooks_<N>.inc`, compiled by `src/cpu/sa2_hot_bulk_<N>.cpp`, balanced by size).
+- Batch 1: the 100 hottest main-thread functions without a native (five the localizer refused, three of them for
+  double-precision arithmetic, replaced by the next five). Batch 2: those three first (double precision is allowed
+  since `-ffp-contract=off` covers the whole executable, copies included), then the next ones, 100 in all (two
+  more for `sub_8254FCE8`, named by the app's sources, and `sub_8214F120`, made a hand native). Seven of batch 1's
+  became hand natives (the bulk list leaves a hooked function out): the build has 193 bulk copies.
+- Transparent to the whole-program passes: `flush_mode_flow.py`, `leaf_dead_stores.py` and `dead_ctx_defs.py` treat a
+  call to a bulk copy as a call to its original (it leaves exactly the original's registers and memory), so the
+  generated code changes only in its call targets and the PGO profile still fits (its line checksums need unchanged
+  line counts).
+- The copies keep the generated code's inline constant-size memcpy / memset (`SA2_MEMCPY_INLINE` /
+  `SA2_MEMSET_INLINE`, `sa2_hot_prelude.h`): the localizer syncs the registers the pch's helper reads (r1, r3, r4)
+  and leaves the call for the cases the helper refuses.
+- Direct dispatch (from bejeweled3-nx): with the use report off (a release), a copy's hook is its state test and the
+  call (`sa2::enh::g_count_uses`).
+
+### Machine: changed-only write-backs (`tools/localize_writebacks.py`)
+
+A copy writes its locals back to the context at every return and around its calls. The pass keeps only the stores of
+registers that may differ from the context there (a may-differ dataflow over the copy's statements: a register
+differs after a write that is not a reload or a sync, until it is synced), with a strict notion of a write (vector
+stores, method calls, a bare use or an address taken count as writes). Copies whose control flow it does not follow
+keep every store (their headers say so). The copies of the batch-2 build: 10,707 register stores kept of 20,199 in
+265 copies (47 % fewer); 11 copies keep every store.
+
+### Hand: batch 1
+
+| Function | What | Share | The hand version |
+|---|---|---|---|
+| `sub_8213EC28` | std::map lower bound | 3.0 % (PC) | branchless tree walk (`n_map_lower_bound.h`) |
+| `sub_82146E48` | 3x4 matrix to 4x4 | | a transpose, overlap fallback (`n_mtx34_to_44.h`) |
+| `sub_82146DD8` | 4x4 matrix to 3x4 | | a transpose, overlap fallback (`n_mtx44_to_34.h`) |
+| `sub_82141700` | one of seven words of a structure | | an offset table (`n_store_slot.h`) |
+| `sub_82963590` | records copy and count | | one memcpy and the cards (`n_records_copy.h`) |
+| `sub_8214BBD8` | keyframe binary search | | branchless search loop (`n_key_search.h`) |
+| `sub_8214E3F0` | strip builder (24-byte vertices out) | 6.1 % (session) | buffer base and cursor in registers (`n_strip_builder.h`) |
+| `sub_82833568` | DXT1 block to 16 float texels | 8.9 % (gameplay) | a texel is one 16-byte copy (`n_dxt1_block.h`) |
+| `sub_8214E2B0` | position strips | 1.3 % (session) | as the strip builder (`n_position_strips.h`) |
+| `sub_828243A0` | texel span of a compressed texture | 5.2 % (gameplay) | texel copy and colour key without reloads (`n_texel_span.h`) |
+
+### Hand: batch 2
+
+| Function | What | Share | The hand version |
+|---|---|---|---|
+| `sub_82833938` | DXT5 block to 16 float texels | 2.6 % (gameplay) | palette and texels without reloads (`n_alpha_block.h`) |
+| `sub_82147628` | points by a 3x4 matrix | | the matrix held (`n_point_transform.h`) |
+| `sub_8214E130` | strips of 24-byte vertices | 1.3 % (gameplay) | buffer base and cursor in registers (`n_vertex24_strips.h`) |
+| `sub_8214F028` | strided position strips | | as the strip builder (`n_strided_strips.h`) |
+| `sub_8214EF60` | strips of copied vertices | | the descriptor held (`n_copied_strips.h`) |
+| `sub_82823E08` | texel span into the block cache | 0.7 % (gameplay) | the cache held, a slot's cards once (`n_texel_store.h`) |
+| `sub_82139750` | six flagged slot copies | 0.5 % (session) | one copy a slot (`n_slot_copies.h`) |
+| `sub_82832298` | alpha rescale of 16 texels | 2.0 % (gameplay) | selects, a record's cards once (`n_alpha_rescale.h`) |
+| `sub_82919200` | clears up to 16 float buffers | 8.2 % (session; not the game thread) | one fill a buffer (`n_buffer_clear.h`) |
+| `sub_8214F120` | position and colour strips | | as the strip builder (`n_colour_strips.h`) |
+
+### What the hand versions do, and why it pays on the A57
+
+Most of these functions' time is not their arithmetic but what every guest store drags along: a byte-swapped store
+and a card mark (`REX_CARD`, banjo-nx's store cards: a byte store to the page's card). A byte store may alias
+anything, so GCC must reload after it every value the loop keeps in guest memory: a vertex buffer's base and cursor
+(three loads and three stores of the cursor a vertex in `sub_8214E3F0`), a matrix (48 loads a pass of four points in
+`sub_82147628`), a decoded palette (four loads, conversions and four card marks a texel in `sub_82833568`). The hand
+versions keep those values in registers for the length of a loop, store the cursor once, and mark the cards of a
+written range once: the same pages (the pages of the stores' first bytes), zeroed after the data as the stores zero
+each after its write.
+
+They are made from the copies (`tools/hand_natives/make_*.py`, `python tools/hand_natives/run_all.py` after every
+codegen): each generator checks the statements of the loops it replaces against the text it was written for, and
+wraps each in a fast loop that applies only under conditions it tests (the written range one host range, apart from
+every value the fast loop holds, no 4 GB wrap) and falls back to the copy's loop otherwise. Every header carries its
+audit: why the fast loop leaves the copy's registers and memory.
+
+### Verification
+
+- **Verify mode** (`sa2_cpu_verify`): the guarded natives compare every call with the original; the unguarded hand
+  natives check their fast loops themselves (`app/src/cpu/hot/fast_loop_check.h`): each run of a fast loop saves the
+  bytes it writes and the registers, keeps its result aside, puts the inputs back, runs the copy's loop and compares;
+  a difference is counted in the `[verify]` line and logged `[hot] DIFFERENCE`.
+- Batch 1 (PC, attract loop, 200 s): 77.1 million native checks, 0 differences.
+- Batch 1 lockstep (every frame recorded; natives on against `SA2_CPU_ENHANCEMENTS=false`): the title 480 of 480
+  frames identical; the 2P demo 293 of 298 identical, the five others (every 64th frame) different only in the blinking
+  "Press START" overlay of the attract demo, on in one run's frame and off in the other's (its blink phase is not the
+  game's frame), the scene behind it identical.
+- Batch 2 (PC, attract loop, 200 s): 157.8 million native checks, 0 differences. 19 fast loops ran and checked
+  themselves (the strip builders, the texel copy, the DXT1 and DXT5 decoders, the texel store, the slot copies, the
+  point transform's passes, the buffer fill on the audio thread); not reached there: the colour key (no keyed
+  texture), the point transform's remainder, slot copies 4 and 6. The guarded alpha rescale and key search: no
+  difference.
+- Batch 2 (PC, a scripted route into a stage, `input_script` of `switch-testing.md` with the stick held 60 s: the
+  save, the menus and a story stage, Dr. Eggman's walker; 200 s): the first run found one difference, not in a batch's native: njCalcPoint (`sub_82146ED8`, round 13's
+  hand-written native) of a garbage matrix in that stage (r3 = 0x4155C714, a float's bits) wrote a NaN of the other sign than the
+  original (0xFF... against 0x7F...), the NaN rule of round 2 (which operand's NaN survives depends on the
+  compilation). Its guard then switched it off for the run; on the console a sampled check could do the same. It and
+  njMultiMatrix now compare with `kReturnIntNaN` (kReturnInt with kAllNaN's NaN rule, `sa2_hot_common.h`). The second
+  run: 182.1 million checks, 0 differences.
+- Batch 2 lockstep (natives on against `SA2_CPU_ENHANCEMENTS=false`): the title 479 of 479 frames identical; the 2P
+  demo 188 of 204 pairs identical, the 16 others again only the "Press START" blink (four frames of each 64th, its
+  phase three frames off). The scripted stage cannot be compared frame for frame (its input follows the wall clock,
+  so each run enters the stage at another frame: the HUD timer differs): natives on against off differ there by a
+  mean 0.048 a pixel, two runs with the natives on by 0.079.
+
+### Also in this build
+
+- `input_joycon_sideways_stick` (SDK, from peggle2-nx 1.0.2 / guwange-nx): a single Joy-Con held sideways had its
+  stick a quarter-turn off (a push to the right read as up); the hold type only changes the system's own menus, and
+  `padGetStickPos` still reports the stick as the Joy-Con is built. Poll turns it now (on by default).
+
+## Batch 3 (2026-10-28): the 2P console run's 100 hottest functions without a native, and seven hand items
+
+From the user's 2P console run (its profile with the 1 ms stack sampling): the 100 hottest guest functions that have
+no native or copy yet, made bulk copies, and seven hand items for the game thread's hottest code in that run, the
+render-state walk (`sub_8214B520`) and what it calls.
+
+### Machine: 100 more bulk copies
+
+`out/hot_work/make_bulk_batch3.py` ranks by the game thread's self samples over the run's 2P intervals
+(`tools/switch_profile_report.py`), then the other guest threads' samples, then the console PGO session's executed
+instructions (main thread), skipping every function with a hook, a copy or a mention in the app's sources; the 100
+lines go to `app/src/cpu/hot/localized_bulk.txt` and are made as batches 1 and 2 were (`tools/post_codegen.py`).
+
+### Hand: batch 3
+
+Six natives from their localized copies (`tools/hand_natives/make_card_batches.py`, run by `run_all.py`; the copies
+stay their references): each makes its stores' card marks once for the record it writes (one or two page marks, the
+same pages or a superset, before it returns or calls; nothing in between reads the cards), and handler 8 runs its
+body inline. Everything else is the copy's text; the generator checks the lines it replaces.
+
+| Function | What | The hand version |
+|---|---|---|
+| `sub_8214B3A0` | render-state handler 8 (the game thread's hottest function in the 2P profile) | its unpack and its body inline, not through the body's hook (`n_state_handler8.h`) |
+| `sub_8214D6D8` | handler 8's body: seven words of one block before a call | the block's cards once (`n_state_block.h`) |
+| `sub_8214B320` | handler 0: one 20-byte record from three lookups | the record's cards once, guarded as its copy was (`n_record_store.h`) |
+| `sub_8214B168` | handler 5: four byte stores of one word | their cards once (`n_state_bytes.h`) |
+| `sub_82147340` | 3x4 matrix transpose: twelve stores into one 48-byte matrix | the matrix's cards once, guarded (`n_matrix_transpose.h`) |
+| `sub_8214D9F8` | colour clamp and pack: four float and four byte stores | their cards once, guarded (`n_colour_pack.h`) |
+
+The seventh: `sub_8214B520`'s call through its table of handlers (0x83850734) promoted to guarded direct calls of its
+ten handlers, most frequent first (`app/indirect_promotions.txt`; `tools/indirect_calls.py` takes up to ten targets a
+line now). A compare a target costs less on the A57 than the table's load and an indirect branch it mispredicts
+across ten targets; any other target takes the old path, and the PC build checks every promoted call against the
+table.
+
+### Verification
+
+- Verify mode (PC, attract loop): 124.0 million native checks, 0 differences.
+- Verify mode (PC, the scripted route into a story stage): 79.3 million checks, 0 differences, no `[hot] DIFFERENCE`
+  line.
+- Lockstep (every frame recorded; all CPU and Renut items on against `SA2_CPU_ENHANCEMENTS=false` with the new Renut
+  items off): the title 474 of 474 frames identical at 720p and 471 of 471 at 1080p (`SA2_RENDER_DOCKED`); the 2P
+  demo 298 of 298 at 720p and 295 of 295 at 1080p (full-resolution hashes with the "Press START" and loading-spinner
+  regions left out, runs paired by frame label). The runs with everything on: setter marks 6.7 of 40 chunks compared
+  a delta, 0 unmarked changes; 3,600 colour resolves handed over instead of drawn and 27,001 repeated clears not sent
+  in the 1080p demo.
+- Not on the PC: `sa2_renut_direct_resolve_mips` is deko3d only (the PC's back end keeps the scratch path); the
+  console run is its check.

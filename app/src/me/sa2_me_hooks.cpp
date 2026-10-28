@@ -48,6 +48,7 @@
 #include "cpu/sa2_hot_copies.h"
 #include "me/me_native_system.h"
 #include "me/sa2_api.h"
+#include "me/sa2_setter_marks.h"
 #include "me/sa2_d3d_api.h"
 #include "renut_engine/gpu/sa2_renut_yield.h"  // sa2_renderer = "renut"
 
@@ -107,6 +108,7 @@ void DumpShaderBlob(const uint8_t* base, uint32_t blob_address, bool vertex) {
 // Draw-time shader load (FlushState's shader part, called from every Draw*).
 REX_EXTERN(__imp__sub_82556A60);
 REX_HOOK_RAW(sub_82556A60) {
+  SA2_SETTER_MARKS(82556A60);  // sa2-nx (2026-10-28, sa2_renut_setter_marks)
   SA2_RENUT_YIELD(sub_82556A60)
   const uint32_t device = ctx.r3.u32;
   if (device >= 0x40000000 && device < 0x7F000000) {
@@ -223,6 +225,7 @@ REX_HOOK_RAW(sub_82563AB0) {
 // sa2_api_resolves: Direct3D's resolve core (its wrapper and the present path call it) as a record.
 REX_EXTERN(__imp__sub_825645A0);
 REX_HOOK_RAW(sub_825645A0) {
+  SA2_SETTER_MARKS(825645A0);  // sa2-nx (2026-10-28, sa2_renut_setter_marks)
   SA2_RENUT_YIELD(sub_825645A0)
   if (sa2::api::Resolve(ctx, base)) return;
   __imp__sub_825645A0(ctx, base);

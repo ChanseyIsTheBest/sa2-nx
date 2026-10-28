@@ -234,7 +234,12 @@ bool GuestCodeMatches(const uint8_t* base, uint32_t address, uint32_t bytes, uin
 
 void StartReport() {
   const int seconds = REXCVAR_GET(sa2_enhancements_report_s);
-  if (seconds <= 0) return;
+  if (seconds <= 0) {
+    // Nothing reads the use counts: the copies' hooks dispatch directly (g_count_uses, sa2_enhancements.h).
+    g_count_uses.store(false, std::memory_order_relaxed);
+    REXLOG_INFO("[enh] use report off: the localized copies' hooks dispatch directly (no per-call counting)");
+    return;
+  }
   // Never joined and never destroyed (libnx cannot detach a thread; see the SDK's threading_posix.cpp).
   new std::thread([seconds] {
     std::vector<uint64_t> last_uses(List().size(), 0), last_amount(List().size(), 0);

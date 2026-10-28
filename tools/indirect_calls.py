@@ -26,7 +26,9 @@ through. One in six call sites of SA2 is one (20,624).
    the code no longer has, is an error: make the list again.
    A line of the list may name up to three targets (`<function> <n> <target> <target2> [<target3>]`, the most
    frequent first): the site then tests them in that order, each with its own guarded direct call, before the
-   indirect one (third round of 2026-10-12: sites that go to two or three functions).
+   indirect one (third round of 2026-10-12: sites that go to two or three functions). sa2-nx (2026-10-28): up to ten,
+   for a dispatch through a fixed table of handlers (sub_8214B520's render-state walk: a compare a target is cheaper
+   than the function table's lookup and an indirect branch the A57 mispredicts across ten targets).
 
   python tools/indirect_calls.py --gen app/generated/default [--promote app/indirect_promotions.txt] [--check]
 Idempotent; a changed list is applied by a new run (sites leave and enter the promoted form).
@@ -93,7 +95,7 @@ def main():
         for line in open(a.promote, encoding='utf-8'):
             line = line.split('#')[0].split()
             if len(line) >= 3:
-                promote[(line[0].upper(), int(line[1]))] = [t.upper() for t in line[2:5]]
+                promote[(line[0].upper(), int(line[1]))] = [t.upper() for t in line[2:12]]
     texts = {}
     defined = set()
     for f in files:

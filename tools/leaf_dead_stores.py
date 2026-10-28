@@ -376,6 +376,19 @@ def sections(img):
     return out
 
 
+def transparent_copies():
+    """sa2-nx (2026-10-28): the bulk localized copies (app/src/cpu/hot/localized_bulk.txt), whose calls count as calls
+    of the original, as the hand-written natives' (hand.txt): a copy is the original's own statements on the same
+    registers (tools/localize_native.py), reads exactly what the original reads and leaves every register the original
+    leaves (its write-backs store what may differ; a register it does not change keeps the caller's value, as in the
+    original), and its hook runs the original when the copy is off."""
+    path = os.path.join(ROOT, 'app', 'src', 'cpu', 'hot', 'localized_bulk.txt')
+    if not os.path.exists(path):
+        return set()
+    return set(int(m.group(1), 16) for m in re.finditer(r'^([0-9A-Fa-f]{8})\b', open(path, encoding='utf-8').read(),
+                                                         re.M))
+
+
 def address_taken(gen, image, starts, bodies):
     pch = open(glob.glob(os.path.join(gen, '*_pch.h'))[0], encoding='utf-8').read()
     value = lambda name: int(re.search(r'#define %s (0x[0-9A-Fa-f]+)' % name, pch).group(1), 16)
@@ -425,6 +438,10 @@ def address_taken(gen, image, starts, bodies):
         paths = [root] if os.path.isfile(root) else [os.path.join(d, f) for d, _, fs in os.walk(root) for f in fs
                                                       if f.endswith(('.cpp', '.h', '.hpp', '.inc', '.c', '.toml', '.txt'))]
         for path in paths:
+            # sa2-nx (2026-10-28): the bulk localized copies' list names functions whose hooks are transparent (exact
+            # copies, transparent_copies() below): not a reason to take their address.
+            if os.path.basename(path) == 'localized_bulk.txt':
+                continue
             try:
                 text = open(path, encoding='utf-8', errors='ignore').read()
             except OSError:
@@ -520,6 +537,7 @@ def main():
     hand = os.path.join(ROOT, 'app', 'src', 'cpu', 'hot', 'hand.txt')
     natives = set(int(m.group(1), 16) for m in re.finditer(r'^([0-9A-Fa-f]{8})\b',
                                                              open(hand, encoding='utf-8').read(), re.M))
+    natives |= transparent_copies()
     for nodes in parsed.values():
         for node in nodes:
             if node.call and not node.call[1] and node.call[0] in natives:

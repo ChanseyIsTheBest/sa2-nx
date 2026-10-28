@@ -101,6 +101,7 @@ pair.
 | `sa2_renut_double_buffer` | `false` (default). `true`: two images instead of three, so a finished frame reaches the screen sooner (less input lag), but a frame that misses a refresh waits for the next one, so busy scenes (2-player) can drop frames |
 | `input_xbox_layout` | Face buttons by position (`true`, default) or by letter (`false`) |
 | `input_joycon_sideways` | Single Joy-Cons held sideways, one per player (`true`, default) |
+| `input_joycon_sideways_stick` | With `input_joycon_sideways`: the single Joy-Con's stick turned for the sideways grip (`true`, default) |
 | `[input_p1]`, `[input_p2]` | Each player's buttons: for every Xbox button, the Switch buttons that press it, e.g. `a = "B, ZR"` |
 
 </div>
@@ -129,6 +130,16 @@ frame) the game thread went from 19.2 ms to 15.5 ms a frame and the renderer's t
 the 16.7 ms of a 60 FPS frame, before a new PGO profile from a console session; the GPU needs 7-9 ms a frame even at
 307 MHz. The heaviest scenes still drop a few frames now and then. The work is in
 [docs/renut-renderer.md](docs/renut-renderer.md).
+
+Version 1.0.4 (2026-10-28) is a CPU and GPU round on top of it, with a new PGO profile from a console session of it:
+the game's hottest functions hand-written or rewritten as native code, the renderer's per-draw work on the game thread
+cut (the setters' marks, a lock-free queue to the render thread), and the frame's resolve copies, mip levels and
+repeated clears made cheaper on the GPU; every change was checked frame for frame against the original on the PC. On
+the console's test builds (1020 MHz, handheld) single-player City Escape held 59-60 FPS (the game thread about 7-11 ms
+busy a frame, the renderer's thread 5-11 ms, at 600-1,500 draws), and the two-player race ran at about 38-54 FPS:
+there the game's own drawing code on its one thread is the limit (about 2,900 draws a frame in its heaviest spot).
+Details in [docs/cpu-rounds.md](docs/cpu-rounds.md) and [docs/renut-renderer.md](docs/renut-renderer.md) (items
+35-43).
 
 What was done to get there, round by round and with the measurements, is in
 [docs/enhancements.md](docs/enhancements.md).

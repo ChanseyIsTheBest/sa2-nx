@@ -23,7 +23,17 @@ call that can reach them, or at the return. A callee whose reach is unknown gets
 imports and any name that is not a generated function, and functions overridden by an app hook other than the natives
 of sa2_hot_guest.cpp (a native touches no more than its original). --sync full restores the old behaviour.
 
+Write-backs (sa2-nx 2026-10-28, bejeweled3-nx's method): each write-back of a copy stores only the registers that may
+differ from the context there (tools/localize_writebacks.py, its docstring is the audit); --writebacks all keeps
+every store. A copy whose control flow the pass does not follow keeps all of them (its header says which).
+
+Bulk copies (sa2-nx 2026-10-28): --bulk app/src/cpu/hot/localized_bulk.txt makes the copies of that list too and
+their hooks, app/generated/hot/localized_bulk_hooks_<N>.inc (SA2_HOT_HOOK_COPY lines with each function's guest code
+size and FNV-1a 64, spread over --shards files by size), which src/cpu/sa2_hot_bulk_<N>.cpp compile. A function the
+app or SDK sources already mention, or that this tool refuses, is left out with a message.
+
   python tools/localize_native.py 82146ED8 [--what "njCalcPoint ..."] [--out app/src/cpu/hot/n_82146ED8.h]
+  python tools/localize_native.py --list app/src/cpu/hot/localized.txt --bulk app/src/cpu/hot/localized_bulk.txt
 """
 import argparse
 import glob
@@ -105,6 +115,9 @@ def native_hooks():
     (SA2_HOT_HOOK_COPY) count too: a copy leaves exactly the registers its original leaves. SA2_COPY_FOR_HOOK does not:
     those functions are also hooked by the renderer (src/me/sa2_me_hooks.cpp), which reads argument registers itself."""
     text = open(os.path.join(ROOT, 'app', 'src', 'cpu', 'sa2_hot_guest.cpp'), encoding='utf-8').read()
+    # sa2-nx (2026-10-28): and the bulk copies' hooks.
+    for inc in glob.glob(os.path.join(ROOT, 'app', 'generated', 'hot', 'localized_bulk_hooks_*.inc')):
+        text += open(inc, encoding='utf-8').read()
     return set(re.findall(r'SA2_HOT_HOOK(?:_UNGUARDED|_COPY)?\(([0-9A-F]{8}),', text))
 
 
@@ -216,13 +229,23 @@ class Reach:
         return self.memo[root]
 
 
-def find_body(gen, name):
+def find_body(gen, name, keep_memcalls=False):
     for path in sorted(glob.glob(os.path.join(gen, '*_recomp.*.cpp'))):
         text = open(path, encoding='utf-8', errors='replace').read()
         m = re.search(r'^DEFINE_REX_FUNC\(' + name + r'\) \{\n(.*?)^\}\n', text, re.S | re.M)
         if m:
-            return unleaf(plain_calls(m.group(1))), path
+            body = m.group(1) if keep_memcalls else plain_calls(m.group(1))
+            return unleaf(body), path
     return None, None
+
+
+# sa2-nx (2026-10-28): a statement line that is one of tools/inline_memcalls.py's inline constant-size calls. The copy
+# keeps it inline: it stores the registers the generated pch's helper reads (RexMemcpyConst: r1, r3, r4; RexMemsetConst:
+# r3, r4) and tries it (SA2_MEMCPY_INLINE / SA2_MEMSET_INLINE, sa2_hot_prelude.h); only when the helper declines does it
+# make the call, synced as any other. The helper writes guest memory and no register, as in the generated code, so the
+# copy's locals stay valid after it; exactly the generated statement's two paths.
+MEMCALL_LINE = re.compile(r'^(\s*)REX_MEM(CPY|SET)_CONST\((\d+), ((?:__imp__)?sub_[0-9A-F]{8})\(ctx, base\)\);\s*$')
+MEMCALL_READS = {'CPY': ('r1', 'r3', 'r4'), 'SET': ('r3', 'r4')}
 
 
 def unleaf(body):
@@ -267,19 +290,110 @@ def main():
                     help='smart: each call syncs only what its callee can reach (default); full: every register')
     ap.add_argument('--list', help='file of "<address> <what>" lines (app/src/cpu/hot/localized.txt): localize them all '
                                    'into app/generated/hot/')
+    ap.add_argument('--bulk', help='file of "<address> <what>" lines (app/src/cpu/hot/localized_bulk.txt): their copies '
+                                   'and their hooks (app/generated/hot/localized_bulk_hooks_<N>.inc)')
+    ap.add_argument('--shards', type=int, default=4, help='hook files for --bulk (src/cpu/sa2_hot_bulk_<N>.cpp each)')
+    ap.add_argument('--writebacks', choices=('changed', 'all'), default='changed',
+                    help='changed: each write-back stores only the registers that may differ (default); all: every one')
     a = ap.parse_args()
-    if a.list:
-        for line in open(a.list, encoding='utf-8'):
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            addr, _, what = line.partition(' ')
-            localize(addr, what.strip(), a.gen, os.path.join(ROOT, 'app', 'generated', 'hot', f'n_{addr.upper()}.h'),
-                     a.allow_double, a.sync)
+    global WRITEBACKS
+    WRITEBACKS = a.writebacks
+    if a.list or a.bulk:
+        if a.list:
+            for line in open(a.list, encoding='utf-8'):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                addr, _, what = line.partition(' ')
+                localize(addr, what.strip(), a.gen, os.path.join(ROOT, 'app', 'generated', 'hot', f'n_{addr.upper()}.h'),
+                         a.allow_double, a.sync)
+        if a.bulk:
+            bulk(a.bulk, a.gen, a.shards, a.sync)
         return
     if not a.address:
         ap.error('an address or --list')
     localize(a.address, a.what, a.gen, a.out, a.allow_double, a.sync)
+
+
+WRITEBACKS = 'changed'
+
+
+def code_hashes(gen, addrs):
+    """Guest code size and FNV-1a 64 of each function (tools/guest_code_hash.py's rule: up to the next function start
+    of the generated code), from the loaded image out/default_image.bin."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from guest_code_hash import BASE, fnv1a64
+    starts = set()
+    for path in glob.glob(os.path.join(gen, '*_recomp.*.cpp')):
+        for m in re.finditer(r'^DEFINE_REX_FUNC\(sub_([0-9A-F]+)\)', open(path, errors='replace').read(), re.M):
+            starts.add(int(m.group(1), 16))
+    starts = sorted(starts)
+    image = open(os.path.join(ROOT, 'out', 'default_image.bin'), 'rb').read()
+    out = {}
+    import bisect
+    for a in addrs:
+        addr = int(a, 16)
+        k = bisect.bisect_right(starts, addr)
+        end = starts[k] if k < len(starts) else addr + 4
+        code = image[addr - BASE:end - BASE]
+        out[a] = (len(code), fnv1a64(code))
+    return out
+
+
+def bulk(path, gen, shards, sync):
+    """The bulk list's copies and their hook files (localized_bulk_hooks_<N>.inc)."""
+    hot = os.path.join(ROOT, 'app', 'generated', 'hot')
+    # The hand-made hooks only (not the bulk files of an earlier run, which name this list's own functions).
+    taken = set(re.findall(r'SA2_(?:HOT_HOOK(?:_UNGUARDED|_COPY)?|COPY_FOR_HOOK)\(([0-9A-F]{8}),',
+                           open(os.path.join(ROOT, 'app', 'src', 'cpu', 'sa2_hot_guest.cpp'), encoding='utf-8').read()))
+    mentioned = other_hooks()
+    entries, seen = [], set()
+    for line in open(path, encoding='utf-8'):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        addr, _, what = line.partition(' ')
+        addr = addr.upper()
+        if addr in seen:
+            continue
+        seen.add(addr)
+        if addr in taken or addr in mentioned:
+            print(f'sub_{addr}: left out of the bulk copies (already hooked or named by the app or SDK sources)')
+            continue
+        try:
+            # Double-precision arithmetic is allowed (sa2-nx 2026-10-28): app/CMakeLists.txt compiles the executable,
+            # the copies' files included, with -ffp-contract=off like the generated code, so a copy fuses nothing its
+            # original does not, on GCC and on Clang alike; the caveat above predates that rule.
+            localize(addr, what.strip() or 'bulk localized copy', gen, os.path.join(hot, f'n_{addr}.h'), True, sync)
+        except SystemExit as e:
+            print(f'sub_{addr}: left out of the bulk copies ({e})')
+            continue
+        entries.append((addr, what.strip()))
+    hashes = code_hashes(gen, [a for a, _ in entries])
+    # Spread by copy size so the shards compile in similar times.
+    sizes = {a: os.path.getsize(os.path.join(hot, f'n_{a}.h')) for a, _ in entries}
+    files = [[] for _ in range(shards)]
+    load = [0] * shards
+    for a, what in sorted(entries, key=lambda e: -sizes[e[0]]):
+        k = load.index(min(load))
+        files[k].append((a, what))
+        load[k] += sizes[a]
+    for k in range(shards):
+        lines = [f'// Bulk localized copies, shard {k} of {shards}: GENERATED by tools/localize_native.py --bulk from '
+                 f'{os.path.relpath(path, ROOT)} (do not edit).',
+                 '// Each copy is the recompiled function\'s own operations (exact by construction), unguarded, with its '
+                 'own key.']
+        for a, what in sorted(files[k]):
+            lines.append(f'#include "n_{a}.h"')
+        for a, what in sorted(files[k]):
+            size, h = hashes[a]
+            desc = f'Native localized copy of sub_{a} (bulk' + (f': {what}' if what else '') + ')'
+            desc = desc.replace('"', "'")
+            lines.append(f'SA2_HOT_HOOK_COPY({a}, sa2_cpu_native_sub_{a}, SA2_COPIES_DEFAULT, "{desc}",')
+            lines.append(f'                  sa2::hot::n_{a}, {size}, 0x{h:016X}ull)')
+        open(os.path.join(hot, f'localized_bulk_hooks_{k}.inc'), 'w', encoding='utf-8', newline='\n').write(
+            '\n'.join(lines) + '\n')
+    print(f'bulk: {len(entries)} copies in {shards} hook files')
 
 
 _REACH = {}
@@ -294,7 +408,7 @@ def reach_for(gen):
 def localize(address, what, gen, out, allow_double, sync='smart'):
     addr = address.upper().replace('SUB_', '').replace('0X', '')
     name = 'sub_' + addr
-    body, path = find_body(gen, name)
+    body, path = find_body(gen, name, keep_memcalls=True)
     if body is None:
         sys.exit(f'{name} not found in {gen}')
 
@@ -325,9 +439,19 @@ def localize(address, what, gen, out, allow_double, sync='smart'):
         after = ''.join(f' l_{r} = ctx.{r};' for r in part)
         return '{ ' + before + m.group(0) + after + ' }'
 
+    memcalls = 0
     for l in lines:
         if l.strip().startswith('//'):
             continue  # the PPC disassembly comments
+        mm = MEMCALL_LINE.match(l)
+        if mm:
+            indent, kind, size, callee = mm.groups()
+            pre = ''.join(f'ctx.{r} = l_{r}; ' for r in MEMCALL_READS[kind] if r in regs)
+            inner = call_sync(CALL.match(f'{callee}(ctx, base);'))
+            calls += 1
+            memcalls += 1
+            code.append(f'{indent}{{ {pre}if (!SA2_MEM{kind}_INLINE({size})) {inner} }}')
+            continue
         l = REG.sub(lambda m: 'l_' + m.group(1), l)
         # Calls and returns get braces: the generated code also writes them as the body of a one-line `if`
         # ("if (ctx.cr6.eq) return;"), where a bare "SA2_SYNC_OUT(); return;" would return unconditionally.
@@ -343,7 +467,7 @@ def localize(address, what, gen, out, allow_double, sync='smart'):
     # (__imp__KeBugCheck, __imp__RtlEnterCriticalSection, ...: the generated files declare those in their own
     # sa2_funcs.N.h, which this header does not include). Indirect calls and traps have no name (no group 1).
     callees = {m.group(1) for l in lines if not l.strip().startswith('//')
-               for m in CALL.finditer(l) if m.group(1)}
+               for m in CALL.finditer(plain_calls(l)) if m.group(1)}
     # tools/indirect_calls.py: a promoted call names its target's hookable symbol in its PC self-check, also where
     # the call itself goes to __imp__sub_X.
     callees |= {m.group(1) for l in lines for m in PROMOTED.finditer(l)}
@@ -374,6 +498,18 @@ inline void Native(PPCContext& ctx, uint8_t* base) {{
 }
 
 }  // namespace sa2::hot::n_''' + addr + '\n'
+    # sa2-nx (2026-10-28): the write-backs limited to the registers that may differ (tools/localize_writebacks.py).
+    wb_note = 'every register written back (--writebacks all)'
+    if WRITEBACKS == 'changed':
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import localize_writebacks
+        try:
+            text, n_wb, kept, before = localize_writebacks.limit_writebacks(addr, text)
+            wb_note = (f'write-backs limited to the registers that may differ from the context there '
+                       f'(tools/localize_writebacks.py): {kept} register stores of {before} at {n_wb} write-backs')
+        except localize_writebacks.Unsupported as e:
+            wb_note = f'every register written back (tools/localize_writebacks.py does not follow it: {e})'
+    text = text.replace('#pragma once\n', f'// {wb_note}.\n#pragma once\n', 1)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     open(out, 'w', encoding='utf-8', newline='\n').write(text)
     try:

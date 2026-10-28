@@ -156,7 +156,10 @@ def main():
             run(tool('dead_ctx_defs.py'), '--gen', game, '--image', IMAGE, '--abi-indirect')
         run(tool('flush_hoist.py'), '--gen', game)
     if not scratch:
-        run(tool('localize_native.py'), '--list', os.path.join(APP, 'src', 'cpu', 'hot', 'localized.txt'))
+        # sa2-nx (2026-10-28): and the bulk copies with their hook files (src/cpu/sa2_hot_bulk_<N>.cpp compile them).
+        bulk = os.path.join(APP, 'src', 'cpu', 'hot', 'localized_bulk.txt')
+        run(tool('localize_native.py'), '--list', os.path.join(APP, 'src', 'cpu', 'hot', 'localized.txt'),
+            *(['--bulk', bulk] if os.path.exists(bulk) else []))
     if optimised:
         game = os.path.join(gen, 'default')
         proofs = os.path.join(ROOT, 'out', 'codegen_proofs')

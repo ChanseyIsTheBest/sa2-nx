@@ -249,3 +249,6 @@
 8296DB20 6 8296D270   # 94384, 100.00 %
 8296DF58 0 82906678   # 383680, 100.00 %
 8296DF58 1 8296D308   # 96940, 100.00 %
+# sa2-nx (2026-10-28, hand item): sub_8214B520's render-state walk calls its handlers through the table at 0x83850734
+# (11 slots, slot 3 empty); the 2P console profile's order (handler 8 is the game thread's hottest function).
+8214B520 0 8214B3A0 8214B168 8214B300 8214B320 8214AEC8 8214AE10 8214B2B0 8214B2D8 8214B3B8 8214B4B0

@@ -23,7 +23,21 @@ switch_profile_stacks = false
 switch_profile_report = false
 sa2_enhancements_report_s = 0
 renut_memory_report = 0.0
+renut_gpu_profile = 0.0
 sa2_gpu_marks_categories = false
+
+# Renut's renderer, 2026-10-28 (docs/renut-renderer.md items 35-42; the console tests of that day): fixed here.
+sa2_renut_setter_marks = true
+sa2_renut_setter_marks_check = true
+sa2_renut_marks_copy = true
+sa2_renut_setters_precise = false
+sa2_renut_lockfree_queue = true
+sa2_renut_colour_handover = true
+sa2_renut_lazy_resolve_mips = true
+sa2_renut_direct_resolve_mips = true
+sa2_renut_clear_repeat = true
+# With sa2_renut_double_buffer (the player's option): a display queue stuck one image deep is emptied once
+sa2_renut_queue_drain = true
 
 # CPU enhancements (docs/enhancements.md)
 sa2_cpu_enhancements = true
