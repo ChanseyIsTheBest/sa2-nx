@@ -102,6 +102,11 @@ pair.
 | `input_xbox_layout` | Face buttons by position (`true`, default) or by letter (`false`) |
 | `input_joycon_sideways` | Single Joy-Cons held sideways, one per player (`true`, default) |
 | `input_joycon_sideways_stick` | With `input_joycon_sideways`: the single Joy-Con's stick turned for the sideways grip (`true`, default) |
+| `sa2_action_buttons` | `false` (default). `true`: the light dash moves to Y, so B or X at a line of light-dash rings somersaults or starts a spin dash; holding X starts Sonic's or Shadow's spin dash at once, and B keeps the usual hold. You still need the Light Shoes |
+| `sa2_analog_fix` | `true` (default): the stick reaches full speed at about two thirds of a push instead of before half, so half a push walks. `false`: the game's own curve |
+| `sa2_deadzone` | `true` (default): a round deadzone for each left stick, and full tilt a little before its edge, the same in every direction. `false`: the game's own deadzone alone |
+| `sa2_camera_invert` | `false` (default). `true`: the camera turns the other way: the right stick's left and right swap, and so do ZL and ZR, also in menus that read them |
+| `sa2_hold_toggle` | `false` (default). `true`: one press of B holds it and the next lets it go, for a mech's lock-on or the spin dash's charge; START also lets it go |
 | `[input_p1]`, `[input_p2]` | Each player's buttons: for every Xbox button, the Switch buttons that press it, e.g. `a = "B, ZR"` |
 
 </div>
@@ -244,6 +249,7 @@ Switch; Python; and your own copy of the game for the code generator. The whole 
 - **[nebadasSwifty](https://github.com/nebadasSwifty/masseffect-nx)** — masseffect-nx: the native renderer this port's
   renderer grew from.
 - **[hedge-dev](https://github.com/hedge-dev/XenosRecomp)** — XenosRecomp, the Xenos shader translator.
+- **[kittycache](https://github.com/kittycache9/OpenSA2)** — OpenSA2: the control options (`app/src/sa2_controls.cpp`), with the SA2 Mod Loader code "Press B to Somersault" by Hyper and MainMemory
 - **[masterspike52](https://github.com/masterspike52/reNut)** — reNut: the Direct3D-level renderer
   (`sa2_renderer = "renut"`, [docs/renut-renderer.md](docs/renut-renderer.md)), reused with the author's permission as
   banjo-nx carries it; **[renderbag](https://github.com/renderbag/plume)** — plume; **[fincs](https://github.com/devkitPro/uam)**

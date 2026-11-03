@@ -19,6 +19,24 @@ input_xbox_layout = true
 # Single Joy-Cons are held sideways, one per player.
 input_joycon_sideways = true
 
+# Control options.
+# true: the stick reaches full speed at about two thirds of a push instead of before half, so half a push walks.
+# false: the game's own curve.
+sa2_analog_fix = true
+# true: a round deadzone for each left stick, so a worn stick that rests off center stays still, and full tilt a
+# little before the stick's edge, the same in every direction. The game's own deadzone still applies after it.
+sa2_deadzone = true
+# true: the light dash moves to Y, so B or X at a line of light-dash rings somersaults or starts a spin dash as
+# anywhere else (you still need the Light Shoes, and the on-screen prompt still shows the usual button). Holding X
+# starts Sonic's or Shadow's spin dash at once, with no charge-up and no somersault; B keeps the usual hold.
+sa2_action_buttons = false
+# true: the camera turns the other way: the right stick's left and right swap, and so do ZL and ZR (LT and RT),
+# also in menus that read them.
+sa2_camera_invert = false
+# true: B as a toggle: one press holds it and the next lets it go, for a mech's lock-on or the spin dash's charge
+# without holding the button. START also lets it go. In menus, a held B stays held until you press B or START.
+sa2_hold_toggle = false
+
 # Button mapping for each player: the Switch buttons that press each Xbox button. Empty = default.
 # Buttons: A B X Y L R ZL ZR PLUS MINUS LSTICK RSTICK UP DOWN LEFT RIGHT SL SR NONE. Example: a = "B, ZR"
 

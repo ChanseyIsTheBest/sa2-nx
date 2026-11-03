@@ -59,6 +59,9 @@ set(SA2_SOURCES
     src/sa2_dlc.cpp
     # The game's language (cvar language: auto = the system language).
     src/sa2_language.cpp
+    # The control options from OpenSA2 (sa2_action_buttons, sa2_analog_fix, sa2_deadzone, sa2_camera_invert,
+    # sa2_hold_toggle), off by default.
+    src/sa2_controls.cpp
     # PGO profile collection (the Switch build with SA2_PGO=generate; empty otherwise).
     src/sa2_pgo.cpp
     # Windows: logs fatal host exceptions the SDK does not report (illegal instruction, ...) with module + offset.
@@ -633,6 +636,6 @@ if(REXGLUE_PLATFORM_SWITCH)
     rexglue_switch_add_nro(sa2
         NAME "Sonic Adventure 2"
         AUTHOR "ChanseyIsTheBest"
-        VERSION "1.0.4"
+        VERSION "1.0.5"
         ICON "${CMAKE_CURRENT_SOURCE_DIR}/icon.jpg")
 endif()

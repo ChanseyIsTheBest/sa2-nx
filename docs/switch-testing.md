@@ -17,7 +17,28 @@ card as `switch\sa2-nx`. With a loose `game_root/` folder instead of the pack (`
 the pack on the card (a few minutes, logged as `[pack] packing N %`); the folder can be deleted afterwards. When a pack
 exists it is always used, so an old `game_root/` folder from earlier tests is no longer read and can be deleted.
 
-## This build (version 1.0.4, 2026-10-28)
+## This build (version 1.0.5, 2026-11-04)
+
+- **Five control options from OpenSA2**, each a key in `sa2.toml` (`app/src/sa2_controls.cpp`): `sa2_analog_fix` and
+  `sa2_deadzone` on by default, the other three off. A `sa2.toml` from an earlier version has none of them, so it gets
+  those defaults: add the lines to change them, or delete the file to get the new default one.
+  - `sa2_action_buttons`: the light dash moves to Y, so B or X at a line of light-dash rings somersaults or starts a
+    spin dash as anywhere else. You still need the Light Shoes, and the on-screen prompt still shows the usual button.
+    Holding X starts Sonic's or Shadow's spin dash at once, with no charge-up and no somersault; B keeps the usual hold.
+  - `sa2_analog_fix`: the stick reaches full speed at about two thirds of a push instead of before half, so half a push
+    walks and a full push still runs.
+  - `sa2_deadzone`: a round deadzone for each left stick, and full tilt a little before its edge, the same in every
+    direction. The game's own deadzone still applies after it.
+  - `sa2_camera_invert`: the camera turns the other way: the right stick's left and right swap, and so do ZL and ZR,
+    also in menus that read them.
+  - `sa2_hold_toggle`: one press of B holds it and the next lets it go. START also lets it go. In menus, a held B stays
+    held until you press B or START. With `sa2_action_buttons`, a tap of X stays a tap, and while B is held this way
+    the instant spin dash is off, since it needs X held without B.
+- **What to check:** each option's own effect; with logging on, `[controls] sa2_action_buttons:` lines name the first
+  light dashes and instant spin dashes. Nothing is saved differently.
+- Update: replacing `sa2.nro` is enough (the shaders are 1.0.3.1's).
+
+## Version 1.0.4 (2026-10-28)
 
 - **Faster:** a CPU round (the hottest game functions as native code, the renderer's per-draw work on the game thread
   cut, a lock-free queue to the render thread) and a GPU round (the frame's resolve copies handed over as images, the
