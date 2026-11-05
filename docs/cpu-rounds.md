@@ -874,3 +874,28 @@ table.
   in the 1080p demo.
 - Not on the PC: `sa2_renut_direct_resolve_mips` is deko3d only (the PC's back end keeps the scratch path); the
   console run is its check.
+
+## 2 MB blocks: game memory and the NRO's code (2026-11-05, version 1.0.6, from kameo-nx v1.0.1)
+
+Found by the Torchlight port, written for Kameo, and carried here with SA2's names. Kameo's notes
+(`docs/kameo-notes.md` there, "2 MB blocks") have the history.
+
+- **Game memory** (`RexGmInit`, key `banjo_window_blocks`): the second argument of `virtmemFindAslr` is a guard, not an
+  alignment, so the guest window was never on a 2 MB boundary and all of the game's memory was on 4 KB pages. 2 MB more is
+  asked for and the base rounded up.
+- **The NRO's code** (`sdk/src/ui/switch_code_blocks.cpp`, key `banjo_code_blocks`, read from `sa2.toml` by itself because
+  it runs before the cvars): hbloader maps the NRO where its virtual and physical addresses don't line up modulo 2 MB. A
+  priority 101 constructor copies text and read-only data to heap that does line up, and swaps the mappings from a page of
+  its own. Here text is 38.8 MB and read-only data 6.3 MB, so it costs about 47 MB, because the loader's copy can't be given
+  back.
+- **`banjo_tlb_test_s`:** once, that many seconds after the first report, the same number of cache lines in random order,
+  one to a page and then packed into a few pages; only the console's numbers mean anything.
+
+What this port was checked for: every exit is `__nx_applet_exit_mode` 1 and `__libnx_exit`, or `exit()` and `abort()`, which
+the crash hooks end with `diagAbortWithResult`, so nothing returns to hbloader, whose own unmap would fail. No thread starts
+before the constructors. `_start` is the text's first instruction (`tools/check_switch_build.py`). `rex_version.cmake`
+already takes the floor version when the SDK is not the repository's root, so this repository's `v*` tags don't stop a
+configure. The generated code does not change: the new SDK code names no guest address.
+
+Only a console tests the move: an emulator has no loader, so the code stays where it is and a self-test of the swap runs
+instead. The path that maps the old copy back if the kernel refuses the new one has never run, here or on Kameo.

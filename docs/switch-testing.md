@@ -17,7 +17,19 @@ card as `switch\sa2-nx`. With a loose `game_root/` folder instead of the pack (`
 the pack on the card (a few minutes, logged as `[pack] packing N %`); the folder can be deleted afterwards. When a pack
 exists it is always used, so an old `game_root/` folder from earlier tests is no longer read and can be deleted.
 
-## This build (version 1.0.5, 2026-11-04)
+## This build (version 1.0.6, 2026-11-05)
+
+- **2 MB memory blocks** (from kameo-nx v1.0.1, found by the Torchlight port). The game's memory and the NRO's code
+  and read-only data now line up so the kernel can use 2 MB blocks instead of 4 KB pages. The move of the code costs
+  about 47 MB of memory, because the loader's copy can't be given back. Keys: `banjo_window_blocks`,
+  `banjo_code_blocks` (both on; `false` in `sa2.toml` turns each off).
+- **What to check, with logging on:** `[code blocks] text ... now on a copy` (`left where it is` means the move skipped
+  itself), `[window blocks] guest window at ..., on a 2 MB boundary`, and with `banjo_tlb_test_s = 60` the `[tlb]` lines:
+  scattered against grouped should be close together where blocks are in use. Only a console tests this: an emulator
+  has no loader, so the code stays where it is there.
+- Update: replacing `sa2.nro` is enough (the shaders are 1.0.3.1's).
+
+## Version 1.0.5 (2026-11-04)
 
 - **Five control options from OpenSA2**, each a key in `sa2.toml` (`app/src/sa2_controls.cpp`): `sa2_analog_fix` and
   `sa2_deadzone` on by default, the other three off. A `sa2.toml` from an earlier version has none of them, so it gets

@@ -488,6 +488,9 @@ REXCVAR_DEFINE_BOOL(banjo_renut_precise_barriers, true, "Banjo/Enhancements",
 
 namespace banjo::renut_gpu {
 
+// sa2-nx (2026-11-05, from kameo-nx): the latency test's clock, at the end of this file.
+void BanjoTlbTestTick();
+
 // banjo_renut_shared_dedupe's counts (render thread), read by the [renut] report (game thread).
 std::atomic<uint64_t> g_shared_reused{0}, g_shared_uploaded{0};
 // banjo_renut_exact_streams' counts and banjo_renut_memory_policy's evictions, for the same report.
@@ -672,6 +675,7 @@ void StatsGameFrame() {
   const double since = std::chrono::duration<double>(now - g_stats.last_report).count();
   if (since < 10.0)
     return;
+  BanjoTlbTestTick();
   const Stats::Half &t = g_stats.total;
   const uint64_t reused = g_shared_reused.exchange(0, std::memory_order_relaxed);
   const uint64_t uploaded = g_shared_uploaded.exchange(0, std::memory_order_relaxed);
@@ -1543,6 +1547,27 @@ void LatchTuning() {
   g_latched.store_cards = REXCVAR_GET(banjo_renut_store_cards) && g_banjo_store_cards;
   g_latched.store_cards_verify = g_latched.store_cards && REXCVAR_GET(banjo_renut_store_cards_verify);
   g_latched_ready.store(true, std::memory_order_release);
+}
+
+// sa2-nx (2026-11-05, from kameo-nx): at the end of the file, so that the other functions keep their PGO profile.
+REXCVAR_DEFINE_INT32(banjo_tlb_test_s, 0, "Banjo/Diagnostics",
+                     "Once, this many seconds after the first report: the TLB's cost in game memory and the NRO's code, "
+                     "in the log (a few hundred ms on the render thread). Only the console's numbers mean anything. 0: never");
+
+#if REX_PLATFORM_SWITCH
+extern "C" void RexGmLatencyTest(void (*emit)(const char*));
+#endif
+
+void BanjoTlbTestTick() {
+#if REX_PLATFORM_SWITCH
+  const int32_t seconds = REXCVAR_GET(banjo_tlb_test_s);
+  if (seconds <= 0) return;
+  static const auto first = std::chrono::steady_clock::now();
+  static bool done = false;
+  if (done || std::chrono::steady_clock::now() - first < std::chrono::seconds(seconds)) return;
+  done = true;
+  RexGmLatencyTest([](const char* line) { REXLOG_INFO("{}", line); });
+#endif
 }
 
 }  // namespace banjo::renut_gpu

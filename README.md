@@ -146,6 +146,10 @@ there the game's own drawing code on its one thread is the limit (about 2,900 dr
 Details in [docs/cpu-rounds.md](docs/cpu-rounds.md) and [docs/renut-renderer.md](docs/renut-renderer.md) (items
 35-43).
 
+Version 1.0.6 (2026-11-05) puts the game's memory and the NRO's code on 2 MB memory blocks instead of 4 KB pages, from
+kameo-nx (found by the Torchlight port), at a cost of about 47 MB of memory. On Kameo it gave about 4.3 % in one
+GPU-heavy spot. Details in [docs/cpu-rounds.md](docs/cpu-rounds.md).
+
 What was done to get there, round by round and with the measurements, is in
 [docs/enhancements.md](docs/enhancements.md).
 

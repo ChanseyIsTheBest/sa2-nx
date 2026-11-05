@@ -2870,7 +2870,7 @@ index 462d0a1..9a65f53 100644
    return active;
  }
 diff --git a/app/src/renut_engine/gpu/banjo_renut_tuning.cpp b/app/src/renut_engine/gpu/banjo_renut_tuning.cpp
-index 667fe94..51800e7 100644
+index 667fe94..add7a6f 100644
 --- a/app/src/renut_engine/gpu/banjo_renut_tuning.cpp
 +++ b/app/src/renut_engine/gpu/banjo_renut_tuning.cpp
 @@ -1,5 +1,6 @@
@@ -2995,7 +2995,17 @@ index 667fe94..51800e7 100644
  REXCVAR_DEFINE_INT32(banjo_renut_ab_s, 4, "Banjo", "Renut's renderer: the half-period of banjo_renut_ab_target, in seconds")
      .range(1, 60);
  REXCVAR_DEFINE_BOOL(banjo_renut_push_point_only, true, "Banjo/Enhancements",
-@@ -429,6 +505,14 @@ std::atomic<uint64_t> g_resolves_drawn{0};  // banjo_deko3d_draw_resolves (2026-
+@@ -412,6 +488,9 @@ REXCVAR_DEFINE_BOOL(banjo_renut_precise_barriers, true, "Banjo/Enhancements",
+ 
+ namespace banjo::renut_gpu {
+ 
++// sa2-nx (2026-11-05, from kameo-nx): the latency test's clock, at the end of this file.
++void BanjoTlbTestTick();
++
+ // banjo_renut_shared_dedupe's counts (render thread), read by the [renut] report (game thread).
+ std::atomic<uint64_t> g_shared_reused{0}, g_shared_uploaded{0};
+ // banjo_renut_exact_streams' counts and banjo_renut_memory_policy's evictions, for the same report.
+@@ -429,6 +508,14 @@ std::atomic<uint64_t> g_resolves_drawn{0};  // banjo_deko3d_draw_resolves (2026-
  std::atomic<uint64_t> g_resolves_skipped[2];  // banjo_renut_resolve_skip (2026-10-19): colour, depth
  std::atomic<uint64_t> g_words_lazy[3];  // banjo_renut_depth_words_lazy: not written, written late, read stale
  std::atomic<uint64_t> g_handover[6];    // banjo_deko3d_depth_handover (CountHandOver)
@@ -3010,7 +3020,7 @@ index 667fe94..51800e7 100644
  std::atomic<uint64_t> g_ring_published{0};  // render-thread proposal 23
  std::atomic<uint64_t> g_kick_submit[4];      // lists submitted at a kick, ranges cleaned by the thread / by the render thread
  std::atomic<uint64_t> g_pushed[4];      // banjo_deko3d_push_constants: float bytes, shared bytes, draws, verify misses
-@@ -536,6 +620,10 @@ const char *AbName(int target) {
+@@ -536,6 +623,10 @@ const char *AbName(int target) {
    case 12: return "banjo_gpu_output_trim";
    case 13: return "banjo_gpu_depth_words_view";
    case 14: return "banjo_renut_record_worker";
@@ -3021,7 +3031,15 @@ index 667fe94..51800e7 100644
    default: return "none";
    }
  }
-@@ -689,6 +777,8 @@ void StatsGameFrame() {
+@@ -584,6 +675,7 @@ void StatsGameFrame() {
+   const double since = std::chrono::duration<double>(now - g_stats.last_report).count();
+   if (since < 10.0)
+     return;
++  BanjoTlbTestTick();
+   const Stats::Half &t = g_stats.total;
+   const uint64_t reused = g_shared_reused.exchange(0, std::memory_order_relaxed);
+   const uint64_t uploaded = g_shared_uploaded.exchange(0, std::memory_order_relaxed);
+@@ -689,6 +781,8 @@ void StatsGameFrame() {
      const std::string probe = rex::latency::Report();
      REXLOG_INFO("[latency] {}; {}", probe.empty() ? std::string("no frame presented") : probe,
                  ::renut::gpu::render_thread::LateInputReport());
@@ -3030,7 +3048,7 @@ index 667fe94..51800e7 100644
      // banjo-nx (2026-10-19, latency batch 3): the display's refresh, the phase and input -> display.
      if (const std::string display = banjo::display_sync::Report(); !display.empty())
        REXLOG_INFO("[display] {}", display);
-@@ -699,6 +789,54 @@ void StatsGameFrame() {
+@@ -699,6 +793,54 @@ void StatsGameFrame() {
                g_kick_submit[1].exchange(0, std::memory_order_relaxed),
                g_kick_submit[2].exchange(0, std::memory_order_relaxed),
                g_kick_submit[0].exchange(0, std::memory_order_relaxed));
@@ -3085,7 +3103,7 @@ index 667fe94..51800e7 100644
    if (DepthHandOverOn()) {
      REXLOG_INFO("[renut] depth hand-over (banjo_deko3d_depth_handover): {} resolves not drawn, {} binds of a target's "
                  "image, {} images taken at a whole clear; {} drawn after all ({} from a taken image); {} lost",
-@@ -769,11 +907,41 @@ bool Deko3DBarrierLeanOn() { return REXCVAR_GET(banjo_deko3d_barrier_lean); }
+@@ -769,11 +911,41 @@ bool Deko3DBarrierLeanOn() { return REXCVAR_GET(banjo_deko3d_barrier_lean); }
  bool Deko3DVsOutputsOn() { return REXCVAR_GET(banjo_deko3d_vs_outputs); }
  bool Deko3DUamPrmtOn() { return REXCVAR_GET(banjo_deko3d_uam_prmt); }
  bool EarlyHoistOn() { return REXCVAR_GET(banjo_deko3d_early_hoist); }
@@ -3129,7 +3147,7 @@ index 667fe94..51800e7 100644
    if (!REXCVAR_GET(banjo_deko3d_uam_prmt))
      flags &= ~1u;
    if (!REXCVAR_GET(banjo_deko3d_uam_gvn))
-@@ -808,6 +976,25 @@ void CountPushedConstants(uint64_t bytes, int what) {
+@@ -808,6 +980,25 @@ void CountPushedConstants(uint64_t bytes, int what) {
    g_pushed[what].store(g_pushed[what].load(std::memory_order_relaxed) + bytes, std::memory_order_relaxed);
  }
  
@@ -3155,6 +3173,32 @@ index 667fe94..51800e7 100644
  void CountHandOver(int what) {
    g_handover[what].store(g_handover[what].load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
  }
+@@ -1358,4 +1549,25 @@ void LatchTuning() {
+   g_latched_ready.store(true, std::memory_order_release);
+ }
+ 
++// sa2-nx (2026-11-05, from kameo-nx): at the end of the file, so that the other functions keep their PGO profile.
++REXCVAR_DEFINE_INT32(banjo_tlb_test_s, 0, "Banjo/Diagnostics",
++                     "Once, this many seconds after the first report: the TLB's cost in game memory and the NRO's code, "
++                     "in the log (a few hundred ms on the render thread). Only the console's numbers mean anything. 0: never");
++
++#if REX_PLATFORM_SWITCH
++extern "C" void RexGmLatencyTest(void (*emit)(const char*));
++#endif
++
++void BanjoTlbTestTick() {
++#if REX_PLATFORM_SWITCH
++  const int32_t seconds = REXCVAR_GET(banjo_tlb_test_s);
++  if (seconds <= 0) return;
++  static const auto first = std::chrono::steady_clock::now();
++  static bool done = false;
++  if (done || std::chrono::steady_clock::now() - first < std::chrono::seconds(seconds)) return;
++  done = true;
++  RexGmLatencyTest([](const char* line) { REXLOG_INFO("{}", line); });
++#endif
++}
++
+ }  // namespace banjo::renut_gpu
 diff --git a/app/src/renut_engine/gpu/banjo_renut_tuning.h b/app/src/renut_engine/gpu/banjo_renut_tuning.h
 index a5ebe07..85a8494 100644
 --- a/app/src/renut_engine/gpu/banjo_renut_tuning.h
