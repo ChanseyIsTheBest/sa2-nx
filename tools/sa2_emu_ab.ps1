@@ -15,7 +15,7 @@
 # stops only the process it started, when the recording's .txt appears (or after -Seconds). The recording
 # (captures\video_1s.*) and the logs go to out\emu_runs\<Name>.
 #   powershell -File tools\sa2_emu_ab.ps1 -Build ult|ult-<variant>|ref106 -Name <run> -Toml out\emu_tomls\<toml> [-Seconds 900]
-param([Parameter(Mandatory = $true)][ValidatePattern("^(ult|ult-[a-z0-9]+|ref106)$")][string]$Build,
+param([Parameter(Mandatory = $true)][ValidatePattern("^(ult|ult-[a-z0-9-]+|ref106)$")][string]$Build,
       [string]$Name = "emu_ab",
       [Parameter(Mandatory = $true)][string]$Toml, [int]$Seconds = 900, [double]$MinCommitGB = 12,
       [string]$Data = "D:\New folder\ryu-data\sa2-ult", [string]$GlslPackage = "", [switch]$StacksFlag)

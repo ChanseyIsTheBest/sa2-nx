@@ -577,6 +577,25 @@ endif()
 if(BANJO_GEN_BACK_CHAIN_ELIDE)
     list(APPEND _banjo_round_definitions REX_BACK_CHAIN_ELIDE)
 endif()
+# sa2-nx-ult (2026-11-20): a diagnostic for the search of the stale stack word (docs/sa2-near-exact.md): the
+# non-volatile saves elided (REX_NV_SAVES_ELIDE) only in the generated files whose index is in SA2_DIAG_NV_ELIDE_FILES
+# ("lo-hi" ranges separated by ';'), compiled without the precompiled header (its REX_DEAD_SAVE would differ). With
+# BANJO_GEN_NV_SAVES_ELIDE OFF, a bisection over the files finds where the saves that SA2's two-player demo depends on
+# are. Empty: nothing (the default).
+set(SA2_DIAG_NV_ELIDE_FILES "" CACHE STRING
+    "Diagnostic: the generated files (index ranges lo-hi;...) with the non-volatile saves elided")
+foreach(_sa2_range IN LISTS SA2_DIAG_NV_ELIDE_FILES)
+    string(REPLACE "-" ";" _sa2_lohi "${_sa2_range}")
+    list(GET _sa2_lohi 0 _sa2_lo)
+    list(GET _sa2_lohi -1 _sa2_hi)
+    foreach(_sa2_i RANGE ${_sa2_lo} ${_sa2_hi})
+        set(_sa2_file "${CMAKE_CURRENT_SOURCE_DIR}/generated/renut_recomp.${_sa2_i}.cpp")
+        if(EXISTS "${_sa2_file}")
+            set_property(SOURCE "${_sa2_file}" APPEND PROPERTY COMPILE_DEFINITIONS REX_NV_SAVES_ELIDE)
+            set_property(SOURCE "${_sa2_file}" PROPERTY SKIP_PRECOMPILE_HEADERS ON)
+        endif()
+    endforeach()
+endforeach()
 if(NOT BANJO_GEN_LOOP_LOCALS)
     list(APPEND _banjo_round_definitions REX_LOOP_LOCALS_OFF)
 endif()
