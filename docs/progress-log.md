@@ -84,3 +84,13 @@ and docs/sa2-near-exact.md.
   base carries under Banjo's addresses (memcpy, memset, the two shader-constant writers; their stack writes and
   offsets checked against SA2's originals).
 - `tools\sa2_package_switch.ps1` (the console package in `out\packages`) and `dist\switch\sa2-nx\sa2_ab_keys.toml`.
+- R1_ASSUME's census: +3,427 functions assumed, 0 differences in 1.69 billion checked calls (sa2-near-exact.md); off.
+- An emulator profile of the attract sequence (Ryujinx starts an NRO without argv, so the SDK's rex logs, the CPU
+  sampler's profile among them, are in `sdmc:/switch/` itself: `tools\sa2_emu_ab.ps1` collects them).
+- The machine copies: 89 + 358 bulk, verified on the PC (sa2-ultimate-notes.md, "The machine copies"); five of 1.0.6's
+  listed functions are hooked here and came out.
+- setjmp / longjmp against the lists: no copy on the path (sa2-near-exact.md).
+- `-fipa-pta` on for SA2's LTO builds, as 1.0.6 (the base has it off without a recorded reason); the inliner limits
+  are already sa2-nx's (64, 12).
+- `tools\sa2_stale_frame_reads.py`: 189 candidate loads (149 functions) for the read of a frame word never written;
+  static, so candidates (the first one's use is on a path its earlier check rules out).
