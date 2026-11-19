@@ -2,7 +2,9 @@
 # folder, for the A/B of the picture (tools/sa2_compare_frames.py --align). Both NROs take /switch/sa2-nx/ as their
 # folder (Ryujinx starts an NRO without argv: each falls back to /switch/sa2-nx/sa2.nro), so each run gets its own
 # files there and puts them back after:
-#   - the NRO (sa2.nro): app\out\switch\renut.nro ("ult") or app\out\ref106\renut.nro ("ref106": 1.0.6, bba67b6a);
+#   - the NRO (sa2.nro): app\out\switch\renut.nro ("ult"), app\out\switch-<variant>\renut.nro ("ult-<variant>": a
+#     build of this tree in a folder of its own, e.g. ult-exact) or app\out\ref106\renut.nro ("ref106": 1.0.6,
+#     bba67b6a);
 #   - deko3d_glsl.bin: none for "ult" (its GLSL package is built in; one beside it would be read first), 1.0.6's
 #     release package for "ref106" (sa2-nx app\out\renut_switch_release\sd\deko3d_glsl.bin, what its installer makes);
 #   - deko3d_shaders.bin (the compiled variants, written as it plays) and the user folder (sa2\): each build's own,
@@ -11,8 +13,9 @@
 # Refuses to start while any Ryujinx runs, with under -MinCommitGB of free commit memory, or while a build compiles;
 # stops only the process it started, when the recording's .txt appears (or after -Seconds). The recording
 # (captures\video_1s.*) and the logs go to out\emu_runs\<Name>.
-#   powershell -File tools\sa2_emu_ab.ps1 -Build ult|ref106 -Name <run> -Toml out\emu_tomls\<toml> [-Seconds 900]
-param([Parameter(Mandatory = $true)][ValidateSet("ult", "ref106")][string]$Build, [string]$Name = "emu_ab",
+#   powershell -File tools\sa2_emu_ab.ps1 -Build ult|ult-<variant>|ref106 -Name <run> -Toml out\emu_tomls\<toml> [-Seconds 900]
+param([Parameter(Mandatory = $true)][ValidatePattern("^(ult|ult-[a-z0-9]+|ref106)$")][string]$Build,
+      [string]$Name = "emu_ab",
       [Parameter(Mandatory = $true)][string]$Toml, [int]$Seconds = 900, [double]$MinCommitGB = 12,
       [string]$Data = "D:\New folder\ryu-data\sa2-ult")
 $ErrorActionPreference = "Stop"
@@ -28,7 +31,9 @@ if ($building) { Write-Output "a build of this tree is running: not starting"; e
 $os = Get-CimInstance Win32_OperatingSystem
 $freeCommit = $os.FreeVirtualMemory / 1MB
 if ($freeCommit -lt $MinCommitGB) { Write-Output ("free commit memory {0:N1} GB < {1} GB: not starting" -f $freeCommit, $MinCommitGB); exit 3 }
-$nroSource = if ($Build -eq "ult") { Join-Path $root "app\out\switch\renut.nro" } else { Join-Path $root "app\out\ref106\renut.nro" }
+$nroSource = if ($Build -eq "ult") { Join-Path $root "app\out\switch\renut.nro" }
+              elseif ($Build -like "ult-*") { Join-Path $root ("app\out\switch-" + $Build.Substring(4) + "\renut.nro") }
+              else { Join-Path $root "app\out\ref106\renut.nro" }
 if (-not (Test-Path $nroSource)) { Write-Output "no NRO at $nroSource"; exit 4 }
 if (-not (Test-Path $Toml)) { Write-Output "no toml at $Toml"; exit 4 }
 $glslRef = "D:\sonic adventure 2\sa2-nx\app\out\renut_switch_release\sd\deko3d_glsl.bin"
