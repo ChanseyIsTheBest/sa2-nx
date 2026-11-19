@@ -11,7 +11,8 @@ For every generated function (the PowerPC instructions in the `// mnemonic opera
     and every frame address it takes (`addi rX,r1,K`: a callee or a pointer may write there).
 A load at an offset of the frame that the function neither stores to (of the load's width, anywhere in the function)
 nor takes the address of is a candidate: what it reads is whatever an earlier call at the same stack depth left
-there. Path order is not followed (a store anywhere in the function counts), so this lists fewer candidates than
+there. Only loads whose value is used count: the loaded register is followed in straight-line order from the load
+until something writes it again (most such loads are dead: the compiler loaded a variable it then overwrote). Path order is not followed (a store anywhere in the function counts), so this lists fewer candidates than
 exist, not more; vector forms with an index register are not followed either.
 
   python tools/sa2_stale_frame_reads.py [--gen app/generated] [--top 60]
@@ -32,10 +33,69 @@ WIDTH = {'lbz': 1, 'lhz': 2, 'lha': 2, 'lwz': 4, 'lwa': 4, 'ld': 8, 'lfs': 4, 'l
          'stb': 1, 'sth': 2, 'stw': 4, 'std': 8, 'stfs': 4, 'stfd': 8}
 
 
+REG = re.compile(r'\b([rf]\d+)\b')
+NO_DEST = re.compile(r'^(st|cmp|tw|td|dcb|icb|sync|lwsync|eieio|isync|mt|stvx|stvewx|stvlx|stvrx)')
+TARGET = re.compile(r'0x([0-9a-f]{8})')
+ARGS = {f'r{i}' for i in range(3, 11)} | {f'f{i}' for i in range(1, 14)}
+RETURNS = {'r3', 'f1'}
+
+
+def used_after(insns, labels, i):
+    """True when the register a load at index i writes can be read before something writes it again, following the
+    control flow (both ways of a conditional branch, the target of an unconditional one; a call reads only the
+    argument registers, a return only r3 / f1)."""
+    dest = insns[i][1].split(',')[0]
+    seen = set()
+    work = [i + 1]
+    while work:
+        j = work.pop()
+        while j < len(insns) and j not in seen:
+            seen.add(j)
+            m, ops = insns[j]
+            regs = REG.findall(ops)
+            if m in ('bl', 'bctrl', 'blrl') or (m.startswith('bl') and not m.startswith('blr')) and m != 'blt':
+                if dest in ARGS:
+                    return True
+                j += 1
+                continue
+            if m.startswith('blr') or m == 'bctr':
+                if dest in RETURNS:
+                    return True
+                if m == 'blr' or m == 'bctr':
+                    break
+                j += 1  # a conditional return
+                continue
+            if m.startswith('b'):
+                tm = TARGET.search(ops)
+                target = labels.get(tm.group(1).upper()) if tm else None
+                unconditional = m == 'b'
+                if target is not None:
+                    work.append(target)
+                elif unconditional:
+                    return True  # leaves the function (a tail call): unknown
+                if unconditional:
+                    break
+                j += 1
+                continue
+            first = regs[0] if regs else None
+            if NO_DEST.match(m):
+                if dest in regs:
+                    return True
+                j += 1
+                continue
+            if dest in regs[1:]:
+                return True
+            if first == dest:
+                break  # written again on this path
+            j += 1
+    return False
+
+
 def scan(path):
     out = []
     name = None
     insns = []
+    labels = {}
 
     def finish():
         if not name:
@@ -79,6 +139,8 @@ def scan(path):
         for i, m, k, w in loads:
             if any(b in stored for b in range(k, k + w)):
                 continue
+            if not used_after(insns, labels, i):
+                continue
             if any(t <= k < t + 1024 for t in taken):  # a taken address at or below it may cover it (an array, a struct)
                 continue
             out.append((name, m, k, frame, os.path.basename(path)))
@@ -87,7 +149,11 @@ def scan(path):
         fm = FUNC.match(line)
         if fm:
             finish()
-            name, insns = fm.group(1), []
+            name, insns, labels = fm.group(1), [], {}
+            continue
+        lm = re.match(r'^loc_([0-9A-F]{8}):', line)
+        if lm and name:
+            labels[lm.group(1)] = len(insns)
             continue
         im = INSN.match(line)
         if im and name:
