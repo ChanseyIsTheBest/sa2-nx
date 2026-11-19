@@ -1,123 +1,134 @@
 # Rebasing sa2-nx on the ultimate base: the inventory and the method
 
-Written 2026-11-19, before any code moved. The rebase starts from sa2-nx 1.0.6 (main, baf523b) and the ultimate base
-(D:\renut-ultimate\base, branch `ultimate`, commit 73b7b731, ports 1-189). The base's working tree had 979 files that
-differ from that commit only in line endings, so the commit is what is taken.
+Written 2026-11-19, before any code moved; sorted into the three lists below the same day (the user's word through the
+base's session: a full rebase, grafting only what SA2 needs). The rebase starts from sa2-nx 1.0.6 (main, baf523b) and
+the ultimate base (D:\renut-ultimate\base, branch `ultimate`, commit 73b7b731, ports 1-189). The base's working tree had
+979 files that differ from that commit only in line endings, so the commit is what is taken.
+
+## The method: a full rebase
+
+- The branch starts as the base's whole tree (e2099f33, "The ultimate base at 73b7b731"; its blobs byte for byte). That
+  is the project from now on. sa2-nx's structure, its SDK and renderer copies, and its versions of the files the base
+  also has are not kept.
+- Katamari's layer goes (36bba673).
+- From sa2-nx, only what SA2 needs and the base does not have is grafted, a commit per piece, each with its line in
+  list (a) or (c) below. Where the base has its own form of something sa2-nx also did, the base's form wins (list
+  (b)). Where a shared file needs SA2's lines, the base's file is taken and only those lines go back.
+- Nothing is grafted because it was there: a piece SA2 runs without, or one the base does better, stays behind
+  (list (d)), with the reason.
+- `docs/ultimate-sync.md` records the base commit the branch is at: later base ports come in with
+  `tools/ult_port_sync.py --range 73b7b731..<base commit>`.
 
 ## What the file comparison says
 
-`git ls-tree` of both commits, blob by blob (`out/tree_compare.tsv` in the worktree; made by a scratch script):
+`git ls-tree` of both commits, blob by blob (`out/tree_compare.tsv` in the worktree): 1,880 files the same, 2,172 in
+both but different (nearly all of sa2-nx's SDK and renderer: the base carries a later form of each), 489 only in sa2-nx
+(220 of them 1.0.4's pgo/*.gcda), 19,584 only in the base (18,873 of them sdk/thirdparty, which sa2-nx fetched instead
+of tracking). banjo-nx took sa2-nx's CPU rounds and Renut work (`docs/renut-cpu-work-for-banjo.md`) before the base began
+(banjo-nx 894d3256, 2026-10-29), and the base took sa2-nx's later queue and core-layout work through dishonored-nx (ports
+103 and 105). The base mentions sa2-nx in 136 files.
 
-| | Files |
-|---|---|
-| The same in both | 1,880 (most of XenosRecomp, uam, plume's unchanged files, some tools) |
-| In both, different | 2,172 (nearly all of sa2-nx's SDK and renderer: the base carries a later form of each) |
-| Only in sa2-nx | 489 (220 of them pgo/*.gcda: 1.0.4's profile) |
-| Only in the base | 19,584 (18,873 of them sdk/thirdparty, which sa2-nx fetches with tools/fetch_thirdparty.py instead of tracking) |
-
-The lineage explains the "different" column. sa2-nx's SDK is rexglue 0.10.0 with `patches/rexglue-sdk-v0.10.0.patch`,
-and its renderer is Renut from banjo-nx c319b29 with `patches/renut-banjo-nx-c319b29.patch`. banjo-nx took sa2-nx's CPU
-rounds and Renut work (`docs/renut-cpu-work-for-banjo.md`) before the base began (banjo-nx 894d3256, 2026-10-29), and the
-base took sa2-nx's later queue and core-layout work through dishonored-nx (ports 103 and 105). The base mentions sa2-nx in
-136 files. So for these files the base's form wins, and only SA2's own lines go back on top.
-
-## Method
-
-1. The worktree takes the base's tree in one commit ("the ultimate base at 73b7b731"). This plan stays in it.
-2. Katamari's game layer goes in one commit: `app/src/katamari_*`, the Katamari hooks and lists, `pgo/` and
-   `pgo-inplace/` (Katamari's profile), its tomls and `tools/make_katamari_tomls.py`, `dist/switch/katamari-nx`, its DLC
-   pack list, its shader-file tools and records, its icon.
-3. SA2's layer comes back piece by piece, a commit each, in the order of the table below. Where a shared file differs,
-   the base's form is kept and SA2's own lines are put back (building.md section 7). Each piece names its source.
-4. `docs/ultimate-sync.md` records the base commit the branch is at, so later base ports come in with
-   `tools/ult_port_sync.py --range 73b7b731..<base commit>`.
-
-### Decisions
+## Decisions
 
 | What | Decision | Why |
 |---|---|---|
-| The project's internal name | `renut`, as the base and Katamari (generated `renut_recomp.N.cpp`, `renut_pch.h`, the CMake target `renut`) | Every base CMake rule, pass and script names `renut_*` first; port 186 lets the passes take another name, but CMake does not. Fewest changes to base files means cleaner `ult_port_sync.py` merges later. SA2's own sources that name `sa2_recomp` / `sa2_pch.h` are changed to the base's names |
-| What the player sees | `switch/sa2-nx/sa2.nro`, `sa2.toml` next to it, the same title, author, icon and NACP as 1.0.6 | A player's install must keep working (the prompt) |
-| The game files | `assets/game_root`: a directory junction to the main checkout's (2.4 GB, never copied). The manifest reads `../assets/game_root/default.xex` as 1.0.6 did | The prompt; the base's own `app/assets` is Katamari's convention and is not used |
-| The two code modules | the main module into `app/generated` (flat, as the base's passes expect), the stage DLL into `app/generated/data_dll` | Step 2 of the work: decided after the first code generation, written in `docs/sa2-ultimate-notes.md` |
-| The game files on the card | SA2's `game_root.nxpack` + `.nxidx` (sa2-nx's pack device), not the base's `.lz4b` files (port 61) | A 1.0.6 player's card has the pack, and sa2-nx's installer makes it; the `.lz4b` form would need every player to repack. The base's `.lz4b` reader stays in the build for any loose `NAME.lz4b` |
-| The renderers | Renut only (the base's), on Vulkan on the PC and deko3d on the Switch | 1.0.6 ships Renut only. sa2-nx's earlier renderers (the native PM4 renderer `app/src/me/native`, the API renderer `sa2_api_*` / `sa2_d3d_api.*`) stay behind: they were the road to Renut, and their keys do nothing in 1.0.6 on the Switch |
-| Renut's state setters | SA2's own code, as 1.0.6 (the base's `d3d/hooks/state.cpp` not bound for SA2) | 1.0.6 draws from the device shadows SA2's Direct3D writes; the base's native setters were written from N&B's and Katamari's disassembly (XDK 7645 / 5632) and SA2's 21076 setters differ (SetTexture's mip-address translation). Binding them is a separate step with its own A/B, not part of a pixel-identical rebase |
-| The PC reference | the 1.0.6 NRO in Ryujinx and the rebased PC build (Renut on Vulkan) | The prompt: every comparison is against 1.0.6 |
+| The project's internal name | `renut`, as the base (generated `renut_recomp.N.cpp`, `renut_pch.h`, the CMake targets `renut`, `renut_recomp`, `renut_Data_DLL`) | every base CMake rule, pass and script names `renut_*`; the fewest changes to base files keep later syncs clean |
+| The app's name | `"sa2"` (`renut_app.h`'s Create) | the SDK names the save folder (the user folder / "sa2") and the PC's settings file after it: a 1.0.6 player's saves and sa2.toml are found as before |
+| What the player sees | `switch/sa2-nx/sa2.nro`, `sa2.toml` next to it, 1.0.6's name, author and icon; NACP version "1.0.6-ult" until a release is decided | a player's install keeps working |
+| The game files | `assets/game_root` and `app/assets`: directory junctions to the main checkout's `assets/game_root` | the prompt; `app/assets` is the base's own convention, which its passes read (`ro_constants --xex`) |
+| The two code modules | the main module into `app/generated` (flat, as the base's passes expect), the stage DLL into `app/generated/data_dll` | docs/sa2-ultimate-notes.md, "Two code modules" |
+| The renderer | Renut only (the base's), Vulkan on the PC, deko3d on the Switch; SA2's own Direct3D keeps the state setters (the base's `state.cpp` not built) | 1.0.6 ships Renut only and leaves the setters to SA2's Direct3D (21076; the base's native setters were written at 7645 / 5632) |
+| The PC reference | the 1.0.6 NRO in Ryujinx and the rebased PC build | the prompt |
 
-## The inventory
+## (a) SA2's layer: grafted
 
-"Base" names the base's form; "comes over" means SA2's form is put on top of the base's tree.
+| Piece | From 1.0.6 | In the rebase | Why it is needed |
+|---|---|---|---|
+| Code generation config | `sa2_manifest.toml`, `overrides.toml`, `overrides_data_dll.toml`, `perf_overrides.toml` / `codegen_flavor.toml`, `indirect_promotions.txt` | `app/renut_manifest.toml`, `renut_config.toml` (SA2's keys), `config/codegen_keys_data_dll.toml`, `overrides.toml`, `overrides_data_dll.toml`, `indirect_promotions.txt`; `config/renut_funcs.toml` and `renut_hooks.toml` emptied | SA2's functions, switch tables, setjmp / longjmp, its two modules; each entry keeps its evidence |
+| Renut's device layout at Direct3D 2.0.21076 | `d3d/d3d.h`, `d3d_native.h`, the hook files' constants | the base's files with SA2's values (`tools/sa2_renut_layout.py`, every value from 1.0.6 by name; the viewport, port 138's field, read from SA2's GetViewport at +13024; SA2's gamma ramp at +15408; the delta capture's private chunk bounds 11008-12224) | the base's are Katamari's (5632) |
+| Renut's hook bindings | the "sa2-nx: SA2's hooks" blocks of `d3d/hooks/{device,draw,resource,shader}.cpp` | Katamari's bindings out, SA2's blocks in (SA2's own device creation, ring segment allocator, SynchronizeToPresentationInterval); the hooks 1.0.6 shared with its own Direct3D hooks are Renut's own | Katamari's addresses are other functions in SA2 |
+| The Swap hook's SA2 lines | `device.cpp` | the base's Swap with SA2's frame pacing first, SA2's gamma ramp offset, no `ResetAllState` (SA2's setters keep the dirty marks the delta chain reads) | SA2's game speed follows its frames; the base's Swap is Katamari's |
+| Frame pacing | `gpu/sa2_renut_pacing.cpp/.h` (`sa2_renut_vblank_pacing`, `sa2_vsync_relaxed`) | as it was, `sa2_vsync_relaxed` defined there with the base's non-CPU master | the base has no game-interval pacing (its frame cap is a fixed rate) |
+| The window scissor's shadow | `src/me/sa2_me_hooks.cpp`'s hook of `sub_8254FCE8` | `src/sa2_renut_hooks.cpp` | Renut reads the window packet SA2's Direct3D never writes |
+| The screen width | `gpu/guest/sa2_screen.cpp` | as it was (the base's `widescreen.cpp` and `photo_capture.cpp` not built, as in 1.0.6) | N&B's / Katamari's game code otherwise |
+| The stage DLL in the NRO | `src/sa2_static_modules.cpp`, the CMake partial link | as it was, under the base's project name (`renut_Data_DLL`) | an NRO cannot load a DLL |
+| OpenSA2's control options (1.0.5) | `src/sa2_controls.cpp` | as it was, on the base's memory helpers | the player's options |
+| The keys other base files read, and 1.0.6's renamed player keys | (Katamari's `katamari_keys.cpp` in the base) | `src/sa2_keys.cpp`: the base's frame cap and the not-built keys; `sa2_renut_double_buffer` read and handed to `pacman_renut_double_buffer`; `sa2_renut_msaa` read and ignored with a log line (docs/sa2-ultimate-notes.md, "Settings") | a 1.0.6 sa2.toml keeps working |
+| The tomls | `sa2_switch.toml`, `sa2_switch_defaults.toml` | the player's as it was; the compiled-in one with 1.0.6's decisions under the base's names (`tools/sa2_effective_keys.py` checks them key by key) | the shipped settings |
+| The icon and the NRO's identity | `app/icon.jpg`, CMake NAME / AUTHOR | `tools/switch/icon/sa2_icon.jpg`, the CMake call | the homebrew menu entry |
+| The game layer's app wiring | `sa2_app.h` | the base's `renut_app.h` with SA2's lines (the app name, the compiled-in settings, the game files' search with the pack) | |
+| The lockstep frame comparison | `src/sa2_capture.cpp/.h`, the SDK's `vblank_per_swap`, `tools/compare_raw.py`, `compare_video.py` | to graft (step 3) | this port's gate: the uninitialised stack word was found only by it, and the base has no lockstep capture |
+| The game files as a pack | SDK `pack_device.*`, `pack_storage_switch.cpp`, the keys `asset_pack`, `asset_pack_build`, `tools/build_asset_pack.py` | to graft (step 5) | a 1.0.6 player's card holds game_root.nxpack and sa2-nx's installer makes it; the base's `.lz4b` (port 61) would need every player to repack |
+| SA2's console fixes in its scenes | Chao Garden's resolves, the long-session texture fixes (1.0.2), the 4x MSAA alias clear | each checked against the base's form in step 5 | 1.0.6 draws them right |
+| SA2's hot functions | `app/src/cpu/hot` lists, 1.0.4's hand natives (`tools/hand_natives`) | lists emptied (Katamari's); the copies remade by the base's tools in step 7; a hand native only where the base's copies do not cover it | |
+| Docs | sa2-nx's `docs/` (records) | to graft as records, with a top note | |
 
-### Already in the base: the base's form is kept, nothing of SA2's comes over
+## (b) General work the base already has: left behind, the base's form kept
 
-| sa2-nx piece | The base's form |
+| sa2-nx's piece | The base's form |
 |---|---|
-| CPU rounds 1-3 of 2026-10-12 and banjo-nx's codegen round (generator options, post-codegen passes, SDK tests) | banjo-nx's copies in the base: `tools/post_codegen.py` and its passes (`pch_no_volatile`, `loop_barriers`, `indirect_calls`, `pch_cold_traps`, `direct_calls`, `guest_cas`, `flush_mode_flow`, `vec_byteswap`, `pch_neon_shuffles`, `ro_constants`, `ro_constants_cfg`, `float_loads`, `frame_traffic`, `loop_locals`, `leaf_locals`, `fp_sign_ops`, `leaf_dead_stores`, `single_floats`, `vperm_one_source`, `inline_memcalls`, `vec_unaligned_stores`, `dead_ctx_defs`, `flush_hoist`, `lr_preserve`, `vsel_neon`, `inline_leaves`), the generator's `fcti_inline`, `fp_copy_pairs`, `div_inline`, `rotate_word_shifts`, `fp_copy_forwarding`, `dcbt_prefetch`, the setjmp locals fix |
-| The flush-mode flow | `tools/flush_mode_flow.py` (and CG-13, port 123/133, on the Switch) |
-| frame_traffic.py's three elisions (`SA2_GEN_*_ELIDE`, off) | `BANJO_GEN_LR_MOVES_ELIDE`, `BANJO_GEN_NV_SAVES_ELIDE`, `BANJO_GEN_BACK_CHAIN_ELIDE` (off; off-by-default.md section 2 cites sa2-nx) |
-| The localized native copies (`app/generated/hot`, `tools/localize_native.py`, the bulk lists, the guard) | the base's machine copies: in place on the Switch (port 81), whole-program register liveness (port 121), the guard and `banjo_hot_poison_dead` |
-| `SA2_GAME_NO_MATH_ERRNO` / `NO_TRAPPING_MATH` | the base's flags (`BANJO_GENERATED_NO_TRAPPING_MATH` off; fp_env_files.py keeps -ftrapping-math on the FPSCR writers) |
-| The SDK's console tuning: critical sections from the processor block, inline `kernel_state()`, `XObject` counts, `TranslateVirtual`, signal skips, the lock words, the core layout (`RexSetGuestThreadCoreLayout`) | the base's SDK (and port 103: the layout applied at each thread's own wait) |
-| Renut's game- and render-thread work (device deltas, constants by the chain, narrow and NEON compares, capture batches, fast paths, wake batch, prefetch, done signal, batch clock, chain reuse, shared constants, stream mask, texture defaults, lean diagnostics, clear repeat, lazy resolve mips) | the same items under `banjo_renut_*` names (banjo-nx took them; renut-cpu-work-for-banjo.md) |
-| The render queue as a lock-free ring (`sa2_renut_lockfree_queue`) | port 105, `dishonored_renut_lockfree_queue` |
-| Double buffering, the display queue drain (`sa2_renut_double_buffer`, `sa2_renut_queue_drain`) | `pacman_renut_double_buffer`, `pacman_renut_queue_drain` |
-| The colour hand-over (`sa2_renut_colour_handover`) | `banjo_deko3d_color_handover` |
-| The setter marks and dirty tags (`sa2_renut_setter_marks`, `_check`, `marks_copy`) | `banjo_renut_tags`, `banjo_renut_tags_check` (to confirm when the hooks are bound: SA2's marks come from its setter hooks, step "Renut at SA2's addresses") |
-| The display gamma ramp at scan-out (`sa2_renut_gamma_ramp`) | port 91, `banjo_renut_game_gamma` (a table at scan-out): needs SA2's ramp offset (+15408) |
-| MSAA (`sa2_renut_msaa`) | `msaa_level` (port 118) |
-| The render resolution by the console's mode (`sa2_renut_dock_resolution`, `sa2_render_height_*`) | `banjo_renut_render_height_docked` / `_handheld`, `banjo_renut_display_height_docked` |
-| No Vulkan driver in a deko3d-only NRO | `REXGLUE_SWITCH_NVK` OFF (banjo-nx's form of sa2-nx's `REXGLUE_SWITCH_NO_NVK`) |
-| Game memory and the NRO's code on 2 MB blocks (1.0.6) | kameo-nx's `sdk/src/ui/switch_code_blocks.cpp` and `RexGmSetWindowBlocks`: the same code; the base's reads `katamari.toml`, which SA2's tree changes to `sa2.toml` (a handoff: the file name from the build) |
-| `tools/cg13_census.ps1`, `tools/stfs_extract.py`, `tools/switch_check.py`, `tools/pointer_fixpoint.py`, `tools/census_*.py`, `tools/arm_cost_census.py`, `tools/loop_body_census.py`, `tools/generated_code_census.py` | the base's copies |
-| The PGO build with the inliner's limit 64 and growth 12 % for game code | to compare with the base's link settings in step 8 |
-| The Joy-Con sideways stick fix, input remapping, the Xbox layout | the base's input system (`input_joycon_sideways_stick`, `input_xbox_layout`, `[input_pN]`) |
+| The CPU rounds of 2026-10-12 and banjo-nx's codegen round (generator options and post-codegen passes) | banjo-nx's copies in the base, `tools/post_codegen.py` and its passes; the generator's `fcti_inline`, `fp_copy_pairs`, `div_inline`, `rotate_word_shifts`, `fp_copy_forwarding`, `dcbt_prefetch`, the setjmp locals fix |
+| The flush-mode flow | `tools/flush_mode_flow.py` (and CG-13, ports 123 / 133) |
+| frame_traffic.py's three elisions | `BANJO_GEN_*_ELIDE` (off; off-by-default.md section 2) |
+| The localized copies, the bulk lists, the guard | the base's machine copies: in place (port 81), register liveness (port 121), the guard, `banjo_hot_poison_dead` |
+| `tools/localize_writebacks.py` (changed-only write-backs) | port 121's LiveOut (`live_out_keep`) and `leaf_dead_stores.py` keep only what callers read; whether a write-back the copy does not change is still stored is checked in step 7 before anything is grafted |
+| `SA2_GAME_NO_MATH_ERRNO` / `NO_TRAPPING_MATH` | `BANJO_GENERATED_MATH_FLAGS`, `BANJO_GENERATED_NO_TRAPPING_MATH` (off; fp_env_files.py) |
+| The SDK's console tuning (critical sections, `kernel_state()`, `XObject` counts, `TranslateVirtual`, signal skips, lock words, the core layout) | the base's SDK; port 103 |
+| Renut's game- and render-thread work of 2026-10-20 to 10-28 | the same items as `banjo_renut_*` |
+| The render queue as a lock-free ring | port 105, `dishonored_renut_lockfree_queue` |
+| Double buffering and the queue drain | `pacman_renut_double_buffer`, `pacman_renut_queue_drain` |
+| The colour hand-over | `banjo_deko3d_color_handover` |
+| The gamma ramp at scan-out | port 91, `banjo_renut_game_gamma` (with SA2's offset, list (a)) |
+| The render resolution by the console's mode | `banjo_renut_render_height_*`, `banjo_renut_display_height_docked` |
+| No Vulkan driver in a deko3d NRO | `REXGLUE_SWITCH_NVK` OFF |
+| 2 MB blocks (1.0.6) | kameo-nx's `switch_code_blocks.cpp` and `RexGmSetWindowBlocks`, the same code (it reads `katamari.toml`: SA2's line, `sa2.toml`, goes back) |
+| The DLC installer (`sa2_dlc.cpp`) | reNut's `renut_engine/dlc_install.cpp` (the running title's packages from `dlc/`; key `renut_dlc_folder`) |
+| The language (`sa2_language.cpp`, `language = auto/english/...`) | the SDK's `language` key (blur-nx's): the same names, case-insensitive; "auto" falls to the console's language as before |
+| The PGO plumbing (`sa2_pgo.cpp`, `pgo_merge.ps1`) | `banjo_pgo.cpp`, `tools/pgo_merge.py` (step 8) |
+| The Joy-Con sideways stick fix, the input maps, the Xbox layout | the base's input system (`input_joycon_sideways_stick`, `[input_pN]`, `input_xbox_layout`) |
+| `tools/cg13_census.ps1`, `stfs_extract.py`, `switch_check.py`, `pointer_fixpoint.py`, `census_*.py`, `arm_cost_census.py`, `loop_body_census.py`, `generated_code_census.py` | the base's copies |
+| The setter marks and dirty tags (`sa2_renut_setter_marks`) | the base has its own form (`banjo_renut_tags`), driven by the native setters; SA2's tag table (`sa2_setter_marks_tags.h`) is SA2's layer and comes over in that form only if a measurement asks for it; until then `banjo_renut_tags` is off in SA2's settings (the deltas compare their chunks: exact) |
 
-### Comes over: SA2's own layer
+## (c) General work the base lacks
 
-| Piece | Where in 1.0.6 | Notes |
+| Piece | Grafted or left | Handoff |
 |---|---|---|
-| Code generation config | `app/sa2_manifest.toml` (as `app/renut_manifest.toml`), `overrides.toml` (both modules), `overrides_data_dll.toml`, `perf_overrides.toml` (as the base's `renut_config.toml` keys), `codegen_flavor.toml`, `indirect_promotions.txt`, `hot_functions.ld` | each entry keeps its evidence; the base's config keys are compared one by one with SA2's |
-| The game layer | `app/src/sa2_capture.cpp/.h`, `sa2_controls.cpp` (OpenSA2's options, 1.0.5), `sa2_crash_log.cpp`, `sa2_d3d_trace.cpp`, `sa2_debug_hooks.cpp`, `sa2_dlc.cpp/.h` (the Battle DLC), `sa2_language.cpp/.h`, `sa2_pgo.cpp/.h` (against the base's `banjo_pgo.cpp`), `sa2_static_modules.cpp` (the stage DLL linked into the NRO), `sa2_app.h` (against `renut_app.h`), `sa2_builtin_config.h.in` | against the base's app (`renut_app.h`, `main.cpp`, `banjo_pgo.cpp`, the game menu) |
-| Renut at SA2's addresses and Direct3D 2.0.21076 | `d3d/d3d.h`, `d3d_native.h` (the device layout; renut-renderer.md has every offset), the "sa2-nx" hook blocks of `d3d/hooks/{device,draw,shader,resource}.cpp`, `banjo_renut_select.cpp`, `guest/sa2_screen.cpp`, `sa2_renut_pacing.cpp/.h` (the 60 Hz frame pacing: SA2's game speed follows its frames), `sa2_renut_yield.h`, `sa2_line_compare.h` (if the base's NEON compare is another), `sa2_setter_marks*.h`, `sa2_compat/` (only what the base lacks), the window-scissor hook of `src/me/sa2_me_hooks.cpp` (sub_8254FCE8), `src/me/sa2_setter_marks.cpp`, `sa2_render_mode.cpp/.h` | from the base's Katamari layout commit (838c8c41: every constant it moved carries "katamari-nx: old->new") to SA2's values; base fields added since (the viewport, port 138) get SA2's offsets read from SA2's code |
-| `sa2_renut_direct_resolve_mips` (on in 1.0.6) | `render/*` | not in the base: comes over if it fits the base's resolve path, else noted (a handoff) |
-| The game files as a pack | `sdk/src/filesystem/devices/pack_device.cpp`, `pack_storage_switch.cpp`, `include/rex/filesystem/devices/pack_device.h`, the keys `asset_pack`, `asset_pack_build`, `tools/build_asset_pack.py` | see Decisions |
-| The lockstep test path | `vblank_per_swap*` (SDK, `xboxkrnl_video.cpp`), `sa2_capture.cpp`, `tools/compare_raw.py`, `tools/compare_video.py` | the frame comparison is this port's gate (the uninitialised stack word was found only by it) |
-| SA2's CPU layer | `app/src/cpu/hot/` (hand.txt, localized.txt, localized_bulk.txt, the hand natives `n_*.h`), `sa2_hot_*`, `sa2_enhancements.*`, `sa2_codegen_checks.cpp`, `sa2_forms_selfcheck.cpp`, `sa2_gpu_wait.cpp`, `sa2_gpu_boost.cpp` | against the base's `banjo_hot_guest.*`, `banjo_hand_natives.h`, `banjo_codegen_checks.cpp`; hand natives only where the base's machine copies do not cover them (step 7) |
-| Tools the base does not have | `tools/localize_writebacks.py`, `tools/hand_natives/` (1.0.4's natives and their generators), `tools/pgo_function_counts.py`, `tools/compare_raw.py`, `compare_video.py`, `tools/build_asset_pack.py`, `tools/nro_set_version.py`, `tools/check_switch_build.py`, `tools/sa2_dump_shaders.py`, `tools/switch_profile_report.py` | each checked against the base's equivalent first (the base's `localize_native.py` may already keep only changed write-backs) |
-| The tomls | `sa2.toml` (PC), `sa2_switch.toml` (the player's), `sa2_switch_defaults.toml` (compiled in) | the 1.0.6 player keys and their base names: `docs/sa2-ultimate-notes.md` |
-| The icon, the NACP, the folder | `app/icon.jpg`, `app/CMakeLists.txt`'s NAME / AUTHOR / VERSION, `switch/sa2-nx` | |
-| Docs | `docs/sa2-notes.md`, `renut-renderer.md`, `cpu-rounds.md`, `enhancements.md`, `switch-testing.md`, `porting-guide.md`, `deko3d-renderer-guide.md`, the rest | SA2's records, kept as they are (a top note says what is stale); the base's guides stay as they are |
-| Credits | README, THIRD_PARTY_NOTICES.md (OpenSA2 GPL-3.0-only, kameo-nx, reNut, Renut, banjo-nx, the base and its ports) | |
+| Guest DLL modules linked into an executable (`rex/system/static_modules.h`, `KernelState::LoadUserModule`) | grafted (the Switch needs it for SA2's stage DLL) | yes: a second module in any port |
+| The post-codegen steps of a second module (`tools/post_codegen_modules.py`, run on every module folder) | grafted | yes |
+| FFmpeg's nine configure-made files the base's tree lacks (cb3a6f56) | grafted | yes: a fresh checkout of the base does not build without them |
+| `sa2_renut_direct_resolve_mips` (resolve mip levels drawn straight into the texture's levels, deko3d; on in 1.0.6) | to decide in step 5 against the base's resolve path | if grafted |
+| `tools/pgo_function_counts.py` (a PGO profile's executed instructions per function) | candidate for step 7 (the base's `switch_hot_bulk.py` takes console profiles; the PGO counts cover more scenes) | if grafted |
+| `tools/hand_natives/` | candidate for step 7 only where the base's copies do not cover a function | |
+| `tools/nro_set_version.py`, `tools/check_switch_build.py` | candidates for step 9 | |
 
-### Left behind, and why
+## (d) Left behind, and why
 
 | Piece | Why |
 |---|---|
-| `app/src/me/native/` (72 files), `me_native_*`, `sa2_api_*`, `sa2_d3d_api.*`, the `sa2_native_*` / `sa2_api_*` / most `sa2_cpu_ring_*` keys | sa2-nx's earlier renderers (masseffect-nx's PM4 renderer and the API renderer): 1.0.6 runs Renut only on the Switch, and the base has Renut on the PC too. Their keys in an old toml are ignored |
-| `patches/` (sa2-nx's patches against rexglue 0.10.0, banjo-nx's Renut, plume, FFmpeg, XenosRecomp) | the base carries the whole SDK and renderer, with its own patches (`tools/renut_patches`) |
-| `tools/win/*` (sa2-nx's PowerShell wrappers), `tools/fetch_thirdparty.py` | the base's `tools/*.bat` / `*.ps1` and its tracked `sdk/thirdparty` replace them |
-| `mesa/` | the base links no Vulkan driver on the Switch by default |
-| `pgo/` (1.0.4's profile) | it fits sa2-nx's code, not the rebased code: step 8 trains a new one |
-| sa2-nx's I/O read-ahead keys (`sa2_io_*`) | the base's host file reads (tw2de_nx's 4 MB pieces, port 146); on the Switch SA2's files come from the pack |
+| `app/src/me/native/` (72 files), `me_native_*`, `sa2_api_*`, `sa2_d3d_api.*`, `sa2_d3d_trace.cpp`, `sa2_debug_hooks.cpp` (an empty template), the `sa2_native_*` / `sa2_api_*` / `sa2_cpu_ring_*` keys | sa2-nx's earlier renderers and their tracing: 1.0.6 runs Renut only on the Switch; their keys in an old toml are ignored |
+| `sa2_crash_log.cpp` (Windows host exception log) | PC only; the base has port 154's crash-report tools |
+| `patches/` | the base carries the whole SDK and renderer with its own patches (`tools/renut_patches`) |
+| `tools/win/*`, `tools/fetch_thirdparty.py` | the base's `tools/*.bat` / `*.ps1` and its tracked `sdk/thirdparty` |
+| `mesa/` | no Vulkan driver on the Switch by default |
+| `pgo/` (1.0.4's profile) | it fits sa2-nx's code: step 8 trains a new one |
+| `sa2_io_*` (sa2-nx's read-ahead) | the base's host file reads (port 146); on the Switch SA2's files come from the pack |
 
-### The base's Katamari layer, which goes
+## The base's Katamari layer, which went (36bba673)
 
-`app/src/katamari_keys.cpp` and `katamari_builtin_config.h.in` (with the keys SA2's layer must define in its own file:
-`frame_cap` and the others `game_menu.cpp` reads), `app/src/cpu/hot`'s Katamari lists, natives and hand.txt,
-`app/src/cpu/katamari_*`, `app/katamari_switch*.toml`, `tools/make_katamari_tomls.py`, `dist/switch/katamari-nx`,
-`pgo/` and `pgo-inplace/`, `app/overrides.toml`, `app/renut_config.toml`'s game keys, `app/config/renut_funcs.toml` and
-`renut_hooks.toml`, `app/indirect_promotions.txt`, `tools/katamari_*.py` and their records, Katamari's icon
-(`tools/switch/icon/katamari_icon.jpg`), Renut's Katamari hook bindings (replaced by SA2's).
+`app/src/katamari_keys.cpp` (replaced by `sa2_keys.cpp`), `katamari_builtin_config.h.in`, `app/src/cpu/katamari_*`,
+`app/katamari_switch*.toml`, `tools/make_katamari_tomls.py`, `dist/switch/katamari-nx`, `pgo/` (`pgo-inplace/` was
+empty), `tools/katamari_*.py`, the forwarder's Katamari files, the icon; and with SA2's pieces: the hot lists and hand.txt,
+`app/overrides.toml`, `config/renut_funcs.toml`, `config/renut_hooks.toml`, `app/indirect_promotions.txt`, Renut's
+Katamari bindings. Katamari's hand natives in `banjo_hand_natives.h` stay compiled (unused) until step 7.
 
 ## The order of work
 
 1. This plan; the base's tree; Katamari's layer out.
-2. Code generation for SA2's two modules with the base's generator and passes (`docs/sa2-ultimate-notes.md` records how).
+2. Code generation for SA2's two modules (`docs/sa2-ultimate-notes.md`, "Two code modules").
 3. The PC build to gameplay; SA2's layer piece by piece; `tools/run_pc_verify.ps1`.
 4. The calling-convention censuses; the setjmp / longjmp check.
 5. The Switch build, Ryujinx against 1.0.6, the keys of off-by-default.md section 1 and 1.0.6's own fixes.
 6. The not-exact forms and their censuses (`docs/sa2-near-exact.md`).
 7. Hot functions; 8. PGO + LTO ready; 9. the console package; 10. handoffs.
 
-A progress log is kept in `docs/progress-log.md` (dated entries).
+The progress log is `docs/progress-log.md`.
