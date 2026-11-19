@@ -73,6 +73,34 @@ compared by `tools/sa2_compare_frames.py --align` (2026-11-19).
   frames of game frames 6000-9000 (every 4th: the title, its fade, the loading, the 2P demo) all identical, in
   segments of one offset each.
 
+## The machine copies (2026-11-20)
+
+SA2's first lists (`app/src/cpu/hot`): sa2-nx 1.0.6's `localized.txt` and `localized_bulk.txt` (from its PC sessions
+and console profiles), 71 functions of an emulator profile of the attract sequence (`tools/switch_hot_bulk.py
+--merge`), and `hand.txt` with 1.0.6's four hand-written natives the base carries (memcpy, memset, the two Direct3D
+shader-constant writers; checked against SA2's originals: offsets, stack writes). Five functions of 1.0.6's lists are
+hooked in this tree (Renut's draws, the window scissor's shadow, the OpenSA2 controls' function) and came out: the
+copy tool does not check its lists against the hooks, and the PC link failed on the duplicates. The build: 89 copies
+(`localized.txt`) and 358 bulk copies in 12 shards.
+
+Verified on the PC with the base's guard (each copy against its generated original on every guarded call),
+`banjo_hot_poison_dead` and every verify self-check:
+
+| Run | Guard | Copies reached | Calls compared | Differences |
+|---|---|---|---|---|
+| copies_city, copies_story | every call | 272 + 211 of 358 bulk | 123 M each | 0 |
+| copies_city2, copies_story2 | every call, later presses | 269-272 + 208-211 | 88 M + | 0 |
+| copies_city3, copies_story3 | every 16th call | 272 + 211 | 109 M (story3) | 0 |
+
+The hand-written natives each against SA2's original: memcpy 24 M calls, memset 0.3 M, the vertex constant writer
+2.0 M, the pixel one 5.4 M: 0 differences. "Differed once and not when repeated" (4-7 calls a run) are inputs another
+thread changed during the comparison, which the guard repeats by design. Every verify self-check 0 (r1 mirror, flush
+modes, folded loads, promoted calls, stack forwards).
+
+The guarded runs start slowly enough that the scripted presses miss the title, so all six played the title, the
+intro cutscenes and the attract demos (the two-player City Escape race among them), not the menus' route; the same
+build without the verify options follows the route into City Escape and plays it (route_plain).
+
 ## The picture against 1.0.6 in the emulator (Ryujinx, 2026-11-19)
 
 The rebased NRO (`app\out\switch\renut.nro`, the everyday build) against 1.0.6's released NRO (bba67b6a, with its
