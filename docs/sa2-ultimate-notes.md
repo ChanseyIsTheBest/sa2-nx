@@ -99,6 +99,29 @@ own GLSL package, compiled-shader cache and user folder), the attract sequence f
   placed elsewhere and a sliver along the edge of Shadow's board (a sub-pixel shift): positions computed on the CPU.
   1.0.6's NRO runs native copies of hot functions that the rebased build does not have yet (`sa2_cpu_native_*`, among
   them `njCalcPoint` and `njMultiMatrix`); next: 1.0.6 with its CPU enhancements off (`sa2_cpu_enhancements = false`).
+- **1.0.6 with its CPU enhancements off:** its demo the same as 1.0.6's default (646 of 750 frames; the rest the
+  title's blinking text), and against the exact rebased build 333 of 750, as before. So 1.0.6's natives are exact
+  here, and the small differences come from the rebased Switch build itself. Next: the exact build with the base's
+  non-CPU enhancements off (`banjo_noncpu_enhancements = false`), then the CPU ones.
+- **The base's non-CPU (renderer) enhancements off:** no change (323 of 750).
+- **The exact build against itself** (the same NRO and toml twice): 3,017 of 3,800 frames identical; the demo's
+  stretches differ between its own runs, which 1.0.6's never do. So what is left is not a fixed difference in the
+  arithmetic but **run-to-run variation of the rebased Switch build in the emulator** (the PC build was repeatable at
+  60 fps). Under Renut the game gets no vblank interrupt in either build (no graphics system: `config.graphics =
+  nullptr`), and the guest clock code is the same; the suspects are the base's ARM-only changes to memory ordering
+  (`tools/guest_fences.py`, new since 1.0.6; compare-and-swap without its trailing barrier) and its other run-time CPU
+  changes, which the x86 PC build cannot show. Next: the exact build with `banjo_cpu_enhancements = false`,
+  `blur_guest_fences_split = false`, `banjo_cpu_guest_cas_no_barrier = false`.
+- **The base's run-time CPU enhancements off, full fences and compare-and-swap barriers:** no change (323 of 750).
+- **What differs, in every comparison:** the same stretches of the demo match and the same stretches do not, and the
+  non-matching ones also differ between two runs of one rebased NRO: the frames with grind sparks on screen. Their
+  placement varies from run to run in the rebased Switch build and never in 1.0.6. Checked and not the cause: the
+  guest time base (`mftb` is `Clock::QueryGuestTickCount` in both trees, the clock code the same), a vblank interrupt
+  (none under Renut in either), the locals the prologue saves write (all zero-initialised in both trees, which is
+  what 1.0.6's stale-stack-word reader of the two-player demo depends on; cpu-rounds.md, "The audit" item 1). Open.
+- **Which float form makes the demo drift:** two builds (`switch-cg13`: CG-13 alone; `switch-vmx`: the two VMX forms
+  alone), each measured by the share of 1.0.6's late demo frames found identical (the exact build: 135 of 200 around
+  game frame 7900; the default build: 0).
 
 ## Gameplay on the PC, verify mode (2026-11-19)
 
