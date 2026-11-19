@@ -273,6 +273,10 @@ def main():
     # blur-nx (2026-11-16, the 15 ms batch, CG-26): the files that write the guest FPSCR keep -ftrapping-math when the
     # rest gets -fno-trapping-math (a port's CMake option: Blur's BLUR_NO_TRAPPING_MATH); last, on the final text.
     run(tool('fp_env_files.py'), '--gen', gen)
+    # sa2-nx-ult (2026-11-19): a manifest's [[modules]] (a guest DLL the generator writes into a folder of its own under
+    # the generated tree, SA2's generated/data_dll): the steps each of its files needs (tools/post_codegen_modules.py).
+    # Nothing in a game with one module.
+    run(tool('post_codegen_modules.py'), '--gen', gen)
     if scratch:
         print(f'post_codegen: optimised codegen steps done on {gen}')
         return
