@@ -1,8 +1,12 @@
 # sa2-nx on the ultimate base: guest functions with a HAND-WRITTEN native (app/src/cpu/hot/banjo_hand_natives.h,
-# namespace banjo::hand::n_<id>). tools/localize_native.py puts each in front of the generated copy of its function
-# wherever that copy is used.
+# namespace banjo::hand::n_<id>). These four are sa2-nx 1.0.6's own (n_827F05C0.h, n_827EFEA0.h, n_d3d_constants.h), which
+# the base carries under the addresses where banjo-nx found the same routines (id=). Checked 2026-11-20: SA2's
+# memcpy saves r3 at -8(r1) as the base's native reproduces; the two constant writers save nothing on the stack and
+# use +376 / mask +8 (vertex) and +120 / mask +0 (pixel), the base's n_821FE230 and n_821FE108.
 #
-#   <address or generated name> [id=<namespace suffix>] [exact=<registers>]
-#
-# Empty until the hot-function step (docs/sa2-ultimate-notes.md): Katamari's natives named Katamari's addresses, and
-# SA2's own (1.0.4's tools/hand_natives) come back only where the base's machine copies do not cover them.
+#   <address> [id=<namespace suffix>] [exact=<registers>]
+
+827F05C0 id=82C111C0 exact=r3   # C runtime memcpy (1.0.6: sa2_cpu_native_memcpy)
+827EFEA0 id=82C116F0   # C runtime memset (1.0.6: sa2_cpu_native_memset)
+8255D990 id=821FE230   # Direct3D vertex shader float constants (1.0.6: n_d3d_constants.h)
+8255D8B8 id=821FE108   # Direct3D pixel shader float constants (1.0.6: n_d3d_constants.h)

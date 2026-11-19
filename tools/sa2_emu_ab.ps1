@@ -18,7 +18,7 @@
 param([Parameter(Mandatory = $true)][ValidatePattern("^(ult|ult-[a-z0-9]+|ref106)$")][string]$Build,
       [string]$Name = "emu_ab",
       [Parameter(Mandatory = $true)][string]$Toml, [int]$Seconds = 900, [double]$MinCommitGB = 12,
-      [string]$Data = "D:\New folder\ryu-data\sa2-ult", [string]$GlslPackage = "")
+      [string]$Data = "D:\New folder\ryu-data\sa2-ult", [string]$GlslPackage = "", [switch]$StacksFlag)
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $ryu = "D:\New folder\Ryubing-src\ryubing\build\Ryujinx.exe"
@@ -60,6 +60,11 @@ $logs = Join-Path $sd "logs"
 foreach ($d in @($captures, $logs)) {
     if (Test-Path $d) { Move-Item $d (Join-Path $out ("before_" + (Split-Path $d -Leaf))) -Force }
 }
+# The SDK's rex logs (sdk/src/ui/switch_crash_hooks.c, RexSwitchLogDir): logs/rex/ beside the NRO on the console, but
+# sdmc:/switch/ itself in Ryujinx, which starts an NRO without argv. The CPU sampler's profile (switch_profile_stacks
+# in the toml, or the flag file -StacksFlag makes) is rex_profile.log there; this run's rex_*.log are collected after.
+$rexDir = Split-Path -Parent $sd
+if ($StacksFlag) { Set-Content -Path (Join-Path $rexDir "stacks_profile.flag") -Value "1" -Encoding ascii }
 
 $env:DOTNET_ROOT = "D:\New folder\dotnet10"
 $started = Get-Date
@@ -80,6 +85,9 @@ Start-Sleep -Seconds 2
 # The run's results out, this build's files back beside, the SD's toml back.
 if (Test-Path $captures) { Move-Item $captures (Join-Path $out "captures") -Force }
 if (Test-Path $logs) { Move-Item $logs (Join-Path $out "logs") -Force }
+Get-ChildItem $rexDir -File -Filter "rex_*.log" | Where-Object { $_.LastWriteTime -ge $started } |
+    Move-Item -Destination $out -Force
+if ($StacksFlag) { Remove-Item (Join-Path $rexDir "stacks_profile.flag") -ErrorAction SilentlyContinue }
 foreach ($item in @("deko3d_shaders.bin", "sa2")) {
     $live = Join-Path $sd $item
     if (Test-Path $live) { Move-Item $live (Join-Path $sd "$item.$Build") -Force }

@@ -725,7 +725,10 @@ message(STATUS "banjo: sa2-nx's CPU rounds: definitions '${_banjo_round_definiti
 if(REXGLUE_PLATFORM_SWITCH)
     option(BANJO_SWITCH_LTO "Link-time optimisation of the game code, the app and Renut's renderer (Switch)" OFF)
     set(BANJO_SWITCH_LTO_JOBS "4" CACHE STRING "Parallel LTRANS jobs of the Switch LTO link")
-    option(BANJO_SWITCH_IPA_PTA "-fipa-pta at the Switch LTO link (sa2-nx and UnleashedRecomp-NX use it)" OFF)
+    # sa2-nx-ult (2026-11-20): ON for SA2, as sa2-nx 1.0.6 shipped (SA2_SWITCH_IPA_PTA, GCC 16): an ordinary optimisation
+    # (interprocedural points-to analysis), with -fno-strict-aliasing and -ffp-contract=off kept at the link. The base
+    # has it off without a recorded reason.
+    option(BANJO_SWITCH_IPA_PTA "-fipa-pta at the Switch LTO link (sa2-nx and UnleashedRecomp-NX use it)" ON)
     set(BANJO_SWITCH_INLINE_AUTO "64" CACHE STRING
         "max-inline-insns-auto of the game code with a profile (empty: the compiler's)")
     set(BANJO_SWITCH_INLINE_UNIT_GROWTH "12" CACHE STRING
