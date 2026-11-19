@@ -406,6 +406,23 @@ void ReleaseGuestShaderLocked(u32 shader_va) {
   ForgetShader(shader_va);
 }
 
+// sa2-nx (2026-10-20; sa2-nx-ult 2026-11-19): the game's own vertex declarations, by object address (render thread):
+// SA2's Direct3D makes its declarations itself (its CreateVertexDeclaration runs, then the host side is made from the
+// elements: RegisterGuestDeclaration below), so they are no record of CreateRecord's.
+namespace {
+std::unordered_map<u32, std::unique_ptr<VertexDeclarationRecord>> g_guest_declarations;
+}  // namespace
+
+const VertexDeclarationRecord *FindGuestDeclarationLocked(u32 declaration_va) {
+  auto it = g_guest_declarations.find(declaration_va);
+  return it != g_guest_declarations.end() ? it->second.get() : nullptr;
+}
+
+void ReleaseGuestDeclarationLocked(u32 declaration_va) {
+  if (g_guest_declarations.erase(declaration_va))
+    ForgetVertexDeclarationLocked(declaration_va);
+}
+
 void BuildDeclarationLayout(VertexDeclarationRecord &declaration) {
   declaration.layout =
       BuildHostVertexLayout(declaration.elements.data(), u32(declaration.elements.size()));

@@ -9429,7 +9429,10 @@ VertexDeclarationRecord &NoDeclaration() {
 // Its D3DVERTEXELEMENT9s (12 bytes each, ended by D3DDECL_END) are at +52 of the declaration, inside the device
 // snapshot, so a draw reads them from its own snapshot; at most 15 before the device's next field (+0x3088). One record
 // per distinct element list; each new list is logged once with its elements, to check the layout.
-constexpr u32 kDeviceDeclarationOffset = 0x2F98;
+// sa2-nx-ult (2026-11-19): SA2's +12568 (its SetFVF path, sub_8255E840's neighbour: `addi r4,r3,12568`, the
+// declaration built from the FVF there, then `stw r4,12240(r31)`, the declaration slot); Katamari's 0x2F98. Its 15
+// elements end at 12800, before SA2's FVF word at +12808.
+constexpr u32 kDeviceDeclarationOffset = 12568;
 constexpr u32 kDeclarationElementsOffset = 52;
 constexpr u32 kDeviceDeclarationMaxElements = 15;
 
@@ -10968,6 +10971,9 @@ int FastDrawLocked(const u8 *device_state, const DrawCall &call, const ReplayCon
     if (declaration_va) {
       if (declaration_va != g_last_declaration_va) {
         g_last_declaration = FindRecord<VertexDeclarationRecord>(declaration_va, RecordKind::VertexDeclaration);
+        // sa2-nx: or one the game's own Direct3D created (d3d/hooks/shader.cpp).
+        if (!g_last_declaration)
+          g_last_declaration = const_cast<VertexDeclarationRecord *>(FindGuestDeclarationLocked(declaration_va));
         g_last_declaration_va = g_last_declaration ? declaration_va : 0;
       }
       declaration = g_last_declaration_va == declaration_va ? g_last_declaration : nullptr;
@@ -12678,6 +12684,9 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     if (declaration_va != g_last_declaration_va) {
       g_last_declaration =
           FindRecord<VertexDeclarationRecord>(declaration_va, RecordKind::VertexDeclaration);
+      // sa2-nx: or one the game's own Direct3D created (d3d/hooks/shader.cpp).
+      if (!g_last_declaration)
+        g_last_declaration = const_cast<VertexDeclarationRecord *>(FindGuestDeclarationLocked(declaration_va));
       g_last_declaration_va = g_last_declaration ? declaration_va : 0;
     }
     declaration = g_last_declaration_va == declaration_va ? g_last_declaration : nullptr;

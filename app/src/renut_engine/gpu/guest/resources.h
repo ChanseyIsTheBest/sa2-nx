@@ -137,6 +137,9 @@ void PrefetchShaderBehind(u32 shader_va);
 // Drops the host side of an in-place guest shader object, if it has one.
 // Requires State().mutex.
 void ReleaseGuestShaderLocked(u32 shader_va);
+// sa2-nx (2026-10-20): the declarations the game's own Direct3D made (d3d/hooks/shader.cpp), by object address.
+const VertexDeclarationRecord *FindGuestDeclarationLocked(u32 declaration_va);
+void ReleaseGuestDeclarationLocked(u32 declaration_va);
 
 // blur-nx (2026-11-13, #13's fix, banjo_renut_deferred_narrow): the cache entry of the in-place shader of 'kind' last
 // registered at 'shader_va' (XGRegisterVertexShader/PixelShader), for a capture made on a game thread (the render

@@ -637,9 +637,9 @@ endif()
 # banjo_diag_runtime_census; nothing on the Switch.
 if(NOT REXGLUE_PLATFORM_SWITCH AND TARGET renut_recomp)
     target_compile_definitions(renut_recomp PRIVATE REX_DIET_CENSUS_ON)
-    if(TARGET renut_Data_DLL)  # sa2-nx-ult
-        target_compile_definitions(renut_Data_DLL PRIVATE REX_DIET_CENSUS_ON)
-    endif()
+    # sa2-nx-ult: not the stage DLL. On the PC it is a DLL of its own, and the census counters are the executable's
+    # (cpu/banjo_codegen_checks.cpp), which a DLL cannot link to; its 160 functions are mostly the stage data's
+    # loaders, and the Switch build has no census.
 endif()
 if(REXGLUE_PLATFORM_SWITCH)
     # The Switch-only forms of the first round (from sasrt-nx), each with its switch back:

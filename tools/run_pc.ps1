@@ -6,9 +6,13 @@
 # swapchain, which a minimised window does not get.
 # -Game (blur-nx, 2026-11-18): another game folder (a web installer's game_root, with its .lz4b files, for example) in
 # place of Katamari's (passing --game_data_root in -Extra too would give the key twice).
+# sa2-nx-ult (2026-11-19): SA2's game files (assets/game_root, the junction to the main checkout's) as the default,
+# and -UserData, the user data folder (default out/pc_user; a copy of a save folder for runs that need one).
 param([int]$Seconds = 90, [string]$Name = "run", [int]$Every = 15, [string]$Extra = "", [switch]$Visible,
-      [string]$Game = "D:/beautifulkatamari/game")
+      [string]$Game = "", [string]$UserData = "")
 $root = Split-Path -Parent $PSScriptRoot
+if (-not $Game) { $Game = (Join-Path $root "assets\game_root") -replace "\\", "/" }
+if (-not $UserData) { $UserData = "$root/out/pc_user" }
 $dir = Join-Path $root "app\out\pc"
 $exe = Join-Path $dir "renut.exe"
 $logs = Join-Path $root "out\pc_runs\$Name"
@@ -17,7 +21,7 @@ $log = Join-Path $logs "$Name.log"
 Remove-Item $log -ErrorAction SilentlyContinue
 $min = if ($Visible) { "false" } else { "true" }
 $args = @("--log_file=$log", "--audio_mute=true", "--window_start_minimized=$min", "--fullscreen=false",
-          "--game_data_root=$Game", "--user_data_root=$root/out/pc_user",
+          "--game_data_root=$Game", "--user_data_root=$UserData",
           "--nfsmw_captura_cada_s=$Every", "--nfsmw_captura_max=60", "--log_file_writer=false") +
         @($Extra -split ' ' | Where-Object { $_ })
 $style = if ($Visible) { "Normal" } else { "Minimized" }
