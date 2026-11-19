@@ -57,8 +57,8 @@ of tracking). banjo-nx took sa2-nx's CPU rounds and Renut work (`docs/renut-cpu-
 | The tomls | `sa2_switch.toml`, `sa2_switch_defaults.toml` | the player's as it was; the compiled-in one with 1.0.6's decisions under the base's names (`tools/sa2_effective_keys.py` checks them key by key) | the shipped settings |
 | The icon and the NRO's identity | `app/icon.jpg`, CMake NAME / AUTHOR | `tools/switch/icon/sa2_icon.jpg`, the CMake call | the homebrew menu entry |
 | The game layer's app wiring | `sa2_app.h` | the base's `renut_app.h` with SA2's lines (the app name, the compiled-in settings, the game files' search with the pack) | |
-| The lockstep frame comparison | `src/sa2_capture.cpp/.h`, the SDK's `vblank_per_swap`, `tools/compare_raw.py`, `compare_video.py` | to graft (step 3) | this port's gate: the uninitialised stack word was found only by it, and the base has no lockstep capture |
-| The game files as a pack | SDK `pack_device.*`, `pack_storage_switch.cpp`, the keys `asset_pack`, `asset_pack_build`, `tools/build_asset_pack.py` | to graft (step 5) | a 1.0.6 player's card holds game_root.nxpack and sa2-nx's installer makes it; the base's `.lz4b` (port 61) would need every player to repack |
+| The lockstep frame comparison | `src/sa2_capture.cpp/.h`, the SDK's `vblank_per_swap`, `tools/compare_raw.py`, `compare_video.py` | grafted: the recorder (Renut's path only, with `sa2_video_hash_only`), `tools/sa2_compare_frames.py` (with `--align`: runs are paired by content), `sa2_lockstep_run.ps1`; NOT `vblank_per_swap` (Renut's Swap never calls VdSwap, so it pins nothing; sa2-ultimate-notes.md) | this port's gate: the uninitialised stack word was found only by it, and the base has no lockstep capture |
+| The game files as a pack | SDK `pack_device.*`, `pack_storage_switch.cpp`, the keys `asset_pack`, `asset_pack_build`, `tools/build_asset_pack.py` | grafted (ae99203c); PC: 1.0.6's own pack read, 750 of 750 frames identical | a 1.0.6 player's card holds game_root.nxpack and sa2-nx's installer makes it; the base's `.lz4b` (port 61) would need every player to repack |
 | SA2's console fixes in its scenes | Chao Garden's resolves, the long-session texture fixes (1.0.2), the 4x MSAA alias clear | each checked against the base's form in step 5 | 1.0.6 draws them right |
 | SA2's hot functions | `app/src/cpu/hot` lists, 1.0.4's hand natives (`tools/hand_natives`) | lists emptied (Katamari's); the copies remade by the base's tools in step 7; a hand native only where the base's copies do not cover it | |
 | Docs | sa2-nx's `docs/` (records) | to graft as records, with a top note | |
@@ -95,7 +95,10 @@ of tracking). banjo-nx took sa2-nx's CPU rounds and Renut work (`docs/renut-cpu-
 |---|---|---|
 | Guest DLL modules linked into an executable (`rex/system/static_modules.h`, `KernelState::LoadUserModule`) | grafted (the Switch needs it for SA2's stage DLL) | yes: a second module in any port |
 | The post-codegen steps of a second module (`tools/post_codegen_modules.py`, run on every module folder) | grafted | yes |
-| FFmpeg's nine configure-made files the base's tree lacks (cb3a6f56) | grafted | yes: a fresh checkout of the base does not build without them |
+| FFmpeg's nine configure-made files the base's tree lacks (cb3a6f56) | grafted | yes: a fresh checkout of the base does not build without them (now the base's port 190) |
+| The generator's module targets without a codegen target (`dll_targets_cmake.inja`: the Switch cross build has none) | fixed (fd930520) | yes, with the second module |
+| 1.0.6's gamma ramp as entries (`sa2_renut_gamma_entries`: the GPU rounds the entry, as 1.0.6's float ramp; the base rounds it itself) | SA2 key, on | yes: a finding for ports compared against a float-ramp build |
+| The asset pack (list (a)) | grafted | yes: the base's own answer is the installer's .lz4b files |
 | `sa2_renut_direct_resolve_mips` (resolve mip levels drawn straight into the texture's levels, deko3d; on in 1.0.6) | to decide in step 5 against the base's resolve path | if grafted |
 | `tools/pgo_function_counts.py` (a PGO profile's executed instructions per function) | candidate for step 7 (the base's `switch_hot_bulk.py` takes console profiles; the PGO counts cover more scenes) | if grafted |
 | `tools/hand_natives/` | candidate for step 7 only where the base's copies do not cover a function | |

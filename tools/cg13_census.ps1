@@ -8,10 +8,12 @@
 # only menus (-Script / -Extra take the game's input script, or -Visible to play it yourself).
 #
 #   powershell -ExecutionPolicy Bypass -File tools\cg13_census.ps1 [-Seconds 300] [-Name cg13_census]
-#       [-Script "20:START,24:A"] [-Sticks 240] [-Extra "--more=keys"] [-Visible] [-Top 40]
+#       [-Script "20:START,24:A"] [-Sticks 240] [-Extra "--more=keys"] [-Visible] [-Top 40] [-UserData <folder>]
+# sa2-nx-ult (2026-11-19): -UserData, the user data folder for the run (a copy of a save: the menus lead elsewhere
+# with one; run_pc.ps1 takes the first --user_data_root, so -Extra cannot give it).
 #   ... -Log out\pc_runs\<run>\<run>.log   (no run: the verdict of an earlier census run's log)
 param([int]$Seconds = 180, [string]$Name = "cg13_census", [string]$Script = "20:START,24:A", [int]$Sticks = 240,
-      [string]$Extra = "", [switch]$Visible, [int]$Top = 40, [string]$Log = "")
+      [string]$Extra = "", [switch]$Visible, [int]$Top = 40, [string]$Log = "", [string]$UserData = "")
 $root = Split-Path -Parent $PSScriptRoot
 if ($Log -ne "") {
   $log = $Log
@@ -28,6 +30,7 @@ if ($Log -ne "") {
   if ($Extra -ne "") { $census += " $Extra" }
   $run = @{ Seconds = $Seconds; Name = $Name; Extra = $census }
   if ($Visible) { $run.Visible = $true }
+  if ($UserData -ne "") { $run.UserData = $UserData }
   & (Join-Path $PSScriptRoot "run_pc.ps1") @run
   $log = Join-Path $root "out\pc_runs\$Name\$Name.log"
 }

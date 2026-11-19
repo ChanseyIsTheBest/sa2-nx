@@ -26,6 +26,31 @@ Port 121's register liveness relies on the 360 convention. Run on SA2's generate
 The setjmp / longjmp pair (libjpeg's error path: setjmp 0x82908F10, longjmp 0x82908AE0): to check with the machine
 copies (the hot-function step).
 
+## CG-13 (`BLUR_FPCR_ONE_MODE`): SA2's census (2026-11-19)
+
+`tools/cg13_census.ps1` on the PC build (the mode switches there; the census counts each stretch of game code between
+a switch off and the next switch on that met a denormal operand or gave an underflow: the scalar results the Switch
+build, one flush mode for everything, would change). Three routes of 240 s each, on copies of the save:
+
+| Run | Route | Windows of 10 s | With a denormal |
+|---|---|---|---|
+| cg13_city | the stage map, City Escape played (sticks) | 23 | 1: the first (start-up) |
+| cg13_story | the Dark story: its opening cutscene, then Iron Gate | 23 | 1: the first (start-up) |
+| cg13_chao | the stage map, the Chao World lobby (sticks) | 23 | 1: the first (start-up) |
+
+About 17,000-18,000 flush-mode switches a second in SA2's game code (each an `msr fpcr` on the console that the
+Switch build leaves out). Gameplay, the cutscene, the menus and the lobby: 0 in every window.
+
+The start-up window, the same in all three runs: the base's own deliberate self-check (`banjo::FormsSelfCheck`) and
+one game site, 506 stretches in `sub_82832B78` (the switch back on at its `vsubfp128`, renut_recomp.71.cpp). That
+function takes 16 entries of four floats 16 bytes apart, compares each one's fourth (alpha) with a constant and marks
+the block when all fall below it, then fits colours with `fmuls` / `fmadds` / `fcfid`: a 4x4 block compressor
+(DXT/BCn) in the library code at 0x828..., reached through a pointer (`sub_82816B40` has no direct caller). It runs
+in the first seconds only. With CG-13 the Switch build gives zero for those denormal operands inside its colour fit;
+what that changes in its output (at most an endpoint of a block, if anything) and where the texture is shown is not
+known yet. The emulator comparison against 1.0.6 (which had no CG-13) is the check; until it is done, CG-13 stays as
+the base has it (on in the Switch build).
+
 ## The forms
 
 Filled in by step 6 of the plan (the CG-13 census, BLUR_NEAR_EXACT's switches, BLUR_NX_R1_ASSUME, BLUR_LOCALIZE_ABI_TRUST,
@@ -34,9 +59,9 @@ the stack-frame elisions and their uninitialised stack word, BANJO_GENERATED_NO_
 | Form | Census | Sites | Verdict | In the build |
 |---|---|---|---|---|
 | CG-13 (`BLUR_FPCR_ONE_MODE`) | | | | ON on the Switch (the base's default) until its census says otherwise |
-| `BLUR_NEAR_EXACT` #1, #2, #5, #17, #19, #41, #42 | | | | off |
+| `BLUR_NEAR_EXACT` #1, #2, #5, #17, #19, #41, #42 | the PC census of the three CG-13 runs (city, story, chao; `[census] near-exact (cumulative)`, the counters compiled into the main module, not the stage DLL) | #1 signalling NaNs stored 0, #2 NaNs converted to integers 0, #17 divisions by zero or INT_MIN / -1 0, #41 compares with a NaN 0, #5 XER[SO] copies 0, #3 / #4 FPSCR writes and reads 0. #42: SA2 has 24 `vmaxfp128` / `vminfp128` sites; none ran on these routes (0 of 0). #19: the only traps are the 2 `twi 31,r0,22` debug traps of the exit census, which already only log | nothing on these routes would change; #42 not covered | off (the base's default); a decision for the user, with a console A/B for the gain |
 | `BLUR_NX_R1_ASSUME` | | | | off |
 | `BLUR_LOCALIZE_ABI_TRUST` | | | | off |
 | `BANJO_GEN_NV_SAVES_ELIDE` | | | | off (the tinted characters of 2026-10-12) |
 | `BANJO_GEN_LR_MOVES_ELIDE`, `BANJO_GEN_BACK_CHAIN_ELIDE`, `SASRT_HOT_LR_ELIDE` | | | | off |
-| `BANJO_GENERATED_NO_TRAPPING_MATH` | | | | off |
+| `BANJO_GENERATED_NO_TRAPPING_MATH` | the fp_env_files check (2026-11-19): `tools/fp_env_files.py` lists the generated files that write the guest's FPSCR (`fpscr.storeFromGuest`, the rounding mode: with CG-13 the only `msr fpcr` left in game code), which must keep `-ftrapping-math` (a float operation moved across the write would round in the other mode) | SA2: 15 files, one write each; on the three census routes 0 FPSCR writes ran (#3). **But the base's CMake does not read `fp_env_files.txt`:** the option puts `-fno-trapping-math` on every file of `renut_recomp` and the DLL, those 15 included (blur-nx's own `BLUR_NO_TRAPPING_MATH` leaves them out) | not safe as the base wires it | off; to turn on, the 15 files must keep `-ftrapping-math` first (a handoff), and a console A/B must show a gain (sa2-nx measured at most 0.5 % of one file) |
