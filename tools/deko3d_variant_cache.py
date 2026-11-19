@@ -422,7 +422,11 @@ def config_specs(prefix, defaults, sspec):
 
 
 def main():
+    global UAM
     ap = argparse.ArgumentParser()
+    # sa2-nx-ult (2026-11-19): the uam to compile with (out/deko3d_tools links to the base's, built before its uam
+    # ports 56, 162 and 163; sa2-nx-ult builds its own into out/deko3d_tools_ult).
+    ap.add_argument('--uam', default=UAM, help='the PC uam (default: out/deko3d_tools/uam-build/uam.exe)')
     ap.add_argument('--generic', action='store_true',
                     help="also every GLSL file's generic variant (2026-10-21, banjo_deko3d_async_variants: what a draw "
                          "uses while its own variant compiles in the background; no constant of the key's state, the "
@@ -464,6 +468,7 @@ def main():
     ap.add_argument('--runtime-log', action='append', default=[],
                     help="a console's renut log: the run-time variants it names (base size and hash) are added")
     a = ap.parse_args()
+    UAM = a.uam
 
     glsl_cache = {}
     signature = {}  # name -> 'size:mtime_ns' of the GLSL file (the key memo below is by it)
