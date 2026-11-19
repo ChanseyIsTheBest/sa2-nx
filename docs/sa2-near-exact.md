@@ -23,8 +23,15 @@ Port 121's register liveness relies on the 360 convention. Run on SA2's generate
 - The stage DLL: its 160 functions get no machine copies and no whole-program liveness (tools/post_codegen_modules.py),
   so the convention is not relied on there.
 
-The setjmp / longjmp pair (libjpeg's error path: setjmp 0x82908F10, longjmp 0x82908AE0): to check with the machine
-copies (the hot-function step).
+The setjmp / longjmp pair (libjpeg's error path: setjmp 0x82908F10, longjmp 0x82908AE0), checked against SA2's first
+hot lists (2026-11-20): six functions call setjmp (`sub_82812A10`, `sub_82812D58`, `sub_828139E8`, `sub_82813BE0`,
+`sub_8282F148`, `sub_8282F5B8`) and four call longjmp (`sub_8280FF70`, `sub_8282A830`, `sub_8282A880`,
+`sub_82877348`). None of the six is on a list (the copy tool refuses a function that calls setjmp, and r1_local skips
+the 11 with setjmp / longjmp), and none of the 37 functions on a direct-call path from a setjmp caller to a longjmp is
+listed. libjpeg reaches its error exit through a pointer, which a static graph cannot follow; the listed functions
+near that code are the compressed-texture routines (DXT blocks, texel spans), not libjpeg's. A guest longjmp restores
+the non-volatile registers from the jump buffer into the context, so the frames it abandons, copies among them, have
+nothing to write back that the resumed code reads.
 
 ## CG-13 (`BLUR_FPCR_ONE_MODE`): SA2's census (2026-11-19)
 
