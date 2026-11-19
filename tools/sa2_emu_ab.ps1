@@ -5,7 +5,8 @@
 #   - the NRO (sa2.nro): app\out\switch\renut.nro ("ult"), app\out\switch-<variant>\renut.nro ("ult-<variant>": a
 #     build of this tree in a folder of its own, e.g. ult-exact) or app\out\ref106\renut.nro ("ref106": 1.0.6,
 #     bba67b6a);
-#   - deko3d_glsl.bin: none for "ult" (its GLSL package is built in; one beside it would be read first), 1.0.6's
+#   - deko3d_glsl.bin: -Glsl when given (any build: one beside the NRO is read before a built-in package), else
+#     none for "ult" (its GLSL package is built in; one beside it would be read first), 1.0.6's
 #     release package for "ref106" (sa2-nx app\out\renut_switch_release\sd\deko3d_glsl.bin, what its installer makes);
 #   - deko3d_shaders.bin (the compiled variants, written as it plays) and the user folder (sa2\): each build's own,
 #     kept beside as <name>.<build> between runs;
@@ -17,7 +18,7 @@
 param([Parameter(Mandatory = $true)][ValidatePattern("^(ult|ult-[a-z0-9]+|ref106)$")][string]$Build,
       [string]$Name = "emu_ab",
       [Parameter(Mandatory = $true)][string]$Toml, [int]$Seconds = 900, [double]$MinCommitGB = 12,
-      [string]$Data = "D:\New folder\ryu-data\sa2-ult")
+      [string]$Data = "D:\New folder\ryu-data\sa2-ult", [string]$Glsl = "")
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $ryu = "D:\New folder\Ryubing-src\ryubing\build\Ryujinx.exe"
@@ -43,7 +44,8 @@ New-Item -ItemType Directory -Force $out | Out-Null
 Copy-Item $nroSource (Join-Path $sd "sa2.nro") -Force
 $glsl = Join-Path $sd "deko3d_glsl.bin"
 if (Test-Path $glsl) { Remove-Item $glsl -Force }  # a copy of a reference file (the release package), never the only one
-if ($Build -eq "ref106") { Copy-Item $glslRef $glsl -Force }
+if ($Glsl) { Copy-Item $Glsl $glsl -Force; Write-Output "GLSL package beside the NRO: $Glsl" }
+elseif ($Build -eq "ref106") { Copy-Item $glslRef $glsl -Force }
 foreach ($item in @("deko3d_shaders.bin", "sa2")) {
     $live = Join-Path $sd $item
     $mine = Join-Path $sd "$item.$Build"

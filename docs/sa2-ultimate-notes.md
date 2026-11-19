@@ -87,7 +87,14 @@ own GLSL package, compiled-shader cache and user folder), the attract sequence f
   whole demo matched 1.0.6 frame for frame, so the difference lives in what only the Switch build does: the base's
   CG-13 (one flush mode), its VMX estimates and fused multiply-add (port 72, ON in the Switch build; the PC build's
   defines change nothing on x86), the deko3d shader chain (the base's GLSL passes, uam), or the emulator's own timing.
-- Under way: 1.0.6 against itself in the emulator (the control), then the cause by builds with each form off.
+- **The control:** 1.0.6 against itself (a second run recording every frame of the demo): its whole two-player demo
+  identical at one offset (545 of 545 sampled frames). The emulator is deterministic here; the rebased NRO's demo
+  frames are found nowhere in 1.0.6's (0 of 2,197 through the demo).
+- **The three float forms off** (`app\out\switch-exact`: `BLUR_FPCR_ONE_MODE`, `SASRT_VMX_FAST_ESTIMATES`,
+  `SASRT_VMX_FUSED_MADD` OFF): 572 of 2,300 of 1.0.6's frames identical, spread over the whole demo (late ones too:
+  135 of 200 around game frame 7900), against none with them on. So they are what makes player 2's run drift; what
+  still differs frame to frame without drifting is the drawing on the Switch path (next: the same build with 1.0.6's
+  GLSL package beside it).
 
 ## Gameplay on the PC, verify mode (2026-11-19)
 
