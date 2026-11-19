@@ -56,6 +56,10 @@ REXCVAR_DEFINE_INT32(sa2_video_lockstep_every, 1, "SA2",
                      "Lockstep recording (sa2_video_every = 1) that keeps one game frame in this many: the Swap still "
                      "waits for every frame, so runs stay comparable frame for frame, with a fraction of the disk")
     .range(1, 600);
+// sa2-nx-ult (2026-11-19): the disk was nearly full; a comparison by hash needs only the .hash and .frames files.
+REXCVAR_DEFINE_BOOL(sa2_video_hash_only, false, "SA2",
+                    "Record only each frame's full-resolution hash and game frame (.hash, .frames), not the frames "
+                    "themselves (.rgba): wide lockstep windows for tools/sa2_compare_frames.py at no disk cost");
 REXCVAR_DEFINE_BOOL(sa2_video_lockstep, true, "SA2",
                     "While a video is recorded (sa2_video_every = 1), the game's Swap hands every frame to the "
                     "recorder and waits until it has taken it: no frame is skipped or taken late, however loaded the "
@@ -156,8 +160,10 @@ void Record(std::function<bool(rex::ui::RawImage&)> grab, int start_s, int frame
   std::error_code ec;
   std::filesystem::create_directories(folder, ec);
   const std::string name = "video_" + std::to_string(start_s) + "s";
-  std::ofstream raw(folder / (name + ".rgba"), std::ios::binary | std::ios::trunc);
-  if (!raw) {
+  const bool hash_only = REXCVAR_GET(sa2_video_hash_only);  // sa2-nx-ult (2026-11-19)
+  std::ofstream raw;
+  if (!hash_only) raw.open(folder / (name + ".rgba"), std::ios::binary | std::ios::trunc);
+  if (!hash_only && !raw) {
     REXLOG_WARN("[capture] cannot write {}", rex::path_to_utf8(folder / (name + ".rgba")));
     return;
   }
@@ -214,7 +220,7 @@ void Record(std::function<bool(rex::ui::RawImage&)> grab, int start_s, int frame
     height = image.height;
     const uint32_t w = width / step, h = height / step;
     frame.resize(size_t(w) * h * 4);
-    for (uint32_t y = 0; y < h; ++y) {
+    for (uint32_t y = 0; y < h && !hash_only; ++y) {
       const uint8_t* row = image.data.data() + size_t(y) * step * image.stride;
       uint8_t* out = frame.data() + size_t(y) * w * 4;
       if (step == 1) {
@@ -223,7 +229,7 @@ void Record(std::function<bool(rex::ui::RawImage&)> grab, int start_s, int frame
         for (uint32_t x = 0; x < w; ++x) std::memcpy(out + size_t(x) * 4, row + size_t(x) * step * 4, 4);
       }
     }
-    raw.write(reinterpret_cast<const char*>(frame.data()), std::streamsize(frame.size()));
+    if (!hash_only) raw.write(reinterpret_cast<const char*>(frame.data()), std::streamsize(frame.size()));
     {
       // Full resolution, RGB only, the wall-clock regions zeroed (in 1280x720 terms; scaled to the image).
       full.resize(size_t(width) * height * 3);
@@ -260,7 +266,7 @@ void Record(std::function<bool(rex::ui::RawImage&)> grab, int start_s, int frame
     g_renut_full = false;
     g_renut_cv.notify_all();
   }
-  raw.close();
+  if (!hash_only) raw.close();
   if (!written) {
     REXLOG_WARN("[capture] no frame recorded (no guest output)");
     return;

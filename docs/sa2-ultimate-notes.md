@@ -45,6 +45,33 @@ Where SA2's compiled-in settings differ from the base's defaults, and why:
 | `switch_thread_stack_pool` | 64 | 4 | 1.0.6's fix for the heap's growth at stage loads (renut-renderer.md, "The heap in long sessions") |
 | `banjo_renut_tags` | false | true | the base's tags need marks from its native state setters, which SA2 does not use (its own Direct3D sets the state); without them a delta could miss a changed chunk. Off, the deltas compare their chunks (exact). SA2's own marks (1.0.4's `sa2_renut_setter_marks`) are not in the base's form yet |
 | `input_rumble` | false | true | 1.0.6 had no rumble; the base's (port 59) is the game's own vibration: a decision for the user |
+| `sa2_renut_gamma_entries` (SA2's, in `backend/present.cpp`) | true | (the base rounds) | the gamma ramp's texels hold the 10-bit entries, as 1.0.6's float ramp did, and the GPU rounds the output: 1.0.6's pixels (below) |
+
+## The picture against 1.0.6 (PC lockstep)
+
+The rebased PC build (`app/out/pc/renut.exe`) against 1.0.6's PC build (`sa2-nx\out\pc\sa2.exe` with
+`sa2_renderer = renut`), both Renut on Vulkan on the PC's RTX 3060, recorded by `tools/sa2_lockstep_run.ps1` and
+compared by `tools/sa2_compare_frames.py --align` (2026-11-19).
+
+- **Pairing by label does not work across runs.** Each run numbers its frames from its own start, and the title and
+  loading screens take a different number of frames each time (the same pair of builds: 3, 21, -12/-15, about 100
+  frames apart in different runs). 1.0.6's lockstep recipe (`vblank_per_swap`) does not help: Renut's Swap never calls
+  VdSwap, and SA2's game steps once per Swap anyway (PaceSwap). The comparison therefore looks for every frame of one
+  run anywhere in the other by its full-resolution hash; the newer build's side is a wide hash-only recording
+  (`sa2_video_hash_only`, `-HashOnly`: no frames written, so no disk).
+- **The one difference: the gamma ramp's rounding.** Aligned by content, every frame differed by one level at 9 of the
+  256 output levels (81-84, 169, 243-244, 252-253 in 1.0.6; about 4 % of the pixels), the rebased build one level
+  lighter, and nothing else (the other differences were the blinking "Press START", which runs on the wall clock and
+  which the hash leaves out). Both builds read the same ramp words at +15408 and pick the same entry; 1.0.6 hands the
+  entry to the output as the float n / 1023 and the GPU converts it to 8 bits, while the base writes
+  round(n * 255 / 1023) itself. The GPU's conversion gives the level below where n * 255 / 1023 is a little above a
+  half, more often towards white (as if it narrowed the float first). The Switch's GPU is NVIDIA's too, so the base's
+  rounding would very likely show there as well; the emulator and the console will tell.
+  `sa2_renut_gamma_entries` (on) makes the texels the entries (10:10:10:2, the same four bytes, for the ramp and for
+  vivapinata's 256 x 256 table) and leaves the rounding to the GPU, as 1.0.6.
+- **With it:** 1.0.6's 400 consecutive frames of the 2P demo (game frames 7000-7399) all identical, and 1.0.6's 750
+  frames of game frames 6000-9000 (every 4th: the title, its fade, the loading, the 2P demo) all identical, in
+  segments of one offset each.
 
 ## Two code modules
 

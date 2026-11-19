@@ -25,6 +25,9 @@ $args = @("--log_file=$log", "--audio_mute=true", "--window_start_minimized=$min
           "--nfsmw_captura_cada_s=$Every", "--nfsmw_captura_max=60", "--log_file_writer=false") +
         @($Extra -split ' ' | Where-Object { $_ })
 $style = if ($Visible) { "Normal" } else { "Minimized" }
+# sa2-nx-ult (2026-11-19): Windows PowerShell 5.1's Start-Process joins the list with spaces and quotes nothing, so a
+# path with a space (D:\sonic adventure 2\...) became several arguments: the log and the game folder were lost.
+$args = @($args | ForEach-Object { if ($_ -match ' ' -and $_ -notmatch '^".*"$') { '"' + $_ + '"' } else { $_ } })
 $p = Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $dir -PassThru -WindowStyle $style `
      -RedirectStandardError (Join-Path $logs "stderr.txt") -RedirectStandardOutput (Join-Path $logs "stdout.txt")
 Write-Output "started pid $($p.Id)"

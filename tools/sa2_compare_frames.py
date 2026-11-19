@@ -10,7 +10,15 @@ Two runs of one build differ only in frames whose picture depends on wall-clock 
 53 frames, its ring and Omochao animated on the loading thread's timing). A change is exact when it adds no other.
 
   python tools/sa2_compare_frames.py <capture folder or .hash of A> <... of B> [--name video_20s] [--out <folder>]
-         [--max-pictures 8] [--labels]
+         [--max-pictures 8] [--labels] [--align | --offset N]
+
+sa2-nx-ult (2026-11-19): with Renut each run numbers its frames from its own start, and the title and loading screens
+take a different number of them from run to run (the same build: 3, 21, about 100 frames apart), so labels alone pair
+different moments. --align looks for every frame of A anywhere in B by its hash (B should cover a wider window: a
+hash-only recording, sa2_video_hash_only, costs no disk) and prints the segments: each run of A's frames found at one
+offset, and the frames found nowhere, the real differences. The offset steps where a loading screen took a different
+number of frames; a fade's repeated frames may show small segments of their own. --offset N pairs B's frame L + N with
+A's frame L as the plain comparison does. A recording without .rgba gives no pictures (--out).
 """
 import argparse
 import glob
@@ -52,14 +60,45 @@ def main():
     ap.add_argument('--out', default='')
     ap.add_argument('--max-pictures', type=int, default=8)
     ap.add_argument('--labels', action='store_true', help='print every differing game frame')
+    ap.add_argument('--align', action='store_true', help='pair the frames by content first (the offset is printed)')
+    ap.add_argument('--offset', type=int, default=None, help="B's frame L + OFFSET is paired with A's frame L")
     args = ap.parse_args()
     base_a, base_b = resolve(args.a, args.name), resolve(args.b, args.name)
     ha, la = load(base_a)
     hb, lb = load(base_b)
+    offset = args.offset or 0
+    if args.align and args.offset is None:
+        where_b = {}
+        for h, lab in zip(hb, lb):
+            if lab != UNKNOWN:
+                where_b.setdefault(h, []).append(lab)
+        segments, previous, found = [], None, 0
+        for h, lab in zip(ha, la):
+            if lab == UNKNOWN:
+                continue
+            labels = where_b.get(h)
+            d = None
+            if labels:
+                # The offset nearest the previous frame's: a frame repeated in B (a fade) keeps the segment going.
+                d = min((x - lab for x in labels), key=lambda o: abs(o - previous) if previous is not None else abs(o))
+                previous = d
+                found += 1
+            if segments and segments[-1][2] == d:
+                segments[-1][1] = lab
+                segments[-1][3] += 1
+            else:
+                segments.append([lab, lab, d, 1])
+        print(f'A: {len(ha)} frames ({base_a}); B: {len(hb)} frames ({base_b})')
+        for first, last, d, n in segments:
+            where = 'NOT IN B' if d is None else f'identical to B at offset {d:+d}'
+            print(f'  A frames {first}-{last}: {where} ({n} frames)')
+        print(f'--align: {found} of {sum(1 for lab in la if lab != UNKNOWN)} frames of A are in B (identical), '
+              f'{sum(s[3] for s in segments if s[2] is None)} are not')
+        return
     by_label_b = {}
     for i, (h, lab) in enumerate(zip(hb, lb)):
         if lab != UNKNOWN:
-            by_label_b.setdefault(lab, (h, i))
+            by_label_b.setdefault(lab - offset, (h, i))
     same, differ, missing, unknown = 0, [], 0, 0
     for i, (h, lab) in enumerate(zip(ha, la)):
         if lab == UNKNOWN:
@@ -90,7 +129,9 @@ def main():
         if args.labels:
             for lab, i, j in differ:
                 print(f'  frame {lab}: A #{i}, B #{j}')
-    if args.out and differ:
+    if args.out and differ and not all(os.path.exists(b + '.rgba') for b in (base_a, base_b)):
+        print('--out: a recording without frames (sa2_video_hash_only): no pictures')
+    elif args.out and differ:
         try:
             import numpy as np
             from PIL import Image

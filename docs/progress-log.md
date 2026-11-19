@@ -24,3 +24,9 @@ and docs/sa2-near-exact.md.
   451 keys paired, 7 differ, none that draws or plays differently).
 - The plan re-sorted into the three lists (the user's word through the base's session: a full rebase).
 - SA2's lockstep recorder and the frame comparison tools.
+- The PC build boots to the title with the Battle DLC. Its first lockstep run against 1.0.6's PC build: every frame
+  different. Two causes, both found: the runs' labels drift apart at loading screens (pairing by content now:
+  `sa2_compare_frames.py --align`, hash-only recordings), and the gamma ramp's rounding (one level at 9 of 256 levels;
+  `sa2_renut_gamma_entries`, sa2-ultimate-notes.md). With both: 400 of 400 and 750 of 750 of 1.0.6's frames identical
+  (title, loading, 2P demo).
+- `tools/run_pc.ps1`: paths with spaces are quoted (Windows PowerShell's Start-Process split them).

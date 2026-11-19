@@ -55,6 +55,19 @@ REXCVAR_DEFINE_DOUBLE(banjo_renut_diag_show_gamma, 1.0, "Banjo/Renut",
 REXCVAR_DEFINE_BOOL(banjo_renut_game_gamma, false, "Banjo/Renut",
                     "Apply the gamma ramp the game loads to the output, as the Xbox 360's display and banjo-nx's own "
                     "renderer do (N&B's darkens the midtones, about x^1.17). Off: Renut's output as before");
+// sa2-nx-ult (2026-11-19): sa2-nx 1.0.6's scan-out (sa2_renut_gamma_ramp) handed the ramp's 10-bit entry n to the 8-bit
+// output as the float n / 1023 and let the GPU convert it; this renderer's texels are the level already rounded,
+// round(n * 255 / 1023). On the PC's GPU (an RTX 3060) the two differ: where n * 255 / 1023 lies a little above a half
+// the GPU's conversion gave the level below (as if it narrowed the float first: the gaps grow towards white). SA2's
+// 2P demo in lockstep: 9 of the 256 output levels, about 4 % of the pixels, each one level lower in 1.0.6, nothing else.
+// On: the texels (the ramp's and vivapinata_present_lut's table) hold the entries themselves, 10:10:10:2 (the same four
+// bytes), so the scan-out outputs n / 1023 as 1.0.6 did and the GPU rounds it the same: 1.0.6's pixels. Off: the
+// base's rounded levels.
+REXCVAR_DEFINE_BOOL(sa2_renut_gamma_entries, true, "SA2/Renderer",
+                    "The game's gamma ramp at scan-out as sa2-nx 1.0.6 applied it: the 10-bit entry goes to the output "
+                    "and the GPU rounds it to 8 bits (1.0.6's pixels). Off: the entry rounded to 8 bits first (the "
+                    "base's; up to one level lighter on 9 of the 256 levels)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(renut_vsync, true, "Nuts&Bolts/Graphics",
                     "Show each frame at the display's refresh: no tearing, and the game runs at "
@@ -179,7 +192,10 @@ bool PresentLutOn() {
 // round(n / 255 * 1023), which is (n * 2046 + 255) / 510: n * 1023 / 255 is never within 1 / 510 of a tie, far more than a
 // float's error. Caller holds s.mutex, outside a pass.
 void UploadGammaLutLocked(VideoState &s, const std::array<uint16_t, 3 * 1024> &ramp, uint32_t version) {
-  constexpr plume::RenderFormat kFormat = plume::RenderFormat::R8G8B8A8_UNORM;
+  // sa2-nx-ult (2026-11-19, sa2_renut_gamma_entries): the entries themselves, 10:10:10:2.
+  static const bool entries = REXCVAR_GET(sa2_renut_gamma_entries);
+  const plume::RenderFormat kFormat =
+      entries ? plume::RenderFormat::R10G10B10A2_UNORM : plume::RenderFormat::R8G8B8A8_UNORM;
   if (!g_gamma.lut_texture) {
     g_gamma.lut_texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(256, 256, 1, kFormat));
     if (!g_gamma.lut_texture)
@@ -201,20 +217,30 @@ void UploadGammaLutLocked(VideoState &s, const std::array<uint16_t, 3 * 1024> &r
   const auto level = [](uint16_t entry) {
     return uint8_t((std::min<uint32_t>(entry, 1023u) * 510u + 1023u) / 2046u);
   };
-  uint8_t r[256], g[256], b[256];
+  const auto texel = [&level](uint16_t entry) -> uint32_t {
+    return entries ? std::min<uint32_t>(entry, 1023u) : level(entry);
+  };
+  uint32_t r[256], g[256], b[256];
   for (uint32_t n = 0; n < 256; ++n) {
     const uint32_t v = (n * 2046u + 255u) / 510u;
-    r[n] = level(ramp[v]);
-    g[n] = level(ramp[1024 + v]);
-    b[n] = level(ramp[2048 + v]);
+    r[n] = texel(ramp[v]);
+    g[n] = texel(ramp[1024 + v]);
+    b[n] = texel(ramp[2048 + v]);
+  }
+  if (entries) {
+    auto *words = static_cast<uint32_t *>(staging.cpu);
+    for (uint32_t j = 0; j < 256; ++j) {
+      for (uint32_t i = 0; i < 256; ++i)
+        words[j * 256 + i] = r[i] | g[j] << 10 | b[i] << 20 | 3u << 30;
+    }
   }
   auto *texels = static_cast<uint8_t *>(staging.cpu);
-  for (uint32_t j = 0; j < 256; ++j) {
+  for (uint32_t j = 0; j < 256 && !entries; ++j) {
     for (uint32_t i = 0; i < 256; ++i) {
       uint8_t *p = texels + (j * 256 + i) * 4;
-      p[0] = r[i];
-      p[1] = g[j];
-      p[2] = b[i];
+      p[0] = uint8_t(r[i]);
+      p[1] = uint8_t(g[j]);
+      p[2] = uint8_t(b[i]);
       p[3] = 255;
     }
   }
@@ -247,7 +273,10 @@ void PrepareGameGammaLocked(VideoState &s) {
   // kameo-nx (2026-11-03): 8 bits, not 32-bit floats: a quarter of the bytes for each of a pixel's three fetches. Each entry
   // is what the 8-bit swapchain would make of its float: n / 1023 is never nearer an 8-bit rounding tie than 0.0014 of a
   // level (checked for all 1024 values), so round() and the render output agree.
-  constexpr plume::RenderFormat kFormat = plume::RenderFormat::R8G8B8A8_UNORM;
+  // sa2-nx-ult (2026-11-19, sa2_renut_gamma_entries): the entries themselves, 10:10:10:2 (1.0.6's float n / 1023).
+  static const bool entries = REXCVAR_GET(sa2_renut_gamma_entries);
+  const plume::RenderFormat kFormat =
+      entries ? plume::RenderFormat::R10G10B10A2_UNORM : plume::RenderFormat::R8G8B8A8_UNORM;
   if (!g_gamma.texture) {
     g_gamma.texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(1024, 1, 1, kFormat));
     if (!g_gamma.texture)
@@ -278,11 +307,17 @@ void PrepareGameGammaLocked(VideoState &s) {
     const auto level = [](uint16_t entry) {
       return uint8_t((std::min<uint32_t>(entry, 1023u) * 510u + 1023u) / 2046u);
     };
-    for (uint32_t i = 0; i < 1024; ++i) {
+    for (uint32_t i = 0; i < 1024 && !entries; ++i) {
       texels[i * 4 + 0] = level(ramp[i]);
       texels[i * 4 + 1] = level(ramp[1024 + i]);
       texels[i * 4 + 2] = level(ramp[2048 + i]);
       texels[i * 4 + 3] = 255;
+    }
+    if (entries) {
+      auto *words = static_cast<uint32_t *>(staging.cpu);
+      const auto entry = [](uint16_t e) { return std::min<uint32_t>(e, 1023u); };
+      for (uint32_t i = 0; i < 1024; ++i)
+        words[i] = entry(ramp[i]) | entry(ramp[1024 + i]) << 10 | entry(ramp[2048 + i]) << 20 | 3u << 30;
     }
     plume::RenderCommandList *cmd = s.command_list;
     cmd->barriers(plume::RenderBarrierStage::COPY,
@@ -310,7 +345,7 @@ void PrepareGameGammaLocked(VideoState &s) {
     bool identity = true;
     for (uint32_t i = 0; i < 3 * 1024 && identity; ++i)
       identity = level(ramp[i]) == level(i % 1024);
-    g_gamma.identity = identity;
+    g_gamma.identity = identity && !entries;  // sa2-nx-ult: its shortcut outputs rounded levels
   }
 }
 
