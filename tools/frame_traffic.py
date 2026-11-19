@@ -188,6 +188,11 @@ def main():
                 stats['lr_functions'] += 1
             frame_seen = False  # the first stwu r1: the saves the compiler makes come before it
             straight = True     # still in the entry's straight line (no label, no branch)
+            # sa2-nx-ult (2026-11-20): the registers the function writes before a store: a store of one of them keeps
+            # data, not the caller's value (SA2's sub_82833568, which has no frame: std r31,-208(r1) after
+            # clrlwi r31,... is an integer-to-float conversion through memory, read back by lfd; elided, the decoded
+            # DXT1 colours went wrong). A save stores the incoming value.
+            written = set()
             k = i + 1
             while k < j:
                 line = lines[k]
@@ -195,6 +200,9 @@ def main():
                 m = COMMENT.match(line)
                 if m:
                     name, operands = m.group(1), m.group(2) or ''
+                    if operands and name not in STORE_OPS and not name.startswith(
+                            ('cmp', 'b', 'tw', 'td', 'dcb', 'icb', 'mt', 'sync', 'lwsync', 'eieio', 'isync', 'st')):
+                        written.add(operands.split(',')[0].strip())
                     if name in ('stwu', 'stdu') and operands.startswith('r1,'):
                         if not chain_read and not walkers and k + 2 < j and CHAIN.match(lines[k + 2]):
                             new[k + 2] = '\tREX_CHAIN_STORE(' + lines[k + 2].strip().rstrip(';') + ');'
@@ -226,7 +234,8 @@ def main():
                         k += 1
                         continue
                 m = NV_SAVE.match(line)
-                if m and not frame_seen and straight and 14 <= int(m.group(2)) <= 31:
+                if m and not frame_seen and straight and 14 <= int(m.group(2)) <= 31 and \
+                        f'{m.group(1)}{m.group(2)}' not in written:
                     new[k] = '\tREX_DEAD_SAVE(' + s.rstrip(';') + ');'
                     stats['nv_saves'] += 1
                 k += 1
