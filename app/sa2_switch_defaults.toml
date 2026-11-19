@@ -1,0 +1,68 @@
+# Sonic Adventure 2 for the Switch (sa2-nx on the ultimate base): the fixed settings, compiled into the NRO
+# (app/CMakeLists.txt, src/renut_app.h BuiltInConfig) and applied before the SD card's sa2.toml, which holds the
+# player's options (app/sa2_switch.toml). A key added to sa2.toml overrides any of these (the test runs use that).
+#
+# sa2-nx 1.0.6's own decisions under the base's key names (docs/sa2-ultimate-notes.md, "Settings"; checked key by key
+# against 1.0.6 with tools/sa2_effective_keys.py). Every other key keeps the base's default.
+
+# The full game (not the XBLA trial), Renut on deko3d, the game files as the asset pack (game_root.nxpack + .nxidx).
+license_mask = 1
+gpu_plugin = ""
+banjo_renderer = "renut"
+renut_gpu_backend = "deko3d"
+asset_pack = true
+asset_pack_build = true
+
+# No log, no profilers, no reports (rex_crash.log and rex_stderr.log stay).
+log_level = "off"
+log_file_writer = false
+switch_profile_stacks = false
+banjo_show_profiler = false
+banjo_show_fps = false
+banjo_stall_watch_seconds = 0
+renut_memory_report = 0.0
+renut_gpu_profile = 0.0
+
+# The render resolution by the console's mode (1.0.6: 1280x720 handheld, 1920x1080 docked).
+banjo_renut_render_height_handheld = 720
+banjo_renut_render_height_docked = 1080
+banjo_renut_display_height_docked = 1080
+# The game's own 8-bit post buffers, as on the Xbox 360 (1.0.6; the base's "High" changes the picture).
+renut_post_process_precision = "Game"
+# No anti-aliasing of the game's own (1.0.6 drew none: msaa_level 1, no SMAA; both are the user's picture decisions).
+msaa_level = 1
+banjo_renut_smaa = false
+# The display gamma ramp SA2's Direct3D keeps (+15408), at scan-out (1.0.6's sa2_renut_gamma_ramp).
+banjo_renut_game_gamma = true
+
+# 1.0.6's renderer and scheduling choices the base has off:
+#   - the core layout (the game's drawing thread alone on core 0; 1.0.6 measured it faster on the console: render
+#     thread 12.5 -> 11.5 ms, game thread 17.6 -> 17.3 ms), with port 103's application at each thread's own wait;
+#   - the deferred chain (Begin*Vertices draws in the delta chain; SA2 draws on one device from one thread);
+#   - the display's own refresh for the frame pacing (banjo_display_sync, which 1.0.6's sa2_renut_pacing.cpp follows)
+#     and the eager kicks;
+#   - alpha_spec stays off (1.0.6: in Ryujinx every textured surface came out one flat colour with it; to check on the
+#     console before it goes on);
+#   - the guest thread stack pool at 64 (1.0.6's fix for the heap's growth at stage loads).
+banjo_renut_core_layout = true
+banjo_renut_deferred_chain = true
+banjo_display_sync = true
+banjo_deko3d_eager_kicks = true
+banjo_deko3d_alpha_spec = false
+switch_thread_stack_pool = 64
+
+# The base's tag-driven delta capture needs marks from state setters this port leaves to SA2's own Direct3D (1.0.6
+# made its own: sa2_renut_setter_marks). Off until SA2's marks are in the base's form: the deltas compare their
+# chunks instead (exact either way).
+banjo_renut_tags = false
+
+# No controller rumble, as 1.0.6 (the base turns the game's own vibration on: input_rumble = true in sa2.toml).
+input_rumble = false
+
+# The base's frame cap stays off: SA2 paces its own frames (sa2_renut_pacing.cpp).
+frame_cap = "Off"
+
+# Controllers: the Xbox layout by position, single Joy-Cons sideways with the stick turned (1.0.6).
+input_xbox_layout = true
+input_joycon_sideways = true
+input_joycon_sideways_stick = true

@@ -149,9 +149,14 @@ include(generated/rexglue.cmake)
 # wins. Without the precompiled header: GCC does not use a PCH made with optimisation in an -O0 file ("__OPTIMIZE__ not
 # defined"); renut_init.h includes renut_pch.h itself. LTO keeps each function's own level. OFF: as before.
 option(BANJO_REGISTER_O0 "Switch: the function registration file at -O0, without the PCH (build time)" ON)
-if(BANJO_REGISTER_O0 AND REXGLUE_PLATFORM_SWITCH AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/renut_register.cpp")
-    set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/generated/renut_register.cpp" APPEND PROPERTY COMPILE_OPTIONS -O0)
-    set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/generated/renut_register.cpp" PROPERTY SKIP_PRECOMPILE_HEADERS ON)
+if(BANJO_REGISTER_O0 AND REXGLUE_PLATFORM_SWITCH)
+    # sa2-nx-ult: the stage DLL's registration file too (generated/data_dll).
+    foreach(_sa2_register generated/renut_register.cpp generated/data_dll/renut_register.cpp)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_sa2_register}")
+            set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/${_sa2_register}" APPEND PROPERTY COMPILE_OPTIONS -O0)
+            set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/${_sa2_register}" PROPERTY SKIP_PRECOMPILE_HEADERS ON)
+        endif()
+    endforeach()
 endif()
 
 # banjo-nx (from sa2-nx): the optimised codegen. The build re-runs the generator by itself whenever an input in
@@ -189,7 +194,13 @@ endif()
 # shader harvest): src/katamari_keys.cpp defines the keys of those files that the kept ones still read.
 set(RENUT_SOURCES
     src/main.cpp
-    src/katamari_keys.cpp
+    # sa2-nx-ult (2026-11-19): SA2's game layer (docs/ultimate-rebase-plan.md). sa2_keys.cpp: the keys the kept base
+    # files read (katamari_keys.cpp's, which it replaces) and 1.0.6's renamed player keys; sa2_controls.cpp: OpenSA2's
+    # control options (sa2-nx 1.0.5).
+    src/sa2_keys.cpp
+    src/sa2_controls.cpp
+    # SA2's own hook around Renut (the window scissor's shadow, 1.0.6's src/me/sa2_me_hooks.cpp).
+    src/sa2_renut_hooks.cpp
     src/game_menu.cpp  # blur-nx (2026-11-18): the game menu (A+B+X+Y+L+R on the Switch, F8 on the PC)
     src/blur_small_alloc.cpp  # blur-nx (2026-11-17, #220; port 151): small C++ allocations per thread (Switch; 32 MB)
     # katamari-nx (2026-10-31): DLC packages in the "dlc" folder next to the NRO installed at start (reNut upstream's).
@@ -219,8 +230,6 @@ set(RENUT_SOURCES
     src/cpu/banjo_forms_selfcheck.cpp
     # blur-nx (2026-11-11, port 90): timings of a few processor forms at boot (blur_microbench, off).
     src/cpu/blur_microbench.cpp
-    # katamari-nx (2026-11-01): diagnostic of the game state's stage fields (katamari_diag_game_state, off).
-    src/cpu/katamari_stage_diag.cpp
     # katamari-nx: the native copies of hot game functions (banjo_hot_guest.cpp and its shards), from this game's PC
     # profile (docs/katamari-notes.md, "Hot functions"): src/cpu/hot/localized.txt and hand.txt.
     src/cpu/banjo_hot_guest.cpp
@@ -270,10 +279,36 @@ endif()
 # (the game runs but the screen stays black).
 rexglue_setup_target(renut GPU_PLUGINS xenos)
 
+# sa2-nx (2026-10-06; sa2-nx-ult 2026-11-19): the stage DLL (gd/DLL/xbox 360/Data_DLL.xex, generated/data_dll) goes
+# into the NRO, since the console has no dynamic loading: its static archive (CMake builds the generated SHARED
+# library as STATIC on this platform) is partially linked into one object, every symbol the module did not export is
+# made local (it is compiled with hidden visibility, as on the PC, and its generated globals share names with the
+# executable's: both modules are generated under one project name), and its two entry points are renamed for
+# src/sa2_static_modules.cpp, which registers them (sdk rex/system/static_modules.h). On the PC it is a DLL.
+if(REXGLUE_PLATFORM_SWITCH AND TARGET renut_Data_DLL)
+    set(_dll_object "${CMAKE_CURRENT_BINARY_DIR}/renut_Data_DLL_linked.o")
+    get_filename_component(_switch_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    add_custom_command(OUTPUT "${_dll_object}"
+        # --force-group-allocation: COMDAT groups (inline functions) become ordinary sections resolved inside the
+        # module; left as groups, the final link could keep the executable's copy of a group whose symbols
+        # --localize-hidden made local here, and drop the module's.
+        COMMAND "${_switch_bin}/aarch64-none-elf-ld" -r --force-group-allocation -o "${_dll_object}.tmp"
+                --whole-archive $<TARGET_FILE:renut_Data_DLL> --no-whole-archive
+        COMMAND "${CMAKE_OBJCOPY}" --localize-hidden
+                --redefine-sym ReXModule_Register=ReXModule_Register_renut_Data_DLL
+                --redefine-sym ReXModule_GetImageInfo=ReXModule_GetImageInfo_renut_Data_DLL
+                "${_dll_object}.tmp" "${_dll_object}"
+        DEPENDS renut_Data_DLL
+        COMMENT "Linking the Data_DLL module into one object for the NRO"
+        VERBATIM)
+    set_source_files_properties("${_dll_object}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+    target_sources(renut PRIVATE "${_dll_object}" src/sa2_static_modules.cpp)
+endif()
+
 # banjo-nx (2026-10-17): Ryujinx starts NROs without argv[0]; the SDK then takes the NRO's usual place on the SD
 # (sdk/src/core/filesystem_posix.cpp). A console's hbloader always passes the path, so nothing changes there.
 if(REXGLUE_PLATFORM_SWITCH AND TARGET rexcore)
-    target_compile_definitions(rexcore PRIVATE REX_SWITCH_FALLBACK_EXE="/switch/katamari-nx/katamari-nx.nro")
+    target_compile_definitions(rexcore PRIVATE REX_SWITCH_FALLBACK_EXE="/switch/sa2-nx/sa2.nro")
 endif()
 
 # banjo-nx (2026-10-16): Renut's Direct3D-level renderer as a second renderer, chosen at boot (banjo_renderer = "renut";
@@ -288,7 +323,8 @@ endif()
 # so the recompiled game's floating point drifted from the Xbox 360 and from the PC build (x86-64-v2 has no FMA), and
 # type-punned guest register/memory accesses relied on strict aliasing. The native game-function replacements are
 # checked against the recompiled code built this way.
-foreach(_banjo_target renut renut_recomp)
+# sa2-nx-ult: and the stage DLL (renut_Data_DLL, generated/data_dll): sa2-nx's rule, every target with generated code.
+foreach(_banjo_target renut renut_recomp renut_Data_DLL)
     if(TARGET ${_banjo_target})
         target_compile_options(${_banjo_target} PRIVATE -ffp-contract=off -fno-strict-aliasing)
     endif()
@@ -306,11 +342,15 @@ endforeach()
 # -DBANJO_GENERATED_NO_TRAPPING_MATH=ON puts it back for a measurement.
 option(BANJO_GENERATED_MATH_FLAGS "-fno-math-errno on the generated game code" ON)
 option(BANJO_GENERATED_NO_TRAPPING_MATH "-fno-trapping-math on the generated game code (not exact, see the comment)" OFF)
-if(BANJO_GENERATED_MATH_FLAGS AND TARGET renut_recomp AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(renut_recomp PRIVATE -fno-math-errno)
-    if(BANJO_GENERATED_NO_TRAPPING_MATH)
-        target_compile_options(renut_recomp PRIVATE -fno-trapping-math)
-    endif()
+if(BANJO_GENERATED_MATH_FLAGS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    foreach(_sa2_game renut_recomp renut_Data_DLL)  # sa2-nx-ult: both modules
+        if(TARGET ${_sa2_game})
+            target_compile_options(${_sa2_game} PRIVATE -fno-math-errno)
+            if(BANJO_GENERATED_NO_TRAPPING_MATH)
+                target_compile_options(${_sa2_game} PRIVATE -fno-trapping-math)
+            endif()
+        endif()
+    endforeach()
 endif()
 
 # The localized native copies (src/cpu/banjo_hot_guest.cpp includes generated/hot) are game code compiled in the app:
@@ -595,6 +635,9 @@ endif()
 # banjo_diag_runtime_census; nothing on the Switch.
 if(NOT REXGLUE_PLATFORM_SWITCH AND TARGET renut_recomp)
     target_compile_definitions(renut_recomp PRIVATE REX_DIET_CENSUS_ON)
+    if(TARGET renut_Data_DLL)  # sa2-nx-ult
+        target_compile_definitions(renut_Data_DLL PRIVATE REX_DIET_CENSUS_ON)
+    endif()
 endif()
 if(REXGLUE_PLATFORM_SWITCH)
     # The Switch-only forms of the first round (from sasrt-nx), each with its switch back:
@@ -631,11 +674,14 @@ if(REXGLUE_PLATFORM_SWITCH)
     endif()
     if(BANJO_SWITCH_OMIT_FRAME_POINTER AND TARGET renut_recomp)
         target_compile_options(renut_recomp PRIVATE -fomit-frame-pointer)
+        if(TARGET renut_Data_DLL)  # sa2-nx-ult: the stage DLL too
+            target_compile_options(renut_Data_DLL PRIVATE -fomit-frame-pointer)
+        endif()
         # The localized copies are game code too (sa2-nx: the same rule for that file).
         set_property(SOURCE ${BANJO_HOT_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -fomit-frame-pointer)
     endif()
 endif()
-foreach(_banjo_target renut_recomp renut)
+foreach(_banjo_target renut_recomp renut renut_Data_DLL)  # sa2-nx-ult: the stage DLL's generated code too
     if(TARGET ${_banjo_target} AND _banjo_round_definitions)
         target_compile_definitions(${_banjo_target} PRIVATE ${_banjo_round_definitions})
     endif()
@@ -869,38 +915,40 @@ foreach(_dep imgui xxhash renderdoc)
     endif()
 endforeach()
 
-# Nintendo Switch: renut.nro next to the ELF. On the SD card it goes in
-# sdmc:/switch/banjo-nx/ with the extracted disc in game_root/ beside it.
+# Nintendo Switch: renut.nro next to the ELF. On the SD card it goes in sdmc:/switch/sa2-nx/ as sa2.nro, with the
+# game as game_root.nxpack + .nxidx (or the extracted folder game_root/) beside it.
 if(REXGLUE_PLATFORM_SWITCH)
     # Link map: which object each function came from, for ranking the profiler's samples per function
     # (tools/switch-cpu-profile.py). It must come from the same build as the NRO that was profiled.
     target_link_options(renut PRIVATE "LINKER:-Map=${CMAKE_BINARY_DIR}/renut.map")
-    # katamari-nx (2026-11-02, the user: only these settings in the toml, the rest hardcoded; sa2-nx's design): the fixed
-    # settings compiled in (src/renut_app.h BuiltInConfig), and the player's katamari.toml, written next to the NRO when
-    # it is missing (DefaultConfigFile). KATAMARI_BUILTIN_CONFIG=OFF: test builds that read a full renut.toml.
-    option(KATAMARI_BUILTIN_CONFIG "Switch: the fixed settings compiled in, the player's options in katamari.toml" ON)
-    if(KATAMARI_BUILTIN_CONFIG)
-        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/katamari_switch_defaults.toml" KATAMARI_BUILTIN_TEXT)
-        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/katamari_switch.toml" KATAMARI_PLAYER_TEXT)
-        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/katamari_builtin_config.h.in"
-                       "${CMAKE_CURRENT_BINARY_DIR}/builtin_config/katamari_builtin_config.h" @ONLY)
+    # sa2-nx's design (1.0.4): the fixed settings compiled in (src/renut_app.h BuiltInConfig), and the player's sa2.toml,
+    # written next to the NRO when it is missing (DefaultConfigFile). SA2_BUILTIN_CONFIG=OFF: test builds that read a
+    # full toml.
+    option(SA2_BUILTIN_CONFIG "Switch: the fixed settings compiled in, the player's options in sa2.toml" ON)
+    if(SA2_BUILTIN_CONFIG)
+        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/sa2_switch_defaults.toml" SA2_BUILTIN_TEXT)
+        file(READ "${CMAKE_CURRENT_SOURCE_DIR}/sa2_switch.toml" SA2_PLAYER_TEXT)
+        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/sa2_builtin_config.h.in"
+                       "${CMAKE_CURRENT_BINARY_DIR}/builtin_config/sa2_builtin_config.h" @ONLY)
         target_include_directories(renut PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/builtin_config")
-        target_compile_definitions(renut PRIVATE KATAMARI_BUILTIN_CONFIG=1)
+        target_compile_definitions(renut PRIVATE SA2_BUILTIN_CONFIG=1)
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-                     "${CMAKE_CURRENT_SOURCE_DIR}/katamari_switch_defaults.toml"
-                     "${CMAKE_CURRENT_SOURCE_DIR}/katamari_switch.toml")
+                     "${CMAKE_CURRENT_SOURCE_DIR}/sa2_switch_defaults.toml"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/sa2_switch.toml")
     endif()
-    set(RENUT_ICON "${CMAKE_CURRENT_SOURCE_DIR}/../tools/switch/icon/katamari_icon.jpg")
+    # sa2-nx's icon (1.0.6's app/icon.jpg).
+    set(RENUT_ICON "${CMAKE_CURRENT_SOURCE_DIR}/../tools/switch/icon/sa2_icon.jpg")
     set(RENUT_ICON_ARG)
     if(EXISTS "${RENUT_ICON}")
         set(RENUT_ICON_ARG ICON "${RENUT_ICON}")
     endif()
-    # katamari-nx (2026-11-02, the user's request): author ChanseyIsTheBest, the user's icon (the cover art).
-    # 2026-11-05: version 1.0.1, the game's memory and the NRO's code on 2 MB blocks, and the boot's cvars.
+    # sa2-nx's homebrew menu entry (1.0.6's name and author). The NRO is renut.nro in the build folder; on the card it
+    # is switch/sa2-nx/sa2.nro, as 1.0.6's (tools/sa2_package.ps1 copies it under that name). "1.0.6-ult": the rebase
+    # on the ultimate base, until a release is decided.
     rexglue_switch_add_nro(renut
-        NAME "Beautiful Katamari"
+        NAME "Sonic Adventure 2"
         AUTHOR "ChanseyIsTheBest"
-        VERSION "1.0.1"
+        VERSION "1.0.6-ult"
         ${RENUT_ICON_ARG})
 endif()
 

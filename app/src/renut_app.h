@@ -30,11 +30,11 @@
 #include "renut_engine/gpu/banjo_renut_capture.h"
 #endif
 #include "cpu/banjo_enhancements.h"
-#if defined(KATAMARI_BUILTIN_CONFIG)
-#include "katamari_builtin_config.h"  // generated from app/katamari_switch_defaults.toml and katamari_switch.toml (CMake)
+#if defined(SA2_BUILTIN_CONFIG)
+#include "sa2_builtin_config.h"  // generated from app/sa2_switch_defaults.toml and sa2_switch.toml (CMake)
 #endif
-namespace katamari::stage_diag {
-void Start();  // src/cpu/katamari_stage_diag.cpp
+namespace sa2::keys {
+void ApplyAliases();  // src/sa2_keys.cpp: 1.0.6's renamed player keys
 }
 namespace blur::small_alloc {
 void Enable();  // blur-nx (2026-11-17, #220; renut-ultimate port 151): src/blur_small_alloc.cpp, after setup
@@ -73,23 +73,24 @@ public:
 
     static std::unique_ptr<rex::ui::WindowedApp> Create(
         rex::ui::WindowedAppContext& ctx) {
-        // katamari-nx: banjo-nx's name, so its config is renut.toml (the built-in config's build: OnConfigurePaths).
-        return std::unique_ptr<RenutApp>(new RenutApp(ctx, "renut", PPCImageConfig));
+        // sa2-nx-ult (2026-11-19): sa2-nx's name. The SDK names the save data folder after it (the user folder /
+        // "sa2") and the PC's settings file (sa2.toml), so a 1.0.6 player's saves and settings are found as before.
+        return std::unique_ptr<RenutApp>(new RenutApp(ctx, "sa2", PPCImageConfig));
     }
 
-    // katamari-nx (2026-11-02, sa2-nx's design): the Switch build's fixed settings, compiled in and applied before
-    // katamari.toml, which holds only the player's options (a key added there still overrides these: test runs).
+    // sa2-nx's design (1.0.4): the Switch build's fixed settings (app/sa2_switch_defaults.toml), compiled in and
+    // applied before sa2.toml, which holds only the player's options (a key added there still overrides these).
     std::string_view BuiltInConfig() const override {
-#if defined(KATAMARI_BUILTIN_CONFIG)
-        return kKatamariBuiltInConfig;
+#if defined(SA2_BUILTIN_CONFIG)
+        return kSa2BuiltInConfig;
 #else
         return {};
 #endif
     }
-    // Without a katamari.toml next to the NRO, the player's default one is written there.
+    // Without an sa2.toml next to the NRO, the player's default one (app/sa2_switch.toml) is written there.
     std::string_view DefaultConfigFile() const override {
-#if defined(KATAMARI_BUILTIN_CONFIG)
-        return kKatamariPlayerConfig;
+#if defined(SA2_BUILTIN_CONFIG)
+        return kSa2PlayerConfig;
 #else
         return {};
 #endif
@@ -149,6 +150,7 @@ public:
     // (src/me, from masseffect-nx) and the emulated Xenos GPU plugin is not loaded (ReXApp only loads it
     // when config.graphics is empty).
     void OnPreSetup(rex::RuntimeConfig& config) override {
+        sa2::keys::ApplyAliases();  // sa2-nx-ult: before the renderer reads its keys
         banjo::ApplyMasterSwitches();
 #if REX_PLATFORM_SWITCH
         // Before the Vulkan device exists (the graphics system creates it after this). Mesa's own disk cache
@@ -229,8 +231,6 @@ public:
         renut::dlc::InstallPackages(runtime());
         // One log line with every enhancement and whether it is active (src/cpu/banjo_enhancements.h).
         banjo::LogEnhancements();
-        // katamari-nx (2026-11-01): katamari_diag_game_state (off): the stage fields of the game state, as they change.
-        katamari::stage_diag::Start();
         // PC: function-level CPU profile (banjo_pc_profile_s = N seconds per report; 0 = off; from futari-nx).
         banjo::pc_profiler::Start();
         // Switch: per-thread CPU accounting, the optional sampler and the stall watchdog.
@@ -275,20 +275,32 @@ public:
         banjo::pgo::Stop();
     }
 
-    // A game_root folder next to the executable is used when no path was given.
-    // On the Switch that is sdmc:/switch/katamari-nx/game_root (the extracted disc).
+    // sa2-nx (1.0.0-1.0.6): without --game_data_root, a game_root next to the executable (on the Switch:
+    // sdmc:/switch/sa2-nx/game_root, the folder itself or only its asset pack, game_root.nxpack + .nxidx), and on a
+    // PC build tree the repository's assets/game_root (each parent folder in turn). An explicit path always wins.
     void OnConfigurePaths(rex::PathConfig& paths) override {
-#if defined(KATAMARI_BUILTIN_CONFIG)
-        // The player's settings file. Not renut.toml: the test builds' full one, left on an SD card, would override
-        // every built-in setting.
-        paths.config_path = rex::filesystem::GetExecutableFolder() / "katamari.toml";
+#if defined(SA2_BUILTIN_CONFIG)
+        // The player's settings file, 1.0.6's name.
+        paths.config_path = rex::filesystem::GetExecutableFolder() / "sa2.toml";
 #endif
         if (paths.game_data_root.empty()) {
             const auto folder = rex::filesystem::GetExecutableFolder();
             std::error_code ec;
-            const auto extracted = folder / "game_root";
-            if (!folder.empty() && std::filesystem::is_directory(extracted, ec)) {
-                paths.game_data_root = extracted;
+            bool found = false;
+            for (auto candidate = folder; !found && !candidate.empty(); candidate = candidate.parent_path()) {
+                for (const auto& sub : {std::filesystem::path("game_root"),
+                                        std::filesystem::path("assets") / "game_root"}) {
+                    auto pack = candidate / sub;
+                    pack += ".nxpack";
+                    if (std::filesystem::is_regular_file(candidate / sub / "default.xex", ec) ||
+                        std::filesystem::is_regular_file(pack, ec)) {
+                        paths.game_data_root = candidate / sub;
+                        found = true;
+                        break;
+                    }
+                }
+                if (candidate == candidate.parent_path())
+                    break;
             }
         }
         renut::dlc::SetUserDataRoot(paths.user_data_root);  // the folder the DLC installer checks for installed ones
