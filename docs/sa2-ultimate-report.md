@@ -15,7 +15,7 @@ steps in [progress-log.md](progress-log.md).
 | PC, verify mode | City Escape played, the Dark story's cutscene and Iron Gate, the Chao World lobby, the attract demos; with and without the machine copies | 0 differences in every self-check; the copies' guard: 0 differences in about 418 million compared calls |
 | Emulator (Ryujinx, deko3d) | the attract sequence against 1.0.6's released NRO | the title identical; the two-player demo plays the same moments, player 2's run no longer drifts since the fused multiply-add is off; a small fixed difference remains (below) |
 | Emulator | the Switch build with the 447 copies in place | block for block as without them |
-| Console | the package `out\packages\2026-11-20_0453_rebase_test1` | **not run** (your word needed) |
+| Console | the package `out\packages\2026-11-20_0844_rebase_test2` (the current tree; `rebase_test1` is the same without `sasrt_gpu_skip_inert_draws` off) | **not run** (your word needed) |
 
 **The remaining difference (open):** with every not-exact float form off, the two-player demo in the emulator matches
 1.0.6 in the same stretches every run and differs in the same others: a few grind sparks placed elsewhere, a sliver
@@ -70,7 +70,7 @@ anywhere (the console decides; PC and emulator timings are not evidence).
 
 ## Next steps
 
-1. A console run of the package (your word): boot, menus, stages, Chao Garden, the two-player modes; send the logs
+1. A console run of the package `rebase_test2` (your word): boot, menus, stages, Chao Garden, the two-player modes; send the logs
    of the `sa2_ab.toml` run (its CPU profile feeds the next batch of copies).
 2. PGO: the instrumented NRO is built and packaged (`out\packages\2026-11-20_0534_pgo_generate`, 90 MB: PGO
    generate, LTO with `-fipa-pta`, the copies in place); a console training session (its notes say what to play),
