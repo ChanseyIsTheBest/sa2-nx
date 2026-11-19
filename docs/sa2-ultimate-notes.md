@@ -38,7 +38,8 @@ Where SA2's compiled-in settings differ from the base's defaults, and why:
 | `renut_post_process_precision` | Game | High | 1.0.6's: the game's 8-bit post buffers (the base's High changes the picture) |
 | `banjo_renut_render_height_docked`, `banjo_renut_display_height_docked` | 1080 | 720 | 1.0.6 (1.0.3.1): 1920x1080 docked |
 | `banjo_renut_game_gamma` | true | false | SA2's display gamma ramp at scan-out (1.0.6's `sa2_renut_gamma_ramp`); the ramp at SA2's +15408 |
-| `banjo_renut_smaa`, `msaa_level` | false, 1 | true, 1 | 1.0.6 drew no anti-aliasing; SMAA would do nothing until SA2's composite shader is listed (`banjo_renut_smaa_after_ps`): the user's picture decision |
+| `msaa_level` | 4 | 1 | the game's own sample counts (the base's key only lowers a count). SA2's render targets are single-sample; its only 4x surfaces are Direct3D's fast-clear aliases, which 1.0.6 drew at 4x. The base's 1 would draw them at 1x: a config for the frame comparison, not the default |
+| `banjo_renut_smaa` | false | true | 1.0.6 drew no anti-aliasing; SMAA would do nothing until SA2's composite shader is listed (`banjo_renut_smaa_after_ps`): the user's picture decision |
 | `banjo_renut_core_layout`, `banjo_renut_deferred_chain`, `banjo_display_sync`, `banjo_deko3d_eager_kicks` | true | false | on in 1.0.6 (each measured or run on SA2's console); off in the base for other games' reasons (off-by-default.md section 4) |
 | `banjo_deko3d_alpha_spec` | false | true | off in 1.0.6: in Ryujinx every textured SA2 surface came out one flat colour with it (renut-renderer.md); to check on the console first |
 | `switch_thread_stack_pool` | 64 | 4 | 1.0.6's fix for the heap's growth at stage loads (renut-renderer.md, "The heap in long sessions") |

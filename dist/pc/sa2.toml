@@ -1,0 +1,16 @@
+# sa2-nx on the ultimate base: the PC test build's settings (app/out/pc/sa2.toml; the PC compiles no settings in).
+# The Switch build's compiled-in choices (app/sa2_switch_defaults.toml) that matter on the PC, Renut on Vulkan (the
+# backend RenderDoc reads), muted and minimised for test runs (tools/run_pc.ps1 passes those two on its command line).
+license_mask = 1
+gpu_plugin = ""
+banjo_renderer = "renut"
+renut_gpu_backend = "vulkan"
+renut_post_process_precision = "Game"
+msaa_level = 4
+banjo_renut_smaa = false
+banjo_renut_game_gamma = true
+banjo_renut_deferred_chain = true
+banjo_renut_tags = false
+banjo_display_sync = true
+input_rumble = false
+frame_cap = "Off"

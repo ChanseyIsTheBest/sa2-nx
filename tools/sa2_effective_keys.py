@@ -21,7 +21,6 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # sa2-nx 1.0.6 key -> the base's key for the same thing (docs/sa2-ultimate-notes.md, "Settings").
 RENAMES = {
     'sa2_renderer': 'banjo_renderer',
-    'sa2_renut_msaa': 'msaa_level',
     'sa2_renut_double_buffer': 'pacman_renut_double_buffer',
     'sa2_renut_queue_drain': 'pacman_renut_queue_drain',
     'sa2_renut_lockfree_queue': 'dishonored_renut_lockfree_queue',

@@ -6,7 +6,9 @@ forms do not count: vspltis* (immediates), lvlx / lvrx (whole-register writes in
 register with itself, `mr rX,rX`. Beautiful Katamari (2026-11-12): 6 of 12,610 sites, all the debug trap
 `twi 31,r0,22` past direct calls (ppc_trap only logs; before the `mr` rule also 66 `mr r8,r8`).
 
-  python tools/cc_exit_census.py [--gen app/generated]
+  python tools/cc_exit_census.py [--gen app/generated] [--all]
+
+--all (sa2-nx-ult, 2026-11-19): every site, with the guest instructions from the call to the read.
 """
 import collections
 import os
@@ -45,9 +47,15 @@ def du(c):
     # `mr rX,rX` / `or rX,rX,rX` (the compiler's no-op markers): the register keeps its value whatever it is.
     if mn in ('mr', 'or') and ops and all(o == ops[0] for o in ops):
         return d, u & ~rl.regs(ops[0])
+    # sa2-nx-ult (2026-11-19, SA2's census): `subfe rD,rA,rA` is ~rA + rA + CA = CA - 1, whatever rA holds (MSVC's
+    # idiom for turning the carry into 0 / -1): it reads no value of rA.
+    if mn == 'subfe' and len(ops) == 3 and ops[1] == ops[2]:
+        return d | rl.regs(ops[0]), u & ~rl.regs(ops[1])
     return d, u
 
 
+ALL = '--all' in sys.argv  # sa2-nx-ult: list every site (below)
+sites = []
 hits = collections.Counter()
 examples = collections.defaultdict(list)
 n_sites = n_bad = 0
@@ -92,6 +100,16 @@ for addr, (path, lines) in bodies.items():
                 hits[reg] += 1
                 if len(examples[reg]) < 3:
                     examples[reg].append('%08X@%d' % (addr, i))
+                if ALL:
+                    # sa2-nx-ult (2026-11-19): every site, with the guest instructions from the call to the first
+                    # instruction that reads the register (in the order of the function's text), to judge each by hand.
+                    bit = 1 << b
+                    reader = next((k for k in range(i + 1, n) if dus[k][1] & bit), None)
+                    end = reader if reader is not None else min(n - 1, i + 6)
+                    text = ' | '.join(c.group(1) + ' ' + c.group(2) for c in comments[i:end + 1])
+                    sites.append('%08X@%d %s: %s' % (addr, i, reg, text))
 print('indirect call sites %d; with a register of EXIT_DEAD read after the call: %d' % (n_sites, n_bad))
 for reg, k in hits.most_common(40):
     print('  %-5s %5d  e.g. %s' % (reg, k, ', '.join(examples[reg])))
+for s in sites:
+    print(s)

@@ -29,8 +29,11 @@ banjo_renut_render_height_docked = 1080
 banjo_renut_display_height_docked = 1080
 # The game's own 8-bit post buffers, as on the Xbox 360 (1.0.6; the base's "High" changes the picture).
 renut_post_process_precision = "Game"
-# No anti-aliasing of the game's own (1.0.6 drew none: msaa_level 1, no SMAA; both are the user's picture decisions).
-msaa_level = 1
+# The game's own sample counts (msaa_level 4: the base only lowers a count, so 4 changes nothing). SA2 makes its render
+# targets single-sample; its only 4x surfaces are Direct3D's fast-clear aliases, which 1.0.6 drew at 4x ("its 4x
+# surfaces stay as they are"). The base's default, 1, would draw them at 1x: a separate config, the frame comparison
+# first. No SMAA (1.0.6 drew none; it would do nothing until SA2's composite shader is listed): the user's decision.
+msaa_level = 4
 banjo_renut_smaa = false
 # The display gamma ramp SA2's Direct3D keeps (+15408), at scan-out (1.0.6's sa2_renut_gamma_ramp).
 banjo_renut_game_gamma = true

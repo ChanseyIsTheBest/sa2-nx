@@ -4,13 +4,17 @@
 #   powershell -File tools/run_ryujinx.ps1 -Seconds 300 -Name emu1 [-Toml <a katamari.toml with test keys>]
 # renut-ultimate (2026-11-07): its own data folder (ryu-data\renut-ultimate, made from katamari-nx's), and the NRO of
 # app\out\<-Build> copied to its SD at each run (katamari-nx's folder and NRO are left alone).
-param([int]$Seconds = 240, [string]$Name = "emu", [string]$Toml = "", [double]$MinCommitGB = 12, [string]$Build = "switch")
+# sa2-nx-ult (2026-11-19): the data folder, the SD folder and the file names are parameters (the base named
+# Katamari's), with SA2's as the defaults; the SD's toml is put back after the run when -Toml replaced it.
+param([int]$Seconds = 240, [string]$Name = "emu", [string]$Toml = "", [double]$MinCommitGB = 12, [string]$Build = "switch",
+      [string]$Data = "D:\New folder\ryu-data\sa2-ult", [string]$Folder = "sa2-nx", [string]$NroName = "sa2.nro",
+      [string]$TomlName = "sa2.toml")
 $root = Split-Path -Parent $PSScriptRoot
 $ryu = "D:\New folder\Ryubing-src\ryubing\build\Ryujinx.exe"
-$data = "D:\New folder\ryu-data\renut-ultimate"
+$data = $Data
 # Ryujinx starts an NRO without argv: the app then takes REX_SWITCH_FALLBACK_EXE (app/CMakeLists.txt) as its own path.
-$sd = Join-Path $data "sdcard\switch\katamari-nx"
-$nro = Join-Path $sd "katamari-nx.nro"
+$sd = Join-Path $data "sdcard\switch\$Folder"
+$nro = Join-Path $sd $NroName
 $out = Join-Path $root "out\emu_runs\$Name"
 if (Get-Process -Name Ryujinx -ErrorAction SilentlyContinue) { Write-Output "a Ryujinx is running (another port's?): not starting"; exit 2 }
 $os = Get-CimInstance Win32_OperatingSystem
@@ -19,7 +23,12 @@ if ($freeCommit -lt $MinCommitGB) { Write-Output ("free commit memory {0:N1} GB 
 $built = Join-Path $root "app\out\$Build\renut.nro"
 if (-not (Test-Path $built)) { Write-Output "no NRO at $built"; exit 4 }
 Copy-Item $built $nro -Force
-if ($Toml) { Copy-Item $Toml (Join-Path $sd "katamari.toml") -Force }
+$sdToml = Join-Path $sd $TomlName
+$sdTomlSaved = $null
+if ($Toml) {
+    if (Test-Path $sdToml) { $sdTomlSaved = [System.IO.File]::ReadAllBytes($sdToml) }
+    Copy-Item $Toml $sdToml -Force
+}
 # renut-ultimate (2026-11-11, port 78; sasrt-nx's idea 27): an NRO without the copies' guard forms (the everyday and
 # release builds) calls every native copy directly whatever the toml's guard keys say: say so before the run.
 $cache = Join-Path $root "app\out\$Build\CMakeCache.txt"
@@ -59,4 +68,8 @@ if (Test-Path $logs) { Copy-Item -Recurse $logs (Join-Path $out "logs") -Force }
 # This run's captures move out of the SD (the SD's folder no longer grows); older ones there are left alone.
 Get-ChildItem $sd -Filter "*.png" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $started } |
     Move-Item -Destination $out -Force
+# The SD's own toml back (after each run).
+if ($Toml) {
+    if ($sdTomlSaved) { [System.IO.File]::WriteAllBytes($sdToml, $sdTomlSaved) } else { Remove-Item $sdToml -ErrorAction SilentlyContinue }
+}
 Get-ChildItem $out -Recurse | Select-Object FullName, Length
