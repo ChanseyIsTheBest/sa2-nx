@@ -811,4 +811,19 @@ bool CaptureFrame(rex::ui::RawImage &out, int timeout_ms) {
   return true;
 }
 
+// sa2-nx (2026-10-20, lockstep captures; sa2-nx-ult 2026-11-19): CaptureFrame in two halves (banjo_renut_capture.h).
+uint64_t RequestFrameCapture() {
+  return g_capture.requested.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
+bool WaitFrameCapture(uint64_t ticket, rex::ui::RawImage &out, int timeout_ms) {
+  FrameCapture &c = g_capture;
+  std::unique_lock lock(c.mutex);
+  if (!c.cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return c.served >= ticket; }) || !c.ok ||
+      c.served != ticket)
+    return false;
+  out = c.image;
+  return true;
+}
+
 } // namespace renut::gpu

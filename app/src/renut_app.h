@@ -40,6 +40,7 @@ namespace blur::small_alloc {
 void Enable();  // blur-nx (2026-11-17, #220; renut-ultimate port 151): src/blur_small_alloc.cpp, after setup
 }
 #include "native/nfsmw_nativo_captura.h"
+#include "sa2_capture.h"  // sa2-nx-ult: SA2's lockstep recorder (sa2_video_s)
 #if !REX_PLATFORM_SWITCH
 #include "profiler/nfsmw_perfil_pc.h"
 #endif
@@ -242,6 +243,8 @@ public:
         if (banjo::renut_gpu::Active()) {
             nfsmw::captura::Arrancar(nfsmw::captura::Capturador(
                 [](rex::ui::RawImage& image) { return renut::gpu::CaptureFrame(image); }));
+            // sa2-nx's lockstep recorder (sa2_video_s; the frame comparisons of tools/compare_raw.py).
+            sa2::capture::StartWithSource([](rex::ui::RawImage& image) { return renut::gpu::CaptureFrame(image); });
         } else
 #endif
         nfsmw::captura::Arrancar([this]() -> rex::ui::Presenter* {
@@ -268,6 +271,7 @@ public:
 #endif
         banjo::pc_profiler::Stop();
         nfsmw::captura::Parar();
+        sa2::capture::Stop();  // sa2-nx-ult
 #if !REX_PLATFORM_SWITCH
         nfsmw::perfil_pc::Parar();
 #endif

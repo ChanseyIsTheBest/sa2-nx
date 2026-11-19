@@ -14,6 +14,8 @@
  * (BlockOnFence_hook), and Swap waits when the game gets a frame too far ahead.
  */
 #include "renut_engine/gpu/sa2_renut_pacing.h"  // sa2-nx-ult: SA2's frame pacing (the Swap hook)
+#include "sa2_capture.h"  // sa2-nx-ult: SA2's lockstep captures (the Swap hook)
+#include "renut_engine/gpu/banjo_renut_capture.h"  // sa2-nx-ult: RequestFrameCapture / WaitFrameCapture
 #include <rex/frame_latency.h>  // banjo-nx (2026-10-19)
 #include "renut_engine/gpu/stage_census.h"  // blur-nx (2026-11-17, the Renut audit's census)
 #include "renut_engine/gpu/host_batch.h"  // blur-nx (2026-11-18, the Renut host batch)
@@ -934,7 +936,10 @@ void D3DDevice_Swap_hook(u32 device_va, u32 front_buffer, u32 parameters) {
   // blur-nx (2026-11-17): the game frames the captures' video waits on (banjo_video_s) and the D3D census reads, counted
   // here rather than in the Present hook (hooks/draw.cpp, which ends in this hook through native::Swap): Blur swaps
   // without Present, so the count stayed 0 and the video never got its first frame (no file in any Ryujinx run).
-  g_banjo_game_frames.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t game_frame = g_banjo_game_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+  // sa2-nx (2026-10-20; sa2-nx-ult 2026-11-19): a lockstep recording (src/sa2_capture.cpp) takes this very frame:
+  // asked before it is queued, handed over below once presented.
+  const uint64_t capture_ticket = sa2::capture::RenutLockstepOn() ? RequestFrameCapture() : 0;
   rex::latency::NoteGuestSwap();  // banjo-nx (2026-10-19, input latency): the probe
   const uint64_t swap_ordinal = rex::latency::SwapCount();
   FlushDeferredVertices(device_va);
@@ -1026,6 +1031,11 @@ void D3DDevice_Swap_hook(u32 device_va, u32 front_buffer, u32 parameters) {
     banjo::display_sync::NotePresented(swap_ordinal);  // banjo-nx (2026-10-19, latency batch 3)
   });
   RunReadyCallbacks();
+  if (capture_ticket) {
+    rex::ui::RawImage image;
+    const bool ok = WaitFrameCapture(capture_ticket, image, 2000);
+    sa2::capture::RenutLockstepFrame(game_frame, ok ? &image : nullptr);
+  }
 
   // sa2-nx (2026-10-20): no ResetAllState. It clears the device's dirty marks (N&B's m_Pending words), which the base's
   // native setters keep; SA2's own Direct3D setters write them instead, and SA2's draws read them (the float constant

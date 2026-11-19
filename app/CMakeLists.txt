@@ -201,6 +201,8 @@ set(RENUT_SOURCES
     src/sa2_controls.cpp
     # SA2's own hook around Renut (the window scissor's shadow, 1.0.6's src/me/sa2_me_hooks.cpp).
     src/sa2_renut_hooks.cpp
+    # sa2-nx's lockstep recorder (sa2_video_s: the frame comparison that gates every change of the code generation).
+    src/sa2_capture.cpp
     src/game_menu.cpp  # blur-nx (2026-11-18): the game menu (A+B+X+Y+L+R on the Switch, F8 on the PC)
     src/blur_small_alloc.cpp  # blur-nx (2026-11-17, #220; port 151): small C++ allocations per thread (Switch; 32 MB)
     # katamari-nx (2026-10-31): DLC packages in the "dlc" folder next to the NRO installed at start (reNut upstream's).
