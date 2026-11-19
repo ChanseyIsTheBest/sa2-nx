@@ -277,6 +277,10 @@ REXCVAR_DEFINE_BOOL(single_tile, false, "Nuts&Bolts/Graphics",
                     "Experimental: with disable_msaa, draw the frame as one tile instead of predicated tiling. "
                     "Breaks the post-process EDRAM layout (bands at the top and bottom of the screen).");
 
+// sa2-nx-ult (2026-11-20): Nuts & Bolts' address, behind the switch of N&B's other address hooks (FPS.cpp,
+// mnk_controls.cpp, me_ring_wait.cpp): in SA2 sub_821F99C0 is another function, which this hook (a pass-through with
+// single_tile off) kept from being copied or called directly.
+#if KATAMARI_BANJO_ADDRESS_HOOKS
 REX_EXTERN(__imp__sub_821F99C0);
 REX_HOOK_RAW(sub_821F99C0) {
   __imp__sub_821F99C0(ctx, base);
@@ -284,3 +288,4 @@ REX_HOOK_RAW(sub_821F99C0) {
     ctx.r3.u64 = 1;
   }
 }
+#endif  // KATAMARI_BANJO_ADDRESS_HOOKS
