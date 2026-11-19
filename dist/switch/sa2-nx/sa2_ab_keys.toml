@@ -1,0 +1,17 @@
+# Sonic Adventure 2 (sa2-nx on the ultimate base): the test configuration. Copy it over sa2.toml next to sa2.nro for a
+# console test, and send back the logs folder afterwards (logs\ next to the NRO). Your own sa2.toml is the play
+# configuration (configs\sa2_play.toml is the same as the one in the package).
+# These keys come first (above the first table, [input_p1]); the player's settings follow.
+
+# Logs: the file log, written by its own thread (the game thread never waits for the SD card).
+log_level = "info"
+log_file_writer = true
+# The CPU sampler: every thread's code addresses into logs\rex\rex_profile.log, 1 ms apart (the hot-function step reads
+# it with the ELF of the package, sa2-nx.elf).
+switch_profile_stacks = true
+
+# An in-run A/B (the base's): the targets named here are switched off for banjo_renut_ab_s seconds, then on again,
+# in turn, and the log's frame-time lines say which half each frame was in. Empty: none.
+banjo_renut_ab_targets = ""
+banjo_renut_ab_s = 30
+
