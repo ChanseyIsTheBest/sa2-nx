@@ -282,6 +282,12 @@ void MaybeSummaryIo(uint64_t now_us) {
       "files with a window",
       d.misses_in_dry, d.stats_in_sd, d.swept_in_sd, paths.inputs_in_tree, d.hits,
       d.filled, d.direct, d.bytes_ram / (1024.0 * 1024.0), window.live_windows);
+  // culdcept-nx (2026-11-20): since startup.
+  const auto keep = rex::filesystem::ReadStatsKeepOpen();
+  REXKRNL_INFO(
+      "[io] keep-open: {} opens reused a parked handle, {} closes parked theirs, {} closed beyond the cap, {} parked "
+      "now; {} size queries answered without a stat",
+      keep.reused, keep.parked, keep.evicted, keep.live, keep.restats_skipped);
 
   /*
    * The line that tells whether a block cache is worth it and whether the window has anything to do.

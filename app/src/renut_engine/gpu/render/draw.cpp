@@ -94,6 +94,12 @@ REXCVAR_DEFINE_STRING(banjo_renut_diag_stream_dump_vs, "", "Banjo/Renut",
 REXCVAR_DEFINE_INT32(banjo_renut_diag_draw_log_s, 0, "Banjo/Renut",
                      "Diagnostic: this many seconds after the first draw, log every draw of the next two frames "
                      "([drawlog]: shaders, counts, target, state; 0 = off)");
+// culdcept-nx (2026-11-19): a window for the draw log (a fade whose second varies from run to run), clears logged too.
+REXCVAR_DEFINE_INT32(banjo_renut_diag_draw_log_until_s, 0, "Banjo/Renut",
+                     "Diagnostic: with banjo_renut_diag_draw_log_s, log one frame in every banjo_renut_diag_draw_log_every "
+                     "up to this second (0 = the two frames only); clears are logged with the draws");
+REXCVAR_DEFINE_INT32(banjo_renut_diag_draw_log_every, 6, "Banjo/Renut",
+                     "Diagnostic: the draw log's window takes one frame in this many");
 REXCVAR_DEFINE_STRING(banjo_renut_diag_blend_skip_exclude, "", "Banjo/Renut",
                       "Diagnostic: pixel shader hashes (hex, comma separated) banjo_gpu_blend_skip leaves alone");
 
@@ -322,6 +328,12 @@ REXCVAR_DEFINE_BOOL(banjo_renut_fast_draw, true, "Banjo/Enhancements",
                     "the render thread's epochs say changed (FastDrawLocked); new targets, declarations, the "
                     "predication, Draw*UP, points, tessellation, memexport, the fur, the composite and range geometry "
                     "keep DrawStateLocked. A/B target 25. Off: DrawStateLocked for every draw")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// culdcept-nx (2026-11-19): see FastForceFields.
+REXCVAR_DEFINE_STRING(banjo_renut_diag_fast_force, "", "Banjo/Renut",
+                      "Diagnostic: 'from-to:mask;...' (seconds after the first fast-draw check, a hexadecimal DrawField "
+                      "mask): in each window every fast draw takes those field bits as changed, whatever its chain "
+                      "says; each window's start is logged ([fastforce]). Empty: off")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 // banjo-nx (2026-10-27): the shadow-path census (draw.h DrawKindsReport).
 REXCVAR_DEFINE_BOOL(banjo_renut_diag_draw_kinds, false, "Banjo/Diagnostics",
@@ -9435,6 +9447,11 @@ VertexDeclarationRecord &NoDeclaration() {
 constexpr u32 kDeviceDeclarationOffset = 12568;
 constexpr u32 kDeclarationElementsOffset = 52;
 constexpr u32 kDeviceDeclarationMaxElements = 15;
+// culdcept-nx (2026-11-19): draw.h's field map counts these bytes as the declaration (FieldOfOffset).
+static_assert(kDeviceOwnDeclarationBegin == kDeviceDeclarationOffset &&
+              kDeviceOwnDeclarationEnd == kDeviceDeclarationOffset + kDeclarationElementsOffset +
+                                              kDeviceDeclarationMaxElements * 12 &&
+              kDeviceOwnDeclarationEnd <= d3d::kDeviceSnapshotSize);
 
 const VertexDeclarationRecord *DeviceDeclarationLocked(const GuestDevice &device) {
   static std::unordered_map<uint64_t, std::unique_ptr<VertexDeclarationRecord>> records;
@@ -9871,24 +9888,46 @@ bool DrawsWithoutPixelShader(const GuestDevice &device, const Targets &t, const 
   return ((color_control >> 4) & 1) == 0;  // alpha to coverage, as MakeKey's
 }
 
+// Whether the draw log takes this frame: banjo_renut_diag_draw_log_s seconds after its first call, the next two frames;
+// culdcept-nx (2026-11-19, the battle's end fade, whose second varies from run to run): with
+// banjo_renut_diag_draw_log_until_s past it, one frame in every banjo_renut_diag_draw_log_every up to that second.
+bool DrawLogFrameLocked(uint64_t frame) {
+  static const int32_t at = REXCVAR_GET(banjo_renut_diag_draw_log_s);
+  if (at <= 0)
+    return false;
+  static const int32_t until = REXCVAR_GET(banjo_renut_diag_draw_log_until_s);
+  static const uint64_t every = uint64_t(std::max(1, REXCVAR_GET(banjo_renut_diag_draw_log_every)));
+  static const auto start = std::chrono::steady_clock::now();
+  static uint64_t first_frame = 0;
+  static bool done = false;
+  if (done)
+    return false;
+  const auto now = std::chrono::steady_clock::now();
+  if (!first_frame) {
+    if (now - start < std::chrono::seconds(at))
+      return false;
+    first_frame = frame + 1;  // from the next whole frame
+  }
+  if (frame < first_frame)
+    return false;
+  if (until > at) {
+    if (now - start >= std::chrono::seconds(until)) {
+      done = true;
+      return false;
+    }
+    return (frame - first_frame) % every == 0;
+  }
+  return frame <= first_frame + 1;
+}
+
 // banjo-nx (2026-10-18, matching RenderDoc captures of Ryujinx to the game's shaders): banjo_renut_diag_draw_log_s
 // seconds after the first draw, every draw of the next two frames: its shaders, counts, target and state, in order.
 void DrawLog(const DrawCall &call, const Geometry &geometry, const ShaderRecord *vs, const ShaderRecord *ps,
              const Targets &targets, const PipelineKey &key, const SharedConstants &sc, u32 export_count) {
-  static const int32_t at = REXCVAR_GET(banjo_renut_diag_draw_log_s);
-  if (at <= 0)
-    return;
-  static const auto start = std::chrono::steady_clock::now();
-  static uint64_t first_frame = 0;
   static uint32_t ordinal = 0;
   static uint64_t ordinal_frame = 0;
   const uint64_t frame = TextureFrameLocked();
-  if (!first_frame) {
-    if (std::chrono::steady_clock::now() - start < std::chrono::seconds(at))
-      return;
-    first_frame = frame + 1;  // from the next whole frame
-  }
-  if (frame < first_frame || frame > first_frame + 1)
+  if (!DrawLogFrameLocked(frame))
     return;
   if (frame != ordinal_frame) {
     ordinal_frame = frame;
@@ -9896,13 +9935,14 @@ void DrawLog(const DrawCall &call, const Geometry &geometry, const ShaderRecord 
   }
   const HostSurface *c0 = targets.color_count ? targets.colors[0] : nullptr;
   RGPU_INFO("[drawlog] frame {} draw {}: vs {:016X} ps {:016X} prim {} count {} -> {} {} inst {}{} target {}x{} fmt {} "
-            "x{} depth {} dc {:08X} blend {:08X} mask {:X} a2c {} vfetch {} bytes, exports {}",
+            "x{} depth {} dc {:08X} blend {:08X} mask {:X} a2c {} vfetch {} bytes, exports {}; colour at {:08X}, depth at "
+            "{:08X}",
             frame, ordinal++, vs ? vs->hash : 0, ps ? ps->hash : 0, call.primitive, call.count,
             geometry.indexed ? "indices" : "vertices", geometry.indexed ? geometry.index_count : geometry.vertex_count,
             geometry.instance_count, call.tessellation ? " tess" : "", c0 ? c0->width : 0, c0 ? c0->height : 0,
             c0 ? int(c0->format) : -1, targets.color_count, targets.depth ? int(targets.depth->format) : -1,
             key.depth_control, key.blend_control[0], key.color_mask, key.alpha_to_coverage, sc.vertex_fetch_bytes,
-            export_count);
+            export_count, c0 ? c0->guest_va : 0, targets.depth ? targets.depth->guest_va : 0);
 }
 
 #if defined(PLUME_DEKO3D)
@@ -10570,6 +10610,53 @@ uint64_t g_fast_pipeline_hits = 0, g_fast_pipeline_misses = 0;  // the 10 s line
 // from before an invalidation (generation).
 uint64_t g_fast_pipeline_miss_why[4] = {};
 uint64_t g_fast_draws = 0, g_full_draws = 0, g_fast_why[16] = {};  // the 10 s line's
+// culdcept-nx (2026-11-19, the board's stale 2D panels with the fast draw): banjo_renut_diag_fast_force's windows, the
+// field bits every fast draw takes as changed in each (a bisection of the fast draw's kept state in one run).
+u32 FastForceFields() {
+  struct Window {
+    double from, to;
+    u32 mask;
+  };
+  static const std::vector<Window> windows = [] {
+    std::vector<Window> w;
+    const std::string spec = REXCVAR_GET(banjo_renut_diag_fast_force);
+    size_t at = 0;
+    while (at < spec.size()) {
+      size_t end = spec.find(';', at);
+      if (end == std::string::npos)
+        end = spec.size();
+      const std::string item = spec.substr(at, end - at);
+      at = end + 1;
+      const size_t dash = item.find('-'), colon = item.find(':');
+      if (dash == std::string::npos || colon == std::string::npos || colon < dash)
+        continue;
+      Window x;
+      x.from = std::strtod(item.substr(0, dash).c_str(), nullptr);
+      x.to = std::strtod(item.substr(dash + 1, colon - dash - 1).c_str(), nullptr);
+      x.mask = u32(std::strtoul(item.substr(colon + 1).c_str(), nullptr, 16));
+      w.push_back(x);
+    }
+    return w;
+  }();
+  if (windows.empty())
+    return 0;
+  static const auto start = std::chrono::steady_clock::now();
+  const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  int index = -1;
+  u32 mask = 0;
+  for (size_t i = 0; i < windows.size(); ++i)
+    if (t >= windows[i].from && t < windows[i].to) {
+      index = int(i);
+      mask = windows[i].mask;
+      break;
+    }
+  static int last = -2;
+  if (index != last) {
+    last = index;
+    RGPU_INFO("[fastforce] {:.1f} s after the first fast-draw check: window {} forces the fields {:05X}", t, index, mask);
+  }
+  return mask;
+}
 
 // The reasons a draw went to DrawStateLocked, by the first met (the 10 s line).
 enum FastWhy : u32 {
@@ -10877,7 +10964,7 @@ int FastDrawLocked(const u8 *device_state, const DrawCall &call, const ReplayCon
   const bool point = call.primitive == kPointList;
   if (call.tessellation || (point && !PointFastDrawOn()))
     return FastMiss(kFastCall);
-  const u32 fields = chain.fields;
+  const u32 fields = chain.fields | FastForceFields();  // culdcept-nx: banjo_renut_diag_fast_force
   // banjo-nx (2026-10-28, per-draw night): the predication is one of the viewport's inputs below (the viewport is all
   // that reads it); A/B 61's off half sends the draw the full way as before.
   if ((fields & kFieldPredication) && ab == 61)
@@ -15878,6 +15965,15 @@ void ClearTargetsLocked(const u32 *target_words, const float *viewport, u32 flag
   Targets targets;
   if (!GatherTargetsWords(target_words, targets))
     return;
+  if (DrawLogFrameLocked(TextureFrameLocked())) {  // culdcept-nx (2026-11-19): the draw log's window takes clears too
+    const HostSurface *c0 = targets.color_count ? targets.colors[0] : nullptr;
+    RGPU_INFO("[drawlog] frame {} clear flags {:X} (colour {:.3f} {:.3f} {:.3f} {:.3f}, depth {:.4f}, stencil {}) rect {} {} "
+              "{} {}: colour at {:08X} {}x{}, depth at {:08X}",
+              TextureFrameLocked(), flags, color ? color[0] : 0.0f, color ? color[1] : 0.0f, color ? color[2] : 0.0f,
+              color ? color[3] : 0.0f, depth, stencil, rect ? rect->x1 : -1, rect ? rect->y1 : -1, rect ? rect->x2 : -1,
+              rect ? rect->y2 : -1, c0 ? c0->guest_va : 0, targets.width, targets.height,
+              targets.depth ? targets.depth->guest_va : 0);
+  }
 
   // D3D clamps clears to the viewport (CDevice viewport floats at 0x3170; blur-nx: 0x3218, kClearViewportOffset).
   ClearRect r = rect ? *rect : ClearRect{0, 0, int32_t(targets.width), int32_t(targets.height)};
@@ -16247,6 +16343,11 @@ void ResolveTargetsLocked(const u32 *targets, u32 flags, const ClearRect *source
               surface->depth ? "depth" : "colour", source_va, surface->width, surface->height, u32(surface->format),
               u32(surface->samples), dest_texture_va, dest_x, dest_y, dest_level, dest_slice, r.x1, r.y1, r.x2, r.y2,
               flags, (flags & 0x100) ? "clear colour after " : "", (flags & 0x200) ? "clear depth after" : "");
+  }
+  if (surface && DrawLogFrameLocked(TextureFrameLocked())) [[unlikely]] {  // culdcept-nx (2026-11-19): the draw log's window
+    RGPU_INFO("[drawlog] frame {} resolve {} at {:08X} ({}x{}) -> texture {:08X}, flags {:X}{}{}", TextureFrameLocked(),
+              surface->depth ? "depth" : "colour", surface->guest_va, surface->width, surface->height, dest_texture_va,
+              flags, (flags & 0x100) ? ", clears the colour after" : "", (flags & 0x200) ? ", clears depth after" : "");
   }
   plume::RenderCommandList *cmd = s.command_list;
   static uint32_t depth_logged = 0;
@@ -16639,6 +16740,13 @@ void ResolveTargetsLocked(const u32 *targets, u32 flags, const ClearRect *source
     // clean; with only the colour cleared each model was depth-tested against the last one's depth. Noted by Kameo:
     // RePowered (MaxDeadBear, BiRabittoh; MIT).
     const u32 other_flags = surface->depth ? clear_flags & 1u : clear_flags & 0x30u;
+    if (DrawLogFrameLocked(TextureFrameLocked())) [[unlikely]] {  // culdcept-nx (2026-11-19): the draw log's window
+      HostSurface *o = GetHostSurfaceLocked(targets[surface->depth ? 0 : 4]);
+      RGPU_INFO("[drawlog] frame {} resolve-clear of {} at {:08X}: flags {:X}, the other ({}) {:08X}{}",
+                TextureFrameLocked(), surface->depth ? "depth" : "colour", surface->guest_va, clear_flags,
+                surface->depth ? "colour" : "depth", o ? o->guest_va : 0,
+                other_flags ? (o && o != surface ? " cleared too" : " not found") : " not asked");
+    }
     if (banjo::renut_gpu::ResolveClearsBothOn() && other_flags) {
       HostSurface *other = GetHostSurfaceLocked(targets[surface->depth ? 0 : 4]);  // M-35: render target 0 or depth
       if (other && other != surface) {

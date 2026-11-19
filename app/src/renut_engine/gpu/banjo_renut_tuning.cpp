@@ -314,12 +314,12 @@ REXCVAR_DEFINE_INT32(banjo_renut_render_height_handheld, 720, "Banjo/Enhancement
                      "Frames without that composite for half a second (menus, loading) are drawn at the display's "
                      "resolution whole. Shadow maps and the post-processing buffers keep the console's sizes. From the "
                      "next frame")
-    .range(480, 1080);
+    .range(360, 1080);  // port 196 (S4ep1-nx's): from 480; a game drawing 1920x1080 is half at 360 (960x540)
 REXCVAR_DEFINE_INT32(banjo_renut_render_height_docked, 720, "Banjo/Enhancements",
                      "NOT exact, the user's request (2026-10-21): banjo_renut_render_height_handheld for docked mode "
                      "(864 = 1536x864, 1.2x the game's; 900 = 1600x900; with banjo_renut_display_height_docked = 1080 "
                      "the HUD at 1920x1080). From the next frame on deko3d (blur-nx 2026-11-18), else read at start")
-    .range(480, 1080);
+    .range(360, 1080);  // port 196 (S4ep1-nx's): from 480
 REXCVAR_DEFINE_INT32(banjo_renut_display_height_docked, 720, "Banjo/Enhancements",
                      "The display's resolution when docked on deko3d (2026-10-21; the swapchain change from sa2-nx "
                      "1.0.3.1): 720 = 1280x720, which the console scales to the TV; 1080 = the swapchain made at "

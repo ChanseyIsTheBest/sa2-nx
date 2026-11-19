@@ -35,6 +35,12 @@
 #include "renut_engine/gpu/log.h"
 #include "renut_engine/gpu/backend/render_thread.h"
 #include "renut_engine/gpu/guest/resources.h"
+
+// renut-ultimate (2026-11-20, port 196): TFU-nx's (via S4ep1-nx, github.com/FurryLilManChild/S4ep1-nx, GPL-3.0).
+REXCVAR_DEFINE_BOOL(banjo_renut_shader_get_function, false, "Banjo/Enhancements",
+                    "Keep each shader's container (its virtual and physical parts) when it is made, for "
+                    "D3D{Vertex,Pixel}Shader_GetFunction_hook (a game that reads its shaders' microcode back, as "
+                    "TFU-nx's does). On only in a port that binds those hooks; off, nothing is kept");
 #include "renut_engine/gpu/lean_mutex.h"  // blur-nx (2026-11-17, audit #8)
 #include "renut_engine/gpu/render/pipeline.h"
 #include "renut_engine/gpu/render/shader_library.h"
@@ -730,7 +736,8 @@ u32 Fetch3DMask(const u8 *container) {
 // renut-ultimate: a 0x11 container only (a 0x0E one's header is laid out otherwise: no export mode read there).
 bool ContainerIsExportOnly(const uint8_t *container) {
   const auto *header = reinterpret_cast<const d3d::ShaderContainer *>(container);
-  if ((u32(header->flags) & 0xFFFFFF00u) != 0x102A1100u)
+  // culdcept-nx: version 0x10 too (XDK 2.0.3424: the same shader info as 0x11).
+  if ((u32(header->flags) & 0xFFFFFF00u) != 0x102A1100u && (u32(header->flags) & 0xFFFFFF00u) != 0x102A1000u)
     return false;
   const u32 word_offset = u32(header->shaderOffset) + 8;
   if (word_offset + 4 > u32(header->virtualSize))
@@ -745,7 +752,9 @@ u32 CreateShaderRecord(const be_u32 *function, bool pixel) {
   const auto *header = reinterpret_cast<const d3d::ShaderContainer *>(container);
   // kameo-nx (2026-11-02, from feedingfrenzy-nx): version 0x0E too (XDK 2135 and 2571); the translator reads it through
   // XenosRecomp/container_0e.h, and only the sizes are read here.
-  if ((u32(header->flags) & 0xFFFFFF00u) != 0x102A1100u && (u32(header->flags) & 0xFFFFFF00u) != 0x102A0E00u) {
+  // culdcept-nx (2026-11-19): version 0x10 too (XDK 2.0.3424's run-time compiler; XenosRecomp/container_10.h).
+  if ((u32(header->flags) & 0xFFFFFF00u) != 0x102A1100u && (u32(header->flags) & 0xFFFFFF00u) != 0x102A0E00u &&
+      (u32(header->flags) & 0xFFFFFF00u) != 0x102A1000u) {
     RGPU_ERROR("Create{}Shader: not a shader container (flags {:08X})", pixel ? "Pixel" : "Vertex",
                u32(header->flags));
     return 0;
@@ -760,6 +769,10 @@ u32 CreateShaderRecord(const be_u32 *function, bool pixel) {
   shader->x360.resource.ReferenceCount = 1u;
 
   shader->hash = HashShaderContainer(container);
+  // Port 196 (TFU-nx's): kept for GetFunction (below), with banjo_renut_shader_get_function.
+  static const bool keep_container = REXCVAR_GET(banjo_renut_shader_get_function);
+  if (keep_container)
+    shader->container.assign(container, container + u32(header->virtualSize) + u32(header->physicalSize));
   shader->entry = FindShaderEntry(shader->hash);
   shader->fetch_3d_mask = Fetch3DMask(container);  // kameo-nx (2026-11-03)
   shader->export_only = !pixel && ContainerIsExportOnly(container);  // vivapinata-nx (2026-11-03)
@@ -785,7 +798,8 @@ void RegisterGuestShader(u32 shader_va, u32 physical_va, bool pixel) {
   const u32 flags = header->flags;
   const u32 virtual_size = header->virtualSize;
   const u32 physical_size = header->physicalSize;
-  if (((flags & 0xFFFFFF00u) != 0x102A1100u && (flags & 0xFFFFFF00u) != 0x102A0E00u) || ((flags & 1) != 0) == pixel ||  // kameo-nx
+  if (((flags & 0xFFFFFF00u) != 0x102A1100u && (flags & 0xFFFFFF00u) != 0x102A0E00u &&
+       (flags & 0xFFFFFF00u) != 0x102A1000u) || ((flags & 1) != 0) == pixel ||  // kameo-nx; culdcept-nx: 0x10
       virtual_size < sizeof(d3d::ShaderContainer) || virtual_size > 0x10000 ||
       physical_size == 0 || physical_size > 0x100000) {
     RGPU_ERROR("XGRegister{}Shader {:08X}: no shader container at {:08X} (flags {:08X})",
@@ -951,6 +965,36 @@ void D3DVertexShader_Bind_hook(u32 shader_va, u32 declaration_va, mapped_u32 str
 [[maybe_unused]] void D3DVertexShader_Bind_flags_hook(u32 shader_va, u32 /*flags*/, u32 declaration_va,
                                                       mapped_u32 stream_strides, u32 /*index*/) {
   D3DVertexShader_Bind_hook(shader_va, declaration_va, stream_strides);
+}
+
+// Port 196 (TFU-nx's of 2026-11-11, via S4ep1-nx): void D3D{Vertex,Pixel}Shader_GetFunction(shader, void *pData,
+// UINT *pSizeOfData). The Force Unleashed reads shader microcode back right after creating it. The originals read the
+// guest object's layout (the container copy at +0x368 / +0x28, the physical part's pointer at +0x20 / +0x18), which a
+// Renut record does not have: TFU's first Renut boot's memcpy ran 3.7 GB off the end of .data. With pData null the size
+// goes to *pSizeOfData; otherwise the container is copied to pData. Not bound here (Katamari does not link them); a port
+// whose game calls them binds both at their addresses with banjo_renut_shader_get_function on:
+//   BANJO_RENUT_HOOK(sub_<its address>, D3DVertexShader_GetFunction_hook);
+// A shader object the game laid out itself (XGRegister*Shader) has no record: then RenutShaderGetFunction returns false
+// and the port calls the original it imports (TFU-nx's GuestVertexShaderGetFunction).
+[[maybe_unused]] bool RenutShaderGetFunction(u32 shader_va, u32 data, u32 size_out, bool pixel) {
+  auto *record = FindRecord<ShaderRecord>(shader_va, pixel ? RecordKind::PixelShader : RecordKind::VertexShader);
+  if (!record || record->container.empty())
+    return false;
+  const u32 size = u32(record->container.size());
+  if (!data) {
+    if (auto *out = GuestPtr<be_u32>(size_out))
+      *out = size;
+    return true;
+  }
+  if (u8 *to = GuestPtr<u8>(data))
+    std::memcpy(to, record->container.data(), size);
+  return true;
+}
+[[maybe_unused]] void D3DVertexShader_GetFunction_hook(u32 shader, u32 data, u32 size_out) {
+  RenutShaderGetFunction(shader, data, size_out, false);
+}
+[[maybe_unused]] void D3DPixelShader_GetFunction_hook(u32 shader, u32 data, u32 size_out) {
+  RenutShaderGetFunction(shader, data, size_out, true);
 }
 
 // Port 173 (from rehatched-nx, its commit 4b3295a9: Angry Birds' crash at the end of level 1): void

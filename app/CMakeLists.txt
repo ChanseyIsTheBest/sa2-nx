@@ -197,8 +197,13 @@ endif()
 # katamari-nx (2026-10-30): banjo-nx's app without the files written for N&B's addresses (its cheats and mid-asm
 # hooks, title update and DLC, the D3D hook layer of banjo-nx's PM4 renderer, its XAudio and hand-written natives, the
 # shader harvest): src/katamari_keys.cpp defines the keys of those files that the kept ones still read.
+# renut-ultimate (2026-11-20, port 193): the game's name in the build stamp (src/build_stamp.cpp) and the NRO's title. A
+# port sets its own here.
+set(RENUT_GAME_NAME "Sonic Adventure 2")
+
 set(RENUT_SOURCES
     src/main.cpp
+    src/build_stamp.cpp  # port 193: the build stamp, the first line of every log (cmake/build_stamp.cmake)
     # sa2-nx-ult (2026-11-19): SA2's game layer (docs/ultimate-rebase-plan.md). sa2_keys.cpp: the keys the kept base
     # files read (katamari_keys.cpp's, which it replaces) and 1.0.6's renamed player keys; sa2_controls.cpp: OpenSA2's
     # control options (sa2-nx 1.0.5).
@@ -280,6 +285,24 @@ list(APPEND RENUT_SOURCES icon/app.rc)
 else()
     add_executable(renut ${RENUT_SOURCES})
 endif()
+
+# Port 193 (TFU-nx's): the build stamp header, rewritten on every build when its text changes (a custom target with no
+# output runs every time; the script leaves the header alone when the commit is the same).
+if(REXGLUE_PLATFORM_SWITCH)
+    set(RENUT_BUILD_KIND "switch")
+else()
+    set(RENUT_BUILD_KIND "pc")
+endif()
+set(RENUT_BUILD_STAMP_DIR "${CMAKE_CURRENT_BINARY_DIR}/build_stamp")
+add_custom_target(renut_build_stamp
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${RENUT_BUILD_STAMP_DIR}"
+    COMMAND "${CMAKE_COMMAND}" "-DOUT=${RENUT_BUILD_STAMP_DIR}/build_stamp.h" "-DROOT=${CMAKE_CURRENT_SOURCE_DIR}/.."
+            "-DKIND=${RENUT_BUILD_KIND}" "-DNAME=${RENUT_GAME_NAME}" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_stamp.cmake"
+    BYPRODUCTS "${RENUT_BUILD_STAMP_DIR}/build_stamp.h"
+    VERBATIM)
+add_dependencies(renut renut_build_stamp)
+target_include_directories(renut PRIVATE "${RENUT_BUILD_STAMP_DIR}")
+set_source_files_properties(src/build_stamp.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
 # GPU_PLUGINS stages the emulated-GPU backend (rexgpu-xenos.dll) next to the exe.
 # It is only used when the gpu_plugin cvar is "xenos"; empty means no GPU at all
@@ -975,7 +998,7 @@ if(REXGLUE_PLATFORM_SWITCH)
     # is switch/sa2-nx/sa2.nro, as 1.0.6's (tools/sa2_package.ps1 copies it under that name). "1.0.6-ult": the rebase
     # on the ultimate base, until a release is decided.
     rexglue_switch_add_nro(renut
-        NAME "Sonic Adventure 2"
+        NAME "${RENUT_GAME_NAME}"  # port 193: set once, above
         AUTHOR "ChanseyIsTheBest"
         VERSION "1.0.6-ult"
         ${RENUT_ICON_ARG})

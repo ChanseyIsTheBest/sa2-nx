@@ -120,6 +120,9 @@ constexpr size_t kMaxSamples = 1 << 15;
 constexpr size_t kFrames = 10;
 // 0-32 renderer/audio counters (see RexSwitchPerfAdd); 40-55 host-runtime overhead (include/rex/sys_counters.h).
 constexpr unsigned kCounterCount = 64;
+}  // namespace
+extern "C" const char* RexAppBuildStamp(void);  // port 193: switch_crash_hooks.c (weak), app/src/build_stamp.cpp
+namespace {
 // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
 std::string ReportPath() {
   return std::string(RexSwitchLogDir()) + "rex_profile.log";
@@ -1151,7 +1154,14 @@ void ProfilerMain(void*) {
   for (unsigned i = 0; i < kCounterCount; ++i) {
     counters_last[i] = CounterRead(i);
   }
+  // Port 193 (TFU-nx's): the last launch's report kept as rex_profile.prev.log, and the build stamp first.
+  {
+    const std::string prev = std::string(RexSwitchLogDir()) + "rex_profile.prev.log";
+    std::remove(prev.c_str());
+    if (std::rename(ReportPath().c_str(), prev.c_str()) != 0) std::remove(ReportPath().c_str());
+  }
   if (FILE* f = std::fopen(ReportPath().c_str(), "w")) {
+    std::fprintf(f, "%s\n", RexAppBuildStamp());
     std::fprintf(f, "image 0x%016" PRIx64 ", code up to 0x%016" PRIx64 "\n\n", g_base,
                  g_text_hi);
     std::fprintf(f, "Stack sampling: %s (%u ms)\n", sample_stacks ? "active" : "disabled",

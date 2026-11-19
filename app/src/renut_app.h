@@ -67,6 +67,8 @@ void RexSwitchApmApply(void);
 }
 #endif
 
+extern "C" const char* RexAppBuildStamp(void);  // port 193 (TFU-nx's): src/build_stamp.cpp
+
 class RenutApp : public rex::ReXApp {
 public:
     RenutApp(rex::ui::WindowedAppContext& ctx, std::string_view name, rex::PPCImageInfo info)
@@ -126,6 +128,7 @@ public:
         fps_dialog_ = std::make_unique<FpsOverlayDialog>(drawer);
         fps_dialog_->fpsManager = &fpsManager;
         fpsManager.showFPS = REXCVAR_GET(banjo_show_fps);  // banjo-nx (2026-10-21)
+        fpsManager.GetCreateCounter("Shown");  // port 196 (S4ep1-nx's): made here, before the display thread ticks it
         drawer->AddDialog(fps_dialog_.get());
         drawer->AddDialog(new RenuLogOverlayDialog(drawer));
         // CPU/GPU profiler window ported from UnleashedRecomp (F5 / banjo_show_profiler).
@@ -224,6 +227,7 @@ public:
 #endif
 
     void OnPostSetup() override {
+        REXLOG_INFO("[build] {}", RexAppBuildStamp());  // port 193 (TFU-nx's): ties this log to its build
         // blur-nx (2026-11-17, #220; renut-ultimate port 151): the small-block arena, blur_small_alloc_mb (32 MB by
         // default, Blur's size; 0 in a game's toml turns it off). Before the DLC install, as Blur has it.
         blur::small_alloc::Enable();

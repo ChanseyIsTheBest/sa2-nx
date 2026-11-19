@@ -666,12 +666,17 @@ bool XmaContext::DecodeFrame(int prepared, int sample_rate, bool stereo) {
       chain_ok = true;
     }
   }
-  // blur-nx (2026-11-13, M-37): the report's clock read every 64 frames of a thread, not every frame.
-  if (static thread_local uint32_t frames = 0; (++frames & 63) == 0) {
-    static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
-    const auto now = std::chrono::steady_clock::now();
-    if (now - last >= std::chrono::seconds(10)) {
-      last = now;
+  // blur-nx (2026-11-13, M-37): the report's clock read every 64 frames, atomic across worker/fallback callers.
+  if (static std::atomic<uint32_t> frames{0}; (frames.fetch_add(1, std::memory_order_relaxed) & 63) == 0) {
+    static std::atomic<int64_t> last_ns{0};
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    int64_t prev_ns = last_ns.load(std::memory_order_relaxed);
+    if (prev_ns == 0) {
+      last_ns.compare_exchange_strong(prev_ns, now_ns, std::memory_order_relaxed);
+    } else if (now_ns - prev_ns >= 10'000'000'000LL &&
+               last_ns.compare_exchange_strong(prev_ns, now_ns, std::memory_order_relaxed)) {
       if (const std::string r = XmaFrameCacheReport(); !r.empty()) REXAPU_INFO("{}", r);
     }
   }
@@ -703,8 +708,8 @@ bool XmaContext::DecodeFrame(int prepared, int sample_rate, bool stereo) {
           ++c.chain_verified;
           if (std::memcmp(raw_frame_.data(), chain_raw_.data(), pcm_bytes) != 0) {
             ++c.chain_differ;
-            static uint32_t logged = 0;
-            if (logged++ < 16)
+            static std::atomic<uint32_t> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16)
               REXAPU_ERROR("banjo_xma_frame_cache_chain_verify: context {}: a frame the cache answered differs from "
                            "the full chain's", id_);
           }
@@ -744,8 +749,8 @@ bool XmaContext::DecodeFrame(int prepared, int sample_rate, bool stereo) {
       ++c.chain_verified;
       if (std::memcmp(raw_frame_.data(), chain_raw_.data(), pcm_bytes) != 0) {
         ++c.chain_differ;
-        static uint32_t logged = 0;
-        if (logged++ < 16)
+        static std::atomic<uint32_t> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16)
           REXAPU_ERROR("banjo_xma_frame_cache_chain_verify: context {}: a frame after the one-frame catch-up differs "
                        "from the full chain's", id_);
       }
@@ -755,8 +760,8 @@ bool XmaContext::DecodeFrame(int prepared, int sample_rate, bool stereo) {
       ++c.verified;
       if (std::memcmp(raw_frame_.data(), verify_pcm.data(), pcm_bytes) != 0) {
         ++c.differ;
-        static uint32_t logged = 0;
-        if (logged++ < 16)
+        static std::atomic<uint32_t> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16)
           REXAPU_ERROR("banjo_xma_frame_cache_verify: context {}: a cached frame differs from FFmpeg's decode", id_);
       }
     }
@@ -981,6 +986,7 @@ bool XmaContext::Work() {
   }
 
   uint8_t silence_reason = 0;  // Measurement only
+  uint32_t zero_output_iters = 0;
   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
     const uint32_t previous_offset = data.input_buffer_read_offset;
     const uint32_t previous_buffer = data.current_buffer;
@@ -990,6 +996,14 @@ bool XmaContext::Work() {
     Decode(&data);
     const uint32_t written = Consume(&output_rb, &data);
     output_bytes_written += written;
+    if (written != 0) {
+      zero_output_iters = 0;
+    } else if (++zero_output_iters >= 256) {
+      // Guard against pathological loops (e.g. loop_count=255 over undecodable frames) holding lock_.
+      data.error_status = 4;
+      silence_reason = 4;
+      break;
+    }
 
     // The last packet can leave several decoded subframes. If this returns with
     // PCM pending, the consumer may wait for a full block without advancing the
@@ -1319,12 +1333,15 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
     packet_info.current_frame_size_ = first_frame_offset - frame_offset;
   }
 
+  bool terminated = false;
   while (true) {
     if (stream.BitsRemaining() < kBitsPerFrameHeader) {
       // A header that starts here may continue in the next packet. Counting it
       // avoids marking the previous frame as the last one and skipping this one.
       // Decode will join both fragments to get its full size.
-      if (stream.BitsRemaining()) {
+      if (stream.BitsRemaining() &&
+          (!xma::IsPacketXma2Type(packet) ||
+           packet_info.frame_count_ < xma::GetPacketFrameCount(packet))) {
         if (stream.offset_bits() == frame_offset) {
           packet_info.current_frame_ = packet_info.frame_count_;
         }
@@ -1335,6 +1352,7 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
 
     const uint64_t frame_size = stream.Peek(kBitsPerFrameHeader);
     if (frame_size == 0 || frame_size == xma::kMaxFrameLength) {
+      terminated = true;
       break;
     }
 
@@ -1352,11 +1370,12 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
     stream.Advance(frame_size - 1);
 
     if (stream.Read(1) == 0) {
+      terminated = true;
       break;
     }
   }
 
-  if (xma::IsPacketXma2Type(packet)) {
+  if (!terminated && xma::IsPacketXma2Type(packet)) {
     const uint8_t xma2_frame_count = xma::GetPacketFrameCount(packet);
     if (xma2_frame_count > packet_info.frame_count_) {
       if (packet_info.current_frame_size_ == 0) {
@@ -1641,8 +1660,15 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     combined.SetOffset(relative_offset - kBitsPerPacketHeader);
 
     uint64_t frame_size = combined.Peek(kBitsPerFrameHeader);
-    if (frame_size == xma::kMaxFrameLength) {
-      data->error_status = 4;
+    if (frame_size == 0 || frame_size == xma::kMaxFrameLength) {
+      if (frame_size == xma::kMaxFrameLength &&
+          kBitsPerPacket - relative_offset >= kBitsPerFrameHeader) {
+        data->error_status = 4;
+        return;
+      }
+      if (!LoopWholeBuffer(data, next_packet_index, current_input_packet_count)) {
+        AdvanceInputPacket(data, next_packet_index);
+      }
       return;
     }
     packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
@@ -1656,7 +1682,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   if (bits_to_copy == 0) {
     REXAPU_ERROR("XmaContext {}: There are no bits to copy!", id());
-    SwapInputBuffer(data);
+    if (!LoopWholeBuffer(data, next_packet_index, current_input_packet_count)) {
+      AdvanceInputPacket(data, next_packet_index);
+    }
     return;
   }
 
@@ -1766,10 +1794,11 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
     return;
   }
 
-  if (!packet_info.isLastFrameInPacket()) {
-    const uint32_t next_frame_offset =
-        (data->input_buffer_read_offset + bits_to_copy) % kBitsPerPacket;
-    data->input_buffer_read_offset = (packet_index * kBitsPerPacket) + next_frame_offset;
+  const uint32_t next_bit =
+      data->input_buffer_read_offset + static_cast<uint32_t>(bits_to_copy);
+  const uint32_t packet_end_bit = (static_cast<uint32_t>(packet_index) + 1) * kBitsPerPacket;
+  if (!packet_info.isLastFrameInPacket() && next_bit < packet_end_bit) {
+    data->input_buffer_read_offset = next_bit;
     return;
   }
 

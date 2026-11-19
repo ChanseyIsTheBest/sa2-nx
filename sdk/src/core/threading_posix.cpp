@@ -123,6 +123,17 @@ REXCVAR_DEFINE_BOOL(thread_signal_skip_idle, true, "Threading",
                     "condition variable's notify (on Horizon always a syscall, svcSignalProcessWideKey, even with "
                     "nobody waiting): the waiters of each condition are counted under its own mutex. false = notify "
                     "on every signal, as before");
+// renut-ultimate (2026-11-20, port 192): TFU-nx's of 2026-11-13, as S4ep1-nx carries it (github.com/FurryLilManChild/
+// S4ep1-nx, GPL-3.0, 0.5.1). TFU's Switch test 8 had 11 % of the game's main thread inside NtReleaseSemaphore (the host
+// mutex and notify_all) in the scenes that missed 30 fps: notify_all woke every thread blocked on the semaphore for each
+// release; they all queued for its mutex, and each that took a count woke the rest again. A count wakes one thread now.
+// The base's other semaphore path, thread_semaphore_address_wait (port 148, off), hands units out itself and is not
+// changed by this.
+REXCVAR_DEFINE_BOOL(thread_semaphore_wake_one, true, "Threading",
+                    "Releasing a semaphore wakes one blocked thread per count released (and a thread that takes a "
+                    "count wakes the next only while counts are left), instead of every blocked thread. The same "
+                    "counts go to blocked threads; fewer wake-ups and less lock contention. false = notify_all as "
+                    "before");
 // renut-ultimate (2026-11-16, port 146; tw2de_nx's of 2026-10-25, ON at the user's word: "port the speed ups as on by default").
 REXCVAR_DEFINE_BOOL(thread_mutant_release_lockfree, true, "Threading",
                     "tw2de_nx (exact): a mutant's release takes its condition's mutex only when a thread is blocked on "
@@ -1012,7 +1023,16 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
     count_ += release_count;
     const uint32_t waiters = cond_waiters_;
     lock.unlock();
-    WakeWaiters(waiters);
+    static const bool wake_one = REXCVAR_GET(thread_semaphore_wake_one);  // port 192
+    if (wake_one && waiters != 0) {
+      // One wake per count, at most one per blocked thread. A woken thread checks the count under mutex_, so a wake
+      // that finds it taken by a thread that never blocked is harmless: that thread took the count instead.
+      for (uint32_t i = 0, n = std::min(release_count, waiters); i < n; ++i) {
+        cond_.notify_one();
+      }
+    } else {
+      WakeWaiters(waiters);  // nobody blocked: counted as an idle signal (thread_signal_skip_idle)
+    }
     NotifyMulti();
     return true;
   }
@@ -1088,6 +1108,14 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
     }
 #endif
     // Called by the waiter under mutex_ (it has left the count already): other waiters re-check the count.
+    // thread_semaphore_wake_one (port 192): the next blocked thread only while counts are left.
+    static const bool wake_one = REXCVAR_GET(thread_semaphore_wake_one);
+    if (wake_one) {
+      if (count_ > 0 && cond_waiters_ > 0) {
+        cond_.notify_one();
+      }
+      return;
+    }
     WakeWaiters(cond_waiters_);
   }
 #if defined(__SWITCH__)

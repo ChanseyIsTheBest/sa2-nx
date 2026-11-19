@@ -211,8 +211,12 @@ REXCVAR_DEFINE_BOOL(sasrt_renut_fixed16_clamp, true, "Banjo/Enhancements",
                     "console stores (unclamped, Sonic Transformed's highlights fed the bloom and exposure: pale and hazy)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
-// sasrt-nx (2026-10-20).
-REXCVAR_DEFINE_BOOL(sasrt_renut_depth_restore, true, "Banjo/Enhancements",
+// sasrt-nx (2026-10-20). renut-ultimate (2026-11-20, port 202): OFF by default under the rule of 2026-11-11
+// (docs/off-by-default.md section 1). S4ep1-nx (github.com/FurryLilManChild/S4ep1-nx, GPL-3.0, its 36c65f40) found it
+// draws Sonic 4's title sky white: its reflection pass draws a resolved depth back as colour into EDRAM the main pass's
+// depth target shares, and taken as the depth every sky and island draw above the horizon failed; its PC A/B with it
+// off gives the console's picture. Katamari never reaches it. sasrt-nx, which it was made for, sets it in its toml.
+REXCVAR_DEFINE_BOOL(sasrt_renut_depth_restore, false, "Banjo/Enhancements",
                     "From sasrt-nx: the EDRAM depth restore: a depth target bound over the EDRAM a 32-bit colour target wrote "
                     "since takes its words as its depth, as on the console, where they are one memory (a game drawing a "
                     "resolved depth back as colour to restore it). Off: the depth target keeps its own")

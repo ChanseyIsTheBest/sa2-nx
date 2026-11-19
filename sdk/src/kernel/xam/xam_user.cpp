@@ -13,8 +13,13 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <string>
+#include <utility>
 
 #include <rex/cvar.h>
 #include <rex/input/input.h>
@@ -31,6 +36,7 @@
 #include <rex/system/xenumerator.h>
 #include <rex/system/xio.h>
 #include <rex/system/xthread.h>
+#include <rex/system/thread_state.h>
 #include <rex/system/xtypes.h>
 
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
@@ -39,6 +45,16 @@ REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
 REXCVAR_DEFINE_BOOL(banjo_xam_profile_all_types, false, "Kernel",
                     "XamUserWriteProfileSettings keeps the int, int64, date, double, float and string settings too "
                     "(off: only the binary ones, as before)");
+// culdcept-nx (2026-11-19, the user: "I can't join multiplayer with a second controller"): what the game asks about users
+// 1-3 and what it is told, logged when an answer changes (and every sign-in screen).
+REXCVAR_DEFINE_BOOL(xam_user_trace, false, "Kernel",
+                    "Diagnostic: the game's questions about users 1-3 (sign-in state and info, XUID, name, privileges) "
+                    "and the answers, logged when an answer changes; every XamShowSigninUI");
+// culdcept-nx (2026-11-19): Culdcept Saga's Versus lobby opens the sign-in screen and took no entry (not even player
+// 1's) when no further pad was signed in: the screen "closed" (XN_SYS_UI off) without having "opened".
+REXCVAR_DEFINE_BOOL(xam_signin_ui_opens, false, "Kernel",
+                    "XamShowSigninUI sends XN_SYS_UI on before the sign-in change and XN_SYS_UI off, as the "
+                    "console's sign-in screen opens and closes. false: only the change and the off (as before)");
 REXCVAR_DEFINE_BOOL(xam_guest_signin, true, "Kernel",
                     "When the game opens the sign-in screen, every further connected controller (2 to 4) is signed "
                     "in as a guest of the profile, as choosing a guest on the console does. Off: only controller 1 "
@@ -144,6 +160,22 @@ std::string GuestName(uint32_t user_index) {
   return name + "(" + std::to_string(user_index) + ")";
 }
 
+// culdcept-nx (2026-11-19, xam_user_trace): one line when the answer to (question, user) changes.
+void TraceUser(const char* what, uint32_t user_index, uint64_t answer, uint64_t detail = 0) {
+  if (!REXCVAR_GET(xam_user_trace) || user_index == 0 || user_index > 4) return;  // 4: user 0 (the caller trace)
+  static std::mutex mutex;
+  static std::map<std::pair<std::string, uint32_t>, std::pair<uint64_t, int64_t>> last;
+  std::lock_guard<std::mutex> lock(mutex);
+  const auto key = std::make_pair(std::string(what), user_index);
+  const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch()).count();
+  const auto it = last.find(key);
+  // Logged when the answer changes, and otherwise at most once a second while the game keeps asking.
+  if (it != last.end() && it->second.first == (answer ^ (detail << 1)) && now - it->second.second < 1000) return;
+  last[key] = {answer ^ (detail << 1), now};
+  REXKRNL_INFO("[usertrace] {}(user {}) -> {:X} ({:X})", what, user_index, answer, detail);
+}
+
 // Signs in every connected controller beyond the first that is not signed in yet; the mask of all signed-in users.
 uint32_t SignInGuests() {
   uint32_t guests = g_guests.load(std::memory_order_relaxed);
@@ -160,7 +192,28 @@ uint32_t SignInGuests() {
   return 1u | guests;
 }
 
+// culdcept-nx (2026-11-19, the user's second controller in Culdcept Saga's Versus lobby): a controller that connects
+// after the game's sign-in screen is signed in as a guest too, and the game told (XN_SYS_SIGNINCHANGED), as a player
+// signing in through the Guide would. The lobby opens the sign-in screen once; a pad switched on after it had no profile
+// and its presses were ignored. Checked from XamInputGetState, at most every half second.
+std::atomic<bool> g_signin_screen_shown{false};
+
 }  // namespace
+
+void SignInLateGuests() {
+  if (!g_signin_screen_shown.load(std::memory_order_relaxed) || !REXCVAR_GET(xam_guest_signin)) return;
+  static std::atomic<int64_t> next_ms{0};
+  const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch()).count();
+  int64_t next = next_ms.load(std::memory_order_relaxed);
+  if (now < next || !next_ms.compare_exchange_strong(next, now + 500)) return;
+  const uint32_t before = g_guests.load(std::memory_order_relaxed);
+  const uint32_t mask = SignInGuests();
+  if ((mask & ~1u) != before) {
+    REXKRNL_INFO("[XAM] signed in after the sign-in screen: users {:04b}; the game told (XN_SYS_SIGNINCHANGED)", mask);
+    REX_KERNEL_STATE()->BroadcastNotification(0x0000000A, mask);
+  }
+}
 
 i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   assert_true(type_mask == 1 || type_mask == 2 || type_mask == 3 || type_mask == 4 ||
@@ -191,6 +244,7 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
     result = X_E_INVALIDARG;
   }
   *xuid_ptr = xuid;
+  TraceUser("XamUserGetXUID", user_index, result, xuid);
   return result;
 }
 
@@ -204,6 +258,17 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
       signin_state = 1;  // signed in locally
     }
   }
+  if (REXCVAR_GET(xam_user_trace) && user_index < 4) {  // culdcept-nx: the guest caller, once a second per (user, caller)
+    auto* ppc = rex::runtime::current_ppc_context();
+    const uint32_t lr = uint32_t(ppc->lr);
+    // The caller's caller: a leaf-framed wrapper (stwu -96, lr saved at -8 of the caller's r1) keeps it at r1 + 88.
+    const uint32_t r1 = uint32_t(ppc->r1.u32);
+    const uint32_t up = r1 ? rex::memory::load_and_swap<uint32_t>(REX_KERNEL_MEMORY()->TranslateVirtual(r1 + 88)) : 0;
+    char what[64];
+    std::snprintf(what, sizeof(what), "XamUserGetSigninState from %08X < %08X", lr, up);
+    TraceUser(what, user_index == 0 ? 4 : user_index, signin_state);
+  }
+  TraceUser("XamUserGetSigninState", user_index, signin_state);
   return signin_state;
 }
 
@@ -230,9 +295,11 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
     info->unk10 = static_cast<uint32_t>(user_index);  // dwGuestNumber
     info->unk14 = 0;                                  // dwSponsorUserIndex
     rex::string::copy_truncating(info->name, GuestName(user_index), rex::countof(info->name));
+    TraceUser("XamUserGetSigninInfo", user_index, X_E_SUCCESS, flags);
     return X_E_SUCCESS;
   }
   if (user_index) {
+    TraceUser("XamUserGetSigninInfo", user_index, X_E_NO_SUCH_USER, flags);
     return X_E_NO_SUCH_USER;
   }
 
@@ -574,12 +641,14 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
     }
 
     if (user_index && !IsGuest(user_index)) {
+      TraceUser("XamUserCheckPrivilege", user_index, X_ERROR_NO_SUCH_USER, mask);
       return X_ERROR_NO_SUCH_USER;
     }
   }
 
   // If we deny everything, games should hopefully not try to do stuff.
   *out_value = 0;
+  TraceUser("XamUserCheckPrivilege", user_index == 0xFF ? 1 : user_index, X_ERROR_SUCCESS, mask);
   return X_ERROR_SUCCESS;
 }
 
@@ -672,12 +741,19 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32 
 }
 
 u32 XamShowSigninUI_entry(u32 unk, u32 unk_mask) {
+  if (REXCVAR_GET(xam_user_trace)) {
+    REXKRNL_INFO("[usertrace] XamShowSigninUI(panes {}, flags {:08X})", uint32_t(unk), uint32_t(unk_mask));
+  }
   // Mask values vary. Probably matching user types? Local/remote?
 
   // To fix game modes that display a 4 profile signin UI (even if playing
   // alone):
   // XN_SYS_SIGNINCHANGED, with the mask of the signed-in users: the profile, and as its guests the further
   // controllers that are connected now (xam_guest_signin)
+  g_signin_screen_shown.store(true, std::memory_order_relaxed);  // culdcept-nx: later pads signed in too
+  if (REXCVAR_GET(xam_signin_ui_opens)) {
+    REX_KERNEL_STATE()->BroadcastNotification(0x00000009, 1);  // XN_SYS_UI (on): the screen opens
+  }
   REX_KERNEL_STATE()->BroadcastNotification(0x0000000A, SignInGuests());
   // Games seem to sit and loop until we trigger this notification:
   // XN_SYS_UI (off)

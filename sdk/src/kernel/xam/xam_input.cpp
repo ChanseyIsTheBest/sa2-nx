@@ -9,6 +9,10 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <string>
+#include <vector>
+#include <cstdlib>
+#include <cstring>
 #include <rex/input/input.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/xam/private.h>
@@ -104,9 +108,56 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetstate(v=vs.85).aspx
 void SwitchKeyboardTestTick();  // xam_ui.cpp (banjo-nx, switch_software_keyboard_test)
+void SignInLateGuests();  // xam_user.cpp (culdcept-nx): pads that connect after the game's sign-in screen
+
+// culdcept-nx (2026-11-19, the user's second controller could not join Culdcept Saga's Versus lobby): the console's
+// XamInputGetState clears the state of a controller that is not connected. Culdcept's poll (sub_82389E28) ignores the
+// result and reads the state buffer, a stack slot the previous controller's poll had just filled: every unconnected
+// port read as a copy of the port polled before it, and the lobby's "which pad pressed A" (the last one wins) named an
+// unconnected, signed-out port. Player 1 alone could not join; with two controllers player 2's A came from port 4.
+REXCVAR_DEFINE_BOOL(xam_input_clear_disconnected, true, "Kernel",
+                    "XamInputGetState clears the state of a controller that is not connected, as the console does "
+                    "(a game that ignores the result reads zeros, not the previous poll's leftovers). false: the "
+                    "state is left as it was (before 2026-11-19)");
+
+// culdcept-nx (2026-11-19, diagnostic): guest words logged when they change, read at the game's controller polls.
+REXCVAR_DEFINE_STRING(debug_watch_u32, "", "Kernel",
+                      "Diagnostic: guest addresses (hex, comma separated) whose 32-bit big-endian words are logged "
+                      "when they change, checked at XamInputGetState");
+namespace {
+void WatchWords() {
+  static const std::vector<uint32_t> addresses = [] {
+    std::vector<uint32_t> out;
+    const std::string text = REXCVAR_GET(debug_watch_u32);
+    size_t at = 0;
+    while (at < text.size()) {
+      size_t end = text.find_first_of(",; ", at);
+      if (end == std::string::npos) end = text.size();
+      const std::string item = text.substr(at, end - at);
+      at = end + 1;
+      if (!item.empty()) out.push_back(uint32_t(std::strtoul(item.c_str(), nullptr, 16)));
+    }
+    return out;
+  }();
+  if (addresses.empty()) return;
+  static std::vector<uint32_t> last(addresses.size(), 0xDEADBEEFu);
+  static std::atomic_flag busy = ATOMIC_FLAG_INIT;
+  if (busy.test_and_set(std::memory_order_acquire)) return;
+  for (size_t i = 0; i < addresses.size(); ++i) {
+    const uint32_t v = rex::memory::load_and_swap<uint32_t>(REX_KERNEL_MEMORY()->TranslateVirtual(addresses[i]));
+    if (v != last[i]) {
+      REXKRNL_INFO("[watch] {:08X}: {:08X} -> {:08X}", addresses[i], last[i], v);
+      last[i] = v;
+    }
+  }
+  busy.clear(std::memory_order_release);
+}
+}  // namespace
 
 u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> input_state) {
   SwitchKeyboardTestTick();
+  SignInLateGuests();
+  WatchWords();
   // Games call this with a NULL state ptr, probably as a query.
   static int call_count = 0;
   if (++call_count <= 5) {
@@ -127,13 +178,20 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
 
   auto* is = input_system();
   if (!REXCVAR_GET(input_diag_users)) {
-    return is->GetState(actual_user_index, input_state);
+    const X_RESULT r = is->GetState(actual_user_index, input_state);
+    if (r != X_ERROR_SUCCESS && input_state && REXCVAR_GET(xam_input_clear_disconnected)) {
+      std::memset(input_state, 0, sizeof(X_INPUT_STATE));
+    }
+    return r;
   }
   // peggle2-nx (input_diag_users): [user][0] calls, [1] connected, [2] something held; user 4 = any.
   static std::atomic<uint32_t> counts[5][3];
   static std::atomic<int64_t> window_start{0};
   const uint32_t slot = ((user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) ? 4 : (user_index & 3);
   const X_RESULT result = is->GetState(actual_user_index, input_state);
+  if (result != X_ERROR_SUCCESS && input_state && REXCVAR_GET(xam_input_clear_disconnected)) {
+    std::memset(input_state, 0, sizeof(X_INPUT_STATE));
+  }
   counts[slot][0].fetch_add(1, std::memory_order_relaxed);
   if (result == X_ERROR_SUCCESS) {
     counts[slot][1].fetch_add(1, std::memory_order_relaxed);

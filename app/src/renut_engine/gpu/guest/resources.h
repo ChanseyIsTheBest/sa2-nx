@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>  // port 196
 #include <memory>
 #include <mutex>
 
@@ -48,6 +49,10 @@ struct ShaderRecord {
 
   uint64_t hash = 0;
   const ShaderCacheEntry *entry = nullptr;  // nullptr: not in the cache (captured)
+  // renut-ultimate (2026-11-20, port 196): TFU-nx's (2026-11-11). The container the game gave Create*Shader (virtual
+  // then physical part), for D3D{Vertex,Pixel}Shader_GetFunction (d3d/hooks/shader.cpp). Kept only with
+  // banjo_renut_shader_get_function on (a game that reads its shaders back: TFU did; N&B and Katamari never did).
+  std::vector<uint8_t> container;
   u32 fetch_3d_mask = 0;  // kameo-nx (2026-11-03): the slots its microcode reads through tfetch3D (Fetch3DMask, d3d/hooks/shader.cpp)
   // banjo-nx (2026-10-23, render-thread round): what every draw reads, together in the record's first lines (the host
   // shader, the summary and the specialised bools were in its fourth to sixth lines, past the stride arrays). The

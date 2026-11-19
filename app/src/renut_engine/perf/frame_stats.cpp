@@ -20,6 +20,8 @@ extern "C" void RexSwitchPerfCount(unsigned id);
 #include "profiler/profiler.h"                      // the on-screen profiler's GPU, present and render thread rows
 #include "renut_engine/gpu/banjo_renut_tuning.h"  // the [renut] report and its in-run A/B
 
+namespace banjo::renderdoc { void GameFrame(); }  // me/banjo_renderdoc.cpp (banjo_renderdoc_game_s)
+
 namespace renut::frame_stats {
 
 namespace {
@@ -137,6 +139,9 @@ State& S() {
 void OnGameFrame() {
   banjo::renut_gpu::StatsGameFrame();
   banjo::profiler::FrameBoundaryAtSwap();  // blur-nx (2026-11-18): the profiler's frame marks, for a game without Present
+  // culdcept-nx (2026-11-19): banjo_renderdoc_game_s's frame tick. Its only caller was N&B's appMainDraw hook
+  // (renut_engine/FPS.cpp, not built since katamari-nx), so the key captured nothing; the Swap is every port's frame.
+  banjo::renderdoc::GameFrame();
   State& s = S();
   std::lock_guard lock(s.mutex);
   const auto now = Clock::now();

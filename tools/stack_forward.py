@@ -64,7 +64,9 @@ STORE32 = re.compile(r'^(\t)REX_STORE_D_U32\(((?:ctx\.r1|r1l)\.u32), (-?\d+), (.
 VLOAD = re.compile(r'^\tsimde_mm_store_si128\(\(simde__m128i\*\)((?:ctx\.)?v\d+)\.u8, REX_BSWAP128\(simde_mm_load_si128'
                    r'\(\(simde__m128i\*\)REX_RAW_ADDR\(ea\)\)\)\);$')
 EA_LINE = re.compile(r'^\tea = \(.+\) & ~0xF;$')
-FWD = re.compile(r'^\tREX_STACK_FWD4\(((?:ctx\.)?v\d+), ea, .*\);$')
+# renut-ultimate (2026-11-20, port 199; deadpool-nx's bbccab91): a forward into a local vector register (l_vN, made by
+# the passes that keep registers as locals) is found too, so --restore puts its load back.
+FWD = re.compile(r'^\tREX_STACK_FWD4\(((?:ctx\.|l_)?v\d+), ea, .*\);$')
 CAPTURE = re.compile(r'\(rex_fw\d+ = \((.*?)\)\)\);$')
 STORE_MNEMONICS = re.compile(r'^(st|dcbz|dcbz128)')
 
@@ -96,6 +98,18 @@ def rewrite_function(lines, stats):
         while j < len(out) and not COMMENT.match(out[j]) and not LABEL.match(out[j]):
             j += 1
         body = range(i + 1, j)
+        # renut-ultimate (2026-11-20, port 199; deadpool-nx's bbccab91, its "stack forwarding fix"): the check at the top
+        # of the loop sees only the lines it visits there (an instruction's comment line, a label), and each instruction
+        # is stepped over whole (i = j): a call in a bl's body, a goto in a conditional branch's, a return or a switch
+        # never ended what was tracked. A call can write the slots (a pointer to the frame passed to it) between the
+        # stores and the load, which would then be given the values stored before the call. Any branch, or a body with
+        # a call, jump, return or switch, ends what is tracked: no store before it is forwarded past it (deadpool-nx also
+        # stopped every forward up to the next label; stores made after the branch are followed again here).
+        if mn.startswith('b') or any('goto ' in out[k] or 'return;' in out[k] or '(ctx, base)' in out[k] or
+                                     'switch (' in out[k] for k in body):
+            slots, base, foreign = {}, {'r1': 0}, False
+            i = j
+            continue
         writes_r1 = (ops and ops[0] == 'r1' and not mn.startswith('st')) or (
             mn in ('stwu', 'stdu', 'stwux', 'stdux') and len(ops) >= 2 and ops[1].endswith('(r1)'))
         if writes_r1:

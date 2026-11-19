@@ -93,6 +93,12 @@ REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
                       "Host API of the GPU emulation plugin: 'any' (D3D12 first where compiled), 'd3d12' or 'vulkan'")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// Port 193 (TFU-nx's): sdk/src/core/cvar.cpp, the last LoadConfig parse failure. Declared here, not in rex/cvar.h:
+// that header is in every generated file's include chain, and changing it recompiles the whole game.
+namespace rex::cvar {
+const std::string& LastConfigError();
+}  // namespace rex::cvar
+
 namespace rex {
 
 // --- ReXApp ---
@@ -240,8 +246,13 @@ bool ReXApp::SetupEnvironment() {
 
   OnPostInitLogging();
 
-  if (std::filesystem::exists(config_path_))
-    REXLOG_DEBUG("Loaded config: {}", config_path_.filename().string());
+  // Port 193 (TFU-nx's): said at info level, and a parse failure as an error, so a log always shows which settings ran.
+  if (!rex::cvar::LastConfigError().empty())
+    REXLOG_ERROR("CONFIG NOT LOADED (every setting in it ignored): {}", rex::cvar::LastConfigError());
+  else if (std::filesystem::exists(config_path_))
+    REXLOG_INFO("Loaded config: {}", config_path_.string());
+  else
+    REXLOG_INFO("No config file at {}: defaults", config_path_.string());
 
   REXLOG_DEBUG("{} starting", GetName());
   if (!game_data_root_.empty()) {

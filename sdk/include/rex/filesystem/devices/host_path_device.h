@@ -37,6 +37,17 @@ struct StatsPaths {
 };
 StatsPaths ReadStatsPaths();
 
+// culdcept-nx (2026-11-20): the read-only handles kept open (HostPathEntry::Park, filesystem_keep_open).
+struct StatsKeepOpen {
+  uint64_t reused = 0;          // opens served by a parked handle (no file-system request)
+  uint64_t parked = 0;          // closes that parked their handle instead of closing it
+  uint64_t evicted = 0;         // parked handles closed to stay within filesystem_keep_open_max
+  uint64_t live = 0;            // parked now
+  uint64_t restats_skipped = 0; // size queries answered from the tree on a read-only device
+};
+StatsKeepOpen ReadStatsKeepOpen();
+void NoteRestatSkipped();
+
 class HostPathDevice : public Device {
  public:
   HostPathDevice(const std::string_view mount_path, const std::filesystem::path& host_path,

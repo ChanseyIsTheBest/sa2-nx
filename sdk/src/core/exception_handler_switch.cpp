@@ -526,6 +526,8 @@ void WriteCrashFile(const char* data, size_t len) {
 // blur-nx (2026-11-18): sdk/src/ui/switch_crash_hooks.c's (weak: an executable without the crash hooks has none).
 extern "C" __attribute__((weak)) const char* RexSwitchStderrRecent(size_t* len);
 
+extern "C" const char* RexAppBuildStamp(void);  // port 193: switch_crash_hooks.c (weak), app/src/build_stamp.cpp
+
 extern "C" void RexSwitchCrashLog(const char* reason, const ThreadExceptionDump* ctx,
                                   uint64_t stack, uint64_t pc) {
   // A second fault while the first is being written (on this thread or another)
@@ -548,6 +550,7 @@ extern "C" void RexSwitchCrashLog(const char* reason, const ThreadExceptionDump*
   svcGetThreadId(&tid, CUR_THREAD_HANDLE);
 
   Append(b, "==== %s ====\n", reason ? reason : "?");
+  Append(b, "%s\n", RexAppBuildStamp());  // port 193 (TFU-nx's): ties the report to its NRO and ELF
   Append(b, "thread %" PRIu64 ", image 0x%016" PRIx64 " (code up to 0x%016" PRIx64 ")\n", tid,
          base, text_hi);
   Append(b, "pc 0x%016" PRIx64 " = image+0x%" PRIx64 "\n", pc, pc - base);

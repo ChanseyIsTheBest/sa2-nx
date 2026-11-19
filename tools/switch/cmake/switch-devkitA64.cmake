@@ -24,7 +24,9 @@ set(REXGLUE_USE_VULKAN ON CACHE BOOL "NVK" FORCE)
 set(REXGLUE_USE_D3D12 OFF CACHE BOOL "No D3D12 on Switch" FORCE)
 
 if(NOT DEFINED DEVKITPRO)
-    if(DEFINED ENV{DEVKITPRO})
+    # renut-ultimate (2026-11-20, port 194; TFU-nx's): devkitPro's Windows installer sets DEVKITPRO to its MSYS2 form
+    # (/opt/devkitpro), which CMake on Windows cannot open; there the Windows folder is used.
+    if(DEFINED ENV{DEVKITPRO} AND NOT (CMAKE_HOST_WIN32 AND "$ENV{DEVKITPRO}" MATCHES "^/"))
         set(DEVKITPRO "$ENV{DEVKITPRO}" CACHE PATH "devkitPro root")
     elseif(CMAKE_HOST_WIN32 AND EXISTS "C:/devkitPro")
         set(DEVKITPRO "C:/devkitPro" CACHE PATH "devkitPro root")

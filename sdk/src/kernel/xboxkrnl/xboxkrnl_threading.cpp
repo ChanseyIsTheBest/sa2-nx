@@ -20,6 +20,7 @@
 #include <vector>
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/threading.h>
@@ -39,6 +40,10 @@
 #include <rex/system/xtypes.h>
 #include <rex/thread/atomic.h>
 #include <rex/thread/mutex.h>
+
+REXCVAR_DEFINE_BOOL(thread_suspend_log, false, "Kernel",
+                    "Diagnostic (culdcept-nx, 2026-11-19): log every NtResumeThread and every NtSuspendThread a thread "
+                    "makes on itself ([suspend] lines: the thread, the counts, the guest caller)");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -184,6 +189,13 @@ u32 NtResumeThread_entry(u32 handle, mapped_u32 suspend_count_ptr) {
   if (thread) {
     REXKRNL_TRACE("[NtResumeThread] handle={:08X} thread={}", uint32_t(handle), thread->name());
     result = thread->Resume(&suspend_count);
+    if (REXCVAR_GET(thread_suspend_log)) {
+      auto* ctx = current_ppc_context();
+      REXKRNL_INFO("[suspend] NtResumeThread {:08X} (id {}) by id {}: previous count {}, now {}; caller lr {:08X}",
+                   uint32_t(handle), thread->thread_id(),
+                   XThread::GetCurrentThread() ? XThread::GetCurrentThread()->thread_id() : 0u, suspend_count,
+                   thread->suspend_count(), ctx ? uint32_t(ctx->lr) : 0u);
+    }
   } else {
     REXKRNL_WARN("[NtResumeThread] handle={:08X} NOT FOUND", uint32_t(handle));
   }
@@ -232,13 +244,30 @@ u32 NtSuspendThread_entry(u32 handle, mapped_u32 suspend_count_ptr) {
     bool is_self_suspend = current_thread && current_thread == thread.get();
     if (is_self_suspend) {
       REXKRNL_TRACE("[NtSuspendThread] self-suspend for thread={:08X}", uint32_t(handle));
+      if (REXCVAR_GET(thread_suspend_log)) {
+        auto* ctx = current_ppc_context();
+        REXKRNL_INFO("[suspend] NtSuspendThread {:08X} (id {}) on itself: count {}; caller lr {:08X}", uint32_t(handle),
+                     thread->thread_id(), thread->suspend_count(), ctx ? uint32_t(ctx->lr) : 0u);
+      }
       suspend_count = thread->SelfSuspend();
       result = X_STATUS_SUCCESS;
+      if (REXCVAR_GET(thread_suspend_log))
+        REXKRNL_INFO("[suspend] {:08X} (id {}) runs again (it was {} before its suspend)", uint32_t(handle),
+                     thread->thread_id(), suspend_count);
     } else {
       result = thread->Suspend(&suspend_count);
     }
 #else
+    if (REXCVAR_GET(thread_suspend_log)) {
+      auto* ctx = current_ppc_context();
+      REXKRNL_INFO("[suspend] NtSuspendThread {:08X} (id {}) by id {}: count {}; caller lr {:08X}", uint32_t(handle),
+                   thread->thread_id(), XThread::GetCurrentThread() ? XThread::GetCurrentThread()->thread_id() : 0u,
+                   thread->suspend_count(), ctx ? uint32_t(ctx->lr) : 0u);
+    }
     result = thread->Suspend(&suspend_count);
+    if (REXCVAR_GET(thread_suspend_log))
+      REXKRNL_INFO("[suspend] {:08X} (id {}) runs again or was suspended (count before {})", uint32_t(handle),
+                   thread->thread_id(), suspend_count);
 #endif
   } else {
     REXKRNL_WARN("[NtSuspendThread] handle={:08X} NOT FOUND", uint32_t(handle));
@@ -986,11 +1015,23 @@ static void xeKfLowerIrql(PPCContext* ctx, unsigned char new_irql) {
 
 // Guest-memory spinlock helpers - store PCR address as owner (matching xenia).
 // PPCContext* provides r13 (PCR address) without needing XThread::GetCurrentThread().
+// renut-ultimate (2026-11-20, port 201): deadpool-nx's (github.com/BanhMi93P/deadpool-nx, GPL-3.0, its 8c90b5ca). A
+// host thread with no guest context queuing an APC (XThread::EnqueueApc) passes the target thread's context: the IRQL
+// was raised and lowered in the target's PCR (r13), while that thread may be running, and the target's PCR stood as the
+// lock's owner. With a context that is not the calling thread's own, the IRQL is left alone and the owner is
+// 0xFFFFFFFF (no guest PCR); the guest's own calls are as before.
+static bool IsCurrentGuestContext(PPCContext* ctx) {
+  return ctx && runtime::ThreadState::Get() && runtime::current_ppc_context() == ctx;
+}
+
 uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_irql) {
-  uint32_t old_irql = change_irql ? xeKfRaiseIrql(ctx, IRQL_DISPATCH) : 0;
-  uint32_t pcr_addr = static_cast<uint32_t>(ctx->r13.u64);
+  const bool own = IsCurrentGuestContext(ctx);
+  uint32_t old_irql = (change_irql && own) ? xeKfRaiseIrql(ctx, IRQL_DISPATCH) : 0;
+  uint32_t pcr_addr = own ? static_cast<uint32_t>(ctx->r13.u64) : 0xFFFFFFFFu;
   const uint32_t self = rex::byte_swap(pcr_addr);
-  assert_true(lock->prcb_of_owner.value != self);  // self-deadlock detection
+  if (own) {
+    assert_true(lock->prcb_of_owner.value != self);  // self-deadlock detection
+  }
   while (!rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
     rex::thread::MaybeYield();
   }
@@ -999,9 +1040,12 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_i
 
 void xeKeKfReleaseSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, uint32_t old_irql,
                            bool change_irql) {
-  assert_true(lock->prcb_of_owner == static_cast<uint32_t>(ctx->r13.u64));
+  const bool own = IsCurrentGuestContext(ctx);  // port 201
+  if (own) {
+    assert_true(lock->prcb_of_owner == static_cast<uint32_t>(ctx->r13.u64));
+  }
   rex::thread::atomic_store_release(0u, &lock->prcb_of_owner.value);
-  if (change_irql && old_irql < IRQL_DISPATCH) {
+  if (change_irql && own && old_irql < IRQL_DISPATCH) {
     xeKfLowerIrql(ctx, static_cast<unsigned char>(old_irql));
   }
 }

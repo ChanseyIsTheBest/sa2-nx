@@ -22,7 +22,9 @@ FetchFilterOverrides ScanFetchFilters(const uint8_t *container) {
   const uint32_t flags = Be32(container);
   const uint32_t virtual_size = Be32(container + 4), physical_size = Be32(container + 8);
   const uint32_t shader_offset = Be32(container + 0x18);
-  if ((flags & 0xFFFFFF00u) != 0x102A1100u || virtual_size > 0x10000 || physical_size > 0x100000 ||
+  // culdcept-nx: version 0x10 too (its shader info is 0x11's).
+  if (((flags & 0xFFFFFF00u) != 0x102A1100u && (flags & 0xFFFFFF00u) != 0x102A1000u) || virtual_size > 0x10000 ||
+      physical_size > 0x100000 ||
       shader_offset + 8 > virtual_size)
     return out;
   const uint32_t physical_offset = Be32(container + shader_offset), code_size = Be32(container + shader_offset + 4);

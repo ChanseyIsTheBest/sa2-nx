@@ -100,7 +100,14 @@ def main():
     m = re.search(r'const uint8_t g_compressedSpirvCache\[\]\s*=\s*\{(.*?)\};', text, re.S)
     if not m:
         sys.exit('renut_switch_shader_cache: no g_compressedSpirvCache in the PC shader cache')
-    blob = bytes(int(v) for v in m.group(1).replace('\n', '').split(',') if v.strip())
+    # renut-ultimate (2026-11-20, port 194; TFU-nx's): XenosRecomp writes the blobs to files and the source takes them
+    # with #embed (13,000 shaders as number lists made a 400 MB source); read the file it names (the PC build's own path
+    # on this machine). A list (BANJO_SHADER_CACHE_LIST=1) is read as before.
+    embed = re.search(r'#embed\s+"([^"]+)"', m.group(1))
+    if embed:
+        blob = open(embed.group(1), 'rb').read()
+    else:
+        blob = bytes(int(v) for v in m.group(1).replace('\n', '').split(',') if v.strip())
     size = re.search(r'const size_t g_spirvCacheCompressedSize\s*=\s*(\d+)', text)
     if not size or int(size.group(1)) != len(blob):
         sys.exit('renut_switch_shader_cache: the SPIR-V array and its size disagree')

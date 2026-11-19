@@ -686,10 +686,26 @@ HostPathFile::~HostPathFile() {
   if (counted_window_) {
     g_live_windows.fetch_sub(1, std::memory_order_relaxed);
   }
+  // culdcept-nx (2026-11-20, filesystem_keep_open): a read-only open of a read-only device leaves its handle parked for
+  // the next open of the same file (HostPathEntry::Park).
+  const bool wants_write =
+      (file_access() & (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
+                        FileAccess::kFileAppendData | FileAccess::kGenericAll)) != 0;
+  if (file_handle_ && entry() && entry()->is_read_only() && !wants_write) {
+    static_cast<HostPathEntry*>(entry())->Park(std::move(file_handle_));
+  }
 }
 
 void HostPathFile::Destroy() {
+  // renut-ultimate (2026-11-20, port 203): sims3-nx (github.com/Zumoly/sims3-nx, GPL-3.0, v0.1.1). Nothing acted on FileDispositionInformation's delete flag
+  // (xboxkrnl_io_info.cpp records it on the entry), so a file a game marks for deletion stayed: The Sims 3 deletes a
+  // marker when a save is complete, and every save loaded as corrupt. Horizon cannot delete an open file, so this
+  // runs after the handle is closed; with another handle still open the delete fails, and that handle's close tries
+  // again.
+  rex::filesystem::Entry* const closing = entry();
+  const bool remove = closing && closing->delete_on_close();
   delete this;
+  if (remove) closing->Delete();
 }
 
 // fsync on POSIX, FlushFileBuffers on Windows. Called by NtFlushBuffersFile, which the game uses right

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 
 #include <rex/filesystem.h>
@@ -55,6 +56,17 @@ class HostPathEntry : public Entry {
 
   X_STATUS Open(uint32_t desired_access, File** out_file) override;
   bool Truncate() override;
+
+  /*
+   * culdcept-nx (2026-11-20, filesystem_keep_open): the host handle of a read-only file on a read-only
+   * device, kept open after the guest closes it so the next open of the same file reuses it. On the
+   * Switch an open is three file-system requests (open, the timestamp query in fsdev_open, the close),
+   * 4-5 ms each time and over 100 ms at worst; Culdcept Saga reopens DATA00.RSP and its layouts and
+   * sound banks every few seconds on the board. The handle is stateless (pread at an offset), so a
+   * reused one reads exactly as a fresh one. Park gives the handle up (closed) when the key is off.
+   */
+  std::unique_ptr<rex::filesystem::FileHandle> TakeParked();
+  void Park(std::unique_ptr<rex::filesystem::FileHandle> handle);
 
   bool can_map() const override { return !lz4_blocks_; }
   std::unique_ptr<memory::MappedMemory> OpenMapped(memory::MappedMemory::Mode mode, size_t offset,

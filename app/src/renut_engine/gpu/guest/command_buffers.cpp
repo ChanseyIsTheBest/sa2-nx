@@ -986,7 +986,10 @@ uint64_t ChangedChunks(const u8 *device, u8 *shadow) {
 // compare, stored whether or not they differ: no branch on the compare; storing equal bytes changes nothing).
 // Title update 3 (banjo-nx 2026-10-29): the snapshot is 12,720 bytes (d3d.h), its last chunk 48 bytes (40 on the base).
 // katamari-nx (2026-10-30): XDK 2.0.5632's snapshot is 12,704 bytes (0x31A0): its last chunk is 32 bytes.
-static_assert(kLastChunkBytes == 32, "TakeLastChunk's loads");
+// renut-ultimate (2026-11-20, port 196): TFU-nx (2026-11-11): XDK 2.0.6534's is 12,712 bytes (0x31A8, as N&B's base):
+// 40 bytes. S4ep1-nx (2026-11-14): XDK 2.0.11626's is 12,888 bytes (0x3258): 24 bytes, one vector and one word.
+// TakeLastChunk takes any of the three (a port at another XDK changes d3d.h's snapshot size, not this).
+static_assert(kLastChunkBytes == 24 || kLastChunkBytes == 32 || kLastChunkBytes == 40, "TakeLastChunk's loads");
 inline uint64_t TakeChunk(const u8 *device, u8 *shadow) {
 #if defined(__aarch64__)
   const uint8x16_t a0 = vld1q_u8(device), a1 = vld1q_u8(device + 16);
@@ -1006,11 +1009,31 @@ inline uint64_t TakeChunk(const u8 *device, u8 *shadow) {
 }
 inline uint64_t TakeLastChunk(const u8 *device, u8 *shadow) {
 #if defined(__aarch64__)
-  const uint8x16_t a0 = vld1q_u8(device), a1 = vld1q_u8(device + 16);
-  const uint8x16_t d0 = veorq_u8(a0, vld1q_u8(shadow)), d1 = veorq_u8(a1, vld1q_u8(shadow + 16));
-  vst1q_u8(shadow, a0);
-  vst1q_u8(shadow + 16, a1);
-  return vmaxvq_u8(vorrq_u8(d0, d1)) != 0;
+  if constexpr (kLastChunkBytes == 24) {
+    // S4ep1-nx (port 196): 16 bytes as a vector, the last 8 as one word.
+    const uint8x16_t a0 = vld1q_u8(device);
+    const uint8x16_t d0 = veorq_u8(a0, vld1q_u8(shadow));
+    vst1q_u8(shadow, a0);
+    uint64_t x, y;
+    std::memcpy(&x, device + 16, 8);
+    std::memcpy(&y, shadow + 16, 8);
+    std::memcpy(shadow + 16, &x, 8);
+    return uint64_t((vmaxvq_u8(d0) != 0) | (x != y));
+  } else {
+    const uint8x16_t a0 = vld1q_u8(device), a1 = vld1q_u8(device + 16);
+    const uint8x16_t d0 = veorq_u8(a0, vld1q_u8(shadow)), d1 = veorq_u8(a1, vld1q_u8(shadow + 16));
+    vst1q_u8(shadow, a0);
+    vst1q_u8(shadow + 16, a1);
+    if constexpr (kLastChunkBytes == 40) {
+      // TFU-nx (port 196): the last 8 bytes as one word.
+      uint64_t x, y;
+      std::memcpy(&x, device + 32, 8);
+      std::memcpy(&y, shadow + 32, 8);
+      std::memcpy(shadow + 32, &x, 8);
+      return uint64_t((vmaxvq_u8(vorrq_u8(d0, d1)) != 0) | (x != y));
+    }
+    return vmaxvq_u8(vorrq_u8(d0, d1)) != 0;
+  }
 #else
   const bool differs = std::memcmp(device, shadow, kLastChunkBytes) != 0;
   std::memcpy(shadow, device, kLastChunkBytes);

@@ -12,6 +12,7 @@
 #include <array>
 #include <bit>
 #include <cctype>
+#include <cmath>  // port 195: input_stick_deadzone
 #include <chrono>  // sasrt-nx (2026-11-03, input_switch_disconnect_grace_ms; port 52)
 #include <cstdio>
 #include <cstring>
@@ -100,6 +101,13 @@ REXCVAR_DEFINE_BOOL(input_joycon_sideways_stick, true, "Input",
 // sasrt-nx (2026-11-03; port 52): a pad HID reports absent for a moment (a Bluetooth hiccup, a style change) reached the
 // game as a disconnect at once, and Sonic Transformed stops a race for it about once a race; shipped games wait before
 // they say so.
+// renut-ultimate (2026-11-20, port 195): S4ep1-nx's of 2026-11-15 (github.com/FurryLilManChild/S4ep1-nx, GPL-3.0). The
+// driver passes the sticks through raw and the game applies its own dead zone; this adds one on top for worn sticks that
+// drift. Radial, rescaled so full tilt stays full. Read live. 0 (the default): the game's own only, as before.
+REXCVAR_DEFINE_INT32(input_stick_deadzone, 0, "Input",
+                     "The Switch's controllers: an extra stick dead zone in percent of full tilt (0 = none, the "
+                     "game's own only; 10 or 20 for drifting sticks). Radial, rescaled so full tilt stays full")
+    .range(0, 50);
 REXCVAR_DEFINE_INT32(input_switch_disconnect_grace_ms, 1000, "Input",
                      "A controller HID reports as not connected is kept, with its last state, for this long before "
                      "the game is told it is gone (a Bluetooth hiccup or a layout change clears in well under a "
@@ -442,6 +450,8 @@ struct SwitchInputDriver::Slot {
    * See DispatchMenuShortcuts.
    */
   uint64_t menu_shortcuts = 0;
+  // Port 206 (sims3-nx's): ZL and ZR seen during the current L+R hold (the two trigger shortcuts below).
+  uint64_t trigger_seen = 0;
 
   // Keystroke synthesis, per pad rather than per guest user.
   uint64_t key_buttons = 0;
@@ -884,6 +894,21 @@ void SwitchInputDriver::Poll(size_t index) {
   gamepad.left_trigger = (held & table.left_trigger) ? 0xFF : 0;
   gamepad.right_trigger = (held & table.right_trigger) ? 0xFF : 0;
   // HID reports up as positive Y, like XInput, so no inversion is needed.
+  if (const int32_t dz = REXCVAR_GET(input_stick_deadzone); dz > 0) {  // port 195
+    auto apply = [dz](HidAnalogStickState& st) {
+      const float len = std::sqrt(float(st.x) * float(st.x) + float(st.y) * float(st.y));
+      const float inner = 32767.0f * float(dz) / 100.0f;
+      if (len <= inner) {
+        st = HidAnalogStickState{};
+        return;
+      }
+      const float out = std::min(32767.0f, (len - inner) * 32767.0f / (32767.0f - inner));
+      st.x = s32(float(st.x) * out / len);
+      st.y = s32(float(st.y) * out / len);
+    };
+    apply(left);
+    apply(right);
+  }
   gamepad.thumb_lx = ClampStickAxis(left.x);
   gamepad.thumb_ly = ClampStickAxis(left.y);
   gamepad.thumb_rx = ClampStickAxis(right.x);
@@ -971,37 +996,32 @@ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
   }
 
   /*
-   * L+R+ZL starts the A/B test lap (switch_perf.cpp). It sends no key to the
-   * game: it talks directly to the profiler. It is kept apart from the loop
-   * above because that one translates buttons into keys and this is not a key.
+   * L+R+ZL starts the A/B test lap (switch_perf.cpp; it talks to the profiler, no key to the game); L+R+ZR opens the
+   * system's controller applet (connect a second controller, change the player order, split a Joy-Con pair; on the UI
+   * thread, like the menus). renut-ultimate (2026-11-20, port 206; sims3-nx's): both fire when the trigger is let go,
+   * and only if the other trigger was not pressed during the same L+R hold. L+R+ZL+ZR (LB+RB+LT+RT) is a game's own
+   * combination in some titles (The Sims 3's cheats) and now reaches the game without opening anything.
    */
-  const uint64_t kBitAb = uint64_t(1) << 8;
-  const bool ab_now = modifier && (held & HidNpadButton_ZL) != 0;
-  const bool ab_before = (slot.menu_shortcuts & kBitAb) != 0;
-  if (ab_now && !ab_before) {
-    RexSwitchPerfToggleAb();
-    REXLOG_INFO("menu shortcut: GPU A/B tests");
-  }
-  slot.menu_shortcuts = ab_now ? (slot.menu_shortcuts | kBitAb)
-                                 : (slot.menu_shortcuts & ~kBitAb);
-
-  /*
-   * L+R+ZR opens the system's controller applet: connect a second controller, change the player order, or split a
-   * Joy-Con pair into two sideways Joy-Cons for two players. On the UI thread, like the menus (it blocks until the
-   * player closes it).
-   */
-  const uint64_t kBitApplet = uint64_t(1) << 9;
-  const bool applet_now = modifier && (held & HidNpadButton_ZR) != 0;
-  const bool applet_before = (slot.menu_shortcuts & kBitApplet) != 0;
-  if (applet_now && !applet_before) {
-    REXLOG_INFO("menu shortcut: controllers");
-    auto show = [this] { ShowControllerApplet(); };
-    rex::ui::Window* const window = window_ui_.load(std::memory_order_acquire);
-    if (!window || !window->app_context().CallInUIThread(show)) {
-      show();
+  constexpr uint64_t kTriggers = HidNpadButton_ZL | HidNpadButton_ZR;
+  const uint64_t triggers = held & kTriggers;
+  if (modifier) slot.trigger_seen |= triggers;
+  if (!triggers && slot.trigger_seen) {
+    const uint64_t seen = slot.trigger_seen;
+    slot.trigger_seen = 0;
+    if (seen == HidNpadButton_ZL) {
+      RexSwitchPerfToggleAb();
+      REXLOG_INFO("menu shortcut: GPU A/B tests");
+    } else if (seen == HidNpadButton_ZR) {
+      REXLOG_INFO("menu shortcut: controllers");
+      auto show = [this] { ShowControllerApplet(); };
+      rex::ui::Window* const window = window_ui_.load(std::memory_order_acquire);
+      if (!window || !window->app_context().CallInUIThread(show)) {
+        show();
+      }
+    } else {
+      REXLOG_INFO("menu shortcut: none (L+R+ZL+ZR goes to the game)");
     }
   }
-  slot.menu_shortcuts = applet_now ? (slot.menu_shortcuts | kBitApplet) : (slot.menu_shortcuts & ~kBitApplet);
 
   /*
    * blur-nx (2026-11-18, the user: "an imgui overlay opened up with the button combination of A+B+X+Y+L+R and closed

@@ -247,7 +247,10 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
       const auto* host_path_entry = dynamic_cast<const HostPathEntry*>(parent_entry);
       if (host_path_entry) {
         const auto file_path = host_path_entry->host_path() / rex::to_path(entry->name());
-        if (!std::filesystem::exists(file_path)) {
+        // Port 203 (sims3-nx's): a file held open for writing can fail its status check with an I/O error on
+        // Horizon; only a real "not found" clears the entry (the exception this threw ended the game).
+        std::error_code exists_error;
+        if (!std::filesystem::exists(file_path, exists_error) && !exists_error) {
           entry->Delete();
           entry = nullptr;
         }
@@ -300,11 +303,13 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
         assert_always();
         return X_STATUS_ACCESS_DENIED;
       case FileDisposition::kSuperscede:
-        // Replace (by delete + recreate).
-        if (!entry->Delete()) {
+        // Replace (by delete + recreate). Port 203 (sims3-nx's): Horizon cannot delete an open file, so an open one
+        // is truncated instead, as kOverwrite does.
+        if (entry->Delete()) {
+          entry = nullptr;
+        } else if (!entry->Truncate()) {
           return X_STATUS_ACCESS_DENIED;
         }
-        entry = nullptr;
         *out_action = FileAction::kSuperseded;
         break;
       case FileDisposition::kOpen:
@@ -336,6 +341,8 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
   // Open.
   auto result = entry->Open(desired_access, out_file);
   if (XFAILED(result)) {
+    REXFS_WARN("Open of '{}' failed: access {:#x}, disposition {}", path, desired_access,
+               uint32_t(creation_disposition));  // port 203 (sims3-nx's)
     *out_action = FileAction::kDoesNotExist;
   }
   return result;

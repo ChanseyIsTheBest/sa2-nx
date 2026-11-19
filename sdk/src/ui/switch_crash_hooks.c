@@ -72,6 +72,26 @@ static void RexSwitchInitLogDir(void) {
 
 void RexSwitchCrashLog(const char* reason, const ThreadExceptionDump* ctx, u64 stack, u64 pc);
 
+/* renut-ultimate (2026-11-20, port 193): TFU-nx's of 2026-11-12, as S4ep1-nx carries it (github.com/FurryLilManChild/
+ * S4ep1-nx, GPL-3.0): the build's stamp (the app's commit), the first line of rex_stderr.log, of rex_profile.log and of
+ * every crash report, so each log is tied to its NRO and ELF. The app defines
+ * it (app/src/build_stamp.cpp); this is the fallback. */
+__attribute__((weak)) const char* RexAppBuildStamp(void) {
+    return "unknown build";
+}
+
+/* Port 193 (TFU-nx's): the last launch's log kept as <name>.prev.log before the new one is made (a test often takes
+ * two launches, and the second erased the first's). A file that cannot be renamed is deleted. */
+static void RexKeepPreviousLog(const char* name) {
+    char path[FS_MAX_PATH], prev[FS_MAX_PATH];
+    snprintf(path, sizeof(path), "%s%s.log", g_rex_log_dir, name);
+    snprintf(prev, sizeof(prev), "%s%s.prev.log", g_rex_log_dir, name);
+    remove(prev);
+    if (rename(path, prev) != 0) {
+        remove(path);
+    }
+}
+
 void abort(void) {
     RexSwitchCrashLog("abort()", NULL, (u64)__builtin_frame_address(0),
                       (u64)__builtin_return_address(0));
@@ -105,8 +125,16 @@ static int RexStderrFile(void) {
     if (g_rex_stderr_fd < 0 && !g_rex_stderr_failed) {
         char path[FS_MAX_PATH];
         snprintf(path, sizeof(path), "%srex_stderr.log", g_rex_log_dir);
+        RexKeepPreviousLog("rex_stderr");  /* port 193 */
         g_rex_stderr_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (g_rex_stderr_fd < 0) g_rex_stderr_failed = 1;
+        if (g_rex_stderr_fd < 0) {
+            g_rex_stderr_failed = 1;
+        } else {
+            /* port 193: the build stamp first */
+            const char* stamp = RexAppBuildStamp();
+            write(g_rex_stderr_fd, stamp, strlen(stamp));
+            write(g_rex_stderr_fd, "\n", 1);
+        }
     }
     return g_rex_stderr_fd;
 }
@@ -193,8 +221,10 @@ static void RexSwitchCrashHooksInit(void) {
     } else {
         char path[FS_MAX_PATH];  /* the device refused: the file at once, as before */
         snprintf(path, sizeof(path), "%srex_stderr.log", g_rex_log_dir);
+        RexKeepPreviousLog("rex_stderr");  /* port 193 */
         if (freopen(path, "w", stderr)) {
             setvbuf(stderr, NULL, _IONBF, 0);
+            fprintf(stderr, "%s\n", RexAppBuildStamp());
         }
     }
     atexit(RexSwitchExitHook);

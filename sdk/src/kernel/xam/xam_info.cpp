@@ -31,6 +31,38 @@
 #include <fmt/format.h>
 #include <fmt/xchar.h>
 
+#if defined(__SWITCH__)
+#include <pthread.h>
+#include <unistd.h>
+#include <cstdio>
+#include "../../core/threading_switch.h"
+extern "C" unsigned int svcSetThreadActivity(unsigned int handle, unsigned int paused);
+// libnx: the next homebrew to load once this one exits (the homebrew loader), and this NRO's own argv.
+extern "C" unsigned int envSetNextLoad(const char* path, const char* argv);
+extern "C" char** __system_argv;
+#endif
+
+// renut-ultimate (2026-11-20, port 205): sims3-nx (github.com/Zumoly/sims3-nx, GPL-3.0, v0.1.1). A title that relaunches itself (XamLoaderLaunchTitle of its own
+// executable, with launch data: The Sims 3 goes back to its main menu that way) ended on the Switch, where nothing
+// starts a terminated title again. Now the launch data waits in relaunch.bin beside the NRO, the homebrew loader is
+// asked to load the same NRO again, and the next start's XamLoaderGetLaunchData answers from the file.
+REXCVAR_DEFINE_BOOL(xam_relaunch_self, true, "Kernel",
+                    "Switch: a title's XamLoaderLaunchTitle of its own executable loads the NRO again with the launch "
+                    "data (relaunch.bin beside the NRO; the homebrew loader's next load) instead of ending");
+
+namespace {
+std::string RelaunchFile() {
+#if defined(__SWITCH__)
+  if (__system_argv && __system_argv[0]) {
+    std::string path = __system_argv[0];
+    const size_t slash = path.find_last_of('/');
+    if (slash != std::string::npos) return path.substr(0, slash + 1) + "relaunch.bin";
+  }
+#endif
+  return "relaunch.bin";
+}
+}  // namespace
+
 REXCVAR_DECLARE(uint32_t, user_language);  // xam_user.cpp
 // renut-ultimate (2026-11-16, port 143; tw2de_nx's, off by default).
 REXCVAR_DEFINE_BOOL(xam_swap_disc_signal, false, "Kernel",
@@ -233,12 +265,32 @@ u32 XamLoaderSetLaunchData_entry(mapped_void data, u32 size) {
   return 0;
 }
 
+// Port 205: the launch data left by the previous run's XamLoaderLaunchTitle (relaunch.bin), taken once.
+static void TakeRelaunchData(XamModule* xam) {
+  static bool taken = false;
+  if (taken) return;
+  taken = true;
+  const std::string file = RelaunchFile();
+  FILE* f = std::fopen(file.c_str(), "rb");
+  if (!f) return;
+  std::vector<uint8_t> bytes;
+  uint8_t chunk[4096];
+  for (size_t n; (n = std::fread(chunk, 1, sizeof(chunk), f)) > 0;) bytes.insert(bytes.end(), chunk, chunk + n);
+  std::fclose(f);
+  std::remove(file.c_str());
+  auto& loader_data = xam->loader_data();
+  loader_data.launch_data_present = !bytes.empty();
+  loader_data.launch_data = std::move(bytes);
+  REXKRNL_INFO("[loader] relaunched with {} bytes of launch data", loader_data.launch_data.size());
+}
+
 u32 XamLoaderGetLaunchDataSize_entry(mapped_u32 size_ptr) {
   if (!size_ptr) {
     return X_ERROR_INVALID_PARAMETER;
   }
 
   auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
+  TakeRelaunchData(xam.get());  // port 205
   auto& loader_data = xam->loader_data();
   if (!loader_data.launch_data_present) {
     *size_ptr = 0;
@@ -251,6 +303,7 @@ u32 XamLoaderGetLaunchDataSize_entry(mapped_u32 size_ptr) {
 
 u32 XamLoaderGetLaunchData_entry(mapped_void buffer_ptr, u32 buffer_size) {
   auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
+  TakeRelaunchData(xam.get());  // port 205
   auto& loader_data = xam->loader_data();
   if (!loader_data.launch_data_present) {
     return X_ERROR_NOT_FOUND;
@@ -284,6 +337,41 @@ void XamLoaderLaunchTitle_entry(mapped_string raw_name_ptr, u32 flags) {
   } else {
     assert_always("Game requested exit to dashboard via XamLoaderLaunchTitle");
   }
+  REXKRNL_INFO("[loader] XamLoaderLaunchTitle '{}' flags {:08X}, {} bytes of launch data", loader_data.launch_path,
+               uint32_t(flags), loader_data.launch_data_present ? loader_data.launch_data.size() : 0);
+
+#if defined(__SWITCH__)
+  // Port 205: the title's own executable again (not another XEX, not the dashboard): leave the launch data beside the
+  // NRO, ask the homebrew loader to load the NRO again, and exit now (guest threads still run, so no static
+  // destructors). Every other guest thread is paused first: the loader unmaps this NRO, and a thread still running its
+  // code crashed (sims3-nx's Instruction Abort).
+  const auto* exe = REX_KERNEL_STATE()->GetExecutableModule().get();
+  const bool own = raw_name_ptr && exe &&
+                   rex::string::utf8_find_name_from_guest_path(loader_data.launch_path) ==
+                       rex::string::utf8_find_name_from_guest_path(exe->path());
+  if (own && REXCVAR_GET(xam_relaunch_self) && __system_argv && __system_argv[0] && __system_argv[0][0]) {
+    if (FILE* f = std::fopen(RelaunchFile().c_str(), "wb")) {
+      if (loader_data.launch_data_present && !loader_data.launch_data.empty()) {
+        std::fwrite(loader_data.launch_data.data(), 1, loader_data.launch_data.size(), f);
+      }
+      std::fclose(f);
+    }
+    envSetNextLoad(__system_argv[0], __system_argv[0]);
+    const RexSwitchHandle self = RexSwitchHandleFor(pthread_self());
+    auto threads = REX_KERNEL_OBJECTS()->GetObjectsByType<rex::system::XThread>();
+    uint32_t paused = 0;
+    for (auto& thread : threads) {
+      if (!thread->thread()) continue;
+      const RexSwitchHandle handle =
+          RexSwitchHandleFor(reinterpret_cast<pthread_t>(thread->thread()->native_handle()));
+      if (handle == REX_SWITCH_INVALID_HANDLE || handle == self) continue;
+      if (svcSetThreadActivity(handle, 1) == 0) ++paused;
+    }
+    REXKRNL_INFO("[loader] paused {} threads, loading the NRO again", paused);
+    rex::FlushLogging();
+    _exit(0);
+  }
+#endif
 
   // This function does not return.
   REX_KERNEL_STATE()->TerminateTitle();

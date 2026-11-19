@@ -12,7 +12,9 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <rex/cvar.h>
 #include <rex/filesystem/device.h>
+#include <rex/filesystem/devices/host_path_device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
@@ -29,6 +31,8 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
+
+REXCVAR_DECLARE(bool, filesystem_keep_open);  // filesystem/devices/host_path_entry.cpp (culdcept-nx)
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -163,7 +167,13 @@ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> i
       // Make sure we're working with up-to-date information, just in case the
       // file size has changed via something other than NtSetInfoFile
       // (eg. seems NtWriteFile might extend the file in some cases)
-      file->entry()->update();
+      // culdcept-nx (2026-11-20, filesystem_keep_open): a read-only device's files never change, so the size from the
+      // tree is kept (the stat was three more file-system requests on the Switch).
+      if (REXCVAR_GET(filesystem_keep_open) && file->entry()->is_read_only()) {
+        rex::filesystem::NoteRestatSkipped();
+      } else {
+        file->entry()->update();
+      }
 
       auto info = info_ptr.as<X_FILE_NETWORK_OPEN_INFORMATION*>();
       info->creation_time = file->entry()->create_timestamp();

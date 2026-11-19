@@ -15,9 +15,12 @@ for line in open(sys.argv[1], encoding='utf-8', errors='replace'):
     if not m:
         continue
     (entry if m.group(1) == 'ENTRY' else ret).add(int(m.group(2)[4:], 16))
-    c = re.search(r'<= (sub_[0-9A-F]{8})', line)
-    if c:
-        ret.add(int(c.group(1)[4:], 16))
+    # renut-ultimate (2026-11-20, port 194; TFU-nx's of 2026-11-12, via S4ep1-nx): every callee the line names, not
+    # only the first ("<= sub_A sub_B", "<= INDIRECT sub_A").
+    c = line.split('<=', 1)
+    if len(c) == 2:
+        for callee in re.findall(r'sub_([0-9A-F]{8})', c[1]):
+            ret.add(int(callee, 16))
 all_ = sorted(entry | ret)
 print(f'# {len(entry)} ENTRY and {len(ret)} RET functions (tools/diet_keep_list.py, from tools/non_argument_audit.py).')
 print('non_argument_as_local_keep = [')

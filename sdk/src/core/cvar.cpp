@@ -6,6 +6,7 @@
  * @license     BSD 3-Clause License
  */
 
+#include <cstdio>  // port 193
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -668,6 +669,10 @@ void LoadConfigString(std::string_view toml_text, std::string_view origin) {
   }
 }
 
+namespace {
+std::string g_config_error;  // port 193: LoadConfig's last parse failure, empty when none
+}  // namespace
+
 void LoadConfig(const std::filesystem::path& config_path) {
   if (!std::filesystem::exists(config_path)) {
     REXLOG_DEBUG("Config file not found: {}", config_path.string());
@@ -680,7 +685,21 @@ void LoadConfig(const std::filesystem::path& config_path) {
     REXLOG_DEBUG("Loaded config from {}", config_path.string());
   } catch (const toml::parse_error& err) {
     REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
+    // renut-ultimate (2026-11-20, port 193): TFU-nx's of 2026-11-12, as S4ep1-nx carries it
+    // (github.com/FurryLilManChild/S4ep1-nx, GPL-3.0, 0.5.1). The config loads before the log opens, so the line above
+    // was lost and a toml with one duplicate key silently applied nothing (TFU's first Switch test ran on defaults).
+    // stderr is open from the start (kept in memory with logging off, port 183, and in a crash report), and the reason
+    // is kept for the app to log again once the log is up (rex_app.cpp).
+    std::fprintf(stderr, "CONFIG NOT LOADED: %s: %s (line %u)\n", config_path.string().c_str(),
+                 std::string(err.description()).c_str(), static_cast<unsigned>(err.source().begin.line));
+    std::fflush(stderr);
+    g_config_error = config_path.string() + ": " + std::string(err.description()) + " (line " +
+                     std::to_string(err.source().begin.line) + ")";
   }
+}
+
+const std::string& LastConfigError() {
+  return g_config_error;
 }
 
 void ApplyEnvironment() {

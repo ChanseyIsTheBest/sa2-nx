@@ -16,6 +16,10 @@
 #if REX_PLATFORM_MAC
 #include <sys/mman.h>
 #endif
+#include <rex/platform.h>
+#if REX_PLATFORM_WIN32
+#include "../core/platform_win.h"  // port 193: VirtualQuery for the guest crash report
+#endif
 
 #include <fmt/format.h>
 
@@ -609,8 +613,27 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
   return mmio_handler_->LookupRange(virtual_address);
 }
 
+#if REX_PLATFORM_SWITCH || REX_PLATFORM_WIN32
 #if REX_PLATFORM_SWITCH
 extern "C" void* RexGmShadowFor(uint64_t window_address);
+#else
+// Port 193 (TFU-nx's of 2026-11-11, via S4ep1-nx): the same report on the PC (it was Switch-only). Guest memory is read
+// only where the host page is committed and readable, so the report cannot fault itself.
+static void* RexGmShadowFor(uint64_t window_address) {
+  MEMORY_BASIC_INFORMATION mbi{};
+  if (!VirtualQuery(reinterpret_cast<const void*>(window_address), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+      (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE |
+      PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY))) {
+    return nullptr;
+  }
+  // A read of 4 bytes may cross into the next page: check that one too.
+  const uint64_t end = window_address + 3;
+  if ((end & ~uint64_t(0xFFF)) != (window_address & ~uint64_t(0xFFF))) {
+    return RexGmShadowFor(end) ? reinterpret_cast<void*>(window_address) : nullptr;
+  }
+  return reinterpret_cast<void*>(window_address);
+}
+#endif
 
 namespace {
 /*
@@ -715,7 +738,7 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
         rex::thread::current_thread_id());
-#if REX_PLATFORM_SWITCH
+#if REX_PLATFORM_SWITCH || REX_PLATFORM_WIN32  // port 193: the PC too
     DumpGuestCrashContext(virtual_membase_);
 #endif
     return false;

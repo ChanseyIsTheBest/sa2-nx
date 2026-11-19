@@ -21,14 +21,129 @@
 #include <rex/math.h>
 #include <rex/memory/mapped_memory.h>
 #include <rex/string.h>
+#include <rex/cvar.h>
+
+#include <algorithm>
+#include <atomic>
+#include <list>
+#include <mutex>
+
+/*
+ * culdcept-nx (2026-11-20): keep the game's data files open (HostPathEntry::Park). The console profile of a board
+ * replay (out/console_runs/prof1) had 18 % of the game thread's slow frames in file-system requests: Culdcept Saga
+ * reopens DATA00.RSP, its layout*.RSL and se_*.xma banks every few seconds, and each open on Horizon is _fsFsOpenCommon
+ * plus fsFsGetFileTimeStampRaw (inside fsdev_open) and each close _fsObjectClose, 4-5 ms an open on average, the worst
+ * over 100 ms. Only read-only opens of a read-only device are kept (the game data, never a save). A handle is just a
+ * descriptor read with pread at an offset, so a reused one returns the same bytes as a fresh one.
+ */
+REXCVAR_DEFINE_BOOL(filesystem_keep_open, true, "Filesystem",
+                    "Keep the host handles of read-only game files open after the guest closes them and reuse "
+                    "them on the next open (no open, timestamp or close request to the file system).");
+REXCVAR_DEFINE_INT32(filesystem_keep_open_max, 32, "Filesystem",
+                     "How many closed read-only handles stay open at most (the oldest is closed beyond it).");
+
+#if REX_PLATFORM_SWITCH
+namespace rex::filesystem {
+bool TruncateOpenFile(const std::filesystem::path& path);  // core/filesystem_posix.cpp (port 203)
+}
+#endif
 
 namespace rex::filesystem {
+
+namespace {
+
+struct ParkedHandle {
+  const HostPathEntry* entry;
+  std::unique_ptr<FileHandle> handle;
+};
+
+// Never destroyed: a device torn down during static destruction at exit still finds them.
+struct Parked {
+  std::mutex mutex;
+  std::list<ParkedHandle> list;  // newest first
+};
+Parked& P() {
+  static Parked* p = new Parked();
+  return *p;
+}
+std::atomic<uint64_t> g_keep_reused{0};
+std::atomic<uint64_t> g_keep_parked{0};
+std::atomic<uint64_t> g_keep_evicted{0};
+std::atomic<uint64_t> g_keep_restats_skipped{0};
+std::atomic<uint64_t> g_keep_retries{0};
+
+// Closes every parked handle; how many there were.
+size_t DropAllParked() {
+  std::list<ParkedHandle> all;  // closed after the lock is let go
+  {
+    std::lock_guard lock(P().mutex);
+    all.swap(P().list);
+  }
+  return all.size();
+}
+
+}  // namespace
+
+StatsKeepOpen ReadStatsKeepOpen() {
+  StatsKeepOpen s;
+  s.reused = g_keep_reused.load(std::memory_order_relaxed);
+  s.parked = g_keep_parked.load(std::memory_order_relaxed);
+  s.evicted = g_keep_evicted.load(std::memory_order_relaxed);
+  s.restats_skipped = g_keep_restats_skipped.load(std::memory_order_relaxed);
+  std::lock_guard lock(P().mutex);
+  s.live = P().list.size();
+  return s;
+}
+
+void NoteRestatSkipped() {
+  g_keep_restats_skipped.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::unique_ptr<FileHandle> HostPathEntry::TakeParked() {
+  std::lock_guard lock(P().mutex);
+  for (auto it = P().list.begin(); it != P().list.end(); ++it) {
+    if (it->entry == this) {
+      auto handle = std::move(it->handle);
+      P().list.erase(it);
+      g_keep_reused.fetch_add(1, std::memory_order_relaxed);
+      return handle;
+    }
+  }
+  return nullptr;
+}
+
+void HostPathEntry::Park(std::unique_ptr<FileHandle> handle) {
+  static const bool keep = REXCVAR_GET(filesystem_keep_open);
+  static const size_t keep_max = size_t(std::max(0, int(REXCVAR_GET(filesystem_keep_open_max))));
+  if (!handle || !keep || !keep_max) {
+    return;  // closed here
+  }
+  std::unique_ptr<FileHandle> evicted;  // closed after the lock is let go (declared first, destroyed last)
+  std::lock_guard lock(P().mutex);
+  P().list.push_front(ParkedHandle{this, std::move(handle)});
+  g_keep_parked.fetch_add(1, std::memory_order_relaxed);
+  if (P().list.size() > keep_max) {
+    evicted = std::move(P().list.back().handle);
+    P().list.pop_back();
+    g_keep_evicted.fetch_add(1, std::memory_order_relaxed);
+  }
+}
 
 HostPathEntry::HostPathEntry(Device* device, Entry* parent, const std::string_view path,
                              const std::filesystem::path& host_path)
     : Entry(device, parent, path), host_path_(host_path) {}
 
-HostPathEntry::~HostPathEntry() = default;
+HostPathEntry::~HostPathEntry() {
+  std::list<ParkedHandle> mine;  // closed after the lock is let go (declared first, destroyed last)
+  std::lock_guard lock(P().mutex);
+  for (auto it = P().list.begin(); it != P().list.end();) {
+    auto next = std::next(it);
+    if (it->entry == this) {
+      mine.splice(mine.end(), P().list, it);
+    }
+    it = next;
+  }
+}
 
 HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
                                      const std::filesystem::path& full_path,
@@ -113,11 +228,29 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
   std::unique_ptr<rex::filesystem::FileHandle> file_handle;
   if (is_read_only() && !(desired_access & (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
                                             FileAccess::kFileAppendData | FileAccess::kGenericAll))) {
+    // culdcept-nx (2026-11-20): or the one a previous open of this file left parked (already wrapped for an .lz4b).
+    file_handle = TakeParked();
+    if (file_handle) {
+      *out_file = new HostPathFile(desired_access, this, std::move(file_handle));
+      return X_STATUS_SUCCESS;
+    }
     file_handle = startup_trace::TakePreopened(static_cast<HostPathDevice*>(device_), path());
   }
   if (!file_handle) {
     file_handle = rex::filesystem::FileHandle::OpenExisting(
         host_path_, desired_access, static_cast<HostPathDevice*>(device_)->allow_share_delete());
+  }
+  // culdcept-nx (2026-11-20, filesystem_keep_open): an open that fails while handles are parked gives them all up and is
+  // tried once more, on any device (game data or saves): whatever limit the system puts on open files, the parked
+  // handles never take a slot a real open needs.
+  if (!file_handle) {
+    if (const size_t dropped = DropAllParked()) {
+      file_handle = rex::filesystem::FileHandle::OpenExisting(
+          host_path_, desired_access, static_cast<HostPathDevice*>(device_)->allow_share_delete());
+      if (g_keep_retries.fetch_add(1, std::memory_order_relaxed) < 20)
+        REXFS_WARN("[io] keep-open: opening '{}' failed with {} handles parked; all closed, opened again: {}",
+                   rex::path_to_utf8(host_path_), dropped, file_handle ? "opened" : "failed again");
+    }
   }
   if (!file_handle) {
     // TODO(benvanik): pick correct response.
@@ -145,6 +278,14 @@ bool HostPathEntry::Truncate() {
   if (is_read_only() || (attributes_ & kFileAttributeDirectory)) {
     return false;
   }
+#if REX_PLATFORM_SWITCH
+  // Port 203 (sims3-nx's): a file that is already open is truncated through its one Horizon handle.
+  if (rex::filesystem::TruncateOpenFile(host_path_)) {
+    size_ = 0;
+    allocation_size_ = 0;
+    return true;
+  }
+#endif
   auto file = rex::filesystem::OpenFile(host_path_, "wb");
   if (!file) {
     return false;

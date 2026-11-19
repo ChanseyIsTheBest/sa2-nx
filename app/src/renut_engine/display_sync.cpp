@@ -2,6 +2,8 @@
 // futari_vblank_phase_auto (the user's own port, docs/futari-notes.md "Input lag"), for a game paced by the frame
 // limiter rather than by its vertical blank, whose frames take more than one refresh from release to image.
 #include "renut_engine/display_sync.h"
+#include "renut_engine/Fps.h"
+#include "renut_engine/hooks.h"  // port 196: fpsManager (the FPS counter)
 
 #include <algorithm>
 #include <atomic>
@@ -372,6 +374,11 @@ void AtRefresh(uint64_t now, uint64_t period) {
   if (newest < 0)
     return;  // dropped meanwhile (eight presents without a refresh)
   ++g_refreshes_with_image;
+  // renut-ultimate (2026-11-20, port 196): S4ep1-nx's of 2026-11-15 (github.com/FurryLilManChild/S4ep1-nx, GPL-3.0).
+  // The FPS counter counts what the player sees: refreshes that showed a new image. The overlay's only other counter
+  // ("Tick", renut_engine/FPS.cpp) is N&B's appMainTickPreDraw hook, built for no other game, so it showed nothing.
+  static FPSCounter *const shown_counter = fpsManager.GetCreateCounter("Shown");
+  shown_counter->Tick();
   g_superseded += uint64_t(newest);
   const Shown s = g_shown[(g_shown_head + uint32_t(newest)) % kShown];
   g_shown_head = (g_shown_head + uint32_t(newest) + 1) % kShown;
@@ -588,8 +595,13 @@ void NoteRelease(uint64_t at, bool anchored) {
 }
 
 void NotePresented(uint64_t swap) {
-  if (!g_running.load(std::memory_order_acquire))
+  if (!g_running.load(std::memory_order_acquire)) {
+    // Port 196: without the display thread (it starts with the frame limiter; Katamari uncapped, the PC) the FPS
+    // counter counts each image presented, since no refresh says which were shown (Ryujinx, 2026-11-20: "0 FPS").
+    static FPSCounter *const presented_counter = fpsManager.GetCreateCounter("Shown");
+    presented_counter->Tick();
     return;
+  }
   const uint64_t now = NowNs();
   const uint64_t index = renut::gpu::Video::PresentCount();
   const uint64_t input = rex::latency::InputTimeOf(swap);

@@ -112,7 +112,9 @@ if(PLUME_D3D12_AGILITY_SDK_ENABLED)
 endif()
 
 if(PLUME_PLATFORM_SWITCH)
-    if(NOT EXISTS "${PLUME_SWITCH_NVK_LIBRARY}")
+    # renut-ultimate (2026-11-20, port 194; TFU-nx's): the driver must exist only when it is linked (PLUME_SWITCH_NVK_LINK,
+    # set by the parent before this file: banjo_renut_gpu.cmake); the deko3d-only build has none.
+    if((NOT DEFINED PLUME_SWITCH_NVK_LINK OR PLUME_SWITCH_NVK_LINK) AND NOT EXISTS "${PLUME_SWITCH_NVK_LIBRARY}")
         message(FATAL_ERROR "PLUME_SWITCH_NVK_LIBRARY does not exist: ${PLUME_SWITCH_NVK_LIBRARY}")
     endif()
     target_compile_definitions(plume PUBLIC
@@ -171,7 +173,12 @@ if(PLUME_PLATFORM_SWITCH)
         "-Wl,--end-group"
     )
     else()
-        target_link_libraries(plume PUBLIC zstd z nx)
+        # Port 194 (TFU-nx's): libzstd only when the switch-zstd portlib is installed (Renut decompresses with its own
+        # copy, renut_zstd; nothing else needs it without the NVK driver).
+        if(EXISTS "${PLUME_SWITCH_PORTLIBS_ROOT}/portlibs/switch/lib/libzstd.a")
+            target_link_libraries(plume PUBLIC zstd)
+        endif()
+        target_link_libraries(plume PUBLIC z nx)
     endif()
 
     # banjo-nx (2026-10-17): the deko3d back end (plume_deko3d*.cpp, banjo-nx docs/deko3d-renderer.md): devkitPro's

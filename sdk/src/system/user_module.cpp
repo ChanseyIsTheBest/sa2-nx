@@ -104,10 +104,23 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
 
   // Search for sibling XEX patch file
   auto patch_entry = kernel_state_->file_system()->ResolvePath(path_ + "p");
+  // Port 204 (sims3-nx's): then the update partition (update:, Runtime::SetupVfs's update_data_root), where a title
+  // update keeps a module's patch (The Sims 3's Sims3.xexp, PrivLoader.xexp).
+  // Only when update: is mounted (Runtime::SetupVfs registers it for an existing update_data_root): a path on a
+  // device that is not there logs an error ("device not found"; Katamari, which has no title update, 2026-11-20).
+  std::string update_target;
+  if (!patch_entry && kernel_state_->file_system()->FindSymbolicLink("update:", update_target)) {
+    std::string file = name_;
+    const size_t slash = path_.find_last_of("\\/");
+    if (file.empty() || file.find('.') == std::string::npos) {
+      file = path_.substr(slash == std::string::npos ? 0 : slash + 1);
+    }
+    patch_entry = kernel_state_->file_system()->ResolvePath("update:\\" + file + "p");
+  }
   if (patch_entry) {
     auto patch_path = patch_entry->absolute_path();
 
-    REXSYS_DEBUG("Loading XEX patch from {}", patch_path);
+    REXSYS_INFO("Loading XEX patch from {}", patch_path);  // port 204: said at info level
 
     auto patch_module = object_ref<UserModule>(new UserModule(kernel_state_));
     result = patch_module->LoadFromFile(patch_path);

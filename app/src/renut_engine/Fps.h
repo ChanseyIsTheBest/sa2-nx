@@ -81,9 +81,11 @@ public:
             else if (fps <= 70.0f) color = ImVec4(0.2f, 1.0f, 0.2f, 1.0f);
             else color = ImVec4(0.2f, 0.6f, 1.0f, 1.0f);
 
+            // Port 196 (S4ep1-nx's): "Shown" counts new images on the display; cpu and gpu only where a game hook
+            // sets them.
             ImGui::TextColored(color, "%.0f FPS", fps);
-            ImGui::TextColored(color,"cpu: %.1fms", cpuMS);
-            ImGui::TextColored(color,"gpu: %.1fms", gpuMS);
+            if (cpuMS > 0.0) ImGui::TextColored(color,"cpu: %.1fms", cpuMS);
+            if (gpuMS > 0.0) ImGui::TextColored(color,"gpu: %.1fms", gpuMS);
         }
 
         float hostFps = static_cast<float>(rex::cvar::Query<double>("present_host_fps"));

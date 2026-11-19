@@ -410,8 +410,9 @@ void XmaDecoder::WorkerThreadMain() {
     if (pending_was) {
       // From the kick to the data being written: the latency the game could notice.
       const int64_t from = g_pending_from_ns.load(std::memory_order_acquire);
-      if (from) {
-        const uint64_t latency = uint64_t(NowNs() - from);
+      const int64_t now_ns = NowNs();
+      if (from && now_ns >= from) {
+        const uint64_t latency = uint64_t(now_ns - from);
         WorkerPeriod();  // blur-nx (2026-11-13, M-39)
         AddOwn(g_measurement_xma_worker.latency_ns, latency);
         AddOwn(g_measurement_xma_worker.latency_n, 1);
@@ -667,17 +668,26 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     // XMADisableContext
     uint32_t base_context_id = (r - XmaRegister::Context0Lock) * 32;
     const int64_t lock_before = NowNs();
+    const int32_t worker_mode = REXCVAR_GET(audio_xma_in_worker);
     uint64_t lock_contexts = 0;
     for (int i = 0; value && i < 32; ++i, value >>= 1) {
       if (value & 1) {
         uint32_t context_id = base_context_id + i;
         auto& context = contexts_[context_id];
         ++lock_contexts;
+        if (worker_mode != 0) {
+          // Drain any pending kick before Disable() clears is_enabled_, including when the
+          // worker just took the pending bit but hasn't acquired context.lock_ yet.
+          const bool took = TakePending(context_id);
+          if (context.Work()) {
+            context.SignalWorkDone();
+            if (took) {
+              g_measurement_xma.contexts_backup.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
+        }
         context.Disable();
-        // [XMA fix] Added Block(false) after Disable(). Without this, the game
-        // could call XMADisableContext and start modifying the context struct
-        // while a decode was still in progress on the worker thread. Block()
-        // waits for the context mutex to be free (poll=false means wait, not spin).
+        // [XMA fix] Wait for any in-flight decode on the worker thread before returning.
         context.Block(false);
       }
     }

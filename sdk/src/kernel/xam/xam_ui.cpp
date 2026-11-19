@@ -19,10 +19,22 @@
 
 REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
                     "Don't display any UI, using defaults for prompts as needed");
+// culdcept-nx (2026-11-19): test routes through a name the game leaves empty.
+REXCVAR_DEFINE_STRING(headless_keyboard_text, "", "Kernel",
+                      "With headless: the text a keyboard prompt (XamShowKeyboardUI) answers with, as if typed. Empty: "
+                      "the game's default text, as before");
 // banjo-nx (2026-10-21): the game's Xbox 360 keyboard (XShowKeyboardUI) as the Switch's own (xam_ui_switch.cpp).
 REXCVAR_DEFINE_BOOL(switch_software_keyboard, true, "Kernel",
                     "Switch: the game's on-screen keyboard is the system's software keyboard applet. false = the "
                     "ImGui text box (no keys to type with on the console)");
+// culdcept-nx (2026-11-19, a keyboard that came back after every cancel on the console): Culdcept Saga reads a
+// cancel as XGetOverlappedResult returning ERROR_CANCELLED (its keyboard object, sub_822AFF18: 1223 -> "cancelled",
+// 0 -> read the buffer). With the result ERROR_SUCCESS and only the extended error ERROR_CANCELLED (Xenia's), it read
+// the cleared buffer as a name the player gave, so the name screen asked again, and the player could not leave it.
+REXCVAR_DEFINE_BOOL(xam_keyboard_cancel_result, true, "Kernel",
+                    "A cancelled keyboard (XamShowKeyboardUI) completes its overlapped with ERROR_CANCELLED as the "
+                    "result as well as the extended error, as the console does. false: the result ERROR_SUCCESS with "
+                    "the extended error only (as before)");
 REXCVAR_DEFINE_DOUBLE(switch_software_keyboard_test, 0.0, "Kernel",
                       "Test: this many seconds after the game first reads a controller, open the keyboard once as "
                       "the game does (XamShowKeyboardUI with an overlapped) and log the result. 0 = off");
@@ -40,6 +52,14 @@ REXCVAR_DEFINE_DOUBLE(switch_software_keyboard_test, 0.0, "Kernel",
 
 #include <algorithm>
 #include <chrono>
+
+// culdcept-nx (2026-11-19, the name screen frozen on the console): Culdcept Saga asks "is this name OK?" with
+// XShowMessageBoxUI. The SDK's ImGui dialog for it was never seen on the console (its overlapped never completed: the
+// game held XN_SYS_UI on and took no input), so on the Switch a message box takes the button the game focused, as with
+// headless (the route runs' answer: the creation, the save, the story and the battle went through), and is logged.
+REXCVAR_DEFINE_BOOL(switch_message_box_focused, true, "Kernel",
+                    "Switch: a system message box (XamShowMessageBoxUI) is answered at once with the button the game "
+                    "focused, as with headless, and logged. false = the SDK's ImGui dialog (never shown on the console)");
 
 namespace rex {
 namespace kernel {
@@ -79,6 +99,21 @@ class XamDialog : public rex::ui::ImGuiDialog {
     if (close_callback_) {
       close_callback_();
     }
+  }
+
+  // renut-ultimate (2026-11-20, port 195): S4ep1-nx's of 2026-11-15 (github.com/FurryLilManChild/S4ep1-nx, GPL-3.0). The
+  // game's message boxes (Sonic 4's save prompt at the title) drew at ImGui's 13 px design size, too small to read on
+  // the handheld screen. Twice the size, the padding with it.
+  virtual void DrawScaled(ImGuiIO& io) = 0;
+  void OnDraw(ImGuiIO& io) final {
+    constexpr float kScale = 2.0f;
+    ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * kScale);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8 * kScale, 4 * kScale));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8 * kScale, 4 * kScale));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12 * kScale, 10 * kScale));
+    DrawScaled(io);
+    ImGui::PopStyleVar(3);
+    ImGui::PopFont();
   }
 
  private:
@@ -237,7 +272,7 @@ class MessageBoxDialog : public XamDialog {
 
   uint32_t chosen_button() const { return chosen_button_; }
 
-  void OnDraw(ImGuiIO& io) override {
+  void DrawScaled(ImGuiIO& io) override {  // port 195
     bool first_draw = false;
     if (!has_opened_) {
       ImGui::OpenPopup(title_.c_str());
@@ -305,11 +340,30 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
     buttons.push_back(rex::string::to_utf8(button));
   }
 
+  // culdcept-nx (2026-11-19): every message box logged (the game's question, its buttons, the answer).
+  {
+    std::string listed;
+    for (size_t i = 0; i < buttons.size(); ++i) {
+      listed += (i ? " | " : "") + buttons[i];
+    }
+    REXKRNL_INFO("XamShowMessageBoxUI: \"{}\": \"{}\" [{}], focused button {}", title, text_str, listed,
+                 uint32_t(active_button));
+  }
+
   X_RESULT result;
-  if (REXCVAR_GET(headless)) {
+  bool answer_focused = REXCVAR_GET(headless);
+#if REX_PLATFORM_SWITCH
+  answer_focused = answer_focused || REXCVAR_GET(switch_message_box_focused);
+#endif
+  if (answer_focused) {
     // Auto-pick the focused button.
-    auto run = [result_ptr, active_button]() -> X_RESULT {
-      *result_ptr = static_cast<uint32_t>(active_button);
+    const uint32_t answer = uint32_t(active_button) < button_count ? uint32_t(active_button) : 0;
+    if (!REXCVAR_GET(headless)) {
+      REXKRNL_INFO("XamShowMessageBoxUI: answered with the focused button {} (\"{}\") (switch_message_box_focused)",
+                   answer, answer < buttons.size() ? buttons[answer] : std::string());
+    }
+    auto run = [result_ptr, answer]() -> X_RESULT {
+      *result_ptr = answer;
       return X_ERROR_SUCCESS;
     };
     result = xeXamDispatchHeadless(run, overlapped.guest_address());
@@ -377,7 +431,7 @@ class KeyboardInputDialog : public XamDialog {
   const std::string& text() const { return text_; }
   bool cancelled() const { return cancelled_; }
 
-  void OnDraw(ImGuiIO& io) override {
+  void DrawScaled(ImGuiIO& io) override {  // port 195
     bool first_draw = false;
     if (!has_opened_) {
       ImGui::OpenPopup(title_.c_str());
@@ -492,7 +546,7 @@ constexpr size_t kPromptMaxChars = 512;
     length = 0;
     if (result == SwitchKeyboardResult::kCancelled) {
       extended_error = X_ERROR_CANCELLED;
-      return X_ERROR_SUCCESS;
+      return REXCVAR_GET(xam_keyboard_cancel_result) ? X_ERROR_CANCELLED : X_ERROR_SUCCESS;
     }
     rex::string::copy_and_swap_truncating(
         out, result == SwitchKeyboardResult::kAccepted ? text : default_value, out_count);
@@ -595,6 +649,13 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
   X_RESULT result;
   if (REXCVAR_GET(headless)) {
     auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
+      // culdcept-nx (2026-11-19): a test route's answer for a game whose default text is empty (Culdcept Saga's
+      // Cepter name: an empty name keeps "Create Cepter" disabled), as if typed.
+      const std::string& typed = REXCVAR_GET(headless_keyboard_text);
+      if (!typed.empty()) {
+        rex::string::copy_and_swap_truncating(buffer, rex::string::to_utf16(typed), buffer_length);
+        return X_ERROR_SUCCESS;
+      }
       // Redirect default_text back into the buffer.
       if (!default_text) {
         std::memset(buffer, 0, buffer_size);
@@ -610,7 +671,7 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
       if (dialog->cancelled()) {
         extended_error = X_ERROR_CANCELLED;
         length = 0;
-        return X_ERROR_SUCCESS;
+        return REXCVAR_GET(xam_keyboard_cancel_result) ? X_ERROR_CANCELLED : X_ERROR_SUCCESS;
       } else {
         // Zero the output buffer.
         auto text = rex::string::to_utf16(dialog->text());

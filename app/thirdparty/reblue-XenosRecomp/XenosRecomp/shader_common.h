@@ -835,8 +835,22 @@ float4 banjoTrim(float4 c, uint target)
 #endif
 }
 
+// culdcept-nx (2026-11-19): the alpha test at the 8-bit precision of the game's colour targets. Culdcept Saga draws its
+// models with ALPHAFUNC GREATEREQUAL and ALPHAREF 255 (threshold 1.0) and a white vertex colour: on the PC (and on any
+// GPU that interpolates perspective-correctly) the interpolated 1.0 comes out as 0.99999994 at scattered pixels, which
+// fail the test, and every model and the ground were speckled with holes (RenderDoc: those pixels "discarded" by the
+// pixel shader; the log's alpha tests: func 6 at 1.0, 1/255 and 0). The console shows no such holes. Rounding both sides
+// to the 8-bit grid (an ALPHAREF is k / 255) keeps every comparison the game makes exact at its targets' precision.
+// 0 (the base's default) is the plain float compare.
+#ifndef RENUT_ALPHA_TEST_UNORM8
+#define RENUT_ALPHA_TEST_UNORM8 0  // the base: off (a picture change: off-by-default.md section 1); culdcept-nx sets 1
+#endif
 void alphaTest(float alpha, uint func, float reference)
 {
+#if RENUT_ALPHA_TEST_UNORM8
+    alpha = round(alpha * 255.0);
+    reference = round(reference * 255.0);
+#endif
     const bool pass = select(func == 0u, false,
                       select(func == 1u, alpha < reference,
                       select(func == 2u, alpha == reference,

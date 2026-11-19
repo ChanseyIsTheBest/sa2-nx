@@ -289,6 +289,11 @@ struct X_KTHREAD {
 };
 static_assert_size(X_KTHREAD, 0xAB0);
 
+// culdcept-nx (2026-11-19): a function every game thread runs as it enters a kernel wait or a sleep (XObject::Wait,
+// SignalAndWait, WaitMultiple, XThread::Delay); nullptr = none. Renut sets it to run the GPU callbacks the render
+// thread has reached (xthread.cpp, ApplyGuestCoreLayoutAtWait).
+void SetGuestWaitHook(void (*hook)());
+
 class XThread : public XObject {
  public:
   static const XObject::Type kObjectType = XObject::Type::Thread;
