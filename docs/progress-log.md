@@ -53,3 +53,11 @@ and docs/sa2-near-exact.md.
   `renut_codegen`, which the cross build does not have. Guarded as the main template guards its own (the template, and
   the generated file by hand so the tree need not be generated again now; the next PC build generates it again, since
   the generator changes).
+- The first Switch build: `app\out\switch\renut.nro`, 55.7 MB (the everyday form: the GLSL package built in, no LTO).
+  A trap on the way: `tools\build_switch.bat` expands `CMAKE_EXTRA` unquoted, so a path with a space came through as
+  "D:/sonic" (a stray log file of the first PC boot happened to exist there, so the configure's check passed and the
+  build tried to run it as uam). `out\switch_build.bat` quotes it; the stray file is in `out\to_delete_stray_20261119`.
+- Censuses on the PC (sa2-near-exact.md): CG-13 on three routes, the near-exact counters, the fp_env_files check; the
+  three keys from SA2's logs and the stereo check (sa2-ultimate-notes.md).
+- `tools\sa2_emu_ab.ps1`: the emulator A/B of the rebased NRO and 1.0.6's in the same SD folder, each with its own files.
+- `tools\deko3d_variant_cache.py --uam`.
