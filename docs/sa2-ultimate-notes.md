@@ -119,9 +119,21 @@ own GLSL package, compiled-shader cache and user folder), the attract sequence f
   guest time base (`mftb` is `Clock::QueryGuestTickCount` in both trees, the clock code the same), a vblank interrupt
   (none under Renut in either), the locals the prologue saves write (all zero-initialised in both trees, which is
   what 1.0.6's stale-stack-word reader of the two-player demo depends on; cpu-rounds.md, "The audit" item 1). Open.
-- **Which float form makes the demo drift:** two builds (`switch-cg13`: CG-13 alone; `switch-vmx`: the two VMX forms
-  alone), each measured by the share of 1.0.6's late demo frames found identical (the exact build: 135 of 200 around
-  game frame 7900; the default build: 0).
+- **Which float form makes the demo drift** (`out\edits\demo_blocks.py`: 1.0.6's demo frames found identical, per
+  200 game frames):
+
+  | Build | Demo frames identical | Around game frame 7900 |
+  |---|---|---|
+  | default (CG-13, VMX estimates, fused multiply-add on) | 60 of 2,259 | 0 of 200 |
+  | exact (all three off), four runs | 485-524 of 2,259 | 135 of 200 |
+  | CG-13 alone | 484 of 2,259 | 135 of 200 |
+  | the two VMX forms alone | 52 of 2,259 | 0 of 200 |
+
+  **The VMX pair (port 72) makes player 2's run drift; CG-13 changes nothing here** (its census's denormals in the demo
+  leave every frame as the exact build has it). The exact runs also agree with each other in every block from game
+  frame 6300 on: what still differs from 1.0.6 there is the same frames every run, so a fixed difference, not timing;
+  only the demo's first 400 frames vary between runs. The user's decision (2026-11-19): the offending shortcut off in
+  SA2's own build, on in the base. Next: the pair split (`switch-est`, `switch-fma`, each with CG-13).
 
 ## Gameplay on the PC, verify mode (2026-11-19)
 
