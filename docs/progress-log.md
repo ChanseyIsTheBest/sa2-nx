@@ -66,3 +66,21 @@ and docs/sa2-near-exact.md.
   multiply-add (`SASRT_VMX_FUSED_MADD`) makes it drift, CG-13 and the estimates do not. The user: the offending one off
   in SA2's build, on in the base: `SASRT_VMX_FUSED_MADD` OFF in `app/CMakeLists.txt`. A smaller fixed difference
   (grind sparks, an edge of a board) remains with every form off; its cause is open.
+- The excess files of the day (18.6 GB: five variant Switch builds, the recordings' frames, run copies of the save)
+  went to `out\to_delete_20261119`, which the user deleted.
+
+## 2026-11-20
+
+- The hooks compiled into SA2's build, checked one by one: every N&B / Katamari address hook is behind
+  `KATAMARI_BANJO_ADDRESS_HOOKS` (undefined, so off) except reNut's `single_tile` hook of `sub_821F99C0` (a
+  pass-through with its key off, but on an SA2 function, which it kept from being copied or called directly): now
+  behind the same switch (`renut_engine/hooks.cpp`).
+- The code generator only orders after `rexglue.exe` (an order-only input of the codegen step): a new generator
+  does not re-run the code generation; touching an input of `codegen.d` (`app/renut_config.toml`) does.
+- The R1_ASSUME census: the code generated again with `BLUR_NX_R1_ASSUME=1` (and the new `dll_targets` template), the PC
+  build, then a verify run.
+- SA2's hot lists for the base's tool (in `out\hot_prep` until the next generation): 1.0.6's `localized.txt` (87) and
+  `localized_bulk.txt` (290 after the 12 that were on both), and `hand.txt` with 1.0.6's four hand-written natives the
+  base carries under Banjo's addresses (memcpy, memset, the two shader-constant writers; their stack writes and
+  offsets checked against SA2's originals).
+- `tools\sa2_package_switch.ps1` (the console package in `out\packages`) and `dist\switch\sa2-nx\sa2_ab_keys.toml`.
