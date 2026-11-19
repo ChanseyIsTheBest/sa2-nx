@@ -130,6 +130,7 @@ own GLSL package, compiled-shader cache and user folder), the attract sequence f
   | the two VMX forms alone | 52 of 2,259 | 0 of 200 |
   | CG-13 + the VMX estimates | 267 of 2,259 | 57 of 200 (no drift; more frames slightly different) |
   | CG-13 + the fused multiply-add | 50 of 2,259 | 0 of 200 (drifts) |
+  | **SA2's default now** (`app\out\switch` rebuilt with the fused multiply-add off) | 268 of 2,259 | 57 of 200 (no drift; block for block as CG-13 + the estimates) |
 
   **The VMX pair (port 72) makes player 2's run drift; CG-13 changes nothing here** (its census's denormals in the demo
   leave every frame as the exact build has it). The exact runs also agree with each other in every block from game
