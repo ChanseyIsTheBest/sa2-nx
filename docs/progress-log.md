@@ -104,3 +104,14 @@ and docs/sa2-near-exact.md.
   of 1.0.6's frames. 1.0.6's "uninitialised stack word" was the tool. The fresh generation was also the determinism
   check: 677 of 726 files identical to the previous run, the 49 others the fixed marks.
 - `sasrt_gpu_skip_inert_draws = false` in SA2's settings (0 in every gameplay window of the PC's and emulator's logs).
+- `tools/frame_traffic.py` back to the base's LF line endings (2d9d4ad7): the worktree had checked out 436 of the base's
+  LF files with CRLF before `core.autocrlf false`; the fix's commit had stored that one file whole with CRLF. The 436
+  were put back as stored (their content was the same). The fix as a patch for the base:
+  `out\handoffs\frame-traffic-data-store.patch` (applies to the base's committed file).
+- The base had moved on to port 222 (2f590c31) during the night: ports 191-222 taken with `tools/ult_port_sync.py`
+  (02450663; docs/ultimate-sync.md): 73 files merged cleanly, 4 new, one conflict (`app/CMakeLists.txt`), the hand port
+  of `d3d/hooks/shader.cpp`. The tested state before it is the branch `ultimate-at-73b7b731`. Port 213's new device
+  field (the device's own vertex declaration) had Katamari's offset 0x2F98 in `draw.h`; its static_assert in
+  `draw.cpp` stopped the build: SA2's 0x3118 (draw.cpp's `kDeviceDeclarationOffset`, 1.0.6's layout).
+- Stack forwarding ruled out for the emulator's remaining demo difference (sa2-ultimate-notes.md): the PC checks every
+  forward against the real load (0 differences in every log), the Switch runs the same forwards.

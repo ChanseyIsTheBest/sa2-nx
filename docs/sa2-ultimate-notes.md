@@ -204,6 +204,13 @@ own GLSL package, compiled-shader cache and user folder), the attract sequence f
   in Ryujinx as ARM code its JIT turns into x86, and the two builds' ARM code differs (the PC builds, compiled from the
   same C++ for x86, are identical frame for frame); an ARM floating-point edge case the JIT does not reproduce exactly
   (flush-to-zero, NaN handling) would show for the one build's instruction sequence only. Only the console tells.
+- **Stack forwarding ruled out by the PC's own check (2026-11-20):** the one place where the PC and the Switch builds
+  run different code on purpose is port 121's forwarded stack loads: the hooked builds (the PC; any build with
+  `SASRT_HOT_IN_PLACE` off) define `REX_STACK_FWD_VERIFY`, take the real load and compare it with the forwarded words;
+  the in-place Switch builds use the forwarded words. So a wrong forward could never show in the PC's frames. But every
+  PC log of the rebase (856 report lines, the two-player demo's lockstep runs among them, about 900,000 compared
+  forwards per run) says 0 differences, and the Switch runs the same forwards. The bug port 199 fixes (a forward past a
+  call that may write the slots) did not happen on these routes. No other definition depends on the in-place form.
 
 ## Gameplay on the PC, verify mode (2026-11-19)
 
@@ -259,3 +266,9 @@ locals, the store cards). Not the whole-program analyses (leaf_dead_stores, dead
 ro_constants, the lr / r1 proofs, inline_leaves) nor the copies: they read one module's call graph and one image, and
 the modules reach each other only through pointers (sa2-nx's audit: the DLL's data holds no pointer into default.xex's
 code, and no indirect call of the game leaves the main image). This is 1.0.6's split.
+
+**Built code addresses (port 191's `tools/built_ptr_scan.py`, 2026-11-20):** the base's new step after a code
+generation, from Sonic 4's port (a callback whose address the game builds with `lis` + `addi` in a gap with no `.pdata`
+entry: the first call through it stopped the game). SA2: **0 candidates** in the main module (31,285 functions
+registered, 23,102 `.pdata` functions) and 0 in the stage DLL (160 registered, 59 `.pdata`; the script's image base is
+the main module's, so the DLL was scanned through a wrapper that sets 0x88000000).

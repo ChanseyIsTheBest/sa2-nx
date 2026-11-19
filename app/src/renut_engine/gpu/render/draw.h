@@ -227,7 +227,9 @@ enum DrawField : u32 {
 // too: the fast draw kept the draw before's vertex layout for Culdcept Saga's board panels (FVF quads), which then drew
 // wrong or not at all on deko3d (found with a field-forcing bisection in Ryujinx: forcing kFieldDecl alone brought them
 // back).
-constexpr u32 kDeviceOwnDeclarationBegin = 0x2F98, kDeviceOwnDeclarationEnd = 0x2F98 + 52 + 15 * 12;
+// sa2-nx-ult (2026-11-20): SA2's device (draw.cpp's kDeviceDeclarationOffset, 12568 = 0x3118, from 1.0.6's layout by
+// name); the base's 0x2F98 is Katamari's. The static_assert in draw.cpp ties the two.
+constexpr u32 kDeviceOwnDeclarationBegin = 0x3118, kDeviceOwnDeclarationEnd = 0x3118 + 52 + 15 * 12;
 constexpr u32 FieldOfOffset(u32 at) {
   if (at < 0x480)
     return 0;
