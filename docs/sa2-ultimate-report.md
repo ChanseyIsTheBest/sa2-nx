@@ -61,7 +61,7 @@ NRO on the Switch and registered statically (`rex/system/static_modules.h`).
 | `BLUR_LOCALIZE_ABI_TRUST`, `SASRT_HOT_LR_ELIDE` | off (the base's default); their censuses need a guard build with them on |
 | The stack-frame elisions | **1.0.6's tint found and fixed:** not a stale stack word the game reads but a real data store `tools/frame_traffic.py` took for a save (SA2's DXT1 decoder `sub_82833568`, frameless: an integer-to-float conversion through the stack); found by bisecting the generated files, then the functions. With the fixed tool all three elisions together: 750 of 750 of 1.0.6's frames identical. Off pending a console A/B |
 | The stereo check | SA2 ignores the speaker setting: the default stays |
-| The three keys from the log | `sasrt_gpu_skip_inert_draws`: 0 in every gameplay window (to set false once the console's log agrees); the other two need the console's log or do not apply |
+| The three keys from the log | `sasrt_gpu_skip_inert_draws`: 0 in every gameplay window of the PC's and the emulator's logs: **false** in SA2's settings; `ultimate_renut_replay_inherit_same` and `banjo_renut_tags_check`: nothing to decide (SA2 runs without the base's tags) |
 
 ## What was measured
 
