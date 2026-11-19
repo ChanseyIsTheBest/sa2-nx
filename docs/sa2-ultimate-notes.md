@@ -93,6 +93,20 @@ promoted indirect calls, 1.12 billion flush-mode checks, 837 million r1 checks, 
 "[hot] DIFFERENCE" line (there are no machine copies yet). The pictures look as 1.0.6's do. Not reached yet: a hunting
 stage (Wild Canyon is on the map; the d-pad route to it is still to find) and a Chao Garden itself (the lobby only).
 
+## Decided from SA2's own logs (the base's porting prompt, step 5)
+
+- `sasrt_gpu_skip_inert_draws`: 0 in every 10 s window of the PC's City Escape run (verify2), gameplay included: false
+  for SA2 (to set in `sa2_switch_defaults.toml` once the emulator's log says the same; not edited during a build).
+- `ultimate_renut_replay_inherit_same`: the PC log has no "replays with the inherited words" line; the emulator's log
+  decides it.
+- `banjo_renut_tags_check`: nothing to decide, SA2 runs with `banjo_renut_tags = false` (no "recording from marks"
+  line).
+- The stereo check (`audio_channel_census`, City Escape, 140 s each): with the default speaker configuration
+  (00010001) SA2 fills FL, FR, RL, RR (C now and then, LFE never); told analog stereo (`audio_speaker_config = 1`) it
+  fills the same four channels in the same amounts. SA2 ignores the setting: the stereo saving would need patching
+  SA2's mixer (blur-nx's `tools/stereo_mix.py`), worth it only if audio shows near the top of a console CPU profile.
+  The default stays.
+
 The base's `input_script` is not 1.0.6's: a hold is `@seconds` (1.0.6: `:seconds`) and the sticks are `LSUP`,
 `LSDOWN`, ... (1.0.6: `LY-`, `LX+`, ...). A test toml of 1.0.6 with an input_script needs its holds and sticks
 rewritten; players' tomls have none.
