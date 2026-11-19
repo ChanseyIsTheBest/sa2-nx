@@ -44,3 +44,12 @@ and docs/sa2-near-exact.md.
 - The 2 MB code blocks' off switch reads `sa2.toml` (the base read `katamari.toml`), as 1.0.6.
 - `katamari_dlc_unlock_packs = true` in SA2's settings: the base's DLC installer otherwise hides Beautiful Katamari's
   nine unlock packs by name (none of them SA2's); nothing hidden, as 1.0.6.
+- The Switch build's inputs: uam built from this tree into `out\deko3d_tools_ult` (the base's PC uam is from
+  2026-11-07, before its uam ports 56, 162 and 163; the base's `tools\deko3d_build_tools.sh` would write into the
+  base through this worktree's `out\deko3d_tools` link, so it was not run) and given to the configure as
+  `BANJO_DEKO3D_UAM` (`out\switch_build.bat`, not committed); `tools\switch_shaders.ps1`: SA2's 103 shaders into
+  `app\out\renut_switch` (the GLSL package, 210 KB, and the Switch shader cache).
+- The Switch configure stopped at the stage DLL's target: the generator's `dll_targets_cmake.inja` made it depend on
+  `renut_codegen`, which the cross build does not have. Guarded as the main template guards its own (the template, and
+  the generated file by hand so the tree need not be generated again now; the next PC build generates it again, since
+  the generator changes).
