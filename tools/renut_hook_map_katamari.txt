@@ -1,0 +1,67 @@
+# katamari-nx (2026-10-30): Renut's hooks (N&B title update 3 addresses) placed by hand in Beautiful Katamari, read by
+# tools/renut_hook_remap_katamari.py before the state tables and the signatures. One line per hook: N&B's function,
+# this game's address (or - to leave it unhooked), the evidence. "sig a/b" = tools/renut_sigmatch.py's score of this
+# function and of the next best one.
+#
+# Device creation and presentation (call chains read in the image, tools/ppc_dis.py, tools/ppc_callers.py)
+sub_82634990  824D0598  Direct3D_CreateDevice: allocates the 0x5700 device (li r3,22272 / 128 alignment, sub_824D0240), calls the device init sub_824E18D0 (XenonGpu_Initialize, InitializePresentationParameters, InitializeApiState); sig 0.39 because N&B inlines that init
+sub_826352B8  824E9428  D3DDevice_Present: SynchronizeToPresentationInterval sub_824E89E8, Resolve sub_824F12B8, KickOff sub_824E0298, then Swap sub_824E8E90; sig 0.43/0.26
+sub_822554F8  824E8E90  D3DDevice_Swap: the only VdSwap caller; sig 0.53/0.26
+sub_82258778  824E89E8  D3D_SynchronizeToPresentationInterval: called by Present before the resolve; sig 0.72/0.39
+sub_82641480  824E6410  D3DDevice_GetDeviceCaps: memcpy(out, 0x820FC1F8, 304), N&B's memcpy(out, 0x82161B30, 304)
+sub_82636F48  824DE218  D3DDevice_SetGammaRamp: InitializePresentationParameters calls it, then SetPWLGamma, in N&B's order; sig 0.63 for both
+sub_82637018  824DE2F8  D3DDevice_SetPWLGamma: as above
+sub_8264B748  824ED278  D3D_XenonGpu_Initialize: called by the device init sub_824E18D0 after the -1 words; sig 0.66/0.23
+sub_82641BC8  824E11A0  D3D_InitializeApiState: called by the device init; reads PresentInterval +13572 and BehaviorFlags +22264; sig 0.58/0.25
+sub_82641EA8  824E1408  D3D_InitializePresentationParameters: makes the auto surfaces (+14800..14808) with CreateTexture / CreateSurface; sig 0.65/0.27
+sub_82642568  824E1B50  D3D_CDevice_Uninitialize: VdShutdownEngines, VdSetGraphicsInterruptCallback; sig 0.40/0.26
+sub_82640090  824E05E8  D3DDevice_SetRingBufferParameters: the VdInitializeRingBuffer caller; sig 0.70/0.21
+sub_821DFC08  824E0110  D3D_CDevice_KickOffSegment: sig 0.71/0.31; CommandBuffer +13492, InKickOff +13216 as the zones say
+sub_821C7360  824E04B0  D3D_CDevice_BeginRingBig: sig 0.67/0.32
+sub_821FC4B8  824DF3F0  D3D_RingBufferDeviceAllocate: sig 0.61/0.31
+sub_8225D370  824DFC48  D3D_CDevice_BlockOnFence: sig 0.55/0.32
+sub_82634740  824D0290  D3D_CBlocker_Check: sig 0.66/0.26
+sub_8225D468  824E03D0  D3DDevice_IsFencePending: sig 0.71/0.47
+# Draw, clear, tiling
+sub_821FD698  824D9758  D3DDevice_DrawVerticesUP: BeginVertices-style reserve, reads VerticesRingEnd +13428 (N&B +13444) and the flags +10940; sig 0.69/0.55
+sub_8224F110  824F3248  D3DDevice_ClearF: sig 0.71/0.40; reads the targets +12432.. and tiling surfaces +12720.. as N&B +12448 / +12736
+sub_821E17C0  824F0150  D3DDevice_EndTiling: sig 0.66/0.36; full viewport 0x820FAEB4 as N&B's 0x82001744
+sub_82246798  -         D3DDevice_BeginTiling: no clear counterpart (sig 0.35/0.32); left to the game (see the notes: tiling census)
+sub_82640818  -         D3DDevice_BeginCommandBuffer: no clear counterpart (sig 0.27); census first
+sub_82640DE8  -         D3DDevice_EndCommandBuffer: no clear counterpart (sig 0.49/0.48)
+sub_821F1A78  -         D3DDevice_RunCommandBuffer: no clear counterpart (sig 0.50/0.48)
+sub_82237FE8  -         D3DDevice_BeginExport: XDK 2.0.5632 has no memexport functions (as feedingfrenzy2-nx found for 6534)
+sub_82237D80  -         D3DDevice_EndExport: as above
+sub_8263F2B8  -         D3DDevice_DrawIndexedVerticesUP: no counterpart found (sig 0.32)
+# Resources
+sub_8263EB88  824D23F8  D3DDevice_CreateSurface: InitializePresentationParameters calls it twice for the auto surfaces, as N&B's; sig 0.61/0.41
+sub_821D7A00  824DB028  D3DResource_Destroy: HiZ owner 0x8315E830 (N&B 0x82E108A0), VdGlobalDevice record 0x82000750; sig 0.59/0.33
+sub_8263D360  824DB448  D3D_UnlockResource: sig 0.61/0.26
+sub_8263D060  824DB210  D3D_LockResource: VdGlobalDevice record 0x82000750 twice (N&B 0x820007F8); sig 0.65/0.30
+sub_821D76C0  824D1258  D3D_Get2DSurfaceDesc: sig 1.00 (the 3D form takes sub_824D1358 at 1.00)
+sub_8263DEA0  824D1358  D3D_Get3DSurfaceDesc: sig 1.00
+sub_8263DCA8  -         D3D_GetGpuTextureDimensions: its best match sub_824D0650 is GetTextureDimensions' (1.00)
+sub_821D7E28  824D2090  D3DTexture_GetSurfaceLevel: (texture, level, out), frame 176; the three getters read in the image
+sub_8263E8A0  824D2160  D3DCubeTexture_GetCubeMapSurface: keeps a third argument (mr r28,r5: the face), frame 192
+sub_8263E980  824D2228  D3DVolumeTexture_GetVolumeLevel: sig 0.75/0.65, the third of the three
+sub_8263E958  -         D3DArrayTexture_LockRect: a one-instruction thunk, not identifiable by signature
+sub_8263EA48  -         D3D_Lock3DSurface_Thunk: as above
+sub_8263E970  -         D3D_Get2DSurfaceDesc_Thunk: as above
+sub_8263E978  -         D3D_Get3DSurfaceDesc_Thunk: as above
+sub_8263E960  -         D3DArrayTexture_GetArraySize: no counterpart (sig 0.33)
+# Shaders
+sub_826375D8  824D6010  D3DDevice_CreatePixelShader: CreateVertexShader takes sub_824D6120 (0.85); this one's next best, 0.66
+sub_8263FBD0  -         D3DVertexShader_Bind: no clear counterpart (sig 0.35/0.28)
+sub_826375A0  -         XGRegisterPixelShader: no counterpart (sig 0.26)
+# State
+sub_821D5060  824D4B48  D3DDevice_SetVertexDeclaration: 5 instructions, VertexDeclaration +11812 (N&B +11824); sig 0.67/0.43
+sub_821F2090  824DE730  D3DDevice_SetViewport: sig 0.63/0.30
+sub_821F2110  824DE4B8  D3D_SetViewport: sig 0.64/0.27
+sub_821F2368  824DDEE0  D3DDevice_SetScissorRect: Present's tail calls it; sig 0.49/0.24
+sub_82248BD0  824DE868  D3DDevice_SetRenderTarget: InitializePresentationParameters calls it after CreateSurface, as N&B's; sig 0.62/0.31
+sub_82248FB0  824DEBD0  D3DDevice_SetDepthStencilSurface: likewise after the depth surface; sig 0.71/0.30
+sub_82248F20  824DE7D0  D3D_SetSurfaceInfo: sig 0.57/0.19; full viewport 0x820FAEB4
+sub_821F9A48  824EFA58  D3DDevice_SetPredication: sig 0.69 (SetCommandBufferPredication's best is the same function at 0.63: XDK 2.0.5632 has one)
+sub_826411C0  -         D3DDevice_SetCommandBufferPredication: see SetPredication
+sub_82255C98  824DE3C0  D3D_ResetAllState: sig 0.73/0.33; the device init sub_824E18D0 calls it last
+sub_82634B90  -         D3D_InvalidateConstants: ambiguous (0.65 / 0.61)

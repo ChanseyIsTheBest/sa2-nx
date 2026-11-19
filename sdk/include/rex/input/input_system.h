@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <rex/input/device_assignment.h>
@@ -71,6 +72,14 @@ class InputSystem : public system::IInputSystem {
   // to be called on every GetState, SetState and GetCapabilities from the game (several per frame),
   // allocating memory and querying every driver each time. See RefreshDevices.
   std::atomic<int64_t> last_refresh_ns_{0};
+
+  // sasrt-nx (2026-11-08; ported to rr6-nx and renut-ultimate the same day). A console crash: a double free inside
+  // RefreshDevices, called from XamInputGetCapabilities. The game calls the controller functions from more than one
+  // thread, and RefreshDevices rebuilds devices_ and device_owners_ (clear, then push_back) with no lock while
+  // another thread reads or rebuilds them; its 50 ms check is a load then a store, so two threads can both pass it.
+  // Every entry that refreshes or reads them holds this. Recursive, because those entries call one another
+  // (GetState: RefreshDevices, DriverForDevice). Taken after the read hooks, never around them.
+  mutable std::recursive_mutex devices_mutex_;
 };
 
 /// Create a default InputSystem with SDL + NOP drivers.

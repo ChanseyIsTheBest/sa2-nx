@@ -66,6 +66,7 @@ u32 BoundDeclType(u32 type);
 // little-endian host format reads a word.
 enum class ElementConversion : u8 {
   Copy32,       // each word endian-swapped and stored little-endian
+  Copy32Finite, // vivapinata-nx: a single 32-bit float, as Copy32 with infinities and NaNs made the largest finite value
   ExpandFloat,  // decoded (and swizzled) to four 32-bit floats on the CPU
 };
 
@@ -94,8 +95,9 @@ struct HostVertexStream {
 // Host layout for a whole declaration. Elements whose usage has no host
 // input location are dropped (no N&B shader reads them).
 struct HostVertexLayout {
+  // banjo-nx (2026-10-28, ARM audit): first (it followed the 512 bytes of streams; read at every whole-buffer draw).
+  u32 used_mask = 0;  // banjo-nx (2026-10-20, from sa2-nx): bit s = streams[s].used (BindStreams walks it)
   HostVertexStream streams[kMaxVertexStreams];
-  u32 used_mask = 0;  // sa2-nx (2026-10-20): bit s = streams[s].used (BindStreams walks it)
   std::vector<plume::RenderInputElement> input_elements;  // semantic names are static strings
 };
 
@@ -111,6 +113,10 @@ u32 FetchDeclType(u32 format, bool is_signed, bool is_integer);
 // stream's vertex fetch constant (usually 2 = 8in32).
 void ConvertVertices(const HostVertexStream &stream, const u8 *guest, u32 guest_stride,
                      u32 vertex_count, u32 endian, u8 *host);
+// banjo-nx (2026-10-23, batch 6): the same from the stream's elements and host stride (a queued fill keeps them in an
+// arena instead of a copy of the stream's vector, a heap allocation per fill).
+void ConvertVertices(const HostVertexElement *elements, u32 element_count, u32 host_stride, const u8 *guest,
+                     u32 guest_stride, u32 vertex_count, u32 endian, u8 *host);
 
 const char *UsageSemantic(u8 usage);
 

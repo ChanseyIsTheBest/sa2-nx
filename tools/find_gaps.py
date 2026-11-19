@@ -66,26 +66,41 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RE_FUNC = re.compile(r'^DEFINE_REX_FUNC\((?:sub_)?([0-9A-Fa-f]{8})\)')
 
 
+RE_LABEL = re.compile(r'^loc_([0-9A-Fa-f]{8}):')
+
+
 def measure_functions(gen_dir):
-    """Returns {start: instruction_count} by walking the generated C++."""
+    """Returns {start: instruction words up to its furthest instruction} by walking the generated C++.
+
+    Port 167 (from fnxf_xiii, its note of 2026-10-23): by addresses, not by count. Every instruction is one
+    '\t// <asm>' line, and every block that does not follow the one before it starts at a label 'loc_XXXXXXXX:'; so
+    each instruction's address is known, and a function reaches its furthest one. Counting alone ("start + 4 * count")
+    stops short of the real end when a function holds data between its instructions (a switch's jump table) or its
+    blocks are not in address order, and then its own tail looked like a gap (fnxf_xiii: sub_822C3300, 67
+    instructions, its last block at 0x822C344C)."""
     sizes = {}
     files = sorted(f for f in os.listdir(gen_dir) if f.endswith('.cpp'))
     for idx, name in enumerate(files, 1):
         path = os.path.join(gen_dir, name)
         current = None
-        count = 0
+        address = furthest = 0
         with open(path, 'r', encoding='utf-8', errors='replace') as fh:
             for line in fh:
                 if line.startswith('DEFINE_REX_FUNC('):
                     m = RE_FUNC.match(line)
                     if m:
                         current = int(m.group(1), 16)
-                        count = 0
+                        address = furthest = current
                 elif current is not None:
                     if line.startswith('\t// '):
-                        count += 1
+                        address += 4
+                        furthest = max(furthest, address)
+                    elif line.startswith('loc_'):
+                        lm = RE_LABEL.match(line)
+                        if lm:
+                            address = int(lm.group(1), 16)
                     elif line.startswith('}'):
-                        sizes[current] = count
+                        sizes[current] = (furthest - current) // 4
                         current = None
         sys.stdout.write("\r  read %d/%d files" % (idx, len(files)))
         sys.stdout.flush()

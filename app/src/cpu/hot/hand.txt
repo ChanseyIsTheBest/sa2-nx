@@ -1,9 +1,38 @@
-# sa2-nx: guest functions with a HAND-WRITTEN native (app/src/cpu/hot/n_*.h, hooked in app/src/cpu/sa2_hot_guest.cpp)
-# whose callers the whole-program analyses (tools/leaf_dead_stores.py, tools/dead_ctx_defs.py) may treat as calls of
-# the original: the native reads the original's arguments, and its guard compares the return and non-volatile
-# registers of the two. Every other hooked call stays unknown (everything live). One address per line.
-827F05C0 memcpy (n_827F05C0.h)
-827EFEA0 memset (n_827EFEA0.h)
-827EF8B0 memmove (n_827EF8B0.h)
-8255D990 Direct3D shader constants, vertex (n_d3d_constants.h)
-8255D8B8 Direct3D shader constants, pixel (n_d3d_constants.h)
+# katamari-nx: guest functions with a HAND-WRITTEN native (app/src/cpu/hot/banjo_hand_natives.h, namespace
+# banjo::hand::n_<id>; Katamari's are at the end of that file). tools/localize_native.py puts each in front of the
+# generated copy of its function wherever that copy is used (banjo-nx's docs/enhancements.md, "Hand-written natives").
+#
+#   <address or generated name> [id=<namespace suffix>] [exact=<registers>]
+#
+# exact: registers the original writes back that the native leaves exactly as the original does. Since the
+# register-diet codegen (2026-10-30 evening: non_argument_as_local, non_volatile_as_local) the originals write back
+# only r1, r3-r10, f1-f13 and v0-v13 (r0, r2, r11, r12, f0, the non-volatiles and v32-v63 are locals of each generated
+# function); every native here writes exactly what its processed original writes back, except the C runtime's three
+# (memset, memcpy, the word copy), which leave the scratch registers r4-r10 as banjo-nx's do (the guard skips those).
+#
+# First five: 2026-10-30, from the PC profile (out/pc_runs/renut4). The rest: 2026-10-30 evening, from the Ryujinx
+# (ARM) profile of the package rc1 (out/emu_runs/emu10_profile), ARM samples in brackets.
+
+82759C98   # 4x4 matrix copy (PC rank 1; ARM 141)
+827598C0 exact=r8,r9,r10,v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13   # 4x4 matrix multiply in place (ARM 81)
+82759780 exact=r8,r9,r10,v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13   # 4x4 matrix multiply, three operands
+82759D20 exact=f13   # translation matrix
+827E7A40   # C runtime memset (banjo-nx's native: the same instructions)
+827E6F50 exact=r3   # C runtime memcpy (banjo-nx's native: the same contract) [ARM 1,371: the second-hottest guest function]
+8266AF60 exact=r3,r8,r9,r10   # string hash, Jenkins' one-at-a-time [ARM 187]
+8271FAD0 exact=r10,f12,f13   # 4-float parameter set with change detection [ARM 157]
+827E73A8   # C runtime word copy [ARM 33; inlined into the copies of the vector memcpy sub_824BFE50, ARM 1,230]
+827595D0 exact=f13   # identity matrix [ARM 27]
+82759A00 exact=r3,f12,f13   # matrix comparison within a tolerance (PC hot)
+# 2026-10-31: seven more, the user's request "hand optimise the top 7 functions of your choice": the hottest pure-data leaves of the rc3 console profile (docs/katamari-notes.md, "Seven more natives").
+827596B0   # 4x4 matrix product, three operands
+8270FE40   # four vectors, a scale and a flag into an object
+82316A78 exact=r3   # sphere test against a box (job threads, 1.3 % of the console's guest samples)
+8275A828   # N vectors turned by a 3x3 matrix
+8275AA88   # N points by a 4x4 matrix with the divide by w (job threads, 1.1 %)
+8276E3D8   # integration step of N bodies (positions, rotations normalised)
+824E97F0 exact=f1   # sine (range reduction and polynomial)
+# 2026-11-01 (rc10), the user's request "optimise these two sub_82277E70 and sub_822683D0 by hand": docs/katamari-notes.md, "rc10".
+82277E70 exact=r1,r3,r4,r5,r6,r8,r9,r10,f11,f12,f13,v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13   # objects' world transform: the matrix chain in registers, the next object prefetched (checks itself: no guard can repeat it)
+82265C08 exact=r3,r8,r9,r10,v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13   # visibility manager's box test (sub_822683D0's hot loop): no stack round trip per corner, the next object prefetched
+8223A970 exact=r1,r3,r4,r8,r9,r10,f13,v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13   # translate then multiply: copy, translation and product in registers

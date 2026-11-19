@@ -22,13 +22,6 @@
 #include <utf8.h>
 
 #include <rex/cvar.h>
-
-REXCVAR_DEFINE_BOOL(window_start_minimized, false, "UI/Window",
-                    "Start the window minimized, without fullscreen and without taking focus "
-                    "(for unattended test runs)")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
-#include <rex/cvar.h>
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
@@ -46,6 +39,9 @@ REXCVAR_DEFINE_BOOL(window_start_minimized, false, "UI/Window",
 #include <X11/Xlib-xcb.h>
 #include <rex/ui/surface_gnulinux.h>
 #endif
+
+REXCVAR_DEFINE_BOOL(window_start_minimized, false, "UI",
+                    "Minimize the game window right after it opens (automated test runs)");
 
 namespace rex::ui {
 
@@ -177,13 +173,7 @@ bool WindowSDL::OpenImpl() {
     }
   }
 
-  // window_start_minimized: start in the taskbar without taking focus (test runs that should not cover the
-  // desktop). Fullscreen is skipped for that run, since a minimized fullscreen window would grab the display again
-  // when restored mid-load.
-  const bool start_minimized = REXCVAR_GET(window_start_minimized);
-  if (start_minimized) {
-    SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
-  } else if (IsFullscreen()) {
+  if (IsFullscreen()) {
     // Borderless desktop fullscreen (a NULL display mode is SDL3's default).
     SDL_SetWindowFullscreen(sdl_window_, true);
   }
@@ -197,9 +187,6 @@ bool WindowSDL::OpenImpl() {
   ApplyTextInputActiveNow();
   ApplyCursorVisibilityNow();
   SDL_ShowWindow(sdl_window_);
-  if (start_minimized) {
-    SDL_MinimizeWindow(sdl_window_);
-  }
 
   // Actualize state for the common Window code. Listener dispatch is handled
   // by Window::Open after OpenImpl returns; these only record initial state.
@@ -213,6 +200,10 @@ bool WindowSDL::OpenImpl() {
   }
   if (SDL_GetWindowFlags(sdl_window_) & SDL_WINDOW_INPUT_FOCUS) {
     OnFocusUpdate(true, destruction_receiver);
+  }
+  // banjo-nx: automated test runs start out of the way (after the size above, so the presenter gets a real one).
+  if (REXCVAR_GET(window_start_minimized)) {
+    SDL_MinimizeWindow(sdl_window_);
   }
   return true;
 }
@@ -383,11 +374,6 @@ void WindowSDL::RearmCursorAutoHideTimer() {
 
 void WindowSDL::FocusImpl() {
   if (!sdl_window_) {
-    return;
-  }
-  // A window started minimized stays in the taskbar until the user restores it.
-  if (REXCVAR_GET(window_start_minimized) &&
-      (SDL_GetWindowFlags(sdl_window_) & SDL_WINDOW_MINIMIZED)) {
     return;
   }
   SDL_RaiseWindow(sdl_window_);

@@ -14,7 +14,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <mutex>
+#include <vector>
 
 #include <rex/kernel.h>
 #include <rex/memory.h>
@@ -193,6 +195,10 @@ struct kPacketInfo {
 
 static constexpr int kIdToSampleRate[4] = {24000, 32000, 44100, 48000};
 
+// blur-nx (2026-11-11, CPU batch 2): word w of the bitmap of enabled contexts (bit n: context 32w + n was last set
+// enabled). Only XmaContext::set_is_enabled writes it.
+uint32_t XmaEnabledWord(uint32_t word);
+
 class XmaContext {
  public:
   static const uint32_t kBytesPerPacket = 2048;
@@ -234,7 +240,12 @@ class XmaContext {
   void set_is_allocated(bool is_allocated) {
     is_allocated_.store(is_allocated, std::memory_order_release);
   }
-  void set_is_enabled(bool is_enabled) { is_enabled_.store(is_enabled, std::memory_order_release); }
+  // blur-nx (2026-11-11, CPU batch 2): also kept in a bitmap of the enabled contexts (EnabledWord), so the XMA
+  // worker's full sweep visits those only instead of loading 320 contexts' flags (xma_context.cpp).
+  void set_is_enabled(bool is_enabled);
+  // blur-nx (2026-11-12, CPU batch 4): the bitmap halves of set_is_enabled (Work takes the flag with an exchange).
+  void SetEnabledBit();
+  void ClearEnabledBit();
 
   void SignalWorkDone() {
     if (work_completion_event_) {
@@ -313,6 +324,50 @@ class XmaContext {
   // Loop subframe precision state
   uint8_t loop_frame_output_limit_ = 0;
   bool loop_start_skip_pending_ = false;
+
+  // katamari-nx (2026-10-31): a loop count with no loop end loops the whole buffer (xma_context.cpp).
+  bool LoopWholeBuffer(XMA_CONTEXT_DATA* data, uint32_t next_packet_index, uint32_t current_input_packet_count);
+
+  // katamari-nx (2026-10-31): audio_xma_loop_trace (xma_context.cpp), diagnostic only.
+  uint32_t trace_lines_ = 0;
+  uint32_t trace_last_offset_ = UINT32_MAX;
+  uint32_t trace_same_offset_ = 0;
+  // katamari-nx (2026-11-01): what the last pass left in the guest's context (input valid bits, output valid), so
+  // the next pass can tell what the game changed in between (trace only).
+  uint8_t trace_stored_inputs_ = 0;
+  bool trace_stored_output_ = false;
+  bool trace_stored_known_ = false;
+  bool TraceOn();
+  void NoteStored(const uint8_t* context_ptr);
+
+  // banjo-nx (2026-10-27, #4 of the CPU-gap table: banjo_xma_frame_cache, xma_context.cpp, DecodeFrame). blur-nx
+  // (2026-11-13, M-02 and M-09 of docs/cpu-moonshots-50-1113.md: cache v2, keyed by (format, previous packet,
+  // packet)): the context's previous frame since its codec was opened (kFresh: none; kUnknown: after an error, until
+  // the codec is opened again, nothing keyed), a copy of its packet with FFmpeg's zero padding (the key's compare and
+  // the catch-up's packet) and its hash, and whether the codec is behind by it (the cache answered it: M-01's
+  // one-frame catch-up decodes it before the next frame the cache cannot answer).
+  enum class CachePrev : uint8_t { kUnknown, kFresh, kKnown };
+  CachePrev cache_prev_ = CachePrev::kUnknown;
+  bool cache_behind_ = false;
+  uint32_t cache_prev_size_ = 0;
+  uint64_t cache_prev_hash_ = 0;
+  std::array<uint8_t, 1 + 4096 + 64> cache_prev_packet_;  // (xma_frame_'s size and AV_INPUT_BUFFER_PADDING_SIZE)
+  void CacheKeepPrev(const uint8_t* data, uint32_t size, uint64_t hash);
+  // blur-nx (2026-11-13, M-05 lazy open, xma_context.cpp PrepareDecoder): the format of the codec (0: none yet, or a
+  // new sound: ResetDecoderState), whether it still has to be opened fresh for it (OpenCodec, which counts the opens
+  // for the 10 s report), and an open that failed in DecodeFrame (ProcessFrame's error_status 4).
+  int codec_rate_ = 0;
+  int codec_channels_ = 0;
+  bool codec_stale_ = false;
+  bool codec_open_failed_ = false;
+  bool OpenCodec();
+  bool DecodeFrame(int prepared, int sample_rate, bool stereo);
+  // blur-nx (2026-11-13, M-01's proof: banjo_xma_frame_cache_chain_verify): a second codec decoding every frame of
+  // the context (the full chain), whose samples every frame the first one decodes or the cache answers is compared
+  // with.
+  AVCodecContext* chain_context_ = nullptr;
+  AVFrame* chain_frame_ = nullptr;
+  std::array<uint8_t, kBytesPerFrameChannel * 2> chain_raw_;
 
 };
 

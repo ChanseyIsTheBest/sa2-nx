@@ -107,6 +107,13 @@ class MnkInputDriver final : public InputDriver,
 
   // Packet number incremented on state change
   uint32_t packet_number_ = 0;
+  // Port 159 (from fnxf_xiii, banjo_mnk_pad_keystrokes): the pad state last reported (the packet number advances
+  // only when it changes), the binds reported down as keystrokes, and the held button's repeat.
+  X_INPUT_GAMEPAD last_gamepad_ = {};
+  uint32_t keystroke_held_ = 0;  // bit i = bind i reported down
+  int repeat_idx_ = -1;          // the bind being repeated, -1 for none
+  bool repeat_started_ = false;  // past the first delay
+  uint64_t repeat_time_ = 0;     // guest ms of the last down or repeat event
 };
 
 }  // namespace rex::input::mnk

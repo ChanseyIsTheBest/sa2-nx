@@ -1,4 +1,5 @@
 #pragma once
+#include <string>  // blur-nx (2026-11-13): WaitReport
 // Frame statistics for the FPS overlay. A game frame is one D3DDevice_Swap:
 // the frames the game actually finishes, whatever its update loop does.
 
@@ -40,7 +41,17 @@ void OnRenderThreadFrame(double busy_ms);
 
 // Called by the renderer when the game thread has waited for the render
 // thread (Swap's frame pacing, fence waits), for the CPU time to leave out.
-void OnGameThreadWait(double ms);
+// blur-nx (2026-11-13, #37 of Blur's docs/cpu-near-exact-50-1113.md: the census of the game thread's waits for the
+// renderer): 'source' 0 a fence (BlockOnFence), 1 Swap's frames-ahead limit, 2 the display's refresh; 2026-11-18: 3 the
+// frame limiter's sleep (profiler.cpp's RecordLimiterWait).
+void OnGameThreadWait(double ms, int source = 0);
+// The 10 s report's line of those waits (count and ms a second by source), and the window started again.
+std::string WaitReport();
+// blur-nx (2026-11-18, for 1 % lows, every port): the 10 s report's frame pacing (three lines): the window's game frames
+// (mean, 1 % and 0.1 % lows, percentiles, the longest) with the render thread's and the GPU's frame times; its five
+// slowest game frames with the game thread's waits in them; the histograms' bins (a quarter ms each, to add up a race's).
+// The window starts again.
+std::string PacingReport();
 
 Snapshot Get();
 

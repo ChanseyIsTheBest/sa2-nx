@@ -443,6 +443,11 @@ namespace plume {
             return VK_FORMAT_D32_SFLOAT_S8_UINT;
         case RenderFormat::D24_UNORM_S8_UINT:  // banjo-nx (2026-10-19)
             return VK_FORMAT_D24_UNORM_S8_UINT;
+        // sasrt-nx (2026-11-11, port 75; its formats batch, rows 6, 8, 10, 74, 93 and 7, 66, 73, 95, 96)
+        case RenderFormat::R10G10B10A2_UNORM:
+            return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        case RenderFormat::R11G11B10_FLOAT:
+            return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
         case RenderFormat::S8_UINT:
             return VK_FORMAT_S8_UINT;
         case RenderFormat::R32_FLOAT:
@@ -595,6 +600,8 @@ namespace plume {
             return VK_CULL_MODE_FRONT_BIT;
         case RenderCullMode::BACK:
             return VK_CULL_MODE_BACK_BIT;
+        case RenderCullMode::FRONT_AND_BACK:  // kameo-nx (2026-11-04)
+            return VK_CULL_MODE_FRONT_AND_BACK;
         default:
             assert(false && "Unknown cull mode.");
             return VK_CULL_MODE_FLAG_BITS_MAX_ENUM;
@@ -5404,11 +5411,10 @@ namespace plume {
         }
 
         volkInitializeCustom(getInstanceProcAddr);
-        // sa2-nx (2026-10-20, from banjo-nx via Peggle 2): without the driver (PLUME_SWITCH_NO_NVK, the failing ICD
-        // stubs) volk finds nothing, and the code below would call vkEnumerateInstanceExtensionProperties through null:
-        // no instance (isValid() false, CreateVulkanInterface returns null).
+        // banjo-nx (2026-10-20): a Switch build without the driver (switch_vulkan_stubs.c) answers every lookup with
+        // NULL; the interface stays invalid (no instance) instead of calling through a NULL pointer below.
         if (vkCreateInstance == nullptr || vkEnumerateInstanceExtensionProperties == nullptr) {
-            fprintf(stderr, "plume: no Vulkan driver (vkCreateInstance not found).\n");
+            fprintf(stderr, "plume: no Vulkan driver in this build.\n");
             return;
         }
         VkResult res = VK_SUCCESS;

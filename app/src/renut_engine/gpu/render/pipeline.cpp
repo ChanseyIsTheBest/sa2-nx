@@ -2,6 +2,7 @@
  * @file    gpu/render/pipeline.cpp
  */
 #include "renut_engine/gpu/render/pipeline.h"
+#include "renut_engine/gpu/ultimate.h"  // port 44: PlainFetchesOn (sasrt_gpu_plain_fetches)
 
 #include <algorithm>
 #include <atomic>
@@ -28,11 +29,31 @@
 // banjo-nx (2026-10-17, deko3d renderer): every graphics pipeline's shaders and specialization constants, one line each,
 // for tools/deko3d_variant_cache.py (the DKSH cache of the deko3d back end, compiled on the PC). Any back end: the
 // constants are the renderer's. Written next to the executable.
+// sasrt-nx (2026-11-08, the user's request: "replace fxaa with banjo's optimised SMAA").
+REXCVAR_DEFINE_BOOL(sasrt_smaa_replaces_fxaa, true, "SASRT/Graphics",
+                    "deko3d renderer, with banjo_renut_smaa on (NOT the game's picture: SMAA's anti-aliasing instead of "
+                    "the game's FXAA): the game's FXAA pass (pixel shader 6C215354C35798B8, the 1152x544 image after the "
+                    "composite, before the final 1280x720 pass) writes its centre sample only (constant 930, pass nofxaa: "
+                    "the edge search compiled out), and SMAA runs on its target right after it "
+                    "(banjo_renut_smaa_after_ps = 6C215354C35798B8 in sasrt_switch.toml). Read at start; the pipelines "
+                    "built with it keep it (no in-run A/B: configs/sasrt_fxaa_game.toml for the game's FXAA)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+namespace banjo::renut_gpu {
+bool SmaaOn();  // banjo_renut_tuning.h
+}
+bool SasrtSmaaReplacesFxaa() {
+  static const bool on = REXCVAR_GET(sasrt_smaa_replaces_fxaa) && banjo::renut_gpu::SmaaOn();
+  return on;
+}
+
 REXCVAR_DEFINE_BOOL(banjo_deko3d_variant_log, false, "Banjo/Renut",
                     "Write deko3d_variants.txt next to the executable: each graphics pipeline's vertex and pixel shader "
                     "and specialization constants (tools/deko3d_variant_cache.py builds the deko3d DKSH cache from it)");
 #include <xxhash.h>
 #include <cstdio>  // banjo-nx (2026-10-20): the pipeline list file
+#if defined(__SWITCH__)
+extern "C" char *fake_heap_end;  // banjo-nx (2026-10-28): libnx: the end of the malloc heap (ReleaseIdlePrebuiltPipelines)
+#endif
 #if defined(_WIN32)
 #include <io.h>  // _commit
 #else
@@ -55,6 +76,14 @@ REXCVAR_DEFINE_BOOL(banjo_deko3d_variant_log, false, "Banjo/Renut",
 #include "renut_engine/gpu/guest/resources.h"
 #include "renut_engine/gpu/render/shader_library.h"
 #include "renut_engine/gpu/banjo_renut_tuning.h"
+#include "renut_engine/gpu/ultimate.h"
+#include "renut_engine/gpu/sasrt_gpu_round.h"  // sasrt-nx (2026-11-08)
+#if defined(PLUME_DEKO3D)
+#include <plume_deko3d.h>  // banjo-nx (2026-10-21): Deko3DSetBackgroundThread
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+#endif
 
 REXCVAR_DEFINE_STRING(renut_pipeline_list, "pipeline_list.bin", "Nuts&Bolts/Graphics",
                       "The pipelines the renderer has built, which it builds ahead of use at the "
@@ -91,7 +120,11 @@ struct PipelineMemo {
 constexpr uint32_t kPipelineMemoSets = 512;
 PipelineMemo g_pipeline_memo[kPipelineMemoSets][2];
 
-inline uint32_t PipelineMemoIndex(const PipelineKey &key) {
+// banjo-nx (2026-10-23, render-thread round): each way's key hash, apart from the ways: a lookup reads this line and
+// then only the way whose hash matches (the two keys were six lines read for a miss).
+uint64_t g_pipeline_memo_tags[kPipelineMemoSets][2];
+
+inline uint64_t PipelineMemoHash(const PipelineKey &key) {
   uint64_t w[8];
   std::memcpy(w, &key, sizeof(w));  // the shaders, the layout hash, topology, formats
   uint64_t h = w[0] * 0x9E3779B97F4A7C15ull ^ w[1] * 0xC2B2AE3D27D4EB4Full ^ w[2] ^ (w[3] << 17) ^ (w[4] >> 3) ^
@@ -100,8 +133,10 @@ inline uint32_t PipelineMemoIndex(const PipelineKey &key) {
   std::memcpy(&b, reinterpret_cast<const char *>(&key) + offsetof(PipelineKey, bool_values), sizeof(b));
   h ^= uint64_t(b) * 0xFF51AFD7ED558CCDull ^ uint64_t(key.alpha_func) << 40 ^ uint64_t(key.blend_control[0]) << 7 ^
        uint64_t(key.depth_control) << 23;
-  return uint32_t((h ^ (h >> 31) ^ (h >> 47)) & (kPipelineMemoSets - 1));
+  return h;
 }
+
+inline uint32_t PipelineMemoSet(uint64_t h) { return uint32_t((h ^ (h >> 31) ^ (h >> 47)) & (kPipelineMemoSets - 1)); }
 // banjo-nx (2026-10-18): bumped each time a prebuild job is done (any thread).
 std::atomic<uint64_t> g_prebuild_epoch{0};
 // banjo-nx (2026-10-18), render thread: specialised keys a worker is building, with the generic pipeline their draws
@@ -174,6 +209,9 @@ uint32_t BlendSkipMode(const PipelineKey &key) {
   case plume::RenderFormat::R8G8B8A8_UNORM:
   case plume::RenderFormat::B8G8R8A8_UNORM:
   case plume::RenderFormat::R16G16B16A16_UNORM:
+  // sasrt-nx (2026-11-11, port 75; its formats batch, rows 6, 8, 10, 74, 93; its audit's finding 2): clamps as the
+  // other UNORM targets do
+  case plume::RenderFormat::R10G10B10A2_UNORM:
   case plume::RenderFormat::R8G8_UNORM:
   case plume::RenderFormat::R8_UNORM:
   case plume::RenderFormat::R16G16_UNORM:
@@ -224,6 +262,9 @@ uint32_t FormatChannels(plume::RenderFormat format) {
   case F::R16G16_FLOAT:
   case F::R32G32_FLOAT:
     return 0x3;
+  // sasrt-nx (2026-11-11, port 75; its formats batch, rows 7, 66, 73, 95, 96; its audit's finding 2): no alpha
+  case F::R11G11B10_FLOAT:
+    return 0x7;
   default:
     return 0xF;
   }
@@ -298,10 +339,13 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
   const bool cull_back = !key.point_sprite && (key.mode_control & 2);
   desc.cullMode = cull_front && !cull_back   ? plume::RenderCullMode::FRONT
                   : cull_back && !cull_front ? plume::RenderCullMode::BACK
+                  : cull_front && banjo::renut_gpu::CullBothOn() ? plume::RenderCullMode::FRONT_AND_BACK  // kameo-nx (2026-11-04)
                                              : plume::RenderCullMode::NONE;
   desc.frontFace = (key.mode_control & 4) ? plume::RenderFrontFace::CLOCKWISE
                                           : plume::RenderFrontFace::COUNTER_CLOCKWISE;
   desc.depthClipEnabled = true;
+  // rr6-nx (2026-11-03, rr6_depth_bias): set per draw (SetDrawDepthBias), so no value of it makes a pipeline.
+  desc.dynamicDepthBiasEnabled = banjo::renut_gpu::DepthBiasOn() && s.device->getCapabilities().dynamicDepthBias;
 
   // RB_DEPTHCONTROL.
   const u32 dc = key.depth_control;
@@ -329,7 +373,31 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
     } else {
       desc.stencilBackFace = desc.stencilFrontFace;
     }
+    // sasrt-nx (2026-11-11, port 82; its GPU list's row 1; UNTESTED), sasrt_gpu_stencil_noop: a face's test that
+    // compares always rejects no pixel (its fail operation cannot happen); with a write mask of 0, or keep on the pass
+    // outcome and on the depth-fail outcome where the depth test can fail, it changes no stencil value either.
+    // Both faces so: the stencil off is exact. Counted in the 10 s "[renut] untested GPU rows" line.
+    if (desc.stencilEnabled && sasrt::gpu_round::StencilNoopOn()) {
+      const bool depth_can_fail =
+          desc.depthEnabled && desc.depthFunction != plume::RenderComparisonFunction::ALWAYS;
+      const auto noop = [&](const auto &f) {
+        if (f.compareFunction != plume::RenderComparisonFunction::ALWAYS)
+          return false;
+        if ((desc.stencilWriteMask & 0xFF) == 0)
+          return true;
+        return f.passOp == plume::RenderStencilOp::KEEP &&
+               (!depth_can_fail || f.depthFailOp == plume::RenderStencilOp::KEEP);
+      };
+      if (noop(desc.stencilFrontFace) && noop(desc.stencilBackFace)) {
+        desc.stencilEnabled = false;
+        sasrt::gpu_round::g_census_stencil_noop.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
   }
+  // sasrt-nx (2026-11-11, port 82; its GPU list's row 4; UNTESTED): the census's count of the pipelines that cull both
+  // faces (render/draw.cpp leaves out the triangle draws that would use them, sasrt_gpu_skip_cull_both).
+  if (desc.cullMode == plume::RenderCullMode::FRONT_AND_BACK)
+    sasrt::gpu_round::g_census_cull_both.fetch_add(1, std::memory_order_relaxed);
   desc.depthTargetFormat = key.depth_format;
 
   desc.renderTargetCount = key.color_count;
@@ -346,7 +414,7 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
 
   // banjo-nx (banjo_gpu_bool_spec): the key's bools as the shaders' specialization constants (banjo_bool_spec.h). One
   // list for every stage: a stage takes the ids it declares (vertex and pixel shader bools have distinct ones).
-  plume::RenderSpecConstant spec[272];  // 256 bools and 900-908
+  plume::RenderSpecConstant spec[340];  // 256 bools, 900-914, 920-930 and sasrt-nx's 932-945, 950-973
   uint32_t spec_count = 0;
   for (uint32_t w = 0; w < 8; ++w) {
     for (uint32_t m = key.bool_mask[w]; m; m &= m - 1) {
@@ -357,6 +425,17 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
   // banjo-nx (banjo_gpu_blend_skip): the pixel shader's discard of pixels the blend would not change.
   if (key.blend_skip)
     spec[spec_count++] = plume::RenderSpecConstant(900, key.blend_skip);
+  // halo3-nx (2026-11-03): the targets the GPU would gamma-encode (draw.cpp, shader_common.h banjoTrim), constant 924, and
+  // their colour exponent biases, 925 (920 / 921 in halo3-nx).
+  if (key.pixel_shader && ((key.reserved >> 4) & 0xFu))
+    spec[spec_count++] = plume::RenderSpecConstant(924, (key.reserved >> 4) & 0xFu);
+  if (key.pixel_shader && (key.reserved >> 8)) {
+    spec[spec_count++] = plume::RenderSpecConstant(925, key.reserved >> 8);
+    // blur-nx (2026-11-17, blur_renut_target_bias_rgb): the colour scaled by the bias too (shader_common.h, constant 927).
+    // One value for the whole run, so not in the key: a variant is keyed by the values of the constants it declares.
+    if (banjo::renut_gpu::TargetBiasRgbOn())
+      spec[spec_count++] = plume::RenderSpecConstant(927, 1);
+  }
   // banjo-nx (banjo_gpu_output_trim): the colour channels the pixel shader leaves 0.
   if (key.output_trim) {
     spec[spec_count++] = plume::RenderSpecConstant(901, key.output_trim);
@@ -364,12 +443,87 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
       spec[spec_count++] = plume::RenderSpecConstant(902, 1);  // the test: trimmed channels 60000
   }
   // banjo-nx (banjo_deko3d_alpha_spec, 2026-10-18): the alpha test's function (+1), constant 903 of the deko3d GLSL.
-  if (key.alpha_func)
+  if (key.alpha_func) {
     spec[spec_count++] = plume::RenderSpecConstant(903, key.alpha_func);
+    if (key.alpha_func == 8u)  // sasrt-nx (2026-11-08, sasrt_gpu_alpha_spec): pipelines built without the test
+      sasrt::gpu_round::Count(sasrt::gpu_round::kAlphaSpec);
+  }
+  // sasrt-nx (2026-11-08, sasrt_gpu_face_sign): constant 928 is 1 in the GLSL (the sign bit); 0 with the key off.
+  if (key.pixel_shader && !sasrt::gpu_round::On(sasrt::gpu_round::kFaceSign))
+    spec[spec_count++] = plume::RenderSpecConstant(928, 0);
+  // sasrt-nx (2026-11-08, sasrt_smaa_replaces_fxaa, the user's request): the game's FXAA pass as a copy of its centre
+  // sample (constant 930, tools/deko3d_glsl_opt.py pass nofxaa); banjo-nx's SMAA runs on its target after it
+  // (banjo_renut_smaa with banjo_renut_smaa_after_ps 6C215354C35798B8, sasrt_switch.toml).
+  if (key.pixel_shader && SasrtSmaaReplacesFxaa() &&
+      static_cast<const ShaderCacheEntry *>(key.pixel_shader)->hash == 0x6C215354C35798B8ull)
+    spec[spec_count++] = plume::RenderSpecConstant(930, 1);
+  // sasrt-nx (2026-11-08, sasrt_gpu_clip_spec; the second GPU round): a draw without a user clip plane (key bit 3
+  // clear): the vertex shader without its clip distance (constant 929 = 0, pass clipspec); plume_deko3d sets the clip slot
+  // off for the pipeline (Deko3DGraphicsPipeline::noUserClip).
+  if (key.vertex_shader && !(key.reserved & 8u)) {
+    spec[spec_count++] = plume::RenderSpecConstant(929, 0);
+    sasrt::gpu_round::Count(sasrt::gpu_round::kClipSpec, 1, 1);  // pipelines built without it (the 10 s line, /n)
+  }
+  // sasrt-nx (2026-11-08, sasrt_gpu_plain_fetches): the fetch constants without signs, gamma or exponent adjust.
+  if (key.pixel_shader && key.fetch_pad) {
+    spec[spec_count++] = plume::RenderSpecConstant(926, key.fetch_pad);
+    sasrt::gpu_round::Count(sasrt::gpu_round::kPlainFetches);  // pipelines built with it (the 10 s line)
+  }
   // banjo-nx (banjo_deko3d_tess_spec, 2026-10-18): not a tessellated draw: the vertex shader's patch kind is 0
   // (SharedConstants.tessellation[0], constant 904 + 1). Decided by the key: no new pipelines.
   if (!key.per_instance_streams && banjo::renut_gpu::TessSpecOn())
     spec[spec_count++] = plume::RenderSpecConstant(904, 1);
+  // vivapinata-nx (2026-11-03, banjo-nx's banjo_gpu_fetch_spec): a tessellated draw's patch kind (+1) and the type words (+1) of its
+  // first four bound fetches, from its key (render/draw.cpp FetchSpecWords): this game's terrain draws up to 580,000 vertices a frame.
+  else if (key.tess_kind)
+    spec[spec_count++] = plume::RenderSpecConstant(904, key.tess_kind);
+  // renut-ultimate (port 44, 2026-11-08; sasrt-nx's sasrt_gpu_plain_fetches): the fetch constants without signs, gamma
+  // or exponent adjust.
+  if (key.pixel_shader && key.fetch_pad)
+    spec[spec_count++] = plume::RenderSpecConstant(926, key.fetch_pad);
+  for (uint32_t k = 0; k < 4; ++k) {
+    if (key.fetch_types[k])
+      spec[spec_count++] = plume::RenderSpecConstant(920 + k, key.fetch_types[k]);
+  }
+  // sasrt-nx (2026-11-08, the third GPU round; render/draw.cpp SasrtSpecWordsOf): the vertex shader's epilogue (932) and
+  // memory fetches' byte order (937-939), the pixel shader's 3D fetches (934-936), as the draw has them.
+  if (key.vertex_shader) {
+    if (key.sasrt_words[0])
+      spec[spec_count++] = plume::RenderSpecConstant(932, key.sasrt_words[0]);
+    if (key.sasrt_words[4]) {
+      spec[spec_count++] = plume::RenderSpecConstant(937, key.sasrt_words[4]);
+      spec[spec_count++] = plume::RenderSpecConstant(938, key.sasrt_words[5]);
+      spec[spec_count++] = plume::RenderSpecConstant(939, key.sasrt_words[6]);
+    }
+    if (key.sasrt_words[8]) {  // sasrt-nx (2026-11-08, sasrt_gpu_export_format_spec)
+      for (uint32_t k = 0; k < 4; ++k)
+        spec[spec_count++] = plume::RenderSpecConstant(940 + k, key.sasrt_words[8 + k]);
+    }
+    if (key.sasrt_words[7] & 4u)  // sasrt-nx (2026-11-08, sasrt_gpu_export_window_ubo; the fourth round)
+      spec[spec_count++] = plume::RenderSpecConstant(944, 1);
+    if ((key.sasrt_words[7] >> 3) & 31u)  // sasrt-nx (2026-11-09, sasrt_gpu_exp_export_parts: an experiment)
+      spec[spec_count++] = plume::RenderSpecConstant(945, (key.sasrt_words[7] >> 3) & 31u);
+  }
+  if (key.pixel_shader) {
+    for (uint32_t k = 1; k < 4; ++k) {
+      if (key.sasrt_words[k])
+        spec[spec_count++] = plume::RenderSpecConstant(933 + k, key.sasrt_words[k]);
+    }
+    // sasrt-nx (2026-11-09, sasrt_gpu_fetch_conversion_spec; the fifth round): fetch constant r's conversion words (16 bits
+    // each, bit 15 set when known) as constant 950 + r.
+    for (uint32_t r = 0; r < 8; ++r) {
+      const uint32_t field = (key.sasrt_words[12 + r / 2] >> (16 * (r & 1))) & 0xFFFFu;
+      if (field & 0x8000u)
+        spec[spec_count++] = plume::RenderSpecConstant(950 + r, field);
+      // sasrt-nx (2026-11-09, sasrt_gpu_fetch_exp_3d_spec): the 3D and cube words' exponent (8 bits each, bit 7 known)
+      const uint32_t e3 = (key.sasrt_words[16 + r / 4] >> (8 * (r & 3))) & 0xFFu;
+      const uint32_t ec = (key.sasrt_words[18 + r / 4] >> (8 * (r & 3))) & 0xFFu;
+      if (e3 & 0x80u)
+        spec[spec_count++] = plume::RenderSpecConstant(958 + r, e3);
+      if (ec & 0x80u)
+        spec[spec_count++] = plume::RenderSpecConstant(966 + r, ec);
+    }
+  }
   // banjo-nx (banjo_deko3d_early_hoist, 2026-10-18): the main body's first texture region ahead of the early alpha test
   // (constant 907, 1 by default in the GLSL); off: after it, as Renut's shaders have it.
   if (!banjo::renut_gpu::EarlyHoistOn())
@@ -390,8 +544,21 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
   }
   // banjo-nx (2026-10-19, GPU, A/B): the listed pixel shaders compiled with 32 GPRs at most (constant 910).
   // (key.reserved bit 1: the off half of the in-run A/B, banjo_renut_ab_target 16.)
-  if (key.pixel_shader && banjo::renut_gpu::Gpr32On() && !(key.reserved & 2u))
+  if (key.pixel_shader && ((banjo::renut_gpu::Gpr32On() && !(key.reserved & 2u)) ||
+                           (key.sasrt_words[7] & 3u)))  // sasrt-nx (2026-11-08): sasrt_gpu_gpr_cap(_filter)
     spec[spec_count++] = plume::RenderSpecConstant(910, 1);
+  // vivapinata-nx (2026-11-12, the shader round; A/B 150): the round's passes as before them (constant 975, 1 by default in
+  // the GLSL; render/draw.cpp SasrtSpecWordsOf sets [7] bit 8 when vivapinata_shader_round is off or in its off half).
+  if (key.pixel_shader && (key.sasrt_words[7] & 0x100u))
+    spec[spec_count++] = plume::RenderSpecConstant(975, 0);
+  // vivapinata-nx (2026-11-12, A/B 151): the early alpha test skipped (constant 976, 1 by default in the GLSL; render/draw.cpp
+  // SasrtSpecWordsOf sets [7] bit 9 when vivapinata_shader_noearly is on, but in its off half).
+  if (key.pixel_shader && (key.sasrt_words[7] & 0x200u))
+    spec[spec_count++] = plume::RenderSpecConstant(976, 0);
+  // vivapinata-nx (2026-11-12, A/B 152): the alpha test moved up (constant 977, 0 by default in the GLSL; render/draw.cpp
+  // SasrtSpecWordsOf sets [7] bit 10 when vivapinata_shader_earlykill is on, but in its off half).
+  if (key.pixel_shader && (key.sasrt_words[7] & 0x400u))
+    spec[spec_count++] = plume::RenderSpecConstant(977, 1);
   // banjo-nx (2026-10-20, GPU A/B): the listed lit shaders' lights in branches (constant 911, pass lightbranch).
   // (key.reserved bit 0: the off half of the in-run A/B, banjo_renut_ab_target 15.)
   if (key.pixel_shader && banjo::renut_gpu::LightBranchOn() && !(key.reserved & 1u))
@@ -399,6 +566,28 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
   // banjo-nx (2026-10-20, diagnostic): the fur family without its pixel work (constant 912, pass nullps).
   if (key.pixel_shader && banjo::renut_gpu::NullPsOn())
     spec[spec_count++] = plume::RenderSpecConstant(912, 1);
+  // banjo-nx (2026-10-20, GPU A/B): the fur's vertex shaders skin once a frame (constant 913, pass skinonce; the draw's
+  // shared word v[84].z picks write or read, render/draw.cpp FurSkinLocked). Only the listed vertex shaders declare it.
+  // (key.reserved bit 2: the off half of the in-run A/B, banjo_renut_ab_target 17.)
+  if (banjo::renut_gpu::SkinOnceOn() && !(key.reserved & 4u))
+    spec[spec_count++] = plume::RenderSpecConstant(913, 1);
+  // dishonored-nx (2026-10-31, dishonored_renut_clamp_7e3; port 106): the colour targets that are 7e3 ones with bias 0
+  // (sasrt_words[7] bits 28-31, render/draw.cpp SasrtSpecWordsOf): their outputs clamped to the 7e3 range (constant 990,
+  // a mask of targets, 0 by default in the GLSL; tools/deko3d_glsl_opt.py clamp7e3).
+  if (key.pixel_shader && (key.sasrt_words[7] >> 28)) {
+    spec[spec_count++] = plume::RenderSpecConstant(990, key.sasrt_words[7] >> 28);
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+      RGPU_INFO("[7e3] a pipeline with the 7e3 clamp (constant 990 = {}) for its 2_10_10_10_FLOAT targets",
+                key.sasrt_words[7] >> 28);
+  }
+#if defined(PLUME_DEKO3D)
+  // vivapinata-nx (2026-11-03, banjo_deko3d_vs_kill_and): the vertex kill as the GPU does it, on both stages (constant 914,
+  // tools/deko3d_glsl_opt.py vskill). Without a pixel shader to discard, or under a geometry shader, the NaN position as before.
+  if (banjo::renut_gpu::VsKillAndOn() && key.pixel_shader && !key.rectangle_list && !key.point_sprite &&
+      plume::Deko3DShaderWritesVertexKill(inputs.vertex_shader))
+    spec[spec_count++] = plume::RenderSpecConstant(914, 1);
+#endif
   desc.specConstants = spec_count ? spec : nullptr;
   desc.specConstantsCount = spec_count;
   if (REXCVAR_GET(banjo_deko3d_variant_log)) {
@@ -411,9 +600,9 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
     for (uint32_t i = 0; i < spec_count; ++i)
       line += fmt::format(" {}={}", spec[i].index, spec[i].value);
     // The state the blend skip and the output trim are decided from (tools/deko3d_variant_cache.py skips these).
-    line += fmt::format(" | targets {} format0 {} blend0 {:08X} mask {:04X} depth {:08X} a2c {}", key.color_count,
+    line += fmt::format(" | targets {} format0 {} blend0 {:08X} mask {:04X} depth {:08X} a2c {} gs {}", key.color_count,
                         int(key.color_formats[0]), key.blend_control[0], key.color_mask, key.depth_control,
-                        key.alpha_to_coverage);
+                        key.alpha_to_coverage, key.point_sprite | key.rectangle_list);  // banjo-nx (2026-10-20): gs
     std::lock_guard<std::mutex> lock(log_mutex);
     if (log_file && logged.insert(line).second) {
       log_file << line << '\n';
@@ -463,8 +652,15 @@ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const Pipel
 constexpr char kListMagic[4] = {'R', 'N', 'P', 'L'};
 // banjo-nx: 2, the key's bool words (banjo_gpu_bool_spec); 3, output_trim; 4, alpha_func (a version 3 list is kept,
 // LoadList).
-constexpr u32 kListVersion = 4;
+// vivapinata-nx: 5, fetch_types and tess_kind (banjo_gpu_fetch_spec; a version 4 list is kept the same way).
+// sasrt-nx (2026-11-08): 6, sasrt_words (the third GPU round; a version 5 list is kept the same way).
+// sasrt-nx (2026-11-09): 7, sasrt_words[12]-[19] (the fifth round; a version 6 list is kept the same way).
+constexpr u32 kListVersion = 7;
 constexpr u32 kListV3KeySize = 184;  // the key up to output_trim
+constexpr u32 kListV4KeySize = 192;  // the key up to reserved
+constexpr u32 kListV5KeySize = 216;  // the key up to fetch_pad
+constexpr u32 kListV6KeySize = 264;  // twelve sasrt_words
+static_assert(sizeof(PipelineKey) == kListV5KeySize + 80, "the version 7 key: version 5's and twenty words");
 
 struct ListHeader {
   char magic[4];
@@ -549,16 +745,47 @@ std::vector<char> EncodeRecord(const PipelineKey &key, const HostVertexLayout &l
 }
 
 // A listed pipeline, as the worker threads build it.
+// banjo-nx (2026-10-28, the heap): a decoded vertex layout and the names its elements point at, one per distinct layout,
+// shared by the jobs that have it (JobLayoutFor).
+struct JobLayout {
+  HostVertexLayout layout;
+  std::deque<std::string> names;  // the elements' semantic names point here
+};
+// banjo-nx (2026-11-01): a key with the draw's own vertex fetch words or patch kind (banjo_gpu_fetch_spec).
+bool FetchSpecialised(const PipelineKey &key) {
+  if (key.tess_kind)
+    return true;
+  for (const uint32_t w : key.fetch_types) {
+    if (w)
+      return true;
+  }
+  return false;
+}
+
 struct Job {
   PipelineKey key{};
   uint64_t hash = 0;
-  HostVertexLayout layout;
-  std::deque<std::string> names;  // the elements' semantic names point here
+  std::shared_ptr<const JobLayout> layout;
   enum class Stage { Pending, Building, Done } stage = Stage::Pending;
   std::unique_ptr<plume::RenderPipeline> pipeline;  // Done: nullptr if taken or failed
+  // banjo-nx (2026-10-28, the heap): when its build was done (steady clock, ms), and whether its pipeline was given back
+  // unused (Pending again, in no queue: TakePrebuilt claims it, SpecialisedPipeline queues it again).
+  int64_t done_ms = 0;
+  bool released = false;
   // Its shaders the game has not made yet (PipelineShaderLoaded); queued at 0.
   u32 shaders_missing = 0;
 };
+
+// banjo-nx (2026-10-28, the heap): the shared block for a layout, by its fields as the record has them.
+std::shared_ptr<const JobLayout> JobLayoutFor(const std::string &bytes, std::unique_ptr<JobLayout> fresh) {
+  static std::mutex mutex;
+  static std::unordered_map<std::string, std::shared_ptr<const JobLayout>> layouts;
+  std::lock_guard lock(mutex);
+  auto [it, made] = layouts.try_emplace(bytes);
+  if (made)
+    it->second = std::move(fresh);
+  return it->second;
+}
 
 bool DecodeRecord(const char *data, size_t size, Job &job) {
   ByteReader r(data, size);
@@ -582,25 +809,63 @@ bool DecodeRecord(const char *data, size_t size, Job &job) {
     job.key.blend_skip = 0;
   if (!banjo::renut_gpu::OutputTrimOn())
     job.key.output_trim = 0;
-  if (!banjo::renut_gpu::AlphaSpecOn())
+  if (!banjo::renut_gpu::AlphaSpecOn() && !sasrt::gpu_round::On(sasrt::gpu_round::kAlphaSpec))  // sasrt-nx (2026-11-08)
     job.key.alpha_func = 0;
+  if (!banjo::renut_gpu::PlainFetchesOn())  // port 44 (sasrt_gpu_plain_fetches)
+    job.key.fetch_pad = 0;
+  if (!banjo::renut_gpu::FetchSpecOn()) {
+    std::memset(job.key.fetch_types, 0, sizeof(job.key.fetch_types));
+    job.key.tess_kind = 0;
+  }
+  {  // sasrt-nx (2026-11-08, the third round): a listed key's words of items now off
+    uint32_t *w = job.key.sasrt_words;
+    if (!sasrt::gpu_round::On(sasrt::gpu_round::kVsScreenSpec))
+      w[0] &= ~3u;
+    if (!sasrt::gpu_round::On(sasrt::gpu_round::kVsRemapSpec))
+      w[0] &= ~12u;
+    if (!sasrt::gpu_round::On(sasrt::gpu_round::kStackSpec))
+      w[1] = 0;
+    if (!sasrt::gpu_round::On(sasrt::gpu_round::kStackFilterSpec))
+      w[2] = w[3] = 0;
+    if (!sasrt::gpu_round::On(sasrt::gpu_round::kFetchEndianSpec))
+      w[4] = w[5] = w[6] = 0;
+    if (!sasrt::gpu_round::On(sasrt::gpu_round::kGprCap))
+      w[7] &= ~1u;
+    if (!sasrt::gpu_round::On(sasrt::gpu_round::kGprCapFilter))
+      w[7] &= ~2u;
+    if (!sasrt::gpu_round::On(sasrt::gpu_round::kExportFmtSpec))
+      w[8] = w[9] = w[10] = w[11] = 0;
+    if (!sasrt::gpu_round::On(sasrt::gpu_round::kFetchConvSpec))  // sasrt-nx (2026-11-09, the fifth round)
+      w[12] = w[13] = w[14] = w[15] = 0;
+    if (!sasrt::gpu_round::On(sasrt::gpu_round::kFetchExpSpec))
+      w[16] = w[17] = w[18] = w[19] = 0;
+  }
   if (!banjo::renut_gpu::BoolSpecOn()) {
     std::memset(job.key.bool_mask, 0, sizeof(job.key.bool_mask));
     std::memset(job.key.bool_values, 0, sizeof(job.key.bool_values));
   }
-  job.key.reserved = 0;
+  // Only the A/B bits (0-2). halo3-nx (89029486): bits 4-31 are the targets' gamma and colour exponent biases, part of the
+  // pipeline: cleared here, a job never matched its draw's key, so every draw to those targets made another job.
+  job.key.reserved &= ~7u;
   job.hash = HashKey(job.key);
+  // banjo-nx (2026-10-28, the heap): decoded into a fresh block, then the shared one for the same fields (JobLayoutFor).
+  auto fresh = std::make_unique<JobLayout>();
+  std::string bytes;
+  const auto put = [&bytes](const void *p, size_t n) { bytes.append(static_cast<const char *>(p), n); };
   for (u32 s = 0; s < kMaxVertexStreams; ++s) {
     u8 used;
     u32 stride;
     if (!r.Get(used) || !r.Get(stride))
       return false;
-    job.layout.streams[s].used = used != 0;
-    job.layout.streams[s].host_stride = stride;
+    fresh->layout.streams[s].used = used != 0;
+    fresh->layout.streams[s].host_stride = stride;
+    put(&used, sizeof(used));
+    put(&stride, sizeof(stride));
   }
   u32 count;
   if (!r.Get(count) || count > 64)
     return false;
+  put(&count, sizeof(count));
   for (u32 i = 0; i < count; ++i) {
     u8 length;
     std::string name;
@@ -612,10 +877,15 @@ bool DecodeRecord(const char *data, size_t size, Job &job) {
         !r.Get(slot) || !r.Get(offset)) {
       return false;
     }
-    job.names.push_back(std::move(name));
-    job.layout.input_elements.emplace_back(job.names.back().c_str(), index, location,
-                                           plume::RenderFormat(format), slot, offset);
+    put(&length, sizeof(length));
+    put(name.data(), length);
+    for (const u32 v : {index, location, format, slot, offset})
+      put(&v, sizeof(v));
+    fresh->names.push_back(std::move(name));
+    fresh->layout.input_elements.emplace_back(fresh->names.back().c_str(), index, location,
+                                              plume::RenderFormat(format), slot, offset);
   }
+  job.layout = JobLayoutFor(bytes, std::move(fresh));
   return true;
 }
 
@@ -626,70 +896,88 @@ bool DecodeRecord(const char *data, size_t size, Job &job) {
 // same pipelines (and their shader variants) were built again at every start. The file is synced to the card at most
 // once a second (kListSyncNs: the records of the last second may still be lost), not per record (a new area appends
 // hundreds).
+// banjo-nx (2026-10-28, per-draw night): written by a thread of its own (WriterLoop); the render thread only appends
+// the encoded records to 'pending'. Before, the render thread wrote and flushed each record (a call into the file
+// system service a pipeline) and synced the card (milliseconds) at most once a second while records came.
+void PipelineListWriterMain();
 struct PipelineList {
-  std::FILE *out = nullptr;
-  bool failed = false;
-  std::unordered_set<uint64_t> listed;  // key hashes in the file
-  std::chrono::steady_clock::time_point last_sync{};
-  bool unsynced = false;
+  std::FILE *out = nullptr;  // the writer's
+  std::atomic<bool> failed{false};
+  std::unordered_set<uint64_t> listed;  // key hashes in the file (render thread; the load at the start)
   static constexpr auto kListSync = std::chrono::seconds(1);
-
-  void Sync() {
-    if (!out || !unsynced)
-      return;
-    std::fflush(out);
-#if defined(_WIN32)
-    _commit(_fileno(out));
-#else
-    fsync(fileno(out));
-#endif
-    unsynced = false;
-    last_sync = std::chrono::steady_clock::now();
-  }
+  std::mutex pending_mutex;
+  std::vector<char> pending;  // records (size word, then the record) not yet written, in order
+  bool writer_started = false;  // render thread
 
   void Append(const PipelineKey &key, uint64_t hash, const HostVertexLayout &layout) {
-    if (failed || !listed.insert(hash).second)
+    if (failed.load(std::memory_order_relaxed) || !listed.insert(hash).second)
       return;
-    if (!out) {
-      const std::filesystem::path path = banjo::renut_gpu::NextToExecutable(REXCVAR_GET(renut_pipeline_list));
-      std::error_code ec;
-      const bool fresh = !std::filesystem::exists(path, ec) || std::filesystem::file_size(path, ec) == 0;
-      out = std::fopen(path.string().c_str(), "ab");
-      if (!out) {
-        failed = true;
-        RGPU_WARN("Pipeline list {} cannot be written; pipelines are not built ahead next time",
-                  path.string());
-        return;
-      }
-      if (fresh) {
-        ListHeader header{};
-        std::memcpy(header.magic, kListMagic, 4);
-        header.version = kListVersion;
-        header.key_size = sizeof(PipelineKey);
-        header.streams = kMaxVertexStreams;
-        std::fwrite(&header, sizeof(header), 1, out);
-      }
-    }
     const std::vector<char> record = EncodeRecord(key, layout);
     const u32 size = u32(record.size());
-    std::fwrite(&size, sizeof(size), 1, out);
-    std::fwrite(record.data(), 1, record.size(), out);
-    std::fflush(out);
-    unsynced = true;
-    if (std::chrono::steady_clock::now() - last_sync >= kListSync)
-      Sync();
+    {
+      std::lock_guard lock(pending_mutex);
+      const size_t at = pending.size();
+      pending.resize(at + sizeof(size) + record.size());
+      std::memcpy(pending.data() + at, &size, sizeof(size));
+      std::memcpy(pending.data() + at + sizeof(size), record.data(), record.size());
+    }
+    if (!writer_started) {
+      writer_started = true;
+      banjo::renut_gpu::StartLongLivedThread(PipelineListWriterMain, 128 * 1024);
+    }
+  }
+
+  // Every kListSync, what came since: written, flushed and synced (the file opened, with its header if new, first).
+  void WriterLoop() {
+    banjo::renut_gpu::OnBackgroundThreadStart("pipeline list writer");
+    std::vector<char> batch;
+    for (;;) {
+      std::this_thread::sleep_for(kListSync);
+      {
+        std::lock_guard lock(pending_mutex);
+        batch.swap(pending);
+      }
+      if (batch.empty())
+        continue;
+      if (!out) {
+        const std::filesystem::path path = banjo::renut_gpu::NextToExecutable(REXCVAR_GET(renut_pipeline_list));
+        std::error_code ec;
+        const bool fresh = !std::filesystem::exists(path, ec) || std::filesystem::file_size(path, ec) == 0;
+        out = std::fopen(path.string().c_str(), "ab");
+        if (!out) {
+          failed.store(true, std::memory_order_relaxed);
+          RGPU_WARN("Pipeline list {} cannot be written; pipelines are not built ahead next time",
+                    path.string());
+          return;
+        }
+        if (fresh) {
+          ListHeader header{};
+          std::memcpy(header.magic, kListMagic, 4);
+          header.version = kListVersion;
+          header.key_size = sizeof(PipelineKey);
+          header.streams = kMaxVertexStreams;
+          std::fwrite(&header, sizeof(header), 1, out);
+        }
+      }
+      std::fwrite(batch.data(), 1, batch.size(), out);
+      std::fflush(out);
+#if defined(_WIN32)
+      _commit(_fileno(out));
+#else
+      fsync(fileno(out));
+#endif
+      batch.clear();
+    }
   }
 };
 PipelineList g_list;
+void PipelineListWriterMain() { g_list.WriterLoop(); }
 
 }  // namespace
 
 // banjo-nx (2026-10-20): the list's last records synced to the card a second after they were written, if no record
-// came after them (the render thread, once a frame).
-void SyncPipelineListLocked() {
-  if (g_list.unsynced && std::chrono::steady_clock::now() - g_list.last_sync >= PipelineList::kListSync)
-    g_list.Sync();
-}
+// came after them (the render thread, once a frame). banjo-nx (2026-10-28, per-draw night): the writer thread's now.
+void SyncPipelineListLocked() {}
 
 namespace {
 
@@ -712,7 +1000,15 @@ std::vector<std::unique_ptr<Job>> LoadList() {
   // banjo-nx (2026-10-18): a version 3 list (before alpha_func): its keys get the fields after output_trim as 0 (the
   // generic pipelines, which the specialised ones draw with until they are built), and the file is written again as
   // version 4.
-  const bool v3 = header_ok && header.version == 3 && header.key_size == kListV3KeySize;
+  // banjo-nx (banjo_gpu_fetch_spec, 2026-10-31): a version 4 list (before fetch_types / tess_kind) the same way: its keys
+  // get the new fields as 0 (generic) and the file is written again as version 5.
+  const u32 old_key_size = !header_ok                                                        ? 0
+                           : header.version == 3 && header.key_size == kListV3KeySize ? kListV3KeySize
+                           : header.version == 4 && header.key_size == kListV4KeySize ? kListV4KeySize
+                           : header.version == 5 && header.key_size == kListV5KeySize ? kListV5KeySize
+                           : header.version == 6 && header.key_size == kListV6KeySize ? kListV6KeySize
+                                                                                     : 0;
+  const bool v3 = old_key_size != 0;  // an older list to convert (version 3, 4, 5 or 6)
   if (!valid && !v3) {
     std::error_code ec;
     std::filesystem::remove(path, ec);
@@ -738,11 +1034,11 @@ std::vector<std::unique_ptr<Job>> LoadList() {
     const char *data = bytes.data() + at;
     u32 data_size = size;
     if (v3) {
-      if (size < kListV3KeySize)
+      if (size < old_key_size)
         break;
-      record.assign(data, data + kListV3KeySize);
+      record.assign(data, data + old_key_size);
       record.resize(sizeof(PipelineKey), 0);
-      record.insert(record.end(), data + kListV3KeySize, data + size);
+      record.insert(record.end(), data + old_key_size, data + size);
       data = record.data();
       data_size = u32(record.size());
       const size_t o = converted.size();
@@ -759,8 +1055,8 @@ std::vector<std::unique_ptr<Job>> LoadList() {
     std::ofstream rewrite(path, std::ios::binary | std::ios::trunc);
     if (rewrite)
       rewrite.write(converted.data(), std::streamsize(converted.size()));
-    RGPU_INFO("Pipeline list {}: version 3, {} pipelines kept as version 4 (generic alpha test)", path.string(),
-              jobs.size());
+    RGPU_INFO("Pipeline list {}: version {}, {} pipelines kept as version {} (the new key fields generic)",
+              path.string(), header.version, jobs.size(), kListVersion);
   }
   // Records of shaders this build lacks stay out of 'listed': a later build
   // that has them lists the pipelines again.
@@ -812,6 +1108,11 @@ void PrebuildWorker() {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 #endif
   banjo::renut_gpu::OnPrebuildWorkerStart();  // banjo-nx: its core and priority on the Switch
+#if defined(PLUME_DEKO3D)
+  // banjo-nx (2026-10-21, banjo_deko3d_async_variants): its pipelines' missing variants are compiled after the draws'
+  // ones, a few at a time (the rest when a draw needs them).
+  plume::Deko3DSetBackgroundThread(true);
+#endif
   std::unique_lock lock(g_prebuild.mutex);
   for (;;) {
     g_prebuild.work.wait(lock, [] { return g_prebuild.stop || !g_prebuild.queue.empty(); });
@@ -826,13 +1127,36 @@ void PrebuildWorker() {
     PipelineInputs inputs;
     inputs.vertex_shader = PrebuildShader(static_cast<const ShaderCacheEntry *>(job.key.vertex_shader));
     inputs.pixel_shader = PrebuildShader(static_cast<const ShaderCacheEntry *>(job.key.pixel_shader));
-    inputs.layout = &job.layout;
+    inputs.layout = &job.layout->layout;
     const bool shaders = inputs.vertex_shader && (!job.key.pixel_shader || inputs.pixel_shader);
+    // banjo-nx (2026-11-01): a pipeline with the draw's own vertex fetch or patch kind (banjo_gpu_fetch_spec: here the terrain) is
+    // built with its own variants, compiled now on this thread (plume::Deko3DSetUrgentVariants); the draws use the generic
+    // pipeline meanwhile. Queued in the background, a console run might never get to it (banjo-nx: one variant every 30-40 s).
+    const bool urgent = FetchSpecialised(job.key);
+    const auto build_start = std::chrono::steady_clock::now();
     lock.unlock();
+#if defined(PLUME_DEKO3D)
+    plume::Deko3DSetUrgentVariants(urgent);
+#endif
     std::unique_ptr<plume::RenderPipeline> pipeline = shaders ? Build(job.key, inputs) : nullptr;
+#if defined(PLUME_DEKO3D)
+    plume::Deko3DSetUrgentVariants(false);
+#endif
+    if (urgent) {
+      const auto *vs_entry = static_cast<const ShaderCacheEntry *>(job.key.vertex_shader);
+      const auto &t = job.key.fetch_types;
+      RGPU_INFO("fetch spec (banjo_gpu_fetch_spec): VS {:016X}'s pipeline with patch kind {} and fetch types "
+                "{:X} {:X} {:X} {:X} (+1) {} in {} ms",
+                vs_entry ? vs_entry->hash : 0, job.key.tess_kind, t[0], t[1], t[2], t[3],
+                pipeline ? "built" : "FAILED",
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - build_start).count());
+    }
     lock.lock();
     job.pipeline = std::move(pipeline);
     job.stage = Job::Stage::Done;
+    job.done_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count();  // banjo-nx (2026-10-28)
     g_prebuild_epoch.fetch_add(1, std::memory_order_release);  // banjo-nx: g_spec_pending asks again
     if (--g_prebuild.building == 0 && g_prebuild.queue.empty())
       g_prebuild.shaders.clear();
@@ -885,8 +1209,15 @@ SpecState SpecialisedPipeline(const PipelineKey &key, uint64_t hash, const HostV
   for (Job *j : jobs) {
     if (std::memcmp(&j->key, &key, sizeof(key)) != 0)
       continue;
-    if (j->stage != Job::Stage::Done)
+    if (j->stage != Job::Stage::Done) {
+      if (j->released) {  // banjo-nx (2026-10-28): given back unused before; built again (generic meanwhile)
+        j->released = false;
+        g_prebuild.queue.push_back(j);
+        StartWorkersLocked();
+        g_prebuild.work.notify_one();
+      }
       return SpecState::Pending;
+    }
     if (!j->pipeline)
       return SpecState::Failed;
     out = std::move(j->pipeline);
@@ -897,6 +1228,13 @@ SpecState SpecialisedPipeline(const PipelineKey &key, uint64_t hash, const HostV
   const std::vector<char> record = EncodeRecord(key, layout);
   if (!DecodeRecord(record.data(), record.size(), *job))
     return SpecState::Failed;
+  // vivapinata-nx (2026-11-12, its console run c20; port 98): the job keeps the draw's own key and hash. DecodeRecord
+  // clears the A/B bits (reserved 0-2) and hashes the cleared key, as a listed record needs; a job made here from an
+  // A/B off half's key (A/B 15 / 16 / 17) then never matched its draw, so every draw made another job, built with the
+  // on half's constants and never taken (vivapinata-nx, A/B 16: 153 thousand jobs in 13 minutes, one bucket's linear
+  // search 670 ms of the render thread a frame, the off halves at 1.5-10 fps).
+  job->key = key;
+  job->hash = hash;
   Job *j = job.get();
   g_prebuild.jobs.push_back(std::move(job));
   jobs.push_back(j);
@@ -907,8 +1245,16 @@ SpecState SpecialisedPipeline(const PipelineKey &key, uint64_t hash, const HostV
 }
 
 bool Specialised(const PipelineKey &key) {
-  if (key.alpha_func)
+  if (key.alpha_func || key.tess_kind || key.fetch_pad)  // port 44: fetch_pad, constant 926
     return true;
+  for (const uint32_t w : key.sasrt_words) {  // sasrt-nx (2026-11-08, the third round)
+    if (w)
+      return true;
+  }
+  for (const uint32_t w : key.fetch_types) {
+    if (w)
+      return true;
+  }
   for (const uint32_t w : key.bool_mask) {
     if (w)
       return true;
@@ -938,6 +1284,7 @@ plume::RenderPipeline *TakePrebuilt(const PipelineKey &key, uint64_t hash,
     return nullptr;
   if (job->stage == Job::Stage::Pending) {
     job->stage = Job::Stage::Done;  // the render thread's now
+    job->released = false;          // banjo-nx (2026-10-28): (a given-back one is built here too)
     claimed = true;
     return nullptr;
   }
@@ -998,31 +1345,73 @@ bool BuildDrawLayout(VideoState &s) {
 static plume::RenderPipeline *GetPipelineSlow(const PipelineKey &key, const PipelineInputs &inputs, uint8_t &kind,
                                               uint64_t &memo_epoch);
 
-// sa2-nx (2026-10-20, sa2_renut_chain_reuse): GetPipelineLocked's calls counted, and the prebuild epoch: a draw whose key
+// banjo-nx (2026-10-23, batch 5): two keys' bytes equal, inline (16 bytes at a time, one OR tree, one test), instead
+// of a C library memcmp call at every draw's lookup (the last key, the memo's ways). The same answer as memcmp == 0.
+static_assert(sizeof(PipelineKey) % 8 == 0, "PipelineKey compared in words");
+inline bool KeyEqual(const PipelineKey &a, const PipelineKey &b) {
+  const auto *x = reinterpret_cast<const uint8_t *>(&a);
+  const auto *y = reinterpret_cast<const uint8_t *>(&b);
+  constexpr size_t kSize = sizeof(PipelineKey);
+#if defined(__aarch64__)
+  uint8x16_t acc = vdupq_n_u8(0);
+  size_t i = 0;
+  for (; i + 16 <= kSize; i += 16)
+    acc = vorrq_u8(acc, veorq_u8(vld1q_u8(x + i), vld1q_u8(y + i)));
+  uint64_t rest = 0;
+  for (; i < kSize; i += 8) {
+    uint64_t u, v;
+    std::memcpy(&u, x + i, 8);
+    std::memcpy(&v, y + i, 8);
+    rest |= u ^ v;
+  }
+  const uint64x2_t o = vreinterpretq_u64_u8(acc);
+  return (vgetq_lane_u64(o, 0) | vgetq_lane_u64(o, 1) | rest) == 0;
+#else
+  return std::memcmp(x, y, kSize) == 0;
+#endif
+}
+
+
+// banjo-nx (2026-10-20, from sa2-nx, banjo_renut_chain_reuse): GetPipelineLocked's calls counted, and the prebuild epoch: a draw whose key
 // is the previous draw's takes that draw's answer when no lookup was made since and no prebuilt pipeline came in
 // (DrawStateLocked). The answer depends on nothing else: the last key and the memo change only in the lookups, and a
 // memo entry of a generic pipeline is held only for its prebuild epoch.
 uint64_t g_pipeline_lookups = 0;
 uint64_t PipelineLookupsLocked() { return g_pipeline_lookups; }
-uint64_t PrebuildEpochLocked() { return g_prebuild_epoch.load(std::memory_order_acquire); }
+// banjo-nx (2026-10-27, render thread night): relaxed, not acquire: read at every fast draw (an LDAR each), and a late
+// view of a new epoch only keeps a draw on the pipeline it had (the generic one) a little longer; GetPipelineLocked's own
+// lock orders the cache it reads once the epoch is seen.
+uint64_t PrebuildEpochLocked() { return g_prebuild_epoch.load(std::memory_order_relaxed); }
+
+// banjo-nx (2026-10-28, per-draw night): see render/pipeline.h.
+bool g_last_lookup_provisional = false;
+bool LastPipelineProvisionalLocked() { return g_last_lookup_provisional; }
 
 plume::RenderPipeline *GetPipelineLocked(const PipelineKey &key, const PipelineInputs &inputs) {
-  ++g_pipeline_lookups;  // sa2-nx
-  if (g_last_pipeline && std::memcmp(&g_last_key, &key, sizeof(key)) == 0)
-    return g_last_pipeline;
+  ++g_pipeline_lookups;  // banjo-nx (from sa2-nx, banjo_renut_chain_reuse)
+  g_last_lookup_provisional = false;
+  if (g_last_pipeline && KeyEqual(g_last_key, key))
+    return g_last_pipeline;  // (a built one: g_last_* name built pipelines only)
   const bool memo_on = banjo::renut_gpu::PipelineMemoOn();
-  const uint32_t set = PipelineMemoIndex(key);
+  const uint64_t key_hash = PipelineMemoHash(key);
+  const uint32_t set = PipelineMemoSet(key_hash);
   PipelineMemo *ways = g_pipeline_memo[set];
+  uint64_t *tags = g_pipeline_memo_tags[set];
   if (memo_on) {
     for (uint32_t w = 0; w < 2; ++w) {
+      if (tags[w] != key_hash)
+        continue;
       PipelineMemo &m = ways[w];
-      if (m.pipeline && std::memcmp(&m.key, &key, sizeof(key)) == 0 &&
+      if (m.pipeline && KeyEqual(m.key, key) &&
           (m.kind != 1 || m.epoch == g_prebuild_epoch.load(std::memory_order_acquire))) {
         if (m.kind)
           banjo::renut_gpu::CountBoolSpec(banjo::renut_gpu::BoolSpecEvent::kGeneric);
+        g_last_lookup_provisional = m.kind == 1;  // banjo-nx (2026-10-28)
         plume::RenderPipeline *hit = m.pipeline;
-        if (w)
+        if (w) {
           std::swap(ways[0], ways[1]);  // the most recent in way 0
+          std::swap(tags[0], tags[1]);
+        }
         return hit;
       }
     }
@@ -1030,11 +1419,14 @@ plume::RenderPipeline *GetPipelineLocked(const PipelineKey &key, const PipelineI
   uint8_t kind = 0;
   uint64_t memo_epoch = 0;
   plume::RenderPipeline *result = GetPipelineSlow(key, inputs, kind, memo_epoch);
+  g_last_lookup_provisional = kind == 1;  // banjo-nx (2026-10-28)
   if (memo_on && result) {
     // The least recent (way 1) goes; the new one takes way 0. (GetPipelineSlow may have filled this set for a generic
     // key: both are kept.)
     ways = g_pipeline_memo[set];
     ways[1] = ways[0];
+    tags[1] = tags[0];
+    tags[0] = key_hash;
     ways[0].key = key;
     ways[0].pipeline = result;
     ways[0].kind = kind;
@@ -1048,7 +1440,7 @@ static plume::RenderPipeline *GetPipelineSlow(const PipelineKey &key, const Pipe
   const uint64_t hash = HashKey(key);
   auto &bucket = g_pipelines[hash];
   for (auto &cached : bucket) {
-    if (std::memcmp(&cached.key, &key, sizeof(key)) == 0) {
+    if (KeyEqual(cached.key, key)) {
       if (cached.pipeline) {
         g_last_key = key;
         g_last_pipeline = cached.pipeline.get();
@@ -1088,6 +1480,10 @@ static plume::RenderPipeline *GetPipelineSlow(const PipelineKey &key, const Pipe
     std::memset(generic.bool_mask, 0, sizeof(generic.bool_mask));
     std::memset(generic.bool_values, 0, sizeof(generic.bool_values));
     generic.alpha_func = 0;  // banjo-nx (banjo_deko3d_alpha_spec): the function read at run time
+    std::memset(generic.fetch_types, 0, sizeof(generic.fetch_types));  // banjo-nx (banjo_gpu_fetch_spec)
+    generic.tess_kind = 0;
+    generic.fetch_pad = 0;  // port 44 (sasrt_gpu_plain_fetches)
+    std::memset(generic.sasrt_words, 0, sizeof(generic.sasrt_words));  // sasrt-nx (2026-11-08, the third round)
     plume::RenderPipeline *pipeline = GetPipelineLocked(generic, inputs);
     if (state == SpecState::Pending) {
       SpecPending &p = g_spec_pending[hash];
@@ -1175,8 +1571,51 @@ void PipelineShaderLoaded(const ShaderCacheEntry *entry) {
     g_prebuild.work.notify_all();
 }
 
+// banjo-nx (2026-10-28, the heap): see render/pipeline.h.
+std::atomic<uint64_t> g_prebuilt_released{0};
+void ReleaseIdlePrebuiltPipelines() {
+  static int64_t next_ms = 0;
+  const uint32_t limit_s = banjo::renut_gpu::PrebuildReleaseSeconds();
+  if (!limit_s)
+    return;
+  const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  if (now < next_ms)
+    return;
+  const bool low = banjo::renut_gpu::MemoryLow();  // sasrt-nx (2026-11-09, sasrt_memory_governor; port 58)
+  next_ms = now + (low ? 5000 : 20000);
+  // banjo-nx (2026-10-28, f7b): only when the heap is short: its room (what sbrk has not handed out yet, as
+  // QueryGpuMemory's budget) below 256 MB. Given back with room to spare, a scene visited again rebuilt hundreds of them
+  // at once. Off the Switch: never (no fixed heap).
+#if defined(__SWITCH__)
+  {
+    const char *top = static_cast<const char *>(sbrk(0));
+    const uint64_t room = (top && fake_heap_end > top) ? uint64_t(fake_heap_end - top) : 0;
+    if (room >= (uint64_t(256) << 20) && !low)  // port 58: the governor's figure counts the GPU region too
+      return;
+  }
+#else
+  return;
+#endif
+  std::vector<std::unique_ptr<plume::RenderPipeline>> gone;
+  {
+    std::lock_guard lock(g_prebuild.mutex);
+    for (const auto &job : g_prebuild.jobs) {
+      if (job->stage != Job::Stage::Done || !job->pipeline || now - job->done_ms < int64_t(limit_s) * 1000)
+        continue;
+      gone.push_back(std::move(job->pipeline));
+      job->stage = Job::Stage::Pending;
+      job->released = true;
+    }
+  }
+  g_prebuilt_released.fetch_add(gone.size(), std::memory_order_relaxed);
+  // (destroyed here, outside the prebuild lock: no draw ever bound them)
+}
+
 PipelineCounts PipelineCountsLocked() {
   PipelineCounts counts;
+  counts.released = size_t(g_prebuilt_released.load(std::memory_order_relaxed));  // banjo-nx (2026-10-28)
   for (const auto &[hash, bucket] : g_pipelines) {
     for (const CachedPipeline &cached : bucket)
       counts.built += cached.pipeline ? 1 : 0;

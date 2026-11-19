@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <queue>
+#include <thread>
 
 #include <rex/kernel.h>
 #include <rex/memory.h>
@@ -94,6 +95,11 @@ class AudioSystem : public system::IAudioSystem {
   } clients_[kMaximumClientCount];
 
   int FindFreeClient();
+
+  // banjo-nx: the client whose callback the worker thread is running (-1: none), set and cleared under the global
+  // lock, and that thread. UnregisterClient waits for it (see there).
+  std::atomic<int> dispatching_client_ = {-1};
+  std::thread::id dispatch_thread_;
 
   std::unique_ptr<rex::thread::Semaphore> client_semaphores_[kMaximumClientCount];
   // Event is always there in case we have no clients.

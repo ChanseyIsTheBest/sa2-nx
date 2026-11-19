@@ -19,6 +19,13 @@
 
 REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
                     "Don't display any UI, using defaults for prompts as needed");
+// banjo-nx (2026-10-21): the game's Xbox 360 keyboard (XShowKeyboardUI) as the Switch's own (xam_ui_switch.cpp).
+REXCVAR_DEFINE_BOOL(switch_software_keyboard, true, "Kernel",
+                    "Switch: the game's on-screen keyboard is the system's software keyboard applet. false = the "
+                    "ImGui text box (no keys to type with on the console)");
+REXCVAR_DEFINE_DOUBLE(switch_software_keyboard_test, 0.0, "Kernel",
+                      "Test: this many seconds after the game first reads a controller, open the keyboard once as "
+                      "the game does (XamShowKeyboardUI with an overlapped) and log the result. 0 = off");
 #include <rex/kernel/xam/private.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -28,6 +35,11 @@ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
+#include <rex/platform.h>
+#include <rex/system/xio.h>
+
+#include <algorithm>
+#include <chrono>
 
 namespace rex {
 namespace kernel {
@@ -417,6 +429,146 @@ class KeyboardInputDialog : public XamDialog {
   bool cancelled_ = true;
 };
 
+// banjo-nx (2026-10-21): xam_ui_switch.cpp.
+enum class SwitchKeyboardResult { kAccepted, kCancelled, kUnavailable };
+SwitchKeyboardResult ShowSwitchKeyboard(const std::u16string& title, const std::u16string& description,
+                                        const std::u16string& default_text, uint32_t flags, uint32_t max_chars,
+                                        std::u16string& out_text);
+
+namespace {
+
+// A guest UTF-16 (big-endian) string, at most max_chars of it: a missing terminator cannot run on.
+std::u16string ReadGuestWString(const char16_t* host, size_t max_chars) {
+  std::u16string out;
+  if (!host) {
+    return out;
+  }
+  for (size_t i = 0; i < max_chars; ++i) {
+    const uint16_t c = rex::memory::load_and_swap<uint16_t>(reinterpret_cast<const uint16_t*>(host) + i);
+    if (!c) {
+      break;
+    }
+    out.push_back(char16_t(c));
+  }
+  return out;
+}
+
+// The most the Switch keyboard takes (swkbd's text is 500 UTF-16 units) and the most of each prompt read.
+constexpr uint32_t kSwitchKeyboardMaxChars = 500;
+constexpr size_t kPromptMaxChars = 512;
+
+}  // namespace
+
+// The Switch's software keyboard for XamShowKeyboardUI (switch_software_keyboard). Everything is read from the guest
+// now, on the game's thread (the prompts may be on its stack); the applet is shown by the kernel's dispatch thread
+// (xeXamDispatchHeadlessEx: a host thread, no lock held, the overlapped completed when it closes), which blocks
+// while the game runs on, as on the 360 (XN_SYS_UI tells it a system UI is up, and XamIsUIActive says so).
+//   accepted: the text into the game's buffer (at most buffer_length - 1 units and a terminator), extended error 0;
+//   cancelled: the buffer as it was, extended error ERROR_CANCELLED (the game checks XGetOverlappedExtendedError);
+//   the applet could not be shown: as with no UI (headless): the default text, accepted.
+[[maybe_unused]] static u32 XamShowKeyboardUISwitch(u32 user_index, u32 flags, mapped_wstring default_text,
+                                                    mapped_wstring title, mapped_wstring description,
+                                                    mapped_wstring buffer, u32 buffer_length,
+                                                    mapped_void overlapped) {
+  if (!buffer_length) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  const uint32_t max_chars = std::clamp<uint32_t>(uint32_t(buffer_length) - 1, 1, kSwitchKeyboardMaxChars);
+  const std::u16string title_text = ReadGuestWString(title.host_address(), kPromptMaxChars);
+  const std::u16string description_text = ReadGuestWString(description.host_address(), kPromptMaxChars);
+  // The default text as it fits the buffer (the keyboard would not take a longer one).
+  const std::u16string default_value = ReadGuestWString(default_text.host_address(), max_chars);
+  const uint32_t flags_value = flags;
+  REXKRNL_INFO("XamShowKeyboardUI: Switch keyboard for user {} (flags {:08X}, buffer {} characters): \"{}\"",
+               uint32_t(user_index), flags_value, uint32_t(buffer_length), rex::string::to_utf8(title_text));
+  char16_t* const out = buffer.host_address();
+  const uint32_t out_count = buffer_length;
+  auto run = [=](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+    std::u16string text;
+    ++xam_dialogs_shown_;
+    const SwitchKeyboardResult result =
+        ShowSwitchKeyboard(title_text, description_text, default_value, flags_value, max_chars, text);
+    --xam_dialogs_shown_;
+    length = 0;
+    if (result == SwitchKeyboardResult::kCancelled) {
+      extended_error = X_ERROR_CANCELLED;
+      return X_ERROR_SUCCESS;
+    }
+    rex::string::copy_and_swap_truncating(
+        out, result == SwitchKeyboardResult::kAccepted ? text : default_value, out_count);
+    extended_error = X_ERROR_SUCCESS;
+    return X_ERROR_SUCCESS;
+  };
+  return xeXamDispatchHeadlessEx(run, overlapped.guest_address());
+}
+
+u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_text, mapped_wstring title,
+                            mapped_wstring description, mapped_wstring buffer, u32 buffer_length,
+                            mapped_void overlapped);
+
+// switch_software_keyboard_test: the game's own call, made from its input thread (XamInputGetState) once the set
+// time has passed: prompts, buffer and overlapped in guest memory, then the overlapped polled on later reads.
+void SwitchKeyboardTestTick() {
+  static const double delay = REXCVAR_GET(switch_software_keyboard_test);
+  if (delay <= 0.0) {
+    return;
+  }
+  static std::atomic<int> stage{0};  // 0 waiting, 1 shown, 2 done
+  static std::atomic<int64_t> start_ns{0};
+  static uint32_t block = 0;
+  constexpr uint32_t kBufferChars = 16;
+  constexpr uint32_t kTitle = 0x00, kDescription = 0x80, kDefault = 0x100, kBuffer = 0x140, kOverlapped = 0x180;
+  auto* memory = REX_KERNEL_MEMORY();
+  int s = stage.load();
+  if (s == 2) {
+    return;
+  }
+  if (s == 0) {
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+    int64_t first = 0;
+    if (start_ns.compare_exchange_strong(first, now_ns) || double(now_ns - first) * 1e-9 < delay ||
+        !stage.compare_exchange_strong(s, 1)) {
+      return;
+    }
+    block = memory->SystemHeapAlloc(0x200);
+    if (!block) {
+      REXKRNL_WARN("switch_software_keyboard_test: no guest memory");
+      stage = 2;
+      return;
+    }
+    auto* base = memory->TranslateVirtual<uint8_t*>(block);
+    std::memset(base, 0, 0x200);
+    auto put = [&](uint32_t offset, std::u16string_view text) {
+      rex::string::copy_and_swap_truncating(reinterpret_cast<char16_t*>(base + offset), text, 0x40);
+    };
+    put(kTitle, u"Name your vehicle");
+    put(kDescription, u"switch_software_keyboard_test");
+    put(kDefault, u"Banjo");
+    auto wstr = [&](uint32_t offset) {
+      return mapped_wstring(reinterpret_cast<char16_t*>(base + offset), block + offset);
+    };
+    const u32 r = XamShowKeyboardUI_entry(0, 0, wstr(kDefault), wstr(kTitle), wstr(kDescription), wstr(kBuffer),
+                                          kBufferChars, mapped_void(base + kOverlapped, block + kOverlapped));
+    REXKRNL_INFO("switch_software_keyboard_test: XamShowKeyboardUI returned {:08X}", uint32_t(r));
+    return;
+  }
+  // s == 1: done yet?
+  auto* base = memory->TranslateVirtual<uint8_t*>(block);
+  if (XOverlappedGetResult(base + kOverlapped) == X_ERROR_IO_PENDING || !stage.compare_exchange_strong(s, 2)) {
+    return;
+  }
+  const uint32_t extended = rex::memory::load_and_swap<uint32_t>(base + kOverlapped + 0x18);
+  const std::u16string text =
+      ReadGuestWString(reinterpret_cast<const char16_t*>(base + kBuffer), kBufferChars + 4);
+  REXKRNL_INFO("switch_software_keyboard_test: done: result {:08X}, extended error {:08X}, buffer \"{}\" ({} "
+               "characters of at most {})",
+               XOverlappedGetResult(base + kOverlapped), extended, rex::string::to_utf8(text), text.size(),
+               kBufferChars - 1);
+  memory->SystemHeapFree(block);
+}
+
 // https://www.se7ensins.com/forums/threads/release-how-to-use-xshowkeyboardui-release.906568/
 u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_text,
                             mapped_wstring title, mapped_wstring description, mapped_wstring buffer,
@@ -430,6 +582,13 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
   }
 
   assert_true(overlapped.guest_address() != 0);
+
+#if REX_PLATFORM_SWITCH
+  if (REXCVAR_GET(switch_software_keyboard) && !REXCVAR_GET(headless)) {
+    return XamShowKeyboardUISwitch(user_index, flags, default_text, title, description, buffer, buffer_length,
+                                   overlapped);
+  }
+#endif
 
   auto buffer_size = static_cast<size_t>(buffer_length) * 2;
 

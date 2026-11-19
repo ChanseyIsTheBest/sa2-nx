@@ -19,6 +19,12 @@ uint64_t HashShaderContainer(const uint8_t *container);
 
 const ShaderCacheEntry *FindShaderEntry(uint64_t hash);
 
+// banjo-nx (2026-10-22): the vertex inputs and literals an entry's offsets index: the build's own arrays
+// (g_shaderVertexInputs, g_shaderLiterals), or on deko3d with the installer's package next to the NRO the table
+// merged with that package's (banjo_renut_deko3d.h InstalledShaderTable). Set before FindShaderEntry returns an entry.
+extern const ShaderVertexInput *g_activeShaderVertexInputs;
+extern const ShaderLiteral *g_activeShaderLiterals;
+
 // Builds the active backend's shader from a cache entry (decompressing the
 // cache on first use). nullptr on failure.
 std::unique_ptr<plume::RenderShader> CreateCachedShader(plume::RenderDevice *device,

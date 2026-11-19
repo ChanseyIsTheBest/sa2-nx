@@ -1,0 +1,63 @@
+# Beautiful Katamari for the Switch: your options. Every other setting is built into the NRO
+# (app/katamari_switch_defaults.toml). Delete this file and the game writes it again at the next start.
+
+# Samples per pixel of the game's edge smoothing (MSAA): 1 (off, the default), 2 or 4 (the game's own).
+# Fewer gives rougher edges and less GPU work.
+msaa_level = 1
+
+# Frame rate cap: "Off" (the game's own, uncapped as on the Xbox 360) or "30".
+frame_cap = "Off"
+
+# Language: 1 = English, 2 = Japanese.
+user_language = 1
+
+# The DLC packs that only unlock what the game itself unlocks (Accessory Sets A-D, Character Sets A-D, Special Accessory).
+# false keeps them from the game; true loads them too. The stage packs always load.
+katamari_dlc_unlock_packs = false
+
+# Face buttons by position, as on an Xbox pad (bottom = A). false = by letter.
+input_xbox_layout = true
+
+# Single Joy-Cons are held sideways, one per player.
+input_joycon_sideways = true
+# With it, a single Joy-Con's stick is turned for the sideways grip.
+input_joycon_sideways_stick = true
+
+# Button mapping for each player: the Switch buttons that press each Xbox button. Empty = default.
+# Buttons: A B X Y L R ZL ZR PLUS MINUS LSTICK RSTICK UP DOWN LEFT RIGHT SL SR NONE. Example: a = "B, ZR"
+
+[input_p1]
+a = ""
+b = ""
+x = ""
+y = ""
+lb = ""
+rb = ""
+lt = ""
+rt = ""
+start = ""
+back = ""
+ls = ""
+rs = ""
+up = ""
+down = ""
+left = ""
+right = ""
+
+[input_p2]
+a = ""
+b = ""
+x = ""
+y = ""
+lb = ""
+rb = ""
+lt = ""
+rt = ""
+start = ""
+back = ""
+ls = ""
+rs = ""
+up = ""
+down = ""
+left = ""
+right = ""

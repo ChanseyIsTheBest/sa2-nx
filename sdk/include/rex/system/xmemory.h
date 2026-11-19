@@ -60,14 +60,13 @@ inline T GuestPtr(u8* base, u32 guest_address) noexcept {
 
 class Memory;
 
-// sa2-nx (2026-10-20, from banjo-nx's SDK of 2026-10-19, CPU proposal 1): the store cards (tools/store_cards.py). A
-// byte per 4 KB guest page at the guest address of its page number (the first MB of the guest window, which
-// Memory::Initialize keeps for them): every guest store outside the stack zeroes its page's card, and so do the host
-// writers of guest memory (MarkStoreCards: the CRT memory hooks, PhysicalHeap::TriggerCallbacks for file reads,
-// decommits and releases, SA2's native replacements). Renut sets the cards of the pages it checks to 1 and proves its
-// cached vertex, index and texture copies by them (banjo_renut_store_cards). The guest window's base: nullptr before
-// Memory::Initialize. Data of the runtime: code outside it (the app; on Windows the runtime is a DLL) passes the guest
-// window's base (Memory::virtual_membase) to MarkStoreCardsAt instead.
+// banjo-nx (2026-10-19, CPU proposal 1): the store cards (tools/store_cards.py). A byte per 4 KB guest page at the guest
+// address of its page number (the first MB of the guest window, which Memory::Initialize keeps for them): every guest
+// store outside the stack zeroes its page's card, and so do the host writers of guest memory (MarkStoreCards: the CRT
+// memory hooks, PhysicalHeap::TriggerCallbacks for file reads, decommits and releases). Renut sets the cards of the pages
+// it checks to 1 and proves its cached vertex and index copies by them (banjo_renut_store_cards). The guest window's
+// base: nullptr before Memory::Initialize. Data of the runtime: code outside it (the app; on Windows the runtime is a
+// DLL) passes the guest window's base (Memory::virtual_membase) to MarkStoreCardsAt instead.
 extern u8* g_store_cards;
 
 inline void MarkStoreCardsAt(u8* cards, u32 guest_address, u32 length) noexcept {
@@ -77,7 +76,16 @@ inline void MarkStoreCardsAt(u8* cards, u32 guest_address, u32 length) noexcept 
   for (u32 page = guest_address >> 12; page <= last; ++page) cards[page] = 0;
 }
 
+#if !REX_PLATFORM_SWITCH
+// PC diagnostics (banjo_renut_store_cards_verify): bytes the host writers marked, [0] in the physical views
+// (0x7F000000 up), [1] elsewhere; [2] calls. Read and reset by RexStoreCardsHostBytes.
+void NoteHostStoreCards(u32 guest_address, u32 length) noexcept;
+#endif
+
 inline void MarkStoreCards(u32 guest_address, u32 length) noexcept {
+#if !REX_PLATFORM_SWITCH
+  NoteHostStoreCards(guest_address, length);
+#endif
   MarkStoreCardsAt(g_store_cards, guest_address, length);
 }
 
@@ -89,7 +97,7 @@ inline void MarkStoreCardsHost(const void* host, size_t length) noexcept {
   if (offset >= 0x100000000ull) return;
   u32 guest = u32(offset);
   if (detail::PhysicalHostOffset(guest) && guest >= 0xE0001000u) guest -= 0x1000u;
-  MarkStoreCards(guest, length > 0xFFFFFFFFull ? 0xFFFFFFFFu : u32(length));
+  MarkStoreCards(guest, length > 0xFFFFFFFFull ? 0xFFFFFFFFu : u32(length));  // (counted on the PC)
 }
 
 enum SystemHeapFlag : uint32_t {
@@ -596,6 +604,12 @@ class Memory {
   // Returns false if guest_address is outside every registered module range.
   bool SetFunction(uint32_t guest_address, PPCFunc* host_function);
   bool HasAnyFunctionTable() const;
+  // banjo-nx (2026-10-29): the lowest table base inside [address, address + size), 0 if none. A title update's
+  // image can be smaller than the base game's, whose image then covers the start of the table that follows the
+  // update's image (XexModule::ApplyPatch must not decommit it).
+  uint32_t FunctionTableBaseIn(uint32_t address, uint32_t size) const;
+  // banjo-nx (2026-10-29): the entry a table holds for guest_address (nullptr outside every table).
+  PPCFunc* TableFunction(uint32_t guest_address) const;
 
  private:
 #if REX_PLATFORM_MAC

@@ -21,7 +21,9 @@ inline std::atomic<u8 *> g_guest_pbase{nullptr};
   g_guest_vbase.store(memory->virtual_membase(), std::memory_order_relaxed);
   g_guest_pbase.store(memory->physical_membase(), std::memory_order_relaxed);
 }
-inline u8 *GuestPhysicalBase() {
+// banjo-nx (2026-10-27, render thread night): always inline: GCC emitted these out of line in the draw paths (a call
+// at each header and buffer pointer: four in FastDrawLocked alone).
+[[gnu::always_inline]] inline u8 *GuestPhysicalBase() {
   u8 *base = g_guest_pbase.load(std::memory_order_relaxed);
   if (!base) [[unlikely]] {
     LoadGuestBases();
@@ -29,7 +31,7 @@ inline u8 *GuestPhysicalBase() {
   }
   return base;
 }
-inline u8 *GuestVirtualBase() {
+[[gnu::always_inline]] inline u8 *GuestVirtualBase() {
   u8 *base = g_guest_vbase.load(std::memory_order_relaxed);
   if (!base) [[unlikely]] {
     LoadGuestBases();
@@ -41,7 +43,7 @@ inline u8 *GuestVirtualBase() {
 
 // Host pointer for a guest VA, or nullptr for VA 0.
 template <typename T>
-inline T *GuestPtr(u32 guest_address) {
+[[gnu::always_inline]] inline T *GuestPtr(u32 guest_address) {  // banjo-nx (2026-10-27): GCC called it in FastDrawLocked
   if (!guest_address)
     return nullptr;
 #if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && defined(__aarch64__))
@@ -54,7 +56,7 @@ inline T *GuestPtr(u32 guest_address) {
 // Host pointer for a GPU physical address (fetch constants, index buffer
 // addresses): the low 29 bits index physical memory.
 template <typename T>
-inline T *GuestPhysicalPtr(u32 physical_address) {
+[[gnu::always_inline]] inline T *GuestPhysicalPtr(u32 physical_address) {
   return reinterpret_cast<T *>(detail::GuestPhysicalBase() + (physical_address & 0x1FFFFFFF));  // TranslatePhysical
 }
 

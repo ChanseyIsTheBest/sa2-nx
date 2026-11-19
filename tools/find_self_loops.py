@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Infinite loops GCC made out of guest polling loops (Switch ELF, AArch64).
+"""banjo-nx: copied from sa2-nx (GPL-3.0, same project family).
+Infinite loops GCC made out of guest polling loops (Switch ELF, AArch64).
 
 A loop that only reads guest memory and branches back (`while (*flag == 0) {}`) is a real wait on the Xbox 360: another
 thread or the GPU changes the word. With guest loads that are not volatile (tools/perf_codegen_post.py) the compiler

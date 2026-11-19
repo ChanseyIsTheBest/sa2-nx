@@ -22,7 +22,15 @@
 #include <rex/system/user_module.h>
 #include <rex/system/xtypes.h>
 
+// renut-ultimate (2026-11-16, port 147; tw2de_nx's of 2026-11-03, off by default at the user's word).
+REXCVAR_DEFINE_BOOL(xconfig_host_time_zone, false, "Kernel",
+                    "tw2de_nx: XConfig's TIME_ZONE_BIAS is the console's time zone (its offset now, DST included, as a "
+                    "bias in minutes), so a game's local time is the player's (xboxkrnl_timezone.cpp; the Switch only, "
+                    "0 elsewhere). false: 0 (UTC), as before");
+
 namespace rex::kernel::xboxkrnl {
+
+int32_t HostTimeZoneBiasMinutes();  // port 147: xboxkrnl_timezone.cpp
 
 X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer,
                                uint16_t buffer_size, uint16_t* required_size) {
@@ -49,6 +57,16 @@ X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer
       // XCONFIG_USER_CATEGORY
       switch (setting) {
         case 0x0001:  // XCONFIG_USER_TIME_ZONE_BIAS
+          // Port 147 (tw2de_nx's, xconfig_host_time_zone): the console's time zone, its offset now as a bias in minutes
+          // (UTC = local + bias). With no daylight-saving dates (STD_DATE / DLT_DATE 0, both extra biases 0) a game's
+          // GetTimeZoneInformation takes this bias alone, so local time is right, DST included, for the offset in
+          // force when the game asks.
+          if (REXCVAR_GET(xconfig_host_time_zone)) {
+            setting_size = 4;
+            memory::store_and_swap<uint32_t>(value, static_cast<uint32_t>(HostTimeZoneBiasMinutes()));
+            break;
+          }
+          [[fallthrough]];
         case 0x0002:  // XCONFIG_USER_TIME_ZONE_STD_NAME
         case 0x0003:  // XCONFIG_USER_TIME_ZONE_DLT_NAME
         case 0x0004:  // XCONFIG_USER_TIME_ZONE_STD_DATE
@@ -61,7 +79,7 @@ X_STATUS xeExGetXConfigSetting(uint16_t category, uint16_t setting, void* buffer
           break;
         case 0x0009:  // XCONFIG_USER_LANGUAGE
           setting_size = 4;
-          memory::store_and_swap<uint32_t>(value, REXCVAR_GET(user_language));
+          memory::store_and_swap<uint32_t>(value, rex::system::EffectiveLanguage());  // blur-nx (2026-11-18)
           break;
         case 0x000A:  // XCONFIG_USER_VIDEO_FLAGS
           setting_size = 4;

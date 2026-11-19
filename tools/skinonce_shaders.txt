@@ -1,0 +1,9 @@
+# banjo-nx (2026-10-20): the fur family's vertex shaders, skinned once a frame with banjo_deko3d_skin_once (constant 913,
+# tools/deko3d_glsl_opt.py pass skinonce; render/draw.cpp FurSkinLocked).
+12399EE21A0440AE
+146DA1F10B7D746E
+7F73E48B8EA43715
+B814D7237E615990
+# 2026-10-20: the 23 skinned vertex shaders of the depth-only draws (shadow maps) were tried (emulator run 109) and
+# taken out: in 10 s 8,101 draws wrote rows, 1,685 read them and 5,563 found the 64-entry table full; writes nobody
+# reads only cost (the stores and the longer shader). Listed in docs/deko3d-renderer.md section 22.

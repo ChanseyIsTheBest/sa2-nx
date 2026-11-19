@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <forward_list>
 #include <mutex>
@@ -105,6 +106,15 @@ class TimerQueue {
                     WaitItem::State::kInCallbackSelfDisarmed) {
               // Item is recurring and didn't self-disarm during callback:
               wait_item->due_ += wait_item->interval_;
+              // katamari-nx (2026-11-01): more than a second behind (the Switch slept, or the process was
+              // suspended), the timer goes on from now instead of firing once for every interval it missed: after
+              // a 6.5-hour sleep on the console that replay held 66-88 % of a core for minutes. Timers less late
+              // than that (a busy moment) still catch up as before.
+              const auto now = clock::now();
+              if (now - wait_item->due_ > std::chrono::seconds(1)) {
+                wait_item->due_ +=
+                    ((now - wait_item->due_) / wait_item->interval_ + 1) * wait_item->interval_;
+              }
               wait_item->state_.store(WaitItem::State::kIdle, std::memory_order_release);
               wait_item->state_.notify_all();
               wait_items.push_front(std::move(wait_item));

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """cpu_aggressive (proposed post-codegen step, after tools/flush_mode_flow.py): flush-mode checks of a loop header
 hoisted in front of the loop.
 

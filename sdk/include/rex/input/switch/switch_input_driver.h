@@ -19,9 +19,17 @@
 
 namespace rex::input::nx {
 
+// blur-nx (2026-11-18, the game menu): the per-player button maps built again from input_p1_* ... input_p4_* (set those
+// first); Poll uses them from its next call. Any thread.
+void RebuildButtonMaps();
+// blur-nx (2026-11-18): the buttons that open the game menu from now on, as input_menu_combo writes them ("L+R+MINUS");
+// false (nothing changed) when the text is not two or more known buttons. Any thread.
+bool SetGameMenuCombo(const std::string& text);
+
 // Polls the pads directly from HID shared memory on the calling guest thread.
 // Unlike the SDL driver it needs no window and no UI-thread event pump.
 //
+// banjo-nx (2026-10-21): ported from sa2-nx's driver (per-player maps, Xbox layout, controller applet).
 // One slot per controller the system reports: slot 0 is the handheld (Joy-Cons attached to the console), slots 1-4
 // are players No1-No4 (Pro Controllers, Joy-Con pairs, single Joy-Cons held sideways). Each connected slot is a device;
 // the input system gives devices guest users in connection order, so the handheld and a Pro Controller are players 1

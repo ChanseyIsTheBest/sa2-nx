@@ -17,9 +17,7 @@
 #include <queue>
 #include <set>
 #include <stack>
-#include <unordered_map>
 #include <unordered_set>
-#include <vector>
 
 #include <fmt/format.h>
 
@@ -39,314 +37,6 @@ using rex::codegen::ppc::decode_instruction;
 using rex::codegen::ppc::Instruction;
 using rex::codegen::ppc::Opcode;
 using rex::memory::load_and_swap;
-
-//=============================================================================
-// Switch bound from the straight-line code before a bctr
-//=============================================================================
-// Both jump table detectors used to look for the bound by walking back from the bctr to the first
-// cmplwi/clrlwi naming the index register, without noticing that the register had been given a new value in
-// between. SA2's sub_824D6468 switches on r11 = mr r11,r10 after cmplwi cr6,r10,67 / bgt; the walk went past
-// both, found clrlwi r11,r11,29 from the code before (r11 was reloaded twice since), and emitted 8 of the 68
-// cases: the game died on "Switch case out of range" in the Battle DLC's desert demo (sa2-nx, 2026-10-05).
-//
-// Here the bound comes from forward value numbering over the straight-line code that falls through to the
-// bctr: `mr` copies a value, any other write makes a new one, and a bound belongs to a value, not to a
-// register number. A bound is a cmplwi crN,rX,K followed by a bgt/bgtlr crN that falls through (K + 1
-// cases) or by a bge (K cases), or a clrlwi/andi. mask. Signed and 64-bit compares are not bounds.
-namespace {
-
-struct RegWrites {
-  uint32_t gpr = 0;  // bit i: GPR i written
-  uint8_t cr = 0;    // bit i: CR field i written
-};
-
-constexpr uint32_t kCallClobberedGprs = 0x00001FF9;  // r0, r3-r12
-
-// Registers an instruction writes, from its encoding. Calls clobber the volatile GPRs and every CR field.
-// What is not known is assumed to write both rT and rA: that can only lose a bound, never invent one.
-RegWrites regWrites(uint32_t w) {
-  RegWrites r;
-  const uint32_t op = w >> 26, rt = (w >> 21) & 31, ra = (w >> 16) & 31;
-  const uint32_t xo = (w >> 1) & 0x3FF, xo9 = (w >> 1) & 0x1FF;
-  const bool rc = w & 1;
-  auto gpr = [&](uint32_t reg) { r.gpr |= 1u << reg; };
-  auto call = [&]() {
-    r.gpr |= kCallClobberedGprs;
-    r.cr = 0xFF;
-  };
-  switch (op) {
-    case 18:  // b/bl
-    case 16:  // bc/bcl
-      if (w & 1)
-        call();
-      return r;
-    case 17:  // sc
-      call();
-      return r;
-    case 19:
-      if ((xo == 16 || xo == 528) && (w & 1))  // bclrl, bcctrl
-        call();
-      else if (xo == 0 || xo == 33 || xo == 129 || xo == 193 || xo == 225 || xo == 257 || xo == 289 ||
-               xo == 417 || xo == 449)  // mcrf, CR logical
-        r.cr = 1u << (rt >> 2);
-      return r;
-    case 7: case 8: case 12: case 14: case 15:  // mulli subfic addic addi addis
-      gpr(rt);
-      return r;
-    case 13:  // addic.
-      gpr(rt);
-      r.cr = 1;
-      return r;
-    case 24: case 25: case 26: case 27:  // ori oris xori xoris (nop writes nothing)
-      if (w != 0x60000000)
-        gpr(ra);
-      return r;
-    case 28: case 29:  // andi. andis.
-      gpr(ra);
-      r.cr = 1;
-      return r;
-    case 20: case 21: case 23: case 30:  // rlwimi rlwinm rlwnm rld*
-      gpr(ra);
-      if (rc)
-        r.cr = 1;
-      return r;
-    case 10: case 11:  // cmpli cmpi
-      r.cr = 1u << (rt >> 2);
-      return r;
-    case 32: case 34: case 40: case 42:  // lwz lbz lhz lha
-      gpr(rt);
-      return r;
-    case 33: case 35: case 41: case 43:  // update forms
-      gpr(rt);
-      gpr(ra);
-      return r;
-    case 46:  // lmw
-      r.gpr |= ~0u << rt;
-      return r;
-    case 58:  // ld ldu lwa
-      gpr(rt);
-      if ((w & 3) == 1)
-        gpr(ra);
-      return r;
-    case 37: case 39: case 45: case 49: case 51: case 53: case 55:  // stores/FP loads with update
-      gpr(ra);
-      return r;
-    case 62:  // std stdu
-      if ((w & 3) == 1)
-        gpr(ra);
-      return r;
-    case 2: case 3: case 4: case 36: case 38: case 44: case 47: case 48: case 50: case 52: case 54: case 59:
-    case 63:  // traps, VMX, stores, FP loads/arith: no GPR
-      return r;
-    case 31:
-      break;
-    default:
-      gpr(rt);
-      gpr(ra);
-      return r;
-  }
-  // Primary opcode 31.
-  switch (xo) {
-    case 467:  // mtspr
-    case 4: case 68:  // tw td
-    case 86: case 278: case 246: case 54: case 1014: case 982: case 470:  // cache ops
-    case 151: case 215: case 407: case 149: case 662: case 918: case 660:  // stores
-    case 663: case 727: case 983: case 919:  // FP stores
-    case 103: case 359: case 519: case 551: case 7: case 39: case 71: case 6: case 38:  // VMX loads
-    case 231: case 487: case 647: case 679: case 135: case 167: case 199:  // VMX stores
-    case 535: case 599:  // lfsx lfdx
-    case 598: case 854:  // sync eieio
-      return r;
-    case 0: case 32:  // cmp cmpl
-    case 512:         // mcrxr
-      r.cr = 1u << (rt >> 2);
-      return r;
-    case 144:  // mtcrf
-      r.cr = 0xFF;
-      return r;
-    case 150: case 214:  // stwcx. stdcx.
-      r.cr = 1;
-      return r;
-    case 183: case 247: case 439: case 181: case 695: case 759: case 567: case 631:  // update stores/FP loads
-      gpr(ra);
-      return r;
-    case 23: case 87: case 279: case 343: case 21: case 341: case 20: case 84: case 534: case 790: case 532:
-    case 339: case 371: case 19: case 83:  // indexed loads, mfspr, mftb, mfcr, mfmsr
-      gpr(rt);
-      return r;
-    case 55: case 119: case 311: case 375: case 53: case 373:  // indexed loads with update
-      gpr(rt);
-      gpr(ra);
-      return r;
-    case 28: case 60: case 124: case 284: case 316: case 412: case 444: case 476:  // logical
-    case 24: case 536: case 792: case 824: case 27: case 539: case 794:            // shifts
-    case 954: case 922: case 986: case 26: case 58:                                // extend, cntlz
-      gpr(ra);
-      if (rc)
-        r.cr = 1;
-      return r;
-    default:
-      break;
-  }
-  if (((w >> 2) & 0x1FF) == 413) {  // sradi
-    gpr(ra);
-    if (rc)
-      r.cr = 1;
-    return r;
-  }
-  switch (xo9) {  // XO-form arithmetic
-    case 266: case 40: case 104: case 235: case 491: case 459: case 138: case 202: case 136: case 10:
-    case 8: case 75: case 11: case 234: case 200: case 232: case 233: case 457: case 489: case 73: case 9:
-      gpr(rt);
-      if (rc)
-        r.cr = 1;
-      return r;
-    default:
-      break;
-  }
-  gpr(rt);
-  gpr(ra);
-  return r;
-}
-
-bool isUnconditionalTransfer(uint32_t w) {
-  const uint32_t op = w >> 26;
-  if (w & 1)
-    return false;  // calls return
-  if (op == 18)
-    return true;
-  const uint32_t bo = (w >> 21) & 31;
-  if (op == 16 || (op == 19 && (((w >> 1) & 0x3FF) == 16 || ((w >> 1) & 0x3FF) == 528)))
-    return (bo & 0x14) == 0x14;
-  return false;
-}
-
-// Cases the switch index in `index_reg` can take at `bctr`, or 0 if the straight-line code before it does not
-// say. read(addr, word) loads one instruction; the walk back stops at an unconditional branch, at lower_bound or
-// after `limit` instructions. A conditional branch to a later instruction of the run is a join, not a bound: both
-// ways reach the bctr (SA2's sub_822E3CD0: cmplwi r31,5 / bgt into the run, then cmplwi r31,11 / bgt out of it,
-// 12 cases). At a join, registers that differ between the two ways get a new value and only the bounds both ways
-// share are kept. After a branch back into the run (a loop) the analysis starts over.
-template <typename ReadWord>
-uint32_t straightLineSwitchBound(ReadWord&& read, uint32_t bctr, uint32_t lower_bound, uint8_t index_reg,
-                                 int limit) {
-  std::vector<std::pair<uint32_t, uint32_t>> run;  // (address, word), oldest first
-  for (uint32_t addr = bctr; static_cast<int>(run.size()) < limit && addr >= lower_bound + 4;) {
-    addr -= 4;
-    uint32_t w = 0;
-    if (!read(addr, w) || isUnconditionalTransfer(w))
-      break;
-    run.emplace_back(addr, w);
-  }
-  std::reverse(run.begin(), run.end());
-  if (run.empty())
-    return 0;
-  const uint32_t run_start = run.front().first;
-
-  struct CrDef {
-    bool cmpl = false;
-    uint32_t value = 0;
-    uint32_t imm = 0;
-    bool operator==(const CrDef& o) const { return cmpl == o.cmpl && value == o.value && imm == o.imm; }
-  };
-  struct State {
-    uint32_t value[32];
-    CrDef cr[8];
-    std::unordered_map<uint32_t, uint32_t> bound;  // value -> cases
-  };
-  State st;
-  uint32_t next_value = 32;
-  for (uint32_t i = 0; i < 32; ++i)
-    st.value[i] = i;  // initial values: one per register
-  std::unordered_map<uint32_t, std::vector<State>> pending;  // join address -> states of the branches to it
-
-  auto add_bound = [&](uint32_t v, uint32_t cases) {
-    auto it = st.bound.find(v);
-    if (it == st.bound.end() || cases < it->second)
-      st.bound[v] = cases;
-  };
-
-  for (const auto& [addr, w] : run) {
-    if (auto it = pending.find(addr); it != pending.end()) {
-      for (const State& other : it->second) {  // merge the ways that join here
-        for (uint32_t g = 0; g < 32; ++g)
-          if (st.value[g] != other.value[g])
-            st.value[g] = next_value++;
-        for (uint32_t f = 0; f < 8; ++f)
-          if (!(st.cr[f] == other.cr[f]))
-            st.cr[f] = {};
-        std::unordered_map<uint32_t, uint32_t> both;
-        for (const auto& [v, cases] : st.bound)
-          if (auto o = other.bound.find(v); o != other.bound.end())
-            both[v] = std::max(cases, o->second);
-        st.bound = std::move(both);
-      }
-      pending.erase(it);
-    }
-    const uint32_t op = w >> 26, rt = (w >> 21) & 31, ra = (w >> 16) & 31, rb = (w >> 11) & 31;
-    const uint32_t xo = (w >> 1) & 0x3FF;
-    if (op == 16 && !(w & 1)) {  // bc: may it reach the bctr when taken?
-      uint32_t bd = w & 0xFFFC;
-      uint32_t target = (w & 2) ? (bd & 0x8000 ? bd | 0xFFFF0000 : bd)
-                                : addr + (bd & 0x8000 ? (bd | 0xFFFF0000) : bd);
-      if (target >= run_start && target <= bctr) {
-        if (target <= addr) {
-          // The end of a loop inside the run (SA2's sub_827A93A8 runs a strlen before its switch): what the
-          // code before it established is unknown afterwards. Start over.
-          for (uint32_t g = 0; g < 32; ++g)
-            st.value[g] = next_value++;
-          for (auto& c : st.cr)
-            c = {};
-          st.bound.clear();
-          pending.clear();
-          continue;
-        }
-        pending[target].push_back(st);
-        continue;  // a join: no bound from this branch
-      }
-    }
-    if ((op == 16 || (op == 19 && xo == 16)) && !(w & 1)) {  // bc / bclr leaving the run, not a call
-      const uint32_t bo = rt, bi = ra;
-      if (!(bo & 0x10) && (bo & 0x04)) {  // tests a CR bit, no CTR decrement; falls through to the bctr
-        const bool branch_if_set = bo & 0x08;
-        const CrDef& c = st.cr[bi >> 2];
-        if (c.cmpl && (bi & 3) == 1 && branch_if_set)  // bgt: falls through when index <= imm
-          add_bound(c.value, c.imm + 1);
-        else if (c.cmpl && (bi & 3) == 0 && !branch_if_set)  // bge: falls through when index < imm
-          add_bound(c.value, c.imm);
-      }
-      continue;
-    }
-    if (op == 10 && !((w >> 21) & 1)) {  // cmpli crN,0,rA,imm (32-bit)
-      st.cr[rt >> 2] = {true, st.value[ra], w & 0xFFFF};
-      continue;
-    }
-    if (op == 31 && xo == 444 && rt == rb) {  // mr rA,rS (or rA,rS,rS)
-      st.value[ra] = st.value[rt];
-      if (w & 1)
-        st.cr[0] = {};
-      continue;
-    }
-    const RegWrites writes = regWrites(w);
-    for (uint32_t f = 0; f < 8; ++f)
-      if (writes.cr & (1u << f))
-        st.cr[f] = {};
-    for (uint32_t g = 0; g < 32; ++g)
-      if (writes.gpr & (1u << g))
-        st.value[g] = next_value++;
-    const uint32_t sh = (w >> 11) & 31, mb = (w >> 6) & 31, me = (w >> 1) & 31;
-    if (op == 21 && sh == 0 && me == 31 && mb > 0)  // clrlwi rA,rS,mb
-      add_bound(st.value[ra], 1u << (32 - mb));
-    if (op == 28 && ((w & 0xFFFF) & ((w & 0xFFFF) + 1)) == 0)  // andi. rA,rS,2^k-1
-      add_bound(st.value[ra], (w & 0xFFFF) + 1);
-  }
-  if (!pending.empty())
-    return 0;  // a branch to the bctr itself
-  auto it = st.bound.find(st.value[index_reg & 31]);
-  return it == st.bound.end() ? 0 : it->second;
-}
-
-}  // namespace
 
 //=============================================================================
 // Constructors
@@ -554,23 +244,122 @@ struct BoundsInfo {
 
 BoundsInfo scanForBounds(const FunctionScanner& scanner, guest_addr_t bctr_address,
                          u8 expected_index_reg) {
-  // See straightLineSwitchBound: the bound must hold the value the index register has at the bctr. The former
-  // walk (first cmpli/clrlwi naming the register, or any cmpli on the CR field of the first bgt, up to 64
-  // instructions back across blocks) took stale bounds from before the register was reloaded.
   BoundsInfo bounds;
-  auto read = [&](uint32_t addr, uint32_t& word) {
-    auto* p = scanner.translate_address<u32>(addr);
-    if (!p)
-      return false;
-    word = load_and_swap<u32>(p);
-    return true;
-  };
-  if (uint32_t cases = straightLineSwitchBound(read, static_cast<uint32_t>(bctr_address), 4,
-                                               expected_index_reg, 64)) {
-    bounds.maxEntries = cases;
-    bounds.indexReg = expected_index_reg;
-    bounds.found = true;
+  constexpr int MAX_SCAN = 64;
+
+  u8 cr_field = 0xFF;  // CR field from conditional branch
+
+  for (int i = 1; i <= MAX_SCAN; ++i) {
+    guest_addr_t addr = bctr_address - (i * 4);
+    if (addr < 4)
+      break;
+
+    auto host_ptr = scanner.translate_address<u32>(addr);
+    if (!host_ptr)
+      break;
+
+    u32 code = load_and_swap<u32>(host_ptr);
+    if (code == 0)
+      break;
+
+    Instruction instr = decode_instruction(addr, code);
+
+    // Look for conditional branch (bc, bca, bcl, bcla, bclr, bclrl)
+    // bgt/ble/bgtlr/blelr are simplified mnemonics for bc with specific BO/BI
+    if (cr_field == 0xFF) {
+      bool is_cond_branch = (instr.opcode == Opcode::bc || instr.opcode == Opcode::bca ||
+                             instr.opcode == Opcode::bcl || instr.opcode == Opcode::bcla ||
+                             instr.opcode == Opcode::bclr || instr.opcode == Opcode::bclrl);
+
+      if (is_cond_branch) {
+        // Check if this could be a bounds check branch (bgt or ble pattern)
+        // BO[4] (bit 0) = 0 means test CR bit
+        // BI[0:1] = condition bit within CR field (GT=1, LT=0, EQ=2, SO=3)
+        u8 bi = instr.B.BI;
+
+        // Check for branches that test the GT bit (BI mod 4 == 1)
+        // bgt: BO=12 (01100), tests CR[GT]=true
+        // ble: BO=4 (00100), tests CR[GT]=false (i.e., not greater = less or equal)
+        if ((bi & 0x3) == 1) {  // Tests GT bit
+          // Extract CR field (bits 2-4 of BI)
+          cr_field = (bi >> 2) & 0x7;
+
+          // Extract default target if branch has target
+          if (instr.branch_target.has_value()) {
+            bounds.defaultTarget = instr.branch_target.value();
+          }
+        }
+      }
+    }
+
+    // Look for rlwinm that sets the index register with a mask
+    // clrlwi rD, rS, n = rlwinm rD, rS, 0, n, 31
+    // This bounds the value to 2^(32-n) - 1 entries
+    if (instr.opcode == Opcode::rlwinm && instr.M.RA == expected_index_reg) {
+      u8 sh = instr.M.SH;
+      u8 mb = instr.M.MB;
+      u8 me = instr.M.ME;
+
+      // clrlwi pattern: SH=0, ME=31, MB > 0
+      // The mask clears leftmost MB bits, so max value = 2^(32-MB) - 1
+      // Entry count = max value + 1 = 2^(32-MB)
+      if (sh == 0 && me == 31 && mb > 0 && mb < 32) {
+        u32 implicit_count = 1u << (32 - mb);
+        REXCODEGEN_TRACE(
+            "  [0x{:08X}] Found clrlwi/rlwinm r{}, ..., {} -> {} entries (implicit mask)", addr,
+            static_cast<u32>(expected_index_reg), mb, implicit_count);
+
+        // Only accept if count is reasonable (2-256 entries)
+        if (implicit_count >= 2 && implicit_count <= 256) {
+          bounds.maxEntries = implicit_count;
+          bounds.indexReg = expected_index_reg;
+          bounds.found = true;
+          break;  // Implicit bounds are definitive
+        }
+      }
+    }
+
+    // Look for cmpli or cmpi (cmplwi/cmpwi - unsigned/signed bounds check)
+    if (instr.opcode == Opcode::cmpli || instr.opcode == Opcode::cmpi) {
+      // cmpli format: cmpli BF, L, RA, UIMM
+      // BF (bits 23-25): CR field
+      // L (bit 21): 0=32-bit, 1=64-bit
+      // RA (bits 16-20): Register to compare
+      // UIMM (bits 0-15): Immediate value
+
+      // BF is top 3 bits of RT field for compare instructions
+      u8 cmp_cr = instr.D.RT >> 2;
+      u8 cmp_ra = instr.D.RA;        // Register being compared
+      u16 cmp_imm = instr.D.UIMM();  // Immediate value (max index)
+
+      // Prefer register match, accept CR-only match as fallback
+      bool cr_matches = (cr_field != 0xFF && cmp_cr == cr_field);
+      bool reg_matches = (cmp_ra == expected_index_reg);
+
+      // CRITICAL: Reject very small immediates (0 or 1) even if register matches
+      // These are likely unrelated comparisons (checking for zero/null, boolean tests)
+      // A real switch table bounds check would have immediate >= 2 (at least 3 cases)
+      if (cmp_imm <= 1) {
+        REXCODEGEN_TRACE(
+            "  [0x{:08X}] Skipping cmpli r{}, {} (immediate too small for switch bounds)", addr,
+            static_cast<u32>(cmp_ra), cmp_imm);
+        continue;
+      }
+
+      // Only accept if register matches, or if CR matches AND immediate is reasonable
+      if (reg_matches || (cr_matches && cmp_imm > 1)) {
+        bounds.maxEntries = cmp_imm + 1;  // cmpli compares against max, so count = max + 1
+        bounds.indexReg = cmp_ra;
+        bounds.found = true;
+
+        // If register matches, we found the best match - done
+        if (reg_matches)
+          break;
+        // If only CR matches, continue scanning for a better (register) match
+      }
+    }
   }
+
   return bounds;
 }
 
@@ -643,12 +432,7 @@ std::vector<guest_addr_t> read_table_entries(const FunctionScanner& scanner,
       // For absolute tables, non-executable target means wrong table address
       if (match.type == JumpTableType::kAbsolute)
         goto done;
-      // Offset tables: skipping the entry would move every later target down one case. With a known bound keep
-      // the position (a null target, emitted as a trap); without one this is the end of the table.
-      if (entry_count == 0)
-        goto done;
-      targets.push_back(0);
-      continue;
+      continue;  // Skip non-executable entries in offset tables (might be default/error cases)
     }
 
     targets.push_back(target);
@@ -715,11 +499,26 @@ static bool is_function_boundary(u32 code, const Instruction& instr, guest_addr_
 //=============================================================================
 // Helper: Detect jump table pattern at bctr instruction
 //=============================================================================
+namespace {
+// katamari-nx (2026-11-01): see FunctionScanner::setForcedIndirectCalls.
+std::unordered_set<uint32_t> g_forced_indirect_calls;
+}  // namespace
+
+void FunctionScanner::setForcedIndirectCalls(const std::unordered_set<uint32_t>& addresses) {
+  g_forced_indirect_calls = addresses;
+}
+
 std::optional<JumpTable> FunctionScanner::detect_jump_table(guest_addr_t bctr_address) {
   // Skip detection if this address has a manually-specified switch table
   if (known_switch_tables_.count(static_cast<uint32_t>(bctr_address))) {
     REXCODEGEN_TRACE("detect_jump_table: skipping 0x{:08X} (manual table exists)", bctr_address);
     return std::nullopt;  // Will be handled by the pre-loaded config
+  }
+  // katamari-nx (2026-11-01): a call through a table of function pointers, read as a jump table, became a switch on
+  // a register that does not hold the index (sub_822AC470: every call trapped, the supermarket DLC level).
+  if (g_forced_indirect_calls.count(static_cast<uint32_t>(bctr_address))) {
+    REXCODEGEN_TRACE("detect_jump_table: 0x{:08X} is an indirect call (config indirect_calls)", bctr_address);
+    return std::nullopt;
   }
 
   const int MAX_SCAN_BACK = static_cast<int>(REXCVAR_GET(backward_scan_limit));
@@ -1500,26 +1299,75 @@ bool isBlockTerminator(const DecodedInsn& insn, uint32_t addr, const CodeRegion&
 
 BoundsInfo scanForBounds(DecodedBinary& decoded, uint32_t bctrAddr, const CodeRegion& region,
                          uint8_t expectedReg, uint32_t funcStart) {
-  // Same analysis as the late detector (straightLineSwitchBound): the former walk matched the first
-  // cmpli/clrlwi naming expectedReg, even when the register had been reloaded since.
   BoundsInfo result;
   const int backwardScanLimit = static_cast<int>(REXCVAR_GET(backward_scan_limit));
+
+  // Use funcStart as lower bound to avoid scanning into other functions
   uint32_t scanLowerBound = std::max(region.start, funcStart);
-  auto read = [&](uint32_t addr, uint32_t& word) {
-    auto* insn = decoded.get(addr);
+
+  REXCODEGEN_TRACE(
+      "scanForBounds: bctr=0x{:08X} region=[0x{:08X}-0x{:08X}] funcStart=0x{:08X} expectedReg=r{}",
+      bctrAddr, region.start, region.end, funcStart, expectedReg);
+
+  uint32_t scanAddr = bctrAddr;
+  for (int i = 0; i < backwardScanLimit && scanAddr >= scanLowerBound + 4; i++) {
+    scanAddr -= 4;
+    auto* insn = decoded.get(scanAddr);
     if (!insn)
-      return false;
-    word = static_cast<uint32_t>(insn->code);
-    return true;
-  };
-  if (uint32_t cases =
-          straightLineSwitchBound(read, bctrAddr, scanLowerBound, expectedReg, backwardScanLimit)) {
-    result.maxEntries = cases;
-    result.indexReg = expectedReg;
-    result.found = true;
-    REXCODEGEN_TRACE("scanForBounds: bctr=0x{:08X} r{} -> {} cases", bctrAddr, expectedReg, cases);
-    return result;
+      break;
+
+    // Stop at unconditional terminators - scanning past basic block boundaries
+    // risks finding unrelated comparisons on the index register
+    if (isTerminator(*insn) && !isConditional(*insn))
+      break;
+
+    using namespace rex::codegen::ppc;
+
+    // Look for cmpli/cmpi followed by conditional branch
+    if (insn->opcode == Opcode::cmpli) {
+      // cmpli crX, L, rA, UIMM
+      REXCODEGEN_TRACE("scanForBounds: found cmpli at 0x{:08X} RA=r{} UIMM={} (expecting r{})",
+                       scanAddr, static_cast<unsigned>(insn->D.RA), static_cast<int>(insn->D.d),
+                       expectedReg);
+      if (insn->D.RA == expectedReg) {
+        result.maxEntries = static_cast<uint32_t>(insn->D.d) + 1;
+        result.indexReg = expectedReg;
+        result.found = true;
+        REXCODEGEN_TRACE("scanForBounds: MATCHED! maxEntries={}", result.maxEntries);
+        return result;
+      }
+    }
+
+    if (insn->opcode == Opcode::cmpi) {
+      // cmpi crX, L, rA, SIMM
+      REXCODEGEN_TRACE("scanForBounds: found cmpi at 0x{:08X} RA=r{} SIMM={} (expecting r{})",
+                       scanAddr, static_cast<unsigned>(insn->D.RA), static_cast<int>(insn->D.d),
+                       expectedReg);
+      if (insn->D.RA == expectedReg) {
+        result.maxEntries = static_cast<uint32_t>(insn->D.d) + 1;
+        result.indexReg = expectedReg;
+        result.found = true;
+        REXCODEGEN_TRACE("scanForBounds: MATCHED! maxEntries={}", result.maxEntries);
+        return result;
+      }
+    }
+
+    // Look for clrlwi (rlwinm rA, rS, 0, MB, 31) which masks bits
+    // MB must be > 0 to actually mask something; MB=0 is a no-op
+    if (insn->opcode == Opcode::rlwinm) {
+      if (insn->M.RA == expectedReg && insn->M.SH == 0 && insn->M.ME == 31 && insn->M.MB > 0) {
+        // Masked to (32 - MB) bits, max value is 2^(32-MB) - 1
+        uint32_t bits = 32 - insn->M.MB;
+        result.maxEntries = 1u << bits;
+        result.indexReg = expectedReg;
+        result.found = true;
+        REXCODEGEN_TRACE("scanForBounds: found clrlwi at 0x{:08X} MB={} maxEntries={}", scanAddr,
+                         static_cast<unsigned>(insn->M.MB), result.maxEntries);
+        return result;
+      }
+    }
   }
+
   REXCODEGEN_TRACE("scanForBounds: no bounds found for bctr=0x{:08X}", bctrAddr);
   return result;
 }
@@ -1533,6 +1381,13 @@ std::optional<JumpTable> detectJumpTable(DecodedBinary& decoded, uint32_t bctrAd
                                          const CodeRegion& containingRegion, uint32_t funcStart,
                                          uint32_t funcEnd) {
   using namespace rex::codegen::ppc;
+
+  // katamari-nx (2026-11-01): the block discovery's detector (its tables go to the function nodes the emission reads)
+  // honours indirect_calls too; the scanner's method alone did not change the code.
+  if (g_forced_indirect_calls.count(bctrAddr)) {
+    REXCODEGEN_TRACE("detectJumpTable: 0x{:08X} is an indirect call (config indirect_calls)", bctrAddr);
+    return std::nullopt;
+  }
 
   const int kMaxBackwardScan = static_cast<int>(REXCVAR_GET(backward_scan_limit));
   const uint32_t kMaxTableEntries = REXCVAR_GET(max_jump_table_entries);

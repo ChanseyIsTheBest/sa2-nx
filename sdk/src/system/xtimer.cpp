@@ -11,9 +11,17 @@
 
 #include <rex/chrono/chrono.h>
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtimer.h>
+
+// Port 159 (from fnxf_xiii): an absolute due time in the past fires at once, as on NT. A game passing 0 (the year
+// 1601) gave the clock conversion a 400-year gap, past what its nanoseconds hold. Off: as before (fixes are off by
+// default in the base).
+REXCVAR_DEFINE_BOOL(banjo_xtimer_clamp_past, false, "Kernel",
+                    "An absolute timer due time in the past fires at once (as NT does) instead of going through a "
+                    "clock conversion that overflows (a due time of 0 is the year 1601)");
 
 namespace rex::system {
 
@@ -53,6 +61,12 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms, uint32_t routine
     // as possible for increased accuracy
     auto after = rex::chrono::hundrednanoseconds(-due_time);
     due_tp = std::chrono::clock_cast<WinSystemClock>(XSystemClock::now() + after);
+  } else if (REXCVAR_GET(banjo_xtimer_clamp_past)) {
+    // Port 159 (fnxf_xiii): a time in the past fires at once; clamped, so no conversion sees a 400-year gap.
+    auto due_x = XSystemClock::from_file_time(due_time);
+    const auto now_x = XSystemClock::now();
+    if (due_x < now_x) due_x = now_x;
+    due_tp = std::chrono::clock_cast<WinSystemClock>(due_x);
   } else {
     due_tp = std::chrono::clock_cast<WinSystemClock>(XSystemClock::from_file_time(due_time));
   }

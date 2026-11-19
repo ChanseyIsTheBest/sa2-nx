@@ -136,6 +136,12 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   /// fonts via AddFontFromMemoryTTF() or similar.
   virtual void OnConfigureFonts(ImFontAtlas* atlas) { (void)atlas; }
 
+  /// sa2-nx: TOML applied before the config file (<name>.toml), as defaults it overrides key by key. Empty = none.
+  virtual std::string_view BuiltInConfig() const { return {}; }
+
+  /// sa2-nx: written as the config file (<name>.toml) when there is none, so the player has one to edit. Empty = none.
+  virtual std::string_view DefaultConfigFile() const { return {}; }
+
   /// Called from the ImGui drawer's Initialize() after the SDK defaults have
   /// been applied. `imgui_style` is the live global ImGuiStyle: patch fields,
   /// or call ImGui::StyleColorsDark(&imgui_style) first to start from a clean
@@ -148,12 +154,6 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
 
   /// Called after logging is initialized. Add log sinks here.
   virtual void OnPostInitLogging() {}
-
-  /// sa2-nx: TOML applied before the config file (<name>.toml), as defaults it overrides key by key. Empty = none.
-  virtual std::string_view BuiltInConfig() const { return {}; }
-
-  /// sa2-nx: written as the config file (<name>.toml) when there is none, so the player has one to edit. Empty = none.
-  virtual std::string_view DefaultConfigFile() const { return {}; }
 
   /// Called after Runtime::LoadXexImage() succeeds. The XEX is loaded and
   /// mapped into guest memory but the module has not launched.
@@ -258,6 +258,8 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
   ui::ImmediateDrawer* immediate_drawer() const { return immediate_drawer_.get(); }
   system::AchievementManager& achievements() const;
 
+  // blur-nx (2026-11-18): the config file the app reads (an app's own menu writes the player's settings into it).
+  const std::filesystem::path& config_path() const { return config_path_; }
   const std::filesystem::path& game_data_root() const { return game_data_root_; }
   const std::filesystem::path& user_data_root() const { return user_data_root_; }
   const std::filesystem::path& update_data_root() const { return update_data_root_; }

@@ -16,6 +16,7 @@
 #include <rex/filesystem.h>
 #include <rex/filesystem/device.h>
 #include <rex/filesystem/devices/host_path_device.h>
+#include <rex/filesystem/lz4_blocks.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory/mapped_memory.h>
@@ -32,8 +33,34 @@ HostPathEntry::~HostPathEntry() = default;
 HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
                                      const std::filesystem::path& full_path,
                                      rex::filesystem::FileInfo file_info) {
-  auto path = rex::string::utf8_join_guest_paths(parent->path(), rex::path_to_utf8(file_info.name));
+  std::string name = rex::path_to_utf8(file_info.name);
+  /*
+   * rr6-nx (2026-11-10): NAME.lz4b is the game's NAME (rex/filesystem/lz4_blocks.h), with the size of the file it
+   * holds, unless a plain NAME lies next to it (an install extracted over an older one): the plain file wins and the
+   * .lz4b stays an ordinary file the game never asks for.
+   */
+  bool lz4_blocks = false;
+  uint64_t lz4_size = 0;
+  if (file_info.type == rex::filesystem::FileInfo::Type::kFile && HasLz4BlocksSuffix(name)) {
+    std::filesystem::path plain = full_path;
+    plain.replace_extension();
+    rex::filesystem::FileInfo plain_info;
+    if (rex::filesystem::GetInfo(plain, &plain_info)) {
+      REXFS_WARN("{} and {} are both in the game folder: the plain file is used (delete one of them)",
+                 rex::path_to_utf8(plain), rex::path_to_utf8(full_path));
+    } else if (ReadLz4BlocksSize(full_path, &lz4_size)) {
+      lz4_blocks = true;
+      name.resize(name.size() - kLz4BlocksSuffix.size());
+    } else {
+      REXFS_WARN("{} is not a valid .lz4b file: left as it is", rex::path_to_utf8(full_path));
+    }
+  }
+  auto path = rex::string::utf8_join_guest_paths(parent->path(), name);
   auto entry = new HostPathEntry(device, parent, path, full_path);
+  entry->lz4_blocks_ = lz4_blocks;
+  if (lz4_blocks) {
+    file_info.total_size = size_t(lz4_size);
+  }
 
   entry->create_timestamp_ = file_info.create_timestamp;
   entry->access_timestamp_ = file_info.access_timestamp;
@@ -76,6 +103,12 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
     return X_STATUS_SUCCESS;
   }
 
+  // rr6-nx (2026-11-10): an .lz4b file is read only.
+  if (lz4_blocks_ && (desired_access & (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
+                                        FileAccess::kFileAppendData | FileAccess::kGenericAll))) {
+    return X_STATUS_ACCESS_DENIED;
+  }
+
   // A read handle the startup preload thread opened ahead of the guest (read-only access only).
   std::unique_ptr<rex::filesystem::FileHandle> file_handle;
   if (is_read_only() && !(desired_access & (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
@@ -90,12 +123,21 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
     // TODO(benvanik): pick correct response.
     return X_STATUS_NO_SUCH_FILE;
   }
+  if (lz4_blocks_) {
+    file_handle = OpenLz4Blocks(std::move(file_handle));  // logs why when it is not a valid .lz4b file
+    if (!file_handle) {
+      return X_STATUS_NO_SUCH_FILE;
+    }
+  }
   *out_file = new HostPathFile(desired_access, this, std::move(file_handle));
   return X_STATUS_SUCCESS;
 }
 
 std::unique_ptr<memory::MappedMemory> HostPathEntry::OpenMapped(memory::MappedMemory::Mode mode,
                                                                 size_t offset, size_t length) {
+  if (lz4_blocks_) {
+    return nullptr;  // rr6-nx: the host file is the packed one
+  }
   return memory::MappedMemory::Open(host_path_, mode, offset, length);
 }
 
@@ -172,6 +214,13 @@ void HostPathEntry::update() {
     return;
   }
   if (file_info.type == rex::filesystem::FileInfo::Type::kFile) {
+    if (lz4_blocks_) {  // rr6-nx: the size of the file it holds
+      uint64_t size = 0;
+      if (!ReadLz4BlocksSize(host_path_, &size)) {
+        return;
+      }
+      file_info.total_size = size_t(size);
+    }
     size_ = file_info.total_size;
     allocation_size_ = rex::round_up(file_info.total_size, device()->bytes_per_sector());
   }

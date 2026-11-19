@@ -1,0 +1,12 @@
+[project]
+sdk_version = "0.10.0"
+name = "renut"
+
+[entrypoint]
+file_path = "assets/default.xex"
+out_directory_path = "generated"
+includes = [
+ "renut_config.toml"
+]
+
+

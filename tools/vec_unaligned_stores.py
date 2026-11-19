@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """stvlx / stvrx without byte loops (from sasrt-nx's tool of 2026-10-14, idea 5 of sa2-nx's list; banjo-nx's copy).
 The generator writes the left / right unaligned vector stores (stvlx, stvrx and their 128 / l forms) as a loop of up
 to 16 single-byte stores:

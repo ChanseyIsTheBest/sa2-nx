@@ -18,13 +18,13 @@
 
 #if REX_PLATFORM_SWITCH
 #include <threading_switch.h>
-// sa2-nx (2026-10-20): Renut's renderer (renut_engine, through banjo-nx) unpins its record worker when the key that
-// pinned it is turned off; SA2's SDK has no unpin (banjo-nx's SDK does): the worker keeps its core then.
-inline bool RexSwitchUnpinCurrentThread(int) { return false; }
 #else
 inline bool RexSwitchSetCurrentThreadPriorityOk(int) { return true; }
 inline int RexSwitchCurrentCore() { return -1; }
 inline bool RexSwitchSetCurrentThreadCore(int) { return true; }
 inline bool RexSwitchPinCurrentThreadToCore(int) { return true; }
 inline bool RexSwitchUnpinCurrentThread(int) { return true; }
+// banjo-nx (2026-10-27): the system core (4-core mode): never there off the Switch.
+inline int RexSwitchSystemCore() { return -1; }
+inline bool RexSwitchMoveCurrentThreadToSystemCore(int) { return false; }
 #endif

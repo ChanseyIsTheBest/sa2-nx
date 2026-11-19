@@ -97,6 +97,12 @@ class ObjectTable {
 
   rex::thread::global_critical_region global_critical_region_;
   std::mutex name_mutex_;
+  // blur-nx (2026-11-13, #56 of Blur's docs/cpu-near-exact-50-1113.md, exact): LookupObject takes this, not the
+  // global critical region (kernel_handle_lookup_own_lock). Every writer of table_, table_capacity_ or an entry's
+  // object holds the global critical region as before and this lock too, only around the write itself (no call out
+  // while holding it), so a lookup sees a whole entry and retains its object before a removal can release it.
+  // Order: the global critical region, then this.
+  std::mutex table_mutex_;
   uint32_t table_capacity_ = 0;
   ObjectTableEntry* table_ = nullptr;
   uint32_t last_free_entry_ = 0;

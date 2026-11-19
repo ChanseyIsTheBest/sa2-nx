@@ -40,6 +40,7 @@ void shutdown() {
 }
 
 extern "C" void nv50_ir_set_banjo_flags(unsigned flags);
+extern "C" unsigned nv50_ir_get_banjo_flags();
 
 void setBanjoFlags(unsigned flags) {
     nv50_ir_set_banjo_flags(flags);
@@ -55,6 +56,15 @@ Result compile(Stage stage, const char* glsl) {
         if (r.ok) c->WriteDksh(r.dksh);
     }
     uam_set_log_callback(nullptr, nullptr);
+    return r;
+}
+
+// mk9-nx (2026-10-24; port 56): see uam_api.h. The passes' flags are the uam thread's (one compile at a time).
+Result compileFast(Stage stage, const char* glsl) {
+    const unsigned flags = nv50_ir_get_banjo_flags();
+    nv50_ir_set_banjo_flags(flags & ~16u);
+    Result r = compile(stage, glsl);
+    nv50_ir_set_banjo_flags(flags);
     return r;
 }
 

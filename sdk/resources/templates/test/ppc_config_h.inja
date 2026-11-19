@@ -65,6 +65,13 @@
     [[clang::musttail]] return __imp__##name(ctx, base);                 \
   }                                                                      \
   extern "C" void __imp__##name([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base)
+#elif defined(__GNUC__) && !defined(__clang__)
+// renut-ultimate (2026-11-16, port 147; tw2de_nx's of 2026-11-01): as codegen/pch_h.inja: GCC drops attributes
+// ahead of extern "C" (the alias was never emitted); after the declarator it emits both (the Switch test NRO).
+#define DEFINE_REX_FUNC(name)                                       \
+  extern "C" REX_FUNC(name)                                         \
+      __attribute__((alias("__imp__" #name), weak, noinline));      \
+  REX_EXTERN(__imp__##name)
 #else
 #define DEFINE_REX_FUNC(name)                                       \
   __attribute__((alias("__imp__" #name)))                           \
@@ -172,10 +179,12 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
   return count;
 }
 
+// mfmsr: the MSR a game thread sees on the 360, 0x9030 (EE ME IR DR; port 147, tw2de_nx 2026-11-01: Xenia's
+// instruction tests, recorded on the hardware), without EE (0x8000) while the global lock is held. It was 0x8000 / 0.
 #define REX_CHECK_GLOBAL_LOCK()                                        \
   ([&]() -> u64 {                                                      \
     auto lock_ = rex::thread::global_critical_region::AcquireDirect(); \
-    return ppc_global_lock_count_().load() ? 0 : 0x8000;               \
+    return ppc_global_lock_count_().load() ? 0x1030 : 0x9030;         \
   }())
 
 #define REX_ENTER_GLOBAL_LOCK()                          \

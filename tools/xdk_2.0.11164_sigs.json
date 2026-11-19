@@ -1,0 +1,27 @@
+{
+ "memset": {
+  "address": "82953880",
+  "instructions": 40,
+  "signature": "8ce32b1d1a08fca7b4698c8955c063f076ec5ac7"
+ },
+ "memcpy": {
+  "address": "82954218",
+  "instructions": 42,
+  "signature": "1aa5da62e91eff8d8deb0a5ed5f0f60c62f63793"
+ },
+ "memcpy_large": {
+  "address": "82953D90",
+  "instructions": 290,
+  "signature": "88893fdbd9a8da3ce8240d139e1df68930f0e3c7"
+ },
+ "exp": {
+  "address": "82954F28",
+  "instructions": 55,
+  "signature": "e009beb0f07d275823e13ea6d1ef31399ef57645"
+ },
+ "sin": {
+  "address": "82954478",
+  "instructions": 56,
+  "signature": "771d290b5e41bb9a229174836d99c3f3f1e98273"
+ }
+}

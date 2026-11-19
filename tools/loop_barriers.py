@@ -28,9 +28,7 @@ Since 2026-10-16 (marathon-nx's PPC_LOOP_BARRIER, proposed for Banjo) the barrie
 not "memory": every guest load in the loop is still issued again after it, which is all it is for, while ctx (thread-
 private host memory; a call already makes the compiler reload it) and the host stack keep their registers. Marathon
 kept the full form in floating-point functions only because of its -ffp-contract=fast; Banjo compiles with
--ffp-contract=off. The window is 4 GB + 4 KB (from peggle2-nx, 2026-10-19): on the PC an address from 0xE0000000 up
-lies 4 KB higher (REX_PHYS_HOST_OFFSET), so the top page of the guest's space is covered there too.
--DREX_LOOP_BARRIER_FULL (CMake BANJO_GEN_NARROW_LOOP_BARRIER=OFF) gives the full form back. An
+-ffp-contract=off. -DREX_LOOP_BARRIER_FULL (CMake BANJO_GEN_NARROW_LOOP_BARRIER=OFF) gives the full form back. An
 older pch macro is replaced.
 
   python tools/loop_barriers.py app/generated/default [app/generated/data_dll ...] [--check] [--all]
@@ -53,7 +51,7 @@ MACRO = (MARKER + '\n#ifndef REX_LOOP_BARRIER\n'
          '#if defined(REX_LOOP_BARRIER_FULL)\n'
          '#define REX_LOOP_BARRIER() __asm__ __volatile__("" ::: "memory")\n'
          '#else  // the guest window only (marathon-nx): ctx and the host stack keep their registers\n'
-         '#define REX_LOOP_BARRIER() __asm__ __volatile__("" : "+m"(*(uint8_t (*)[0x100001000ull])base))\n'
+         '#define REX_LOOP_BARRIER() __asm__ __volatile__("" : "+m"(*(uint8_t (*)[0x100000000ull])base))\n'
          '#endif\n#endif\n')
 # A read of guest memory, or anything that could hide one: a load, a raw address, a call of any kind.
 # REX_RO_: a load tools/ro_constants.py folded to a constant still counts, so that a second run of this script on
@@ -61,6 +59,70 @@ MACRO = (MARKER + '\n#ifndef REX_LOOP_BARRIER\n'
 GUEST = re.compile(r'REX_LOAD|REX_RO_|REX_RAW_ADDR|REX_ADDR|REX_GUEST_CAS|\bbase\b|REX_CALL_INDIRECT_|ppc_trap\(')
 INDIRECT = re.compile(r'REX_CALL_INDIRECT_')
 OTHER_CALL = re.compile(r'\b\w+\(ctx, base[,)]')
+
+
+# blur-nx (2026-11-17, #226 of docs/cpu-codegen-universal-30-1116.md): a third kind of loop needs no barrier: one whose
+# every branch decides on values the loop did not load. Its exits (bdnz's counter, a counter against a bound, ...) do
+# not depend on guest memory, so a load the compiler moves or merges across iterations cannot make it spin; what may
+# change is only when another thread's store is seen inside it, which a data-race-free program cannot tell (the rule
+# GCC applies to every plain load outside loops). Conservative: no call of any kind, no atomic, trap, return or switch
+# in the loop; no goto from outside into its middle; every register a line with a guest load (or a register so
+# reached) mentions counts as loaded. A census of the generated tree of 2026-11-16: 3,429 of 19,471 barriers.
+# BLUR_BARRIER_COUNTED=0 in the environment: the two kinds before it only.
+COUNTED = os.environ.get('BLUR_BARRIER_COUNTED', '1') != '0'
+IDENT = re.compile(r'(?<![\w.])([A-Za-z_]\w*)')
+
+
+def tokens(line):
+    """Every name a statement mentions that is not a field (registers whether ctx.rN, a local rN, a loop or leaf local
+    l_rN or r1_local's r1l, temporaries, ea, ...): a superset is safe here, it only keeps more barriers."""
+    out = set()
+    for t in IDENT.findall(line.replace('ctx.', '')):
+        if t.startswith('l_'):
+            t = t[2:]
+        if re.fullmatch(r'r\d+l', t):
+            t = t[:-1]
+        out.add(t)
+    return out
+
+
+LOADISH = re.compile(r'REX_LOAD|REX_RO_|REX_RAW_ADDR|REX_ADDR|REX_GUEST_CAS|\bbase\b')
+UNSAFE = re.compile(r'\(ctx, base[,)]|REX_CALL_INDIRECT_|REX_GUEST_CAS|ppc_trap\(|\breturn\b|\bswitch \(|setjmp|longjmp')
+IF_COND = re.compile(r'^\tif \((.*)\) goto loc_[0-9A-F]{8};$')
+
+
+def counter_only(body, at, end, lines, label_at):
+    """#226: the loop body[at..end] (lines: its statements) branches only on values it did not load."""
+    if any(UNSAFE.search(l) for l in lines):
+        return False
+    inner = {lab for lab, k in label_at.items() if at < k <= end}
+    for k, l in enumerate(body):
+        if at <= k <= end:
+            continue
+        if any(t in inner for t in GOTO.findall(l)):
+            return False  # entered from outside other than at the header
+    tainted = set()
+    changed = True
+    while changed:
+        changed = False
+        for l in lines:
+            if l.startswith('\tif ('):
+                continue  # a branch writes nothing
+            toks = tokens(l) - {'goto', 'if'}
+            if LOADISH.search(l) or toks & tainted:
+                new = toks - tainted
+                if new:
+                    tainted |= new
+                    changed = True
+    for l in lines:
+        m = IF_COND.match(l)
+        if m:
+            cond = m.group(1)
+            if LOADISH.search(cond) or tokens(cond) & tainted:
+                return False
+        elif l.startswith('\tif (') or ('goto' in l and not ONLY_GOTO.match(l)):
+            return False  # a form this cannot read
+    return True
 
 
 def needed_headers(body, headers):
@@ -105,6 +167,9 @@ def needed_headers(body, headers):
         if not readable:
             need.add(header)
             continue
+        if COUNTED and counter_only(body, at, end, lines, label_at):
+            continue  # #226: it ends whatever memory says
+
         # Is there a way from the header back to it that passes no indirect call?
         seen = set()
         stack = [at]
@@ -175,13 +240,11 @@ def process(folder, check, everywhere):
         sys.exit(f'loop barriers: no *_pch.h in {folder}')
     text = open(pch, encoding='utf-8').read()
     pch_changed = False
-    # The older forms: the full barrier, and the 4 GB window before peggle2-nx's 4 KB of slack (2026-10-19).
-    for older in (MACRO_OLD, MACRO.replace('0x100001000ull', '0x100000000ull')):
-        if older in text:
-            text = text.replace(older, MACRO, 1)
-            pch_changed = True
-            if not check:
-                open(pch, 'w', encoding='utf-8', newline='\n').write(text)
+    if MACRO_OLD in text:
+        text = text.replace(MACRO_OLD, MACRO, 1)
+        pch_changed = True
+        if not check:
+            open(pch, 'w', encoding='utf-8', newline='\n').write(text)
     if MARKER not in text:
         if '#define REX_LOAD_U8(x)' not in text:
             sys.exit(f'loop barriers: no REX_LOAD_U8 in {pch}: the generated pch changed')

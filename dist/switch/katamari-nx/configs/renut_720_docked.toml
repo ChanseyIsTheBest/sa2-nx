@@ -1,0 +1,628 @@
+# katamari-nx (Beautiful Katamari on the Switch, Renut's renderer on deko3d): 720 lines docked too, the Xbox 360's own (pixel-identical)
+# Made by tools/make_katamari_tomls.py from banjo-nx's shipped renut.toml (2026-10-29). Copy over katamari.toml next to
+# the NRO, the only toml it reads (renut.toml with KATAMARI_BUILTIN_CONFIG off). Credits: reNut's renderer (masterspike52,
+# reuse permitted), banjo-nx, sa2-nx, NetherSX2_nx (four-core layout), battd_nx (the GPU arena), bejeweled3-nx and the zuma
+# ports (hot functions).
+# banjo-nx test config (Switch). Lines are cvars.
+
+# Renderer: the native Vulkan renderer (needs banjo_shaders.mesp and banjo_shaders.mesp.idx next to the NRO).
+# Set masseffect_renderer_native = false to fall back to ReXGlue's emulated Xbox 360 GPU (slow, reference image).
+gpu_plugin = ""
+masseffect_renderer_native = false
+gpu_allow_invalid_fetch_constants = true
+readback_memexport = false
+readback_memexport_fast = false
+
+# MSAA as the game sets it (2x). true = no MSAA (both work on PC).
+# Package 28b (your choice, 2026-10-17): the game's 2x MSAA off for Renut's renderer (one sample per pixel: aliased
+# edges, less GPU bandwidth); configs/banjo_renut_msaa.toml puts it back. banjo-nx's renderer collapses MSAA itself and
+# its configs keep this false.
+disable_msaa = false
+
+# Shaders the renderer cannot identify are written here once (raw microcode). Please send this folder back:
+# they get added to banjo_shaders.mesp (new areas of the game may have shaders the PC runs have not seen yet).
+banjo_shader_misses = "sdmc:/switch/katamari-nx/shader_misses"
+
+# Logs go to logs/rex/ next to the NRO. Please send them back after a test.
+log_level = "info"
+# The file log is written by a thread of its own (from futari-nx): the ring thread never waits for the SD card.
+log_file_writer = true
+
+# Controls (2026-10-21, from sa2-nx; your request). Face buttons by position, as on the Xbox 360 pad the game was made
+# for: the bottom button (B on Switch controllers) acts as A, the right one (A) as B, the left one (Y) as X, the top one
+# (X) as Y. false = by letter (the Switch's A acts as A). The settings menus follow it.
+input_xbox_layout = true
+# Two players: the handheld (Joy-Cons on the console) and each connected controller (Pro Controller, Joy-Con pair,
+# single Joy-Con) are players in the order they connect. L+R+ZR opens the system's controller screen (connect a second
+# controller, change the order, split a Joy-Con pair into two). Single Joy-Cons are held sideways, one per player: the
+# four buttons under the right thumb are the face buttons, SL / SR are ZL / ZR, minus or plus is Start.
+input_joycon_sideways = true
+# Per-player button maps: the [input_p1] and [input_p2] sections at the end of this file.
+# The game's on-screen keyboard (naming things) opens the Switch's own keyboard (2026-10-21, your request): type with
+# the touch screen or the controller, + or OK accepts, Cancel keeps the old name. false = the old ImGui text box.
+switch_software_keyboard = true
+
+# Profiler (ported from UnleashedRecomp-NX): on-screen window, per-thread CPU report, stall watchdog.
+# Your call (2026-10-21): the profiler window and reNut's FPS counter off (the window cost ~7 % of a core redrawing its
+# graphs). The logs are written as before (rex_profile.log, banjo_profiler.log, the [renut] lines). true shows them.
+banjo_show_profiler = false
+banjo_show_fps = false
+banjo_stall_watch_seconds = 1
+# Profiling (on in every config except configs/banjo_cpu_verify.toml):
+# CPU: the SDK's sampler records every thread's code addresses into logs/rex/rex_profile.log.
+switch_profile_stacks = true
+# The app's own sampler (logs/rex/banjo_profiler.log); configs/banjo_profile.toml turns it on as well.
+banjo_cpu_profiler = false
+
+# Performance enhancements (docs/enhancements.md). Each one is active only when its own key AND its group's master
+# switch are on; the log has one "[enhancements]" line saying what ran. Set a master to false for an A/B test.
+banjo_cpu_enhancements = true
+banjo_noncpu_enhancements = true
+# CPU: the game's wait for GPU ring space sleeps instead of spinning (3 threads spun at ~55 % each).
+banjo_wait_blocking_ring = true
+# Non-CPU: Mesa's own SD-card shader cache off (the renderer's cache/ file keeps the pipelines).
+banjo_mesa_disk_cache_off = true
+# Non-CPU: compile the pipelines listed in cache/masseffect_native_pipelines.bin in the background from boot.
+masseffect_native_pipelines_prewarm = true
+banjo_prewarm_threads = 1
+# Non-CPU: per-stage shader cache in the GPU driver (a shader shared by several pipelines is compiled once).
+masseffect_nvk_cache_per_stage = true
+# CPU: the Draw* record pairing never paired a draw in Banjo (Mass Effect's device offsets): skipped. Same shaders.
+banjo_no_draw_pairing = true
+# CPU: a draw with the same render-target state as the draw before reuses its EDRAM preparation (sa2-nx). Same image.
+banjo_ring_edram_memo = true
+# CPU: shader constants with the same bytes as the block uploaded last keep it bound (sa2-nx). Same bytes.
+banjo_ring_constants_dedupe = true
+# CPU: shader-object bookkeeping in one shared table (no thread-local lookups on ARM); render-target lookups from a memo;
+# the ring's frame-pacing wait sleeps until a vblank or submission instead of waking every 50 us (all from sa2-nx or
+# measured here; same results).
+banjo_note_shader_fast = true
+banjo_ring_target_memo = true
+banjo_ring_wait_vblank = true
+# CPU: a draw's vertex window inside a larger copy of the same buffer already uploaded this frame reuses it (from the
+# Sonic Transformed port; 55-60 % fewer vertex bytes copied on PC; same bytes, self-checked).
+banjo_ring_vertex_containment = true
+# CPU: vertex data that does not change keeps its converted copy in a buffer that lasts across frames; each use reads
+# the game's bytes once (a fingerprint of all of them) instead of copying them into the frame's upload buffer. All
+# vertex data of the main menu and of gameplay is of that kind. Self-checked: the first 4096 uses and one in 4096
+# after are compared byte by byte ("persistent vertices" line in the log, every 10 s). _mb is the buffer's size.
+banjo_ring_vertex_persistent = true
+banjo_ring_vertex_persistent_mb = 64
+# Part of it: a buffer read once stays good for the draws the game had already sent when it was read.
+banjo_ring_vertex_persistent_submitted = true
+# CPU: the index cache matches index ranges by address within a synchronization epoch (no hash of every draw's indices).
+banjo_ring_index_epoch = true
+# CPU: the direct renderer's step 1 (draw state as host records instead of PM4). Identical image, but not faster on
+# PC; configs/banjo_direct_ab.toml measures it on the console. Off until then.
+banjo_direct_state = false
+
+# CPU: the native renderer's ring-thread fast paths (from masseffect-nx's measured best profile). Each one checks itself
+# against the regular path for its first masseffect_native_verify_n uses and logs a DIFFERENCE line (and falls back) if
+# they ever disagree. Checked on PC with Banjo: no differences, same image.
+masseffect_native_flat_identity = true
+masseffect_native_fast_pair = true
+masseffect_native_raw_microcode = true
+masseffect_native_pm4_fast = true
+masseffect_native_compare_fast = true
+masseffect_native_fast_copy = true
+masseffect_native_fast_copy_verify = 256
+# 2 = the A57's hardware CRC32 pair instead of XXH3 for the fingerprints (sa2-nx round 6; masseffect_crc_fingerprint.h:
+# 2^-64 collision odds, ~4 bytes/cycle against XXH3's ~3; they only decide same-frame reuse).
+masseffect_native_fingerprint_mode = 2
+# The fingerprint above (mode 2) by a PMULL-folded 64-bit CRC instead of the CRC32 pair (half the work per byte).
+banjo_ring_pmull_fingerprint = true
+masseffect_native_dedupe_max_fingerprint = 16384
+masseffect_native_indices_cache = true
+# The upload buffer (every draw's vertices and indices) in CPU-cached memory, published before each submit (sa2-nx round
+# 3: the console wrote 5,251 MB/s there against 2,506 in the uncached type). Same bytes.
+masseffect_native_upload_memory = 1
+masseffect_native_verify_n = 2048
+masseffect_notify_no_lock = true
+# Deferred command recording (a worker thread records the Vulkan commands the render thread would make itself): ON
+# since package 25, its worker on core 0 (the ring split's decoder has core 2). Package 24b's console A/B (target 16):
+# the executor's work a draw -12.2 % and 5.0 % more Swaps with the worker on core 0 (-10.3 % / +3.2 % on core 2); before
+# the ring split (package 21b) it had been "slightly worse". Same commands, same picture (checked in-run on PC).
+# configs/banjo_deferred_ab.toml still switches it every 4 s.
+masseffect_native_deferred_recording = true
+masseffect_deferred_native_fast = true
+masseffect_deferred_native_update = true
+banjo_deferred_core = 0
+# Measurement-only work off (no change to the image): texture-reuse statistics on the ring thread.
+masseffect_native_diag_reuse = false
+# GPU profiling: a GPU timestamp at every pass-category change, so the "GPU per Swap" lines give time per category and
+# the idle gap (no change to the image).
+masseffect_gpu_marks_categories = true
+
+# From the SA2 port (2026-10-07), each with its own key (all on by default; the CPU / non-CPU master switches turn them
+# off with the rest). CPU: base-zero vertex binding for shaders that read r0, EDRAM bound-plan memo, estimator reason.
+banjo_vertices_base_zero_r0 = true
+banjo_ring_bound_plan_memo = true
+banjo_ring_estimator_reason = true
+# GPU: resolves drawn on the 3D engine, depth + color clears into their 1x owners, push constants once per pass,
+# narrower pass-end barriers, handheld GPU profile (460.8 MHz; nothing when docked).
+banjo_gpu_resolve_draw = true
+banjo_gpu_edram4_clear_color0 = true
+banjo_gpu_push_once = true
+banjo_gpu_pass_narrow_end = true
+banjo_gpu_boost = true
+# GPU, need the shader package of this build (banjo_shaders.mesp): blend skip, structured control flow, and per-pipeline
+# facts the shaders stop testing per vertex/pixel. (The blend skip here is our native renderer's; Renut's renderer has
+# its own key, banjo_renut_blend_skip, off: see below.)
+banjo_gpu_blend_skip = true
+banjo_gpu_structured_cf = true
+banjo_gpu_texcoords_unswapped = true
+banjo_gpu_no_texture_signs = true
+banjo_gpu_identity_remap = true
+banjo_gpu_index_base_held = true
+# The alpha test right after the last instruction the alpha needs: a 2x2 quad whose pixels all fail stops there
+# (tools/early_alpha.py; needs the shader package of this build).
+banjo_gpu_early_alpha = true
+
+# From the SA2 port's CPU rounds (2026-10-13). Most of that work is in the NRO itself (how the game code is built);
+# these are its run-time keys, CPU group: compare-and-swap without the trailing barrier, a critical section's owner
+# taken from the game's own processor block instead of a thread lookup, no wake-up system call for an event or
+# semaphore nobody waits on.
+banjo_cpu_guest_cas_no_barrier = true
+kernel_critsec_pcr_owner = true
+thread_signal_skip_idle = true
+# Renderer correctness fix from the SA2 port (non-CPU group): a texture the game allocates a few pages above a freed
+# render-target copy gets its own image instead of being drawn into the old one.
+banjo_native_partial_resolve_inside = true
+# Driver side, from the SA2 port (non-CPU group): ask the graphics driver for its per-draw fast paths (they were never
+# requested in earlier builds: the app looked them up under a name this driver does not export). Each path checks
+# itself inside the driver and switches itself off on a difference ("C6 NVK per draw" lines in the log).
+banjo_gpu_nvk_draw_contract = true
+# Long sessions, from the SA2 port (non-CPU group): render-target copies the game stopped using two minutes ago are
+# released instead of kept until the game is closed (GPU memory filled up over one to two hours in SA2 and NFSMW:
+# shadows glitch, then black textures). Textures the game keeps showing long after drawing them (its cached shadow
+# atlas, things drawn once) are kept, up to a budget of 128 MB in all. The log reports the total every 600 frames
+# ("resolved textures and ... parked hold N MB").
+banjo_native_resolved_retire_idle = true
+banjo_native_resolved_idle_frames = 3600
+banjo_native_resolved_budget_mb = 128
+# Texture correctness (non-CPU group): a sampler takes the filters the shader's own fetch instruction asks for.
+banjo_native_tfetch_filters = true
+
+# Removing emulation the game does not rely on (2026-10-13 evening; non-CPU group; docs/enhancements.md).
+# The frame's targets were imported from the emulated EDRAM (the console GPU's small render memory) far more often than
+# the game reads old contents: full-screen clears and passes are now recognised in three more cases.
+banjo_gpu_proof_tess_leftover = true
+banjo_gpu_proof_triangle = true
+banjo_gpu_edram4_color_consumer = true
+banjo_gpu_edram4_alias_by_shape = true
+banjo_gpu_edram4_copy_batch = true
+# The scene is drawn once instead of once per tile (the Xbox 360 splits the 720p scene in two halves that share its
+# render memory, and the game sends every draw twice). Checks itself: every dropped second-pass draw is compared with
+# the one made for it ("tiles once" line in the log); a frame it does not recognise is drawn in two passes as before.
+banjo_gpu_tiles_once = true
+# Texture correctness: level range of a sampler by the console's rule, and array textures whose big level is not
+# loaded yet built from the first level present (this was the dark patches on Banjo's fur).
+banjo_native_mip_range = true
+banjo_native_stacked_baseless = true
+
+# After the second console run (2026-10-13 night; CPU group, the renderer thread; docs/enhancements.md).
+# A shader program the game loads again from the same place is recognised by one compare instead of three copies and
+# a hash (about a thousand times a frame); small vertex buffers are no longer sampled on every draw; the compare of
+# shader constants stops while it never finds an equal block.
+banjo_ring_shader_load_memo = true
+banjo_ring_vertex_epoch = true
+banjo_ring_constants_adaptive = true
+# Console trial, OFF here: the graphics driver's early depth rejection in the direction Banjo's scene uses
+# (configs/banjo_zcull_greater.toml turns it on; check the picture and the "scene" figure of the "GPU per Swap" line).
+banjo_gpu_zcull_greater = false
+
+# Render thread and GPU round of 2026-10-14 (docs/enhancements.md). CPU group, the renderer thread: a draw asks once
+# whether its vertex shader is the one loaded; the sampler cache compares in line; vertex buffers already proven
+# unchanged are bound before the upload tables are searched.
+banjo_ring_identity_once = true
+banjo_ring_sampler_fast = true
+banjo_ring_vertex_proven_first = true
+# Non-CPU group: the particle simulation's point draws no longer pull the render target's memory into place first
+# (what they draw there is overwritten by the next draw; checked every time, "dead raster" line in the log); the
+# two-rectangle rest of a Clear is drawn one rectangle at a time.
+banjo_gpu_dead_raster = true
+banjo_gpu_rect_split = true
+# Non-CPU group: a depth clear drawn in the depth-only mode counts as a full overwrite even with the alpha test left
+# on (no pixel shader runs in that mode). The loading screen's clear moved the whole depth buffer between two
+# layouts twice a frame without it ("depth-only mode with alpha bits set" in the "overwrite proof" log line).
+banjo_gpu_proof_depth_only = true
+# Non-CPU group: a Clear's edge strip (the part of a surface that is not a whole number of EDRAM tiles) takes its
+# tiles without bringing the rest of each tile over first; the rest is brought over only if something reads it before
+# the tile is overwritten whole ("split tiles" log line). The shadow maps' edge columns were 100 tiles a frame.
+banjo_gpu_edram4_split_tiles = true
+
+# Hot game functions as native copies (2026-10-14; CPU group; docs/enhancements.md): eighteen functions of the game run
+# as copies that keep their work in the processor; each compares itself with the original and turns itself off if they differ.
+banjo_cpu_native_sub_82376878 = true
+banjo_cpu_native_sub_823769E8 = true
+banjo_cpu_native_sub_82B6B258 = true
+banjo_cpu_native_sub_82373F70 = true
+banjo_cpu_native_sub_821F9BB8 = true
+banjo_cpu_native_sub_822DA610 = true
+banjo_cpu_native_sub_82377E88 = true
+banjo_cpu_native_sub_823828A8 = true
+banjo_cpu_native_sub_82376450 = true
+banjo_cpu_native_sub_8222A1D0 = true
+banjo_cpu_native_sub_82378BC0 = true
+banjo_cpu_native_sub_82229110 = true
+banjo_cpu_native_sub_82382780 = true
+banjo_cpu_native_xaudio_src_m03 = true
+banjo_cpu_native_sub_82A02D00 = true
+banjo_cpu_native_sub_822216C8 = true
+banjo_cpu_native_sub_82376768 = true
+banjo_cpu_native_sub_82229C90 = true
+
+# Texture memory on the Switch (2026-10-22, the 36z6 crash in the town): the textures the renderer keeps for the GPU are
+# released when they have not been used for a while and the heap (one for everything on the Switch) has less than this
+# many MB of room left; under half of it, after only a few frames unused and checked every second. A released texture is
+# made again from the game's memory when it is drawn (a short upload, the same picture). Before, nothing was ever
+# released on the Switch and loading the town filled the heap.
+# 2026-10-23 (batch 5): 384, not 512. The overclocked console run had 486 MB of the budget left, under the 512 MB
+# reserve, so cold textures were released every 32 frames (hundreds every 10 s) and made again on the render thread
+# (stutters). 384 keeps the margin for the town that filled the heap before any were released.
+banjo_renut_textures_reserve_mb = 384
+# 2026-10-23 (batch 5): the converted-stream cache at 192 MB (128 before): at 128 the overclocked run refused 15-50
+# thousand copies every 10 s and converted them again every frame. The 64 MB more comes out of the same 486 MB left.
+banjo_renut_stream_cache_mb = 128
+
+# Bulk localized copies (2026-10-22, your request; the method of the Bejeweled 3 port): every game function your
+# console profiles found hot that still ran as generated code (363 functions, app/src/cpu/hot/localized_bulk.txt) runs
+# as a localized copy. configs/banjo_cpu_native_bulk_off.toml is the A/B (all of them back to the generated code).
+banjo_cpu_native_bulk = true
+# The copies' self-check (the guard) is off: every hook calls its copy directly, with no countdown to the next checked
+# call (bejeweled3-nx's direct dispatch). configs/banjo_hot_guard_on.toml puts the guard back (the first 64 calls of
+# each thread and then 1 in 4096 run both versions and compare; a difference switches that copy off and is logged).
+banjo_hot_guard_calls = 0
+banjo_hot_guard_period = 0
+
+# Hand-written natives (2026-10-14; CPU group; docs/enhancements.md): the game's C runtime memcpy and memset and four
+# Direct3D writers (the two shader-constant writers and the two writers of the state flush) as native code written by
+# hand, in front of the copies of those functions. The first four switch each native off everywhere at once (the
+# generated copies then run); the six below are the hooks of the functions themselves.
+banjo_hand_memcpy = true
+banjo_hand_memset = true
+banjo_hand_constants = true
+banjo_hand_state_flush = true
+banjo_cpu_native_memcpy = true
+banjo_cpu_native_memset = true
+banjo_cpu_native_constants_vs = true
+banjo_cpu_native_constants_ps = true
+banjo_cpu_native_flush_constants = true
+banjo_cpu_native_flush_registers = true
+
+# Stability (2026-10-14, after the out-of-memory crash 6.5 minutes into a console run): megabytes of the graphics
+# memory budget kept free. With less left, textures not used for a few seconds are released as they are when the
+# texture cache reaches its limit. 0 = off.
+banjo_native_textures_reserve_mb = 192
+
+# Native Direct3D draw path (2026-10-14; CPU group; docs/d3d-native.md): DrawIndexedVertices and DrawVertices with their
+# draw-time state flush as native code that writes the same command bytes into Direct3D's command buffer; checked
+# against the original on a copy of the device (first calls of each thread, then 1 in 4096).
+banjo_d3d_native_draw_indexed = true
+banjo_d3d_native_draw_vertices = true
+
+# The API layer's operations (2026-10-14; non-CPU group; docs/d3d-native.md section 9). A marker around Direct3D's Clear
+# and Resolve tells the renderer when they cover a whole surface; the surface's partly covered edge tiles (pitch padding)
+# are then taken whole instead of being copied in from the EDRAM's previous owner every frame. On the PC with these
+# settings, the intro cutscene went from about 87 transfer tiles a frame to 0 (your last log: 23 ms of GPU a frame).
+banjo_d3d_api_clear = true
+banjo_d3d_api_resolve = true
+# Non-CPU group: a draw that writes nothing (no colour, depth, stencil or memory; occlusion queries are answered by the
+# renderer itself) is not drawn: about 850 a frame in the intro (from sasrt-nx's port).
+banjo_gpu_skip_dead_draws = true
+# CPU group, OFF: trusting Direct3D's vertex buffer Locks instead of re-reading vertex memory is not exact for this game
+# (loading rewrites vertex memory without a Lock). Kept for diagnostics only.
+banjo_ring_vertex_lock_rule = false
+
+# Package 26 (2026-10-17). The renderer, chosen at boot: "native" = banjo-nx's renderer (every banjo_* GPU and ring key
+# above), "renut" = Renut upstream's Direct3D-level renderer through plume/Vulkan (docs/renut-renderer-port.md). The CPU
+# and codegen work runs with either. Since package 28 this file boots Renut's renderer, every one of its optimisations on
+# (all its banjo_renut_* and banjo_gpu_* keys default to on; the master switches above are on);
+# configs/banjo_renderer_native.toml is this file with "native".
+banjo_renderer = "renut"
+# Package 29 (2026-10-17): Renut's renderer on deko3d (docs/deko3d-renderer.md) instead of Vulkan/NVK. Its compiled
+# shaders are in deko3d_shaders.bin next to the NRO; a shader that is not there is compiled on the console (a short
+# stall the first time) and added to it. "vulkan" = NVK as up to package 28b (configs/banjo_renut_vulkan.toml).
+renut_gpu_backend = "deko3d"
+renut_post_process_precision = "Game"
+# Package 30 (2026-10-17): the blend skip is off for Renut's renderer (it blurred what the depth of field keeps sharp,
+# and hid the river water on deko3d). banjo_gpu_blend_skip above is our native renderer's now; this is Renut's.
+# configs/banjo_renut_blendskip_ab.toml turns it on again, switched every 4 s, for a comparison only.
+banjo_renut_blend_skip = false
+# Package 31 (2026-10-18, the visual fixes; docs/deko3d-renderer.md section 12). Alpha to coverage with MSAA off is an
+# alpha test at 0.5, as the native renderer does: the GPU's own dither drew the grass, fur and foliage edges as a checker
+# pattern (the "non-square pixels"). configs/banjo_renut_a2c_dither.toml has the old way.
+banjo_renut_alpha_to_mask_test = true
+# The depth resolve's words carry the stencil, whose bit the depth of field tests to keep the characters sharp (Kazooie
+# blurred in close-ups without it). configs/banjo_renut_words_no_stencil.toml has the old way.
+banjo_renut_depth_words_stencil = true
+# Package 32 (2026-10-18): the Xbox's pixel centres (half a pixel; Renut's renderer drew everything half a pixel up-left,
+# which the depth of field's blur turned into a 4-pixel halo around Kazooie and Banjo), and the point size limits read as
+# the hardware reads them. configs/banjo_renut_half_pixel_off.toml has the old placement.
+banjo_renut_half_pixel_offset = true
+banjo_renut_point_minmax_radius = true
+# Package 33 (2026-10-18, GPU time on deko3d; docs/deko3d-renderer.md section 13). Colour resolves are drawn, not copied
+# on the copy engine (each copy idled the whole GPU before and after it); the depth of field reads the depth resolve's
+# words where they are (no copy every frame); depth targets are compressed; Zcull skips tiles a draw cannot pass the
+# depth test in. configs/banjo_deko3d_copied_resolves.toml, _words_copied, _depth_uncompressed and _zcull_off turn each
+# off, banjo_deko3d_gpu_before.toml all four.
+banjo_deko3d_draw_resolves = true
+banjo_gpu_depth_words_view = true
+banjo_deko3d_depth_compression = true
+banjo_deko3d_zcull = true
+# Package 33 shader work (docs/deko3d-shader-optimisations.md): the alpha test's function, the tessellation kind and the
+# vertex shader outputs the pixel shader reads are part of each pipeline (the shaders drop what they do not need; a
+# draw without the alpha test lets the GPU test depth before shading), and uam writes byte swaps as PRMT.
+# configs/banjo_deko3d_alpha_spec_off.toml, _tess_spec_off, _vs_outputs_off and _uam_prmt_off turn each off.
+banjo_deko3d_alpha_spec = true
+banjo_deko3d_tess_spec = true
+banjo_deko3d_vs_outputs = true
+banjo_deko3d_uam_prmt = true
+# Package 34: uam reuses what a shader computes again (value numbering: the early alpha test's texture fetch and the
+# main body's are one) and leaves out the SSY / SYNC pair around branches on constant-buffer values (which cannot
+# diverge). configs/banjo_deko3d_uam_gvn_off.toml and _uam_uniform_branches_off turn each off (each with a shader cache
+# of its own, deko3d_shaders_f<flags>.bin, compiled as it goes).
+banjo_deko3d_uam_gvn = true
+banjo_deko3d_uam_uniform_branches = true
+# Package 34: in the fur-type pixel shaders the main body's texture region goes ahead of Renut's early alpha test, so the
+# test reuses its fetches (the top shader of the GPU profile: 4 texture fetches fewer, 2 registers more).
+# configs/banjo_deko3d_early_hoist_off.toml is the A/B (its shaders are in deko3d_shaders.bin too).
+banjo_deko3d_early_hoist = true
+# Package 34: a resolve the same as the last one into its texture, from a source nothing has written since, is not done
+# again (the 10 s "depth resolve words" line counts them; the emulator route had 4 in 6 minutes).
+banjo_renut_resolve_skip = true
+# Package 34: a depth resolve writes its words (the depth and stencil as bytes, which the depth of field reads) only for
+# the destinations read that way (on the emulator route 1 of the 5 a frame; the shadow maps never): about 14 MB a frame
+# less to write. configs/banjo_renut_words_always.toml writes them every time (as before).
+banjo_renut_depth_words_lazy = true
+# Package 35 (GPU, no shader changes): barriers recorded in a row are one (a drain instead of several), a transition into
+# a layout that is only written keeps the texture cache, and one read layout to another needs none.
+# configs/banjo_deko3d_barriers_before.toml turns both off. The deko3d line every 10 s counts the barriers.
+banjo_deko3d_barrier_merge = true
+banjo_deko3d_barrier_lean = true
+# Package 35: a depth resolve of a whole target, without its words, is left in the target's image: the textures sample it
+# there, and at the target's next whole clear the texture takes that image (the target another). The shadow maps are no
+# longer copied each frame (the "depth hand-over" line every 10 s). configs/banjo_deko3d_depth_handover_off.toml draws
+# every depth resolve as before.
+banjo_deko3d_depth_handover = true
+# Package 35: D24S8 depth targets (the shadow maps, small render-to-texture targets) as 24-bit unorm depth with stencil,
+# the Xbox 360's own format, instead of 32-bit float: half the bytes. Their depth is the 24-bit value the console keeps
+# (the float targets held more bits). The 20e4 float scene depth stays 32-bit float.
+# configs/banjo_deko3d_depth24_off.toml is the A/B.
+banjo_deko3d_depth24 = true
+# Package 35 (render thread): a draw's float constants and SharedConstants go to the GPU as updates of only the 64-byte
+# groups that changed (pipelined constant-buffer updates), not as a new 5.7 KB upload per draw.
+# configs/banjo_deko3d_push_constants_off.toml is the A/B.
+banjo_deko3d_push_constants = true
+# Package 35 (render thread, proposal 23): the upload ring's cache clean done by a thread on the background core.
+banjo_deko3d_ring_cleaner = true
+# Package 35 (input latency): the GPU gets each frame's work in pieces at the game's kicks, not all at the present, so
+# it starts sooner; and when the render thread is the slower one, the game reads the controller later in the frame
+# (by the time its frame would otherwise wait), so the picture shows newer input. The [latency] line every 10 s gives
+# input -> swap -> present. configs/banjo_deko3d_kick_submit_off.toml and banjo_late_input_off.toml are the A/Bs.
+banjo_deko3d_kick_submit = true
+banjo_late_input = true
+# Input latency (2026-10-20, no vsync): where the GPU is the limit, the next frame is recorded (and the game
+# released) only when the GPU has the current frame's last part left, instead of a whole frame ahead.
+# The [latency] lines say what it does (input -> GPU done, frames held back). Same pixels. ON since package 36k (the
+# console's 36j logs: at the 30 fps cap the GPU, about 80 % busy, is still on the frame before when a frame's work
+# arrives, so its controller read waits about a frame in the queue); configs/banjo_deko3d_latency_trim_off.toml is
+# the old way. OFF again since 36l: with eager kicks a frame's last part is a small list, so holding until only it is
+# left starved the GPU (36k on the console: every held frame ran it dry, the trim backed off).
+banjo_deko3d_latency_trim = false
+# Package 36s: banjo_late_input_gpu (36l-36r: late input also taking the GPU queue's slack) and its margin key are
+# removed. Your console runs: no gain at the 30 fps cap, and in scenes just able to hold 30 it held the controller
+# read back up to 29 ms and cost about 6 fps (36q). Plain late input (above) stays.
+# Package 35b (latency batch 3): the frame limiter (frame_cap) follows the display's refresh: each frame is released at
+# a refresh plus a phase, found by measurement as late as the images still reach the display at the refresh they did
+# before (the limiter's own 33.3 ms timer slid against the display: up to a refresh more of waiting, and uneven frames).
+# The [display] line every 10 s gives present -> display and input -> display. OFF in package 35b: in the emulator
+# every run with it on stalled or hung (not yet explained). ON since package 36i at the user's request, for the console
+# (the Ryujinx test runs keep it off); configs/banjo_display_sync_off.toml is the old way.
+# banjo_display_phase_auto = false with banjo_display_phase_us sets the phase by hand.
+banjo_display_sync = true
+banjo_display_phase_auto = true
+banjo_display_phase_max_us = 12000
+# Package 36 (2026-10-19 night). GPU: texture size queries read from a buffer (A5E2: 8 -> 4 texture operations a pixel
+# over the whole screen); discarding pixel shaders of draws that write no depth or stencil (particles and other
+# blended effects; the fur shells write depth) depth tested before they run; both the same pixels. The fur family with 32 GPRs at most is an A/B, off.
+banjo_deko3d_txq_constants = true
+banjo_deko3d_early_z = true
+banjo_deko3d_gpr32 = false
+# GPU A/B (package 36c): the heaviest lit shaders' point lights in branches on their reach (warps out of a light's
+# reach skip it); the same pixels, off until the console says it is faster.
+banjo_deko3d_light_branch = false
+# GPU (package 36g): the fur's meshes skinned once a frame; the other shells read the skinned rows (half the vertex
+# work of their draws). The same pixels. On at the user's request (2026-10-20); configs/banjo_deko3d_skin_once_off.toml
+# is the old way, configs/banjo_deko3d_skin_once_ab.toml switches it off and on every 4 s in one run.
+banjo_deko3d_skin_once = true
+# Input latency (package 36i): the frame goes to the GPU in more, earlier parts (lists of 100 draws, each at its own
+# kick), so at the frame cap the GPU works while the render thread replays the frame. Same pictures. On at the user's
+# request (2026-10-20); configs/banjo_deko3d_eager_kicks_off.toml is the old way, _ab.toml switches it every 4 s.
+banjo_deko3d_eager_kicks = true
+# Anti-aliasing (2026-10-21, your request): SMAA 1x (Jimenez et al.'s SMAA, MIT) on the 3D image right after the
+# game's final composite and before the HUD is drawn over it, so the HUD and its text stay sharp. SMAA's medium
+# preset; banjo_renut_smaa_quality = 2 is the high one (smoother diagonals, more GPU time). It smooths edges: not the
+# game's own picture. On in every config (your call); false here turns it off. configs/banjo_renut_smaa_ab.toml
+# switches it every 4 s (its GPU time in the "[renut A/B]" lines), _high.toml is the high preset, _compare.toml
+# writes same-frame before/after pictures.
+banjo_renut_smaa = true
+# NOT exact, your call (2026-10-21): 75 % of each fur part's shells (three of every four; 16 of Banjo's 21, his
+# outermost shell drawn, so the fur keeps its length; the dialogue portrait's too). 100 draws every shell as the
+# game; configs/banjo_renut_fur_shells_all.toml does that.
+banjo_renut_fur_shells_percent = 75
+# NOT exact, your call (2026-10-21): the dialogue portrait (the 96 x 96 box in the dialogue window) with half its fur
+# shells (11 of 21) and 2x MSAA instead of the game's 4x (1 = none, 0 = the game's).
+# configs/banjo_renut_portrait_full.toml puts both back.
+banjo_renut_portrait_fur_shells_percent = 50
+banjo_renut_portrait_msaa_samples = 2
+# NOT exact, your request (2026-10-21): the internal resolution. The 3D image at 1152x648 in handheld mode and 1536x864
+# docked; the HUD, menus and text at the display's resolution (1280x720 handheld, 1920x1080 docked: the swapchain is
+# made at 1920x1080 when docked, as sa2-nx does). Right after the game's final composite and SMAA the image is scaled
+# up and the HUD is drawn over it. Menus and loading screens (no composite) are drawn at the display's resolution
+# whole. Shadow maps and the blur buffers keep the console's sizes. Any height from 360 to 1080 for either mode
+# (rounded to a multiple of 9: 648, 702, 756, 810, 864, 900, ...; read at start). configs/banjo_renut_native_720p.toml
+# is the game's own 720p.
+banjo_renut_render_height_handheld = 720
+banjo_renut_render_height_docked = 720
+banjo_renut_display_height_docked = 1080
+# The upscale: 0 = bilinear (your choice, every config: one sample a pixel, the cheapest), 1 = bicubic Catmull-Rom
+# (sharper, five samples a pixel).
+banjo_renut_upscale_filter = 0
+# Your call (2026-10-21, package 36z2): no extra mip level for textures drawn above 1x (docked: the 3D image at 1.2x,
+# the HUD at 1.5x; about 4 ms a docked frame in 36z). NOT exact docked: the blur passes read the full-size image only,
+# as handheld and the game's 720p do. No effect in handheld. configs/banjo_renut_host_mips_on.toml puts them back.
+banjo_renut_host_mips = false
+# Your request (2026-10-21, after the freeze in a shader compile): no draw waits for a shader compile. A shader variant
+# missing from deko3d_shaders.bin is compiled in the background while its draws use the shader's generic variant (the
+# same pixels, a little slower), and the draw takes its own variant once it is done. deko3d_shaders.bin has the generic
+# variant of every shader in the game. false: the draw waits, as before (configs/banjo_deko3d_async_variants_off.toml).
+banjo_deko3d_async_variants = true
+# The colour flash: while the game stalls (loading) the last frame is not re-presented unless a menu is up (the screen
+# keeps the last frame, as the console does), and never from a texture no resolve wrote.
+banjo_renut_stall_present = false
+# The colour flash, 2nd kind (2026-10-20): textures sampled through the swizzle of the device's fetch constant (what
+# the GPU reads), not their header's in guest memory, which the game may be rewriting (a bloom level read as solid
+# yellow turned the whole frame yellow). The same pixels whenever the two agree.
+banjo_renut_device_swizzle = true
+# NOT exact, your call (2026-10-20): 1 draws every fur shell (as the game); 2 draws every 2nd shell of each mesh
+# (11 of Banjo's 21: thinner fur, the same length), 3 every 3rd. The fur is about 18 ms of the heaviest frame.
+banjo_renut_fur_shells = 1
+# NOT exact, your call (2026-10-20): the same for the dialogue portrait (targets of 128 x 128 or less), where 21
+# shells cost ~2.5 ms of the heaviest frames for a few thousand pixels; 3 draws 7 of 21.
+banjo_renut_portrait_fur_shells = 1
+# Package 36d (GPU, exact): each bone row read with one 128-bit load instead of four 32-bit ones (the fur and
+# shadow-map vertex shaders, memory-bound on the console). Needs 36d's deko3d_shaders.bin; off uses
+# deko3d_shaders_f447.bin (in the package too).
+banjo_deko3d_uam_wide_rows = true
+# The gamma ramp the game loads (about x^1.17: darker midtones), which the Xbox 360's display and banjo-nx's
+# own renderer apply and Renut's renderer never has: on, the output looks as on a 360 (the deko3d builds'
+# picture changes). Off by default: your call (2026-10-20).
+banjo_renut_game_gamma = false
+# Package 34 (CPU, 2026-10-19): the render thread's cached vertex and index copies proven by the store cards (every guest
+# store outside the stack marks its 4 KB page; Renut hashes a copy only when one of its pages was written since it was
+# last proven) instead of hashed whole after every kick (gameplay: 16 MB a frame, a quarter of the render thread). The
+# "store cards" line every 10 s counts them. configs/banjo_renut_store_cards_off.toml hashes as before (the marks stay).
+banjo_renut_store_cards = true
+# Package 34 (CPU): the render thread's per-draw lookups memoised (render targets, texture bindings, the recording
+# threads' buffer lookups), each keyed by everything it reads. configs/banjo_renut_cpu_memos_off.toml is the A/B.
+banjo_renut_cpu_memos = true
+# Package 34 (CPU): the pipeline lookup memoised before it hashes the draw's state.
+# configs/banjo_renut_pipeline_memo_off.toml is the A/B.
+banjo_renut_pipeline_memo = true
+# Diagnostics for Renut's renderer: its GPU time by pass every 10 s ("GPU profile" lines; the console's timer ticks
+# are corrected since package 28), and one frame every 30 s of its resolves, clears and target changes ("[trace]").
+# The "[renut]" lines every 10 s (frame rate, render thread, GPU, draw kinds, depth words, check worker) are always on;
+# switch_profile_stacks above samples every thread's code (logs/rex/rex_profile.log).
+renut_gpu_profile = 10.0
+banjo_renut_diag_resolve_trace = true
+# Package 30 (your request): the GPU profile split by pixel shader and blending as well ("GPU profile" lines: the main
+# 1280x720 pass in ms, with draws a frame), to see where deko3d's GPU time goes. Its timestamps cost a little GPU and
+# render thread time; false gives the plain profile.
+banjo_renut_diag_gpu_shaders = true
+# Frame pacing (your "it likes 20 if it cannot hold 30"): the game no longer waits for the display's vblanks itself
+# (its present interval rounded every frame to 33 or 50 ms); the frame cap holds 30 and a frame rate between 20 and 30
+# shows as it is. configs/banjo_pacing_game.toml puts the game's own pacing back.
+target_refreshRate = -1
+frame_cap = "Off"
+
+# ---- Controls per player (2026-10-21, from sa2-nx). Keep these sections at the END of the file: in TOML every line
+# after a [section] header belongs to that section. ----
+# Which Switch buttons press each Xbox 360 button; "" = the default (input_xbox_layout above for a/b/x/y; the button in
+# the same place for the rest). A comma-separated list of: A B X Y L R ZL ZR PLUS MINUS LSTICK RSTICK UP DOWN LEFT RIGHT
+# SL SR, or NONE. Example: a = "B, ZR". Player 1's map also serves players 3 and 4. Read at start.
+
+# Four-core mode (2026-10-27, NetherSX2_nx's layout; docs/four-core-mode.md). With a launch that grants all four
+# cores (the forwarder below), audio, XAudio's mixer, the XMA decoder and the shader compiles run on core 3 and the
+# game on 0-2. Running under banjo_forwarder_program_id, Banjo writes that forwarder's four-core NPDM to
+# sdmc:/atmosphere/contents/<id>/exefs/main.npdm; launch the forwarder a second time to get the cores. The log line
+# "[banjo] system core: process cores 0xF, system core 3 ..." confirms it. No effect with the usual three cores.
+# After the first four-core console run (audio stutters: core 3 full, the system takes about half of it): only
+# the audio output, the Audio Worker and XAudio's mixer go there; the mixer at priority 45 (0x2D); the shader
+# compiles and the XMA Decoder stay on cores 0-2 (set them true to try them on core 3 again).
+# 2026-10-28 (the user's request): the uam shader compile thread alone goes to core 3 (banjo_system_core_uam), at
+# the lowest priority (the audio threads there go first) and held to 10 % of the core by its rests
+# (banjo_deko3d_background_compile_share); the pipeline prebuild workers stay on cores 0-2.
+# Dynamic resolution (2026-10-28, the user's request): the 3D image between 540 and 720 lines handheld and between
+# 720 and 1080 docked (900 before night_gpu5; at 1080 the 3D is at the display's own size, the HUD drawn into it
+# without the upscale): the low height while the GPU's time a frame is above 34.5 ms (banjo_renut_dynamic_gpu_ms,
+# the user's choice; 40 before), the high one again once it has fitted for banjo_renut_dynamic_up_s (1 s, quick;
+# down at least 5 s after a change; the log says each change). Docking or undocking starts at 720. The HUD stays at
+# the display's resolution.
+# banjo_renut_dynamic_resolution = false (renut_dynamic_off.toml) keeps 648 / 864 as before.
+# night_gpu5 (the user's request): banjo_renut_dynamic_steps = 4 heights between the ends: handheld 540 576 612 648
+# 684 720, docked 720 792 864 936 1008 1080. Down goes to the highest that is predicted to fit, up to the highest
+# that fits with room (the log names each change). 0 = only the two ends.
+banjo_renut_dynamic_resolution = false
+banjo_renut_dynamic_handheld_low = 540
+banjo_renut_dynamic_handheld_high = 720
+banjo_renut_dynamic_docked_low = 720
+banjo_renut_dynamic_docked_high = 1080
+banjo_renut_dynamic_steps = 4
+banjo_renut_dynamic_gpu_ms = 34.5
+banjo_renut_dynamic_up_s = 1.0
+banjo_system_core = 1
+banjo_system_core_compiles = false
+banjo_system_core_uam = true
+banjo_system_core_xma = false
+banjo_system_core_mixer_priority = 45
+banjo_forwarder_program_id = ""
+banjo_renut_host_packets = false
+banjo_renut_literals_resident = true
+banjo_renut_replay_lookahead = false
+banjo_renut_texture_slot_skip = false
+banjo_renut_replay_record_prefetch = false
+banjo_renut_shadow_sort = false
+banjo_renut_clear_repeat = true
+banjo_deko3d_provisional_count = true
+banjo_renut_diag_terrain = true
+# Title update 3 (2026-10-29): banjo-nx is now the updated game (docs/title-update-3.md). The update's default.xexp
+# goes next to default.xex in game_root, its db_index.txt and 12 bundles in sdmc:/switch/katamari-nx/update/, and the
+# DLC package (optional) in sdmc:/switch/katamari-nx/dlc/. The native copies of game functions are called directly
+# (no guard): the first update package's console session compared 215,000 calls of its 512 copies with the
+# game's own code under the guard and found 0 differences (2026-10-29; the user: guard off from then on).
+# renut_guard.toml is this file with the guard on (banjo_hot_guard_calls / banjo_hot_guard_period), for a check.
+renut_shadow_resolution = "1x"
+renut_ambient_occlusion = "Half"
+katamari_hand_matrix_copy = true
+katamari_hand_matrix_multiply = true
+katamari_hand_matrix_translation = true
+katamari_hand_sphere_box = false
+banjo_xma_frame_cache = false
+katamari_dlc_unlock_packs = false  # true: also load the accessory / character / special accessory packs
+
+[input_p1]
+a = ""
+b = ""
+x = ""
+y = ""
+lb = ""
+rb = ""
+lt = ""
+rt = ""
+start = ""
+back = ""
+ls = ""
+rs = ""
+up = ""
+down = ""
+left = ""
+right = ""
+
+[input_p2]
+a = ""
+b = ""
+x = ""
+y = ""
+lb = ""
+rb = ""
+lt = ""
+rt = ""
+start = ""
+back = ""
+ls = ""
+rs = ""
+up = ""
+down = ""
+left = ""
+right = ""

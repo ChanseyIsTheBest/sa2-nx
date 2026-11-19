@@ -60,12 +60,6 @@ def main() -> None:
         for register in range(16):
             put(container, shader + 32 + register * 4, register << 8)
     container[virtual_size:] = raw
-    # sa2-nx: no constant table and no definition table, whatever the template had. With a template from the game
-    # (a real CTAB) XenosRecomp would not link the wrapped shader by register (it then rejects every undeclared
-    # fetch), and the template's DEF literals would be baked into a shader they do not belong to. Direct3D's own
-    # shaders get their constants from the ring (SET_CONSTANT), which the native renderer passes through.
-    put(container, 16, 0)  # constantTableOffset
-    put(container, 20, 0)  # definitionTableOffset
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(container)
 

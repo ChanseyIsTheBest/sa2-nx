@@ -46,9 +46,16 @@ bool Lookup(u32 guest_va, RecordKind *out_kind);
 // value may name a destroyed record.
 uint64_t Generation();
 
+// rr6-nx (2026-11-08, rr6_records_lockfree; port 47): the lock-free table over the record heap. MarkOwned keeps
+// resource.cpp's owned headers in it (called under that set's lock: true when one is added, false only when one was
+// erased). OwnedFast and OursFast (a record or an owned header): 1 or 0, or -1 when the locked containers must answer.
+void MarkOwned(u32 guest_va, bool owned);
+int OwnedFast(u32 guest_va);
+int OursFast(u32 guest_va);
+
 // A block of the guest physical window for renderer-owned guest memory (the
 // Begin*Vertices scratch). Never freed. 0 on failure.
-u32 AllocPhysicalBlock(u32 size);
+u32 AllocPhysicalBlock(u32 size, bool quiet = false);  // quiet: no error logged on failure (port 161)
 
 } // namespace records
 

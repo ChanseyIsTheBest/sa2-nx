@@ -11,13 +11,34 @@
 #include "renut_engine/gpu/backend/video.h"
 #include "renut_engine/gpu/log.h"
 
+#if defined(__SWITCH__)
+#include <unistd.h>  // banjo-nx (2026-10-28): sbrk (HeapRoomShort)
+extern "C" char *fake_heap_end;  // libnx: the end of the malloc heap
+#endif
+
 namespace renut::gpu {
+
+namespace {
+// banjo-nx (2026-10-28, the console's new area): the heap's room (what sbrk has not handed out) below 256 MB, the rule
+// of f7b. Switch only.
+bool HeapRoomShort() {
+#if defined(__SWITCH__)
+  const char *top = static_cast<const char *>(sbrk(0));
+  const uint64_t room = (top && fake_heap_end > top) ? uint64_t(fake_heap_end - top) : 0;
+  return room < (uint64_t(256) << 20);
+#else
+  return false;
+#endif
+}
+constexpr uint32_t kShortHeapTrimResets = 30;
+}  // namespace
 
 bool UploadRing::Init(plume::RenderDevice *device, const char *name, bool constant_sets, bool host_cached) {
   device_ = device;
   name_ = name;
   constant_sets_ = constant_sets;
   host_cached_ = host_cached;
+  ++s_resets_;  // banjo-nx (2026-10-23, batch 6): its chunks go
   chunks_.clear();
   current_ = 0;
   offset_ = 0;
@@ -72,9 +93,15 @@ bool UploadRing::AddChunk(uint64_t min_size) {
 }
 
 void UploadRing::Reset() {
+  ++s_resets_;  // banjo-nx (2026-10-23, batch 6)
   window_chunks_ = std::max(window_chunks_, current_ + 1);
   // banjo-nx: banjo_renut_memory_policy's trim interval (kTrimResets without it).
-  if (++window_resets_ >= banjo::renut_gpu::UploadTrimResets(kTrimResets, kFramesInFlight)) {
+  // banjo-nx (2026-10-28, the console's new area): after kShortHeapTrimResets while the heap is short (a ring kept
+  // 224-320 MB of a loading burst's chunks for over a minute, the heap's room at 18-34 MB). The window starts again
+  // either way (its busiest frame's chunks stay, the rest go).
+  ++window_resets_;
+  if (window_resets_ >= banjo::renut_gpu::UploadTrimResets(kTrimResets, kFramesInFlight) ||
+      (window_resets_ >= kShortHeapTrimResets && HeapRoomShort())) {
     // A large chunk made for one big allocation goes too; the first one stays.
     if (chunks_.size() > window_chunks_)
       chunks_.resize(std::max<size_t>(window_chunks_, 1));

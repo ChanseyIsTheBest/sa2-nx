@@ -38,9 +38,37 @@ MACROS = MARKER + '''
 #if defined(__aarch64__)
 extern "C" unsigned char g_rex_atomic_legacy_barrier;
 #endif
+#if defined(REX_NX_CENSUS_ON)
+// blur-nx (2026-11-13, #32 of Blur's docs/cpu-near-exact-50-1113.md): the PC census of which threads use each word a
+// guest compare-and-swap writes (app/src/cpu/banjo_codegen_checks.cpp).
+extern "C" void RexNxCasCensus(const void* word);
+#endif
+#if defined(__aarch64__)
+// blur-nx (2026-11-16, #163 of docs/cpu-codegen-recheck-360-precision-1114.md): 1 = the sequentially consistent loop
+// (ldaxr / stlxr) instead of the relaxed one (sdk/src/core/atomic_posix.cpp; the app's key blur_guest_cas_relaxed).
+extern "C" unsigned char g_rex_guest_cas_seq_cst;
+#endif
+#ifndef REX_GUEST_CAS_ORDER
+// renut-ultimate (2026-11-17, port 150): the order of the relaxed form, written here by tools/guest_cas.py from the
+// tree. Relaxed for a game with no isync. Acquire (ldaxr / stxr) for one with any: the PowerPC acquire idiom
+// `lwarx; stwcx.; bne-; isync` orders every later access after the lwarx, and the generator writes isync as nothing,
+// so the exclusive load must give that order itself. (lwsync, sync and eieio are fences of their own: guest_fences.py.)
+#define REX_GUEST_CAS_ORDER @ORDER@
+#endif
 template <typename T, typename E, typename D>
 [[gnu::always_inline]] static inline bool RexGuestCas(T* p, E e, D d) noexcept {
+#if defined(REX_NX_CENSUS_ON)
+  RexNxCasCensus(static_cast<const void*>(p));
+#endif
   T expected = static_cast<T>(e);
+#if defined(__aarch64__) && !defined(REX_GUEST_CAS_SEQ_CST)
+  // blur-nx (2026-11-16, #163): on the 360 lwarx / stwcx. order no other access; the game orders with its own
+  // lwsync / sync / eieio (REX_GUEST_LWSYNC and kin, tools/guest_fences.py; Blur has no isync), so the exclusives
+  // need no acquire or release of their own: ldxr / stxr. Exact with respect to the 360's memory model.
+  // renut-ultimate (2026-11-17): REX_GUEST_CAS_ORDER, acquire in a game with isync (above).
+  if (!g_rex_guest_cas_seq_cst) [[likely]]
+    return __atomic_compare_exchange_n(p, &expected, static_cast<T>(d), false, REX_GUEST_CAS_ORDER, __ATOMIC_RELAXED);
+#endif
   const bool swapped = __atomic_compare_exchange_n(p, &expected, static_cast<T>(d), false, __ATOMIC_SEQ_CST,
                                                    __ATOMIC_SEQ_CST);
 #if defined(__aarch64__)
@@ -76,16 +104,31 @@ def main():
             changed += 1
             if not a.check:
                 open(path, 'w', encoding='utf-8', newline='\n').write(text.replace(old, new))
+    # renut-ultimate (2026-11-17, port 150): the game's isync instructions (the generator's comment line before each
+    # statement; isync's statement is nothing) decide the relaxed form's order (REX_GUEST_CAS_ORDER above).
+    isyncs = sum(len(re.findall(r'(?m)^\s*// isync\s*$', open(os.path.join(a.gen, f), encoding='utf-8').read()))
+                 for f in files)
+    block = MACROS.replace('@ORDER@', '__ATOMIC_ACQUIRE' if isyncs else '__ATOMIC_RELAXED')
     pch = os.path.join(a.gen, pchs[0])
     text = open(pch, encoding='utf-8').read()
-    if not a.undo and MARKER not in text:
-        anchor = '#define REX_LOAD_U8(x)'
-        if anchor not in text:
-            sys.exit('ERROR (post-codegen patch): guest_cas: no REX_LOAD_U8 in %s: the generated pch changed' % pch)
+    if not a.undo and block not in text:
+        if MARKER in text:
+            # An older form of the block (or the other order) in place of, as loop_locals.py does with its own.
+            start = text.index(MARKER)
+            tail = '#define REX_GUEST_CAS(p, e, d) RexGuestCas((p), (e), (d))\n#endif\n#endif\n'
+            end = text.index(tail, start) + len(tail)
+            new_text = text[:start] + block + text[end:]
+            print('guest_cas: the macros in %s were replaced by the current ones' % pch)
+        else:
+            anchor = '#define REX_LOAD_U8(x)'
+            if anchor not in text:
+                sys.exit('ERROR (post-codegen patch): guest_cas: no REX_LOAD_U8 in %s: the generated pch changed' % pch)
+            new_text = text.replace(anchor, block + anchor, 1)
         if not a.check:
-            open(pch, 'w', encoding='utf-8', newline='\n').write(text.replace(anchor, MACROS + anchor, 1))
-    print('guest_cas%s: %d compare-and-swap sites %s in %d files (%d already in that form)' %
-          (' (check only)' if a.check else '', sites, 'restored' if a.undo else 'rewritten', changed, present))
+            open(pch, 'w', encoding='utf-8', newline='\n').write(new_text)
+    print('guest_cas%s: %d compare-and-swap sites %s in %d files (%d already in that form); %d isync: the relaxed '
+          'form is %s' % (' (check only)' if a.check else '', sites, 'restored' if a.undo else 'rewritten', changed,
+                          present, isyncs, 'acquire (ldaxr / stxr)' if isyncs else 'relaxed (ldxr / stxr)'))
 
 
 if __name__ == '__main__':

@@ -48,7 +48,7 @@
  *
  *   It only ever lowers back to what the console had at the start: nothing is ever raised above
  *   that. And if this firmware did not have the "high GPU + unchanged RAM" pair, the GPU is left
- *   as it was rather than raising the RAM; sa2_switch_ram_1600 opts into that trade.
+ *   as it was rather than raising the RAM; masseffect_switch_ram_1600 opts into that trade.
  */
 
 #include "rex/ui/switch_apm.h"
@@ -264,7 +264,7 @@ extern "C" void RexSwitchApmApply(void) {
     if (gpu_rose && still_memory) {
       if (!still_of_truth) {
         std::fprintf(stderr,
-                     "[apm] 0x%08X raises the memory to %.1f MHz, but sa2_switch_ram_1600 is "
+                     "[apm] 0x%08X raises the memory to %.1f MHz, but masseffect_switch_ram_1600 is "
                      "true: it is accepted and the memory is NOT watched\n",
                      c.config, double(emc1) / 1e6);
         std::fprintf(stderr, "[apm] SET 0x%08X: GPU %.1f MHz (was %.1f), memory %.1f MHz\n",
@@ -295,7 +295,7 @@ extern "C" void RexSwitchApmApply(void) {
    * the EMC of the active apm configuration, and clkrst cannot fight that.
    *
    * So the console is left as it was, and the log says exactly what trade is available and how to
-   * take it (sa2_switch_ram_1600).
+   * take it (masseffect_switch_ram_1600).
    */
   if (has_original && R_SUCCEEDED(apmSetPerformanceConfiguration(mode, config_original))) {
     u32 gpu2 = 0, emc2 = 0;
@@ -304,7 +304,7 @@ extern "C" void RexSwitchApmApply(void) {
                  "[apm] this firmware has NO %d MHz configuration that leaves the memory "
                  "at %.1f MHz; going back to the original 0x%08X (GPU %.1f MHz, memory %.1f MHz).\n"
                  "[apm] IF YOU PREFER THE HIGH GPU CLOCK EVEN IF THE RAM GOES UP TO 1600: set "
-                 "sa2_switch_ram_1600 = true in sa2.toml\n",
+                 "masseffect_switch_ram_1600 = true in masseffect.toml\n",
                  mhz, double(emc0) / 1e6, config_original, double(gpu2) / 1e6, double(emc2) / 1e6);
   } else {
     std::fprintf(stderr, "[apm] no %d MHz configuration worked and the original could NOT be restored: "

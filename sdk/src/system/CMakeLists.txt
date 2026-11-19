@@ -19,6 +19,7 @@ set(REXSYSTEM_SOURCES
     xsocket.cpp
     xsymboliclink.cpp
     xobject.cpp
+    wait_registry.cpp  # blur-nx (2026-11-14): the stall dumps' guest waits
     xmodule.cpp
     guest_path.cpp
 

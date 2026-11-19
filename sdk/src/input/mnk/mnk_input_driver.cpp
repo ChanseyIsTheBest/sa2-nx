@@ -16,6 +16,7 @@
 #include <rex/ui/keybinds.h>
 #include <rex/ui/virtual_key.h>
 #include <rex/ui/window.h>
+#include <rex/chrono/clock.h>
 
 #include <algorithm>
 #include <string>
@@ -25,6 +26,13 @@
 #include <cstring>
 #include <string_view>
 
+// Port 159 (from fnxf_xiii): the keyboard as a pad also for XInputGetKeystroke (the keybind_* keys become VK_PAD_*
+// keystroke events, with the SDL driver's repeat: 400 ms, then every 100 ms), and the packet number advanced only when
+// the state changes (as real XInput and the SDL driver: on every poll a held key looked like a new press each frame).
+// PC only. Off: as before (menus that read keystrokes do not react to the keyboard).
+REXCVAR_DEFINE_BOOL(banjo_mnk_pad_keystrokes, false, "Input",
+                    "Keyboard as a pad: keystroke events for XInputGetKeystroke, and the packet number advanced only "
+                    "when the state changes");
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
 REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
                     "Use the mouse for the right stick. Off means the right stick comes "
@@ -261,10 +269,10 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  // Mass Effect test harness (host only): SA2_AUTO_INPUT="T:BTN[:SECONDS];..." scripts the pad
+  // Mass Effect test harness (host only): MASSEFFECT_AUTO_INPUT="T:BTN[:SECONDS];..." scripts the pad
   // from the first poll, ignoring window focus, so unattended runs can get past menus and move.
   // BTN: A B X Y START BACK LB RB LT RT UP DOWN LEFT RIGHT LX+ LX- LY+ LY- RX+ RX- RY+ RY-.
-  if (const char* script = std::getenv("SA2_AUTO_INPUT"); script && *script) {
+  if (const char* script = std::getenv("MASSEFFECT_AUTO_INPUT"); script && *script) {
     static const auto start = std::chrono::steady_clock::now();
     const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     uint16_t b = 0; uint8_t lt = 0, rt = 0; int32_t lx = 0, ly = 0, rx = 0, ry = 0;
@@ -312,6 +320,14 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
                           has_focus_ && is_active());
 
   if (!is_active() || !has_focus_) {
+    if (REXCVAR_GET(banjo_mnk_pad_keystrokes)) {
+      // Port 159: a released pad is a new packet only if something was held before.
+      X_INPUT_GAMEPAD idle = {};
+      if (std::memcmp(&idle, &last_gamepad_, sizeof(idle)) != 0) {
+        last_gamepad_ = idle;
+        ++packet_number_;
+      }
+    }
     if (out_state) {
       std::memset(out_state, 0, sizeof(*out_state));
       out_state->packet_number = packet_number_;
@@ -400,7 +416,23 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
   };
 
-  packet_number_++;
+  if (REXCVAR_GET(banjo_mnk_pad_keystrokes)) {
+    // Port 159: the packet number advances only when the state changes (real XInput, the SDL driver).
+    X_INPUT_GAMEPAD pad = {};
+    pad.buttons = buttons;
+    pad.left_trigger = lt;
+    pad.right_trigger = rt;
+    pad.thumb_lx = clamp16(lx);
+    pad.thumb_ly = clamp16(ly);
+    pad.thumb_rx = clamp16(rx);
+    pad.thumb_ry = clamp16(ry);
+    if (std::memcmp(&pad, &last_gamepad_, sizeof(pad)) != 0) {
+      last_gamepad_ = pad;
+      ++packet_number_;
+    }
+  } else {
+    packet_number_++;
+  }
 
   if (out_state) {
     out_state->packet_number = packet_number_;
@@ -428,6 +460,60 @@ X_RESULT MnkInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   std::lock_guard lock(state_mutex_);
+  if (REXCVAR_GET(banjo_mnk_pad_keystrokes)) {
+    // Port 159 (from fnxf_xiii): key presses become pad keystroke events (the queue was never filled).
+    struct Bind {
+      std::string keys;
+      uint16_t vk;
+    };
+    const Bind binds[] = {
+        {REXCVAR_GET(keybind_a), 0x5800},           {REXCVAR_GET(keybind_b), 0x5801},
+        {REXCVAR_GET(keybind_x), 0x5802},           {REXCVAR_GET(keybind_y), 0x5803},
+        {REXCVAR_GET(keybind_right_shoulder), 0x5804}, {REXCVAR_GET(keybind_left_shoulder), 0x5805},
+        {REXCVAR_GET(keybind_dpad_up), 0x5810},     {REXCVAR_GET(keybind_dpad_down), 0x5811},
+        {REXCVAR_GET(keybind_dpad_left), 0x5812},   {REXCVAR_GET(keybind_dpad_right), 0x5813},
+        {REXCVAR_GET(keybind_start), 0x5814},       {REXCVAR_GET(keybind_back), 0x5815},
+        {REXCVAR_GET(keybind_lstick_press), 0x5816}, {REXCVAR_GET(keybind_rstick_press), 0x5817},
+        {REXCVAR_GET(keybind_left_trigger), 0x5806}, {REXCVAR_GET(keybind_right_trigger), 0x5807},
+        {REXCVAR_GET(keybind_lstick_up), 0x5820},    {REXCVAR_GET(keybind_lstick_down), 0x5821},
+        {REXCVAR_GET(keybind_lstick_right), 0x5822}, {REXCVAR_GET(keybind_lstick_left), 0x5823},
+        {REXCVAR_GET(keybind_rstick_up), 0x5830},    {REXCVAR_GET(keybind_rstick_down), 0x5831},
+        {REXCVAR_GET(keybind_rstick_right), 0x5832}, {REXCVAR_GET(keybind_rstick_left), 0x5833},
+    };
+    static_assert(std::size(binds) <= 32, "keystroke_held_ is a 32-bit mask");
+    const uint64_t now = rex::chrono::Clock::QueryGuestUptimeMillis();
+    const bool live = is_active() && has_focus_;
+    for (size_t i = 0; i < std::size(binds); ++i) {
+      const bool down = live && IsBindPressed(key_down_, binds[i].keys);
+      const bool was = (keystroke_held_ >> i) & 1u;
+      if (down != was) {
+        EnqueueKeystroke(binds[i].vk, down);
+        keystroke_held_ ^= (1u << i);
+        if (down) {
+          // The newest pressed button is the one that repeats (as in the SDL driver).
+          repeat_idx_ = int(i);
+          repeat_started_ = false;
+          repeat_time_ = now;
+        } else if (repeat_idx_ == int(i)) {
+          repeat_idx_ = -1;
+        }
+      }
+    }
+    // A held button: KEYDOWN|REPEAT after 400 ms, then every 100 ms (the SDL driver's HID_SDL_REPEAT_DELAY / RATE).
+    if (repeat_idx_ >= 0 && keystroke_queue_.empty()) {
+      if (!repeat_started_ && now >= repeat_time_ + 400) {
+        repeat_started_ = true;
+        repeat_time_ = now - 100;  // the first repeat at once
+      }
+      if (repeat_started_ && now >= repeat_time_ + 100) {
+        repeat_time_ = now;
+        X_INPUT_KEYSTROKE ks = {};
+        ks.virtual_key = binds[repeat_idx_].vk;
+        ks.flags = X_INPUT_KEYSTROKE_KEYDOWN | X_INPUT_KEYSTROKE_REPEAT;
+        keystroke_queue_.push(ks);
+      }
+    }
+  }
   if (keystroke_queue_.empty()) {
     return X_ERROR_EMPTY;
   }

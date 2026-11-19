@@ -169,6 +169,20 @@ namespace plume {
         S8_UINT,
         // banjo-nx (2026-10-19): 24-bit unorm depth with 8-bit stencil, 4 bytes a pixel (deko3d Z24S8; the Xenos D24S8).
         D24_UNORM_S8_UINT,
+        // sasrt-nx (2026-11-11, port 75; its formats batch, rows 6, 8, 10, 74, 93: renut_format_10bit_exact): 10:10:10:2
+        // unorm, R in bits 0-9 ... A in 30-31 (the Xenos 2_10_10_10's own 32-bit layout; deko3d RGB10A2, Vulkan
+        // A2B10G10R10_PACK32, D3D12 R10G10B10A2).
+        R10G10B10A2_UNORM,
+        // sasrt-nx (2026-11-11, port 75; its formats batch, rows 7, 66, 73, 95, 96: renut_format_7e3_rg11b10): 11:11:10
+        // unsigned float, no alpha (deko3d RG11B10, Vulkan B10G11R11_UFLOAT_PACK32, D3D12 R11G11B10_FLOAT).
+        R11G11B10_FLOAT,
+        // renut-ultimate (2026-11-16, port 145; tw2de_nx's of 2026-10-25): the Xenos 5:6:5, 1:5:5:5 and 4:4:4:4 in the
+        // GPU's own 16-bit formats (the same bit layout, the first component in the lowest bits; deko3d RGB565_Unorm,
+        // RGB5A1_Unorm, RGBA4_Unorm: Maxwell B5G6R5, A1B5G5R5, A4B4G4R4 with the identity swizzle). deko3d only
+        // (banjo_deko3d_native_16bit; the other back ends never get them).
+        R5G6B5_UNORM,
+        R5G5B5A1_UNORM,
+        R4G4B4A4_UNORM,
         MAX
     };
 
@@ -208,7 +222,9 @@ namespace plume {
         UNKNOWN,
         NONE,
         FRONT,
-        BACK
+        BACK,
+        // kameo-nx (2026-11-04): both faces, as PA_SU_SC_MODE_CNTL can ask. The vertex shader still runs. D3D12 has none.
+        FRONT_AND_BACK
     };
 
     enum class RenderFrontFace {
@@ -571,7 +587,14 @@ namespace plume {
         case RenderFormat::R32_UINT:
         case RenderFormat::R32_SINT:
         case RenderFormat::D24_UNORM_S8_UINT:
+        // sasrt-nx (2026-11-11, port 75; its formats batch, rows 6, 8, 10, 74, 93 and 7, 66, 73, 95, 96)
+        case RenderFormat::R10G10B10A2_UNORM:
+        case RenderFormat::R11G11B10_FLOAT:
             return 4;
+        case RenderFormat::R5G6B5_UNORM:  // port 145 (tw2de_nx's)
+        case RenderFormat::R5G5B5A1_UNORM:
+        case RenderFormat::R4G4B4A4_UNORM:
+            return 2;
         case RenderFormat::R8G8_TYPELESS:
         case RenderFormat::R8G8_UNORM:
         case RenderFormat::R8G8_UINT:
@@ -654,6 +677,12 @@ namespace plume {
         case RenderFormat::D32_FLOAT:
         case RenderFormat::D32_FLOAT_S8_UINT:
         case RenderFormat::D24_UNORM_S8_UINT:
+        // sasrt-nx (2026-11-11, port 75; its formats batch, rows 6, 8, 10, 74, 93 and 7, 66, 73, 95, 96)
+        case RenderFormat::R10G10B10A2_UNORM:
+        case RenderFormat::R11G11B10_FLOAT:
+        case RenderFormat::R5G6B5_UNORM:  // port 145 (tw2de_nx's)
+        case RenderFormat::R5G5B5A1_UNORM:
+        case RenderFormat::R4G4B4A4_UNORM:
         case RenderFormat::R32_FLOAT:
         case RenderFormat::R32_UINT:
         case RenderFormat::R32_SINT:

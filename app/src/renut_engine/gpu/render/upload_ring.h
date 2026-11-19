@@ -25,7 +25,7 @@ namespace renut::gpu {
 // banjo-nx (2026-10-18): 256 registers and a zero register after them (tools/deko3d_glsl_opt.py, pass bonerow: a
 // relative read clamped to 256 reads zeros instead of selecting them).
 constexpr uint32_t kFloatConstantsUboBytes = 256 * 16 + 16;
-constexpr uint32_t kSharedConstantsUboBytes = 1360;  // sizeof(SharedConstants), render/draw.cpp (2026-10-19: + pixel origin)
+constexpr uint32_t kSharedConstantsUboBytes = 1552;  // sizeof(SharedConstants), render/draw.cpp (2026-10-19: + pixel origin; halo3-nx: + loop constants)
 
 struct UploadAllocation {
   plume::RenderBufferReference ref;  // buffer + offset, for copies / views
@@ -41,7 +41,12 @@ struct UploadAllocation {
 
 class UploadRing {
 public:
-  static constexpr uint64_t kChunkSize = 32ull << 20;
+  // banjo-nx (2026-10-28, the heap): 16 MB (32 before). The first chunk of each ring stays for the whole session (64 MB
+  // for the two rings, the heap at 2.9 of 3.08 GB in the d4 city); a city frame fills a few MB with the constants
+  // pushed. A frame that needs more adds a chunk, which the trim below gives back.
+  static constexpr uint64_t kChunkSize = 16ull << 20;
+  // kameo-nx (2026-11-04, banjo_renut_split_frame_mb): the chunk this frame is writing, so how far it has got.
+  size_t CurrentChunk() const { return current_; }
   // Resets (frames of this slot) after which chunks beyond what those frames
   // used are released.
   static constexpr uint32_t kTrimResets = 300;
@@ -62,6 +67,9 @@ public:
   void HandOff(std::vector<Range> &out);
   // The slot's fence has been waited: nothing uses the ring's memory.
   void Reset();
+  // banjo-nx (2026-10-23, batch 6): the Reset() calls of every ring so far: an allocation made while this is unchanged
+  // still holds what was written into it (render/draw.cpp keeps fetch copies and converted streams across kicks).
+  static uint64_t Resets() { return s_resets_; }
   UploadAllocation Allocate(uint64_t size, uint64_t alignment = 256);
   // banjo-nx (2026-10-19, render-thread proposal 10): 'size' bytes, with 'room' bytes (>= size) left in the chunk from
   // the allocation's start (a uniform buffer bound at a fixed size over a smaller allocation stays inside the chunk);
@@ -96,6 +104,7 @@ private:
   // The most chunks a frame used since the last trim, and the resets since.
   size_t window_chunks_ = 1;
   uint32_t window_resets_ = 0;
+  static inline uint64_t s_resets_ = 1;
 };
 
 } // namespace renut::gpu

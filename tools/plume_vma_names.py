@@ -69,7 +69,10 @@ def defined(lib):
 def check(build):
     plume = defined(os.path.join(build, 'plume', 'libplume.a'))
     sdk = set()
-    sdk_dir = os.path.join(ROOT, 'sdk', 'out', 'switch-arm64')
+    # renut-ultimate (2026-11-07): the SDK's libraries are in the build folder (REXGLUE_OUTPUT_IN_BUILD), else the shared one.
+    sdk_dir = os.path.join(build, 'rexglue-sdk', 'out')
+    if not os.path.isdir(sdk_dir):
+        sdk_dir = os.path.join(ROOT, 'sdk', 'out', 'switch-arm64')
     for name in os.listdir(sdk_dir):
         if name.endswith('.a'):
             sdk |= defined(os.path.join(sdk_dir, name))

@@ -16,6 +16,7 @@
 #include "glsl/opt_add_neg_to_sub.h"
 #include "main/mtypes.h"
 #include "program/program.h"
+#include "program/prog_parameter.h"  // port 162: _mesa_free_parameter_list
 #include "state_tracker/st_glsl_to_tgsi.h"
 #include "tgsi/tgsi_from_mesa.h"
 #include "glsl/ir_uniform.h"
@@ -114,7 +115,16 @@ struct gl_program_with_tgsi : public gl_program
 static void
 destroy_gl_program_with_tgsi(void* p)
 {
-	gl_program_with_tgsi::from_ptr(p)->cleanup();
+	gl_program_with_tgsi* prog = gl_program_with_tgsi::from_ptr(p);
+	prog->cleanup();
+	// Port 162 (from fnxf_xiii, its uam patch 11): the program's parameter list (st_link_shader; Mesa's
+	// _mesa_delete_program frees it), ~1.7 KB a compile, leaked before. Here, when the program itself goes: cleanup()
+	// also runs while it is still in use.
+	if (prog->Parameters)
+	{
+		_mesa_free_parameter_list(prog->Parameters);
+		prog->Parameters = NULL;
+	}
 }
 
 static void
@@ -580,10 +590,16 @@ unsigned glsl_program_compute_get_shared_size(glsl_program prg)
 void glsl_program_free(glsl_program prg)
 {
 	for (unsigned i = 0; i < MESA_SHADER_STAGES; i++) {
-		if (prg->_LinkedShaders[i])
+		if (prg->_LinkedShaders[i]) {
 			ralloc_free(prg->_LinkedShaders[i]->Program);
+			// Port 162 (from fnxf_xiii, its uam patch 11): the linked shader itself (rzalloc(NULL) in
+			// link_intrastage_shaders, not a child of the program or of prg): its IR, ~23 KB a compile, leaked before.
+			ralloc_free(prg->_LinkedShaders[i]);
+			prg->_LinkedShaders[i] = nullptr;
+		}
 	}
 
+	delete prg->UniformHash;  // port 162 (from fnxf_xiii, its uam patch 11): link_assign_uniform_locations' map, leaked before
 	delete prg->AttributeBindings;
 	delete prg->FragDataBindings;
 	delete prg->FragDataIndexBindings;

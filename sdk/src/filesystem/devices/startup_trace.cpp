@@ -9,19 +9,19 @@
  *
  * Two modes, both off by default:
  *
- *  RECORD (sa2_io_trace_record). Every guest read of a read-only game file is appended to an
+ *  RECORD (masseffect_io_trace_record). Every guest read of a read-only game file is appended to an
  *  in-memory log (kind, thread, file, offset, length, time since mount); so is every open. A small
- *  thread rewrites the trace file every 15 s and once more at sa2_io_trace_record_s seconds after
+ *  thread rewrites the trace file every 15 s and once more at masseffect_io_trace_record_s seconds after
  *  the mount, so a run that is killed early still leaves a usable trace.
  *
- *  PRELOAD (sa2_io_preload). Right after the mount the trace is parsed (one small read) and a
+ *  PRELOAD (masseffect_io_preload). Right after the mount the trace is parsed (one small read) and a
  *  low-priority thread walks it in order:
  *    - an "open" step opens the file ahead of the guest and parks the handle in a pool; the guest's
  *      HostPathEntry::Open takes it instead of paying the open itself;
  *    - reads of the same file that are adjacent in the trace are merged into one pread of up to
- *      sa2_io_preload_coalesce_kb (this is where most of the gain is: 8 x 128 KB reads become one
+ *      masseffect_io_preload_coalesce_kb (this is where most of the gain is: 8 x 128 KB reads become one
  *      1 MB read), then sliced back into the exact (offset, length) ranges the guest will ask for;
- *    - the slices live in a bounded store (sa2_io_preload_mb). When the guest asks for exactly
+ *    - the slices live in a bounded store (masseffect_io_preload_mb). When the guest asks for exactly
  *      one of them, the read is a memcpy; when its last recorded use is done the slice is freed.
  *  The store never holds more than the cap: the thread waits for the guest to consume, and drops
  *  slices that are far behind the guest's position in the trace (the guest skipped them).
@@ -80,39 +80,39 @@ extern "C" void RexSwitchSetCurrentThreadPriority(int priority);
 extern "C" bool RexSwitchSetCurrentThreadCore(int core);
 #endif
 
-REXCVAR_DEFINE_BOOL(sa2_io_trace_record, false, "Filesystem",
+REXCVAR_DEFINE_BOOL(masseffect_io_trace_record, false, "Filesystem",
                     "Record the guest's reads and opens of the read-only game files into the startup "
-                    "trace file (see sa2_io_trace_file). Turn on for one run to refresh the trace; "
-                    "when on, sa2_io_preload is ignored.");
-REXCVAR_DEFINE_INT32(sa2_io_trace_record_s, 50, "Filesystem",
+                    "trace file (see masseffect_io_trace_file). Turn on for one run to refresh the trace; "
+                    "when on, masseffect_io_preload is ignored.");
+REXCVAR_DEFINE_INT32(masseffect_io_trace_record_s, 50, "Filesystem",
                      "Seconds after the VFS mount at which the trace recording stops and the final "
                      "trace file is written (it is also rewritten every 15 s).");
-REXCVAR_DEFINE_STRING(sa2_io_trace_file, "", "Filesystem",
+REXCVAR_DEFINE_STRING(masseffect_io_trace_file, "", "Filesystem",
                       "Startup trace file. Empty = <parent of the game folder>/cache/startup_reads.bin.");
-REXCVAR_DEFINE_BOOL(sa2_io_preload, false, "Filesystem",
+REXCVAR_DEFINE_BOOL(masseffect_io_preload, false, "Filesystem",
                     "Replay the startup trace on a low-priority background thread: read the recorded "
                     "ranges ahead of the guest into a bounded RAM store so its reads are memcpy.");
-REXCVAR_DEFINE_INT32(sa2_io_preload_mb, 64, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_preload_mb, 64, "Filesystem",
                      "Hard cap of the preload store, in MB (resident slices plus the read in flight).");
-REXCVAR_DEFINE_INT32(sa2_io_preload_max_range_kb, 4096, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_preload_max_range_kb, 4096, "Filesystem",
                      "Trace reads larger than this many KB are not preloaded.");
-REXCVAR_DEFINE_INT32(sa2_io_preload_coalesce_kb, 1024, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_preload_coalesce_kb, 1024, "Filesystem",
                      "Adjacent trace reads of one file are merged into a single SD read of up to this "
                      "many KB (0 = one SD read per trace read).");
-REXCVAR_DEFINE_INT32(sa2_io_preload_opens, 32, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_preload_opens, 32, "Filesystem",
                      "Max read handles the preload thread keeps pre-opened for the guest (0 = do not "
                      "pre-open files).");
-REXCVAR_DEFINE_BOOL(sa2_io_preload_check_mtime, true, "Filesystem",
+REXCVAR_DEFINE_BOOL(masseffect_io_preload_check_mtime, true, "Filesystem",
                     "Besides the size, require the file's write time to equal the recorded one.");
-REXCVAR_DEFINE_BOOL(sa2_io_preload_verify, false, "Filesystem",
+REXCVAR_DEFINE_BOOL(masseffect_io_preload_verify, false, "Filesystem",
                     "Test aid: every read served from the preload store is also read from the SD and "
                     "compared; mismatches are logged. Slower than no preload; never use for timing.");
-REXCVAR_DEFINE_INT32(sa2_io_preload_priority, 58, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_preload_priority, 58, "Filesystem",
                      "Horizon thread priority of the preload thread (Switch only; 59 is the lowest "
                      "the process may use, the game's threads run at 44 and below).");
-REXCVAR_DEFINE_INT32(sa2_io_preload_core, -1, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_preload_core, -1, "Filesystem",
                      "Preferred core of the preload thread (Switch only, -1 = leave it to the kernel).");
-REXCVAR_DEFINE_STRING(sa2_io_trace_markers,
+REXCVAR_DEFINE_STRING(masseffect_io_trace_markers,
                       "coalesced.ini,engine.xxx,bioc_base,entrymenu,bioa_pro10", "Filesystem",
                       "Comma separated, case-insensitive substrings. The first guest read of the first "
                       "file whose path contains each one is logged as a '[io] timeline' line.");
@@ -198,16 +198,9 @@ struct State {
   std::map<std::tuple<uint32_t, uint64_t, uint32_t>, uint32_t> range_index;
   std::vector<uint32_t> order;  // range indices in trace order (first occurrences only)
   std::vector<Step> plan;
-  // MSVC's std::deque has an unconstrained copy constructor and a throwing move constructor, so a std::vector of
-  // deques of move-only handles tries to copy them when it grows. Deleting the copy makes it move instead.
-  struct HandleQueue : std::deque<std::unique_ptr<FileHandle>> {
-    HandleQueue() = default;
-    HandleQueue(HandleQueue&&) = default;
-    HandleQueue& operator=(HandleQueue&&) = default;
-    HandleQueue(const HandleQueue&) = delete;
-    HandleQueue& operator=(const HandleQueue&) = delete;
-  };
-  std::vector<HandleQueue> pool;  // per trace file, mutable under mu
+  // banjo-nx: deque, not vector: MSVC's std::deque move constructor is not noexcept, so a vector of them
+  // would copy (unique_ptr) when it grows. Same use otherwise.
+  std::deque<std::deque<std::unique_ptr<FileHandle>>> pool;  // per trace file, mutable under mu
   size_t pool_count = 0;
   uint64_t resident = 0;  // bytes in the store + reserved by the read in flight
   uint64_t peak = 0;
@@ -280,7 +273,7 @@ bool StartWorker(const char* name, void (*fn)()) {
 }
 
 std::filesystem::path TracePath(const std::filesystem::path& host_root) {
-  const std::string& configured = REXCVAR_GET(sa2_io_trace_file);
+  const std::string& configured = REXCVAR_GET(masseffect_io_trace_file);
   if (!configured.empty()) {
     return rex::to_path(configured);
   }
@@ -498,7 +491,7 @@ void SnapshotTrace(State& g, bool final_write) {
 
 void RecorderThread() {
   State& g = G();
-  const double stop_s = std::max(5, REXCVAR_GET(sa2_io_trace_record_s));
+  const double stop_s = std::max(5, REXCVAR_GET(masseffect_io_trace_record_s));
   double next_snapshot = 15.0;
   double next_beat = 5.0;
   for (;;) {
@@ -533,9 +526,9 @@ void RecorderThread() {
 // ---------------------------------------------------------------------------------------------
 
 void BuildPlan(State& g) {
-  const uint64_t max_range = uint64_t(std::max(0, REXCVAR_GET(sa2_io_preload_max_range_kb))) * 1024;
-  const uint64_t coalesce = uint64_t(std::max(0, REXCVAR_GET(sa2_io_preload_coalesce_kb))) * 1024;
-  const bool opens = REXCVAR_GET(sa2_io_preload_opens) > 0;
+  const uint64_t max_range = uint64_t(std::max(0, REXCVAR_GET(masseffect_io_preload_max_range_kb))) * 1024;
+  const uint64_t coalesce = uint64_t(std::max(0, REXCVAR_GET(masseffect_io_preload_coalesce_kb))) * 1024;
+  const bool opens = REXCVAR_GET(masseffect_io_preload_opens) > 0;
 
   // Distinct ranges, first occurrence order; count the uses.
   std::vector<uint32_t> first_of_event(g.trace_events.size(), UINT32_MAX);
@@ -660,7 +653,7 @@ bool FileIsValid(State& g, std::vector<uint8_t>& verdict, uint32_t file) {
   FileInfo info{};
   const TraceFile& tf = g.trace_files[file];
   bool ok = GetInfo(HostFile(g.root, tf.path), &info) && info.total_size == tf.size;
-  if (ok && REXCVAR_GET(sa2_io_preload_check_mtime) && info.write_timestamp != tf.mtime) {
+  if (ok && REXCVAR_GET(masseffect_io_preload_check_mtime) && info.write_timestamp != tf.mtime) {
     ok = false;
   }
   verdict[file] = ok ? 1 : 2;
@@ -757,13 +750,13 @@ bool ReadRun(State& g, Handles& handles, const std::vector<uint32_t>& run) {
 void PreloadThread() {
   State& g = G();
 #if REX_PLATFORM_SWITCH
-  RexSwitchSetCurrentThreadPriority(REXCVAR_GET(sa2_io_preload_priority));
-  const int core = REXCVAR_GET(sa2_io_preload_core);
+  RexSwitchSetCurrentThreadPriority(REXCVAR_GET(masseffect_io_preload_priority));
+  const int core = REXCVAR_GET(masseffect_io_preload_core);
   if (core >= 0) RexSwitchSetCurrentThreadCore(core);
 #endif
   Handles handles;
   std::vector<uint8_t> verdict(g.trace_files.size(), 0);
-  const size_t max_pool = size_t(std::max(0, REXCVAR_GET(sa2_io_preload_opens)));
+  const size_t max_pool = size_t(std::max(0, REXCVAR_GET(masseffect_io_preload_opens)));
   uint32_t consecutive_errors = 0;
   double next_report = 5.0;
   bool alive = true;
@@ -876,8 +869,8 @@ void PreloadThread() {
 
 void OnMount(HostPathDevice* device) {
   State& g = G();
-  const bool want_record = REXCVAR_GET(sa2_io_trace_record);
-  const bool want_preload = REXCVAR_GET(sa2_io_preload);
+  const bool want_record = REXCVAR_GET(masseffect_io_trace_record);
+  const bool want_preload = REXCVAR_GET(masseffect_io_preload);
   if (!device || !device->is_read_only() || (!want_record && !want_preload)) {
     return;
   }
@@ -889,8 +882,8 @@ void OnMount(HostPathDevice* device) {
     g.root = device->host_path();
     g.t0 = Clock::now();
     g.trace_path = TracePath(g.root);
-    g.cap = uint64_t(std::max(1, REXCVAR_GET(sa2_io_preload_mb))) << 20;
-    std::string list = REXCVAR_GET(sa2_io_trace_markers);
+    g.cap = uint64_t(std::max(1, REXCVAR_GET(masseffect_io_preload_mb))) << 20;
+    std::string list = REXCVAR_GET(masseffect_io_trace_markers);
     size_t at = 0;
     while (at <= list.size()) {
       size_t comma = list.find(',', at);
@@ -904,13 +897,13 @@ void OnMount(HostPathDevice* device) {
 
   if (want_record) {
     if (want_preload) {
-      REXFS_WARN("[io] trace: sa2_io_trace_record is on, sa2_io_preload is ignored for this run");
+      REXFS_WARN("[io] trace: masseffect_io_trace_record is on, masseffect_io_preload is ignored for this run");
     }
     g.recording = true;
     g.events.reserve(8192);
     g.active.store(true);
     REXFS_INFO("[io] trace: recording the reads of '{}' for {} s into {}",
-               rex::path_to_utf8(g.root), std::max(5, REXCVAR_GET(sa2_io_trace_record_s)),
+               rex::path_to_utf8(g.root), std::max(5, REXCVAR_GET(masseffect_io_trace_record_s)),
                rex::path_to_utf8(g.trace_path));
     if (!StartWorker("recorder", RecorderThread)) {
       g.recording = false;
@@ -938,7 +931,7 @@ void OnMount(HostPathDevice* device) {
              std::chrono::duration<double, std::milli>(Clock::now() - t).count(),
              g.trace_events.size(), g.trace_files.size(), g.ranges.size(),
              double(g.planned_bytes) / 1048576.0, g.skipped_big,
-             REXCVAR_GET(sa2_io_preload_max_range_kb), g.plan.size(), g.cap >> 20);
+             REXCVAR_GET(masseffect_io_preload_max_range_kb), g.plan.size(), g.cap >> 20);
   g.preloading = true;
   g.active.store(true);
   if (!StartWorker("preload", PreloadThread)) {
@@ -1061,7 +1054,7 @@ bool OnRead(uint32_t tag, uint64_t offset, std::span<uint8_t> buffer, size_t* ou
 }
 
 bool VerifyEnabled() {
-  return REXCVAR_GET(sa2_io_preload_verify);
+  return REXCVAR_GET(masseffect_io_preload_verify);
 }
 
 void ReportVerify(uint32_t tag, uint64_t offset, size_t length, bool equal) {

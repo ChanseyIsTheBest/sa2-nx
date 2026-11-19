@@ -21,7 +21,6 @@
 // Logging CVAR declarations (defined in logging.cpp)
 REXCVAR_DECLARE(std::string, log_level);
 REXCVAR_DECLARE(std::string, log_file);
-REXCVAR_DECLARE(bool, log_to_file);
 REXCVAR_DECLARE(bool, log_verbose);
 REXCVAR_DECLARE(bool, log_noisy);
 REXCVAR_DECLARE(int32_t, log_flush_interval);

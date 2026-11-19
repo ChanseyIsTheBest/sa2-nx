@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """memcpy / memset calls of a constant size up to 64 bytes inline at the call site (from sasrt-nx's tool of
 2026-10-14, idea 6 of sa2-nx's list, also sonic-unleashed-nx's SWITCH_INLINE_MEMCPY; banjo-nx's copy).
-A call of the C runtime's memcpy (sub_82BB4510) or memset (sub_82BB4A40) whose size register r5 is set to a constant
+A call of the C runtime's memcpy (sub_82C111C0) or memset (sub_82C116F0; title update 3, the base's sub_82BB4510 / sub_82BB4A40) whose size register r5 is set to a constant
 (li r5,N) earlier in the same straight line, with nothing in between that writes r5, a label or a call, becomes
     REX_MEMCPY_CONST(N, <the call as it was>);      REX_MEMSET_CONST(N, <the call as it was>);
 The helpers (in the generated pch, below; the pure parts in sdk/include/rex/ppc/memcalls.h, tested by
@@ -70,8 +69,8 @@ template <uint32_t N>
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--gen', required=True)
-    ap.add_argument('--memcpy', default='827F05C0')
-    ap.add_argument('--memset', default='827EFEA0')
+    ap.add_argument('--memcpy', default='82C111C0')
+    ap.add_argument('--memset', default='82C116F0')
     ap.add_argument('--check', action='store_true')
     a = ap.parse_args()
     call = re.compile(r'^(\t+)((?:__imp__)?sub_(%s|%s)\(ctx, base\));$' % (a.memcpy.upper(), a.memset.upper()))

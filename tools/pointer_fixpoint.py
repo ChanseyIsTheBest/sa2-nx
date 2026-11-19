@@ -30,14 +30,25 @@ import struct
 import subprocess
 import sys
 
+
+def gen_file(gen, suffix):
+    """renut-ultimate (2026-11-19, port 186; found by sasrt-nx's sync): the generator names its files after the project
+    (<project>_pch.h, <project>_init.cpp, <project>_recomp.N.cpp): renut_ in the base, a port's own name otherwise."""
+    for name in sorted(os.listdir(gen)):
+        m = re.fullmatch(r'(\w+)_recomp\.\d+\.cpp', name)
+        if m:
+            return os.path.join(gen, m.group(1) + '_' + suffix)
+    return os.path.join(gen, 'renut_' + suffix)
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, 'app')
 TOOLS = os.path.join(ROOT, 'tools')
-GEN = os.path.join(APP, 'generated', 'default')
-MANIFEST = os.path.join(APP, 'sa2_manifest.toml')
+GEN = os.path.join(APP, 'generated')  # katamari-nx: one flat tree
+MANIFEST = os.path.join(APP, 'renut_manifest.toml')
 OVERRIDES = os.path.join(APP, 'overrides.toml')
 IMAGE_BASE = 0x82000000
-CODE_LO, CODE_HI = 0x82120000, 0x82970600  # set from the generated tree in main()
+CODE_LO, CODE_HI = 0x82140000, 0x828AF6A8  # set from the generated tree in main()
 
 gc = {'__name__': 'gc'}
 exec(compile(open(os.path.join(TOOLS, 'gap_classify.py')).read(), 'gc', 'exec'), gc)
@@ -54,13 +65,17 @@ def find_rexglue():
 
 
 def code_range():
-    # The SDK writes the code range into the generated init file (PPCImageConfig).
-    text = open(os.path.join(GEN, 'sa2_init.cpp'), errors='replace').read()
-    base = re.search(r'code_base\s*=\s*0x([0-9A-Fa-f]+)', text)
-    size = re.search(r'code_size\s*=\s*0x([0-9A-Fa-f]+)', text)
-    if base and size:
-        return int(base.group(1), 16), int(base.group(1), 16) + int(size.group(1), 16)
-    return 0x82120000, 0x82970600  # from the runtime log of the first boot
+    # The generator writes the code range into the generated precompiled header (REX_CODE_BASE / REX_CODE_SIZE);
+    # older SDKs wrote it into the init file (PPCImageConfig).
+    for path in (gen_file(GEN, 'pch.h'), gen_file(GEN, 'init.cpp'), gen_file(GEN, 'config.h')):
+        if not os.path.exists(path):
+            continue
+        text = open(path, errors='replace').read()
+        base = re.search(r'(?:REX_CODE_BASE|code_base\s*=)\s*0x([0-9A-Fa-f]+)', text)
+        size = re.search(r'(?:REX_CODE_SIZE|code_size\s*=)\s*0x([0-9A-Fa-f]+)', text)
+        if base and size:
+            return int(base.group(1), 16), int(base.group(1), 16) + int(size.group(1), 16)
+    sys.exit('code range not found in the generated tree: run tools/codegen.ps1 first')
 
 
 def read_gaps(scratch):
@@ -76,16 +91,18 @@ def read_gaps(scratch):
 
 
 def built_addresses(image, lo, hi):
-    """Code addresses the code builds as constants: `lis rX,hi` followed (within 8 instructions, before rX is written
+    """Code addresses the code builds as constants: `lis rX,hi` followed (within 32 instructions, before rX is written
     again) by `addi rY,rX,lo` or `ori rY,rX,lo`. That is how a function pointer is passed as a callback or stored in
     a table at run time; no data word holds it, so the plain pointer scan misses it (SA2's sub_829427B8: built at
-    0x82942810, the 2-minute recording stopped at its first call). Yields (value, address of the addi/ori)."""
+    0x82942810, the 2-minute recording stopped at its first call). katamari-nx: the window was 8 instructions and
+    missed sub_823700C8 (lis r9 at 0x8237068C, addi r3,r9,200 nine instructions later; the console stopped on its
+    first call). Yields (value, address of the addi/ori)."""
     for off in range(lo - IMAGE_BASE, hi - IMAGE_BASE - 3, 4):
         x = struct.unpack_from('>I', image, off)[0]
         if x >> 26 != 15 or (x >> 16) & 31:  # lis rX,imm is addis rX,0,imm
             continue
         rx, upper = (x >> 21) & 31, (x & 0xFFFF) << 16
-        for k in range(1, 9):
+        for k in range(1, 33):
             y = struct.unpack_from('>I', image, off + 4 * k)[0]
             op, rt, ra, imm = y >> 26, (y >> 21) & 31, (y >> 16) & 31, y & 0xFFFF
             if op in (14, 24) and ra == rx:  # addi / ori from rX
@@ -121,23 +138,25 @@ def pointer_candidates(image, gaps, lo, hi):
 
 
 def scratch_codegen(rexglue, d, candidates):
-    ov = open(OVERRIDES).read()
-    m = re.search(r'^\[functions\]\s*$', ov, re.M)
+    # katamari-nx: the scratch tree gets every [functions] entry of the real one (config/renut_funcs.toml and
+    # overrides.toml) plus the candidates, in one overrides.toml, and a manifest of its own (the real one includes
+    # renut_config.toml, whose codegen keys do not move function boundaries).
+    entries = []
+    for path in (os.path.join(APP, 'config', 'renut_funcs.toml'), OVERRIDES):
+        if os.path.exists(path):
+            text = open(path).read()
+            m = re.search(r'^\[functions\]\s*$', text, re.M)
+            if m:
+                entries.append(text[m.end():])
     body = ''.join(f'"0x{a:08X}" = {{ }}\n' for a in sorted(candidates))
-    open(os.path.join(d, 'overrides.toml'), 'w').write(ov[:m.end()] + '\n' + body + ov[m.end():])
-    game = os.path.join(ROOT, 'assets', 'game_root').replace('\\', '/')
-    man = open(MANIFEST).read()
-    # Only the entrypoint: the candidates are in default.xex, and the [[modules]] entries (the stage-data DLL) would
-    # otherwise get the same file and output paths from the substitutions below.
-    man = man.split('[[modules]]', 1)[0]
-    man = re.sub(r'^game_root = .*$', f'game_root = "{game}"', man, flags=re.M)
-    man = re.sub(r'^file_path = .*$', f'file_path = "{game}/default.xex"', man, flags=re.M)
-    man = re.sub(r'^out_directory_path = .*$', 'out_directory_path = "gen"', man, flags=re.M)
-    man = re.sub(r'^includes = .*$', 'includes = ["overrides.toml"]', man, flags=re.M)
-    open(os.path.join(d, 'sa2_manifest.toml'), 'w').write(man)
+    open(os.path.join(d, 'overrides.toml'), 'w').write('[functions]\n' + body + '\n'.join(entries))
+    game = os.path.realpath(os.path.join(APP, 'assets')).replace('\\', '/')
+    man = ('[project]\nsdk_version = "0.10.0"\nname = "renut"\n\n[entrypoint]\n'
+           f'file_path = "{game}/default.xex"\nout_directory_path = "gen"\nincludes = ["overrides.toml"]\n')
+    open(os.path.join(d, 'renut_manifest.toml'), 'w').write(man)
     log = os.path.join(d, 'codegen.log')
     with open(log, 'w') as f:
-        subprocess.run([rexglue, '--force', 'codegen', 'sa2_manifest.toml'], cwd=d, stdout=f,
+        subprocess.run([rexglue, '--force', 'codegen', 'renut_manifest.toml'], cwd=d, stdout=f,
                        stderr=subprocess.STDOUT)
     return os.path.join(d, 'gen'), log
 

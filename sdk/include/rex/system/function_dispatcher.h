@@ -85,6 +85,11 @@ class FunctionDispatcher : public IModuleRegistrar {
   bool SetFunction(uint32_t guest_address, ::PPCFunc* func) override;
   ::PPCFunc* GetFunction(uint32_t guest_address);
   bool HasAnyFunctionTable() const { return !module_tables_.empty(); }
+  // banjo-nx (2026-10-29): writes every registered function into its table slot again; returns how many slots
+  // held something else. A title update whose image is smaller than the base game's: the base image is loaded
+  // over the start of the table (which follows the update's image) and the patch zeroes that part, so every
+  // indirect call into the first part of the code took GetFunction's locked map lookup instead of the table.
+  size_t RewriteFunctionTable();
   /**
    * caller_address must be inside a registered module, or 0 to mean "host-
    * initiated, route to the entrypoint pool".

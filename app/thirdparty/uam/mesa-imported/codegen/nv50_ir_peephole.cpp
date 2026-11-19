@@ -23,6 +23,9 @@
 #include "codegen/nv50_ir.h"
 #include <map>
 #include <unordered_map>
+#include <algorithm>  // port 163
+#include <string>
+#include <vector>
 #include "codegen/nv50_ir_target.h"
 #include "codegen/nv50_ir_build_util.h"
 
@@ -4819,6 +4822,313 @@ TexCluster::visit(BasicBlock *bb)
    return true;
 }
 
+// Port 163 (from fnxf_xiii, its notes of 2026-10-21 to 11-17): the register pressure passes. Off by default (banjo
+// flags 2048 and up: plume_deko3d's uamFlags, banjo_deko3d_uam_pressure).
+// Port 163 (from fnxf_xiii's fix of 2026-11-17, extended here): a definition in a register fixed before allocation (a
+// fragment shader's colour outputs: the "mov $rN" before EXIT). Nothing reads those registers as far as the allocator
+// sees (the hardware does at EXIT), so an instruction placed after one could be given its register and overwrite the
+// output. fnxf_xiii: 24 pixel variants of 12 shaders came out that way under PressureSink (flags 2048 + 8192 + 65536).
+// None of the moving passes places a new definition after one: PressureSink stops its scan there (fnxf_xiii's fix),
+// and here also PressureHoist never moves one up, GlobalSink inserts in front of one, and Remat makes no copy after one.
+static bool banjoWritesFixedGpr(const Instruction *j)
+{
+   for (int d = 0; j->defExists(d); ++d) {
+      const Value *v = j->getDef(d);
+      if (v && v->reg.file == FILE_GPR && v->reg.data.id >= 0)
+         return true;
+   }
+   return false;
+}
+
+// fnxf_xiii (2026-10-21, banjo flag 2048; 4096: texture fetches too): each value computed as late as its first use
+// allows, when that shortens what is live. uam keeps the GLSL's order, and the translated Xbox 360 code computes values
+// early (its compiler scheduled for its own 128-register file): a value computed long before its use holds a register
+// all the way. An instruction whose only uses are later in its block moves to just before the first of them, when none
+// of its sources ends there (every source is used again at or after the new place, or outside the block): its result
+// lives shorter and no source lives longer. Bottom-up, so a chain feeding one use moves down with it. Pure
+// reordering of pure operations: the same results. (A SPIR-V round trip of the same GLSL, whose output computes each
+// expression at its use, was measured at ~6 registers fewer on the shaders above 56; this is the part of it uam can do.)
+class PressureSink : public Pass
+{
+private:
+   virtual bool visit(BasicBlock *);
+   bool movable(const Instruction *) const;
+   static bool usesValue(const Instruction *, const Value *);
+   static bool crossLane(const Instruction *i)
+   {
+      return isTextureOp(i->op) || i->op == OP_DFDX || i->op == OP_DFDY || i->op == OP_QUADOP ||
+             i->op == OP_SHFL || i->op == OP_VOTE;
+   }
+public:
+   static bool isCrossLane(const Instruction *i) { return crossLane(i); }
+   bool textures = false;
+   bool passTextures = false;
+   bool allowNeutral = false;
+   unsigned moved = 0;
+   bool canMove(const Instruction *i) const { return movable(i); }
+   // what i may not be moved above (PressureHoist): for a load, what writes memory; for what reads other lanes,
+   // nothing (above a discard more lanes are alive); a texture fetch keeps its place among the others
+   bool stopsHoist(const Instruction *i, const Instruction *j) const
+   {
+      if (j->fixed || j->asFlow() || j->op == OP_CALL || j->op == OP_BAR || j->op == OP_MEMBAR)
+         return true;
+      if (isTextureOp(i->op) && (isTextureOp(j->op) || isSurfaceOp(j->op)))
+         return true;
+      return false;
+   }
+};
+
+bool
+PressureSink::usesValue(const Instruction *i, const Value *v)
+{
+   for (int s = 0; i->srcExists(s); ++s) {
+      if (i->getSrc(s) == v)
+         return true;
+      // an indirect source's address
+      const ValueRef &r = i->src(s);
+      if (r.isIndirect(0) && i->getIndirect(s, 0) == v)
+         return true;
+      if (r.isIndirect(1) && i->getIndirect(s, 1) == v)
+         return true;
+   }
+   for (int d = 0; i->defExists(d); ++d) {
+      // a predicate or carry the instruction also reads is a source; a def is never one
+   }
+   if (i->predSrc >= 0 && i->getSrc(i->predSrc) == v)
+      return true;
+   if (i->flagsSrc >= 0 && i->getSrc(i->flagsSrc) == v)
+      return true;
+   return false;
+}
+
+bool
+PressureSink::movable(const Instruction *i) const
+{
+   if (i->op == OP_PHI || i->op == OP_UNION || i->fixed || i->asFlow() || i->isPredicated() || i->join || i->exit)
+      return false;
+   if (!i->defExists(0) || i->defExists(1) || i->flagsDef >= 0)
+      return false;
+   if (i->getDef(0)->reg.file != FILE_GPR)
+      return false;
+   // SSA only (banjo 2026-10-22): its result and its register sources defined once, so no other definition is
+   // passed on the way
+   if (i->getDef(0)->defs.size() != 1)
+      return false;
+   for (int s = 0; i->srcExists(s); ++s) {
+      const Value *v = i->getSrc(s);
+      if (v && v->reg.file == FILE_GPR && v->defs.size() > 1)
+         return false;
+      const ValueRef &r = i->src(s);
+      for (int d = 0; d < 2; ++d)
+         if (r.isIndirect(d) && i->getIndirect(s, d)->defs.size() > 1)
+            return false;
+   }
+   if (isTextureOp(i->op)) {
+      if (!textures)
+         return false;
+      // offsets that are registers are sources usesValue does not see; immediates are fine (banjo 2026-10-22)
+      const TexInstruction *t = i->asTex();
+      for (int k = 0; k < t->tex.useOffsets; ++k)
+         for (int c = 0; c < 3; ++c)
+            if (t->offset[k][c].get() && !t->offset[k][c].get()->inFile(FILE_IMMEDIATE))
+               return false;
+      return true;
+   }
+   if (isSurfaceOp(i->op))
+      return false;
+   switch (i->op) {
+   case OP_DISCARD: case OP_STORE: case OP_ATOM: case OP_EXPORT: case OP_EMIT: case OP_RESTART:
+   case OP_BAR: case OP_MEMBAR: case OP_TEXBAR: case OP_CALL: case OP_QUADON: case OP_QUADPOP:
+   case OP_SUSTB: case OP_SUSTP: case OP_SUREDB: case OP_SUREDP: case OP_RDSV: case OP_WRSV:
+   case OP_SHFL: case OP_VOTE: case OP_PFETCH: case OP_AFETCH: case OP_SELP: case OP_CCTL:
+      return false;
+   case OP_LOAD:
+      // constant buffers and shader inputs only (nothing writes them while the shader runs)
+      return i->src(0).getFile() == FILE_MEMORY_CONST || i->src(0).getFile() == FILE_SHADER_INPUT;
+   default:
+      return true;
+   }
+}
+
+bool
+PressureSink::visit(BasicBlock *bb)
+{
+   Instruction *prev;
+   for (Instruction *i = bb->getExit(); i; i = prev) {
+      prev = i->prev;
+      if (!movable(i))
+         continue;
+      Value *def = i->getDef(0);
+      if (def->uses.empty())
+         continue;
+      // every use in this block (not a phi: a phi's use is on the edge into another block)
+      bool local = true;
+      for (ValueRef *u : def->uses) {
+         const Instruction *ui = u->getInsn();
+         if (!ui || ui->bb != bb || ui->op == OP_PHI) {
+            local = false;
+            break;
+         }
+      }
+      if (!local)
+         continue;
+      // the first use after it, and nothing on the way that the instruction may not pass
+      Instruction *first = nullptr;
+      for (Instruction *j = i->next; j; j = j->next) {
+         if (usesValue(j, def)) {
+            first = j;
+            break;
+         }
+         // a texture fetch keeps its place among the other texture and surface operations (passTextures: only the
+         // surface ones; fetches only read)
+         if (isTextureOp(i->op) && ((isTextureOp(j->op) && !passTextures) || isSurfaceOp(j->op)))
+            break;
+         // what reads other lanes (derivatives, quad operations, a fetch's implicit level of detail) stays before a
+         // discard: after it the discarded lanes' values are gone
+         if (j->op == OP_DISCARD && crossLane(i))
+            break;
+         if (j->op == OP_PHI)
+            break;
+         // Port 163 (fnxf_xiii's fix of 2026-11-17): nothing sinks past a write of a fixed register (the colour
+         // outputs; banjoWritesFixedGpr).
+         if (banjoWritesFixedGpr(j))
+            break;
+      }
+      if (!first || first == i->next)
+         continue;
+      // what moving it costs: the registers of the sources that would end later (each is used again at or after the
+      // new place, or lives on past the block, or it ends here and lives longer), against its own result's
+      unsigned extended = 0;
+      for (int s = 0; i->srcExists(s); ++s) {
+         const Value *v = i->getSrc(s);
+         if (!v || v->reg.file != FILE_GPR || v->inFile(FILE_IMMEDIATE))
+            continue;
+         bool alive = false;
+         for (ValueRef *u : v->uses) {
+            const Instruction *ui = u->getInsn();
+            if (!ui || ui == i)
+               continue;
+            if (ui->bb != bb || ui->op == OP_PHI) {
+               alive = true;
+               break;
+            }
+         }
+         if (!alive) {
+            for (const Instruction *j = first; j; j = j->next) {
+               if (usesValue(j, v)) {
+                  alive = true;
+                  break;
+               }
+            }
+         }
+         if (!alive) {
+            bool counted = false;  // a source read twice counts once
+            for (int t = 0; t < s && !counted; ++t)
+               counted = i->getSrc(t) == v;
+            if (!counted)
+               extended += (v->reg.size + 3) / 4;
+         }
+      }
+      // fewer: a gain; as many (allowNeutral): no loss, and the sources' own producers can follow it down
+      const unsigned own = (def->reg.size + 3) / 4;
+      if (extended > own || (extended == own && !allowNeutral))
+         continue;
+      bb->remove(i);
+      bb->insertBefore(first, i);
+      ++moved;
+   }
+   return true;
+}
+
+// fnxf_xiii (2026-10-21, banjo flag 16384; 32768: also when it is even): PressureSink's other half. An instruction that
+// is the last reader of some of its sources moves up to just after the last of its sources is computed, when the
+// sources it ends that way take more registers than its result: they end sooner and only its result lives longer.
+// Top-down, so a chain that consumes values as they come moves up with them.
+class PressureHoist : public Pass
+{
+private:
+   virtual bool visit(BasicBlock *);
+public:
+   PressureSink *rules = nullptr;
+   bool allowNeutral = false;
+   unsigned moved = 0;
+};
+
+bool
+PressureHoist::visit(BasicBlock *bb)
+{
+   Instruction *next;
+   for (Instruction *i = bb->getEntry(); i; i = next) {
+      next = i->next;
+      if (i->op == OP_PHI || !rules->canMove(i))
+         continue;
+      // Port 163: a fixed register's write is not moved up: what follows it could be given its register
+      // (banjoWritesFixedGpr; fnxf_xiii's PressureHoist moved it with 32768).
+      if (banjoWritesFixedGpr(i))
+         continue;
+      // the earliest place: after the last instruction of this block that computes one of its sources (or after the
+      // block's phis), and not above a barrier for what may not pass one
+      Instruction *after = nullptr;  // insert after this (null: at the head, after the phis)
+      for (Instruction *j = i->prev; j; j = j->prev) {
+         bool feeds = false;
+         for (int d = 0; j->defExists(d) && !feeds; ++d) {
+            for (int s = 0; i->srcExists(s) && !feeds; ++s)
+               feeds = i->getSrc(s) == j->getDef(d);
+         }
+         if (feeds || j->op == OP_PHI || rules->stopsHoist(i, j)) {
+            after = j;
+            break;
+         }
+      }
+      if (after == i->prev)
+         continue;
+      Instruction *from = after ? after->next : bb->getEntry();
+      // the registers of the sources it ends: every other use of them is before the new place, in this block
+      unsigned ended = 0;
+      for (int s = 0; i->srcExists(s); ++s) {
+         const Value *v = i->getSrc(s);
+         if (!v || v->reg.file != FILE_GPR)
+            continue;
+         bool seen = false;
+         for (int t = 0; t < s && !seen; ++t)
+            seen = i->getSrc(t) == v;
+         if (seen)
+            continue;
+         bool ends = true;
+         for (ValueRef *u : v->uses) {
+            const Instruction *ui = u->getInsn();
+            if (!ui || ui == i)
+               continue;
+            if (ui->bb != bb || ui->op == OP_PHI) {
+               ends = false;
+               break;
+            }
+            // a use between the new place and the old one: the source lives on there anyway
+            for (const Instruction *j = from; j && j != i; j = j->next) {
+               if (j == ui) {
+                  ends = false;
+                  break;
+               }
+            }
+            if (!ends)
+               break;
+         }
+         if (ends)
+            ended += (v->reg.size + 3) / 4;
+      }
+      const unsigned own = (i->getDef(0)->reg.size + 3) / 4;
+      if (ended < own || (ended == own && !allowNeutral))
+         continue;
+      bb->remove(i);
+      if (after)
+         bb->insertAfter(after, i);
+      else
+         bb->insertHead(i);
+      ++moved;
+   }
+   return true;
+}
+
 // =============================================================================
 
 // Remove computations of unused values.
@@ -5021,7 +5331,11 @@ PostRADualIssue::visit(BasicBlock *bb)
          if (!check || check->fixed || check->join || check->asFlow())
             break;
 
-         if (isChainedCommutationLegal(i, check) && target->canDualIssue(i, check)) {
+         // Port 162 (from fnxf_xiii, its uam patch 10): the pair's own test first. Both are pure, so the result is
+         // the same, but the chain test walks every instruction between i and check (O(n) per candidate, O(n^3) per
+         // block): fnxf_xiii measured it at 85 % of a pixel shader's compile time, for pairs that cannot dual-issue
+         // anyway (Maxwell: ALU then non-ALU). The same DKSH.
+         if (target->canDualIssue(i, check) && isChainedCommutationLegal(i, check)) {
             while (check->prev != i)
                bb->permuteAdjacent(check->prev, check);
             next = check;
@@ -5056,6 +5370,517 @@ private:
 #else
 #define BANJO_LDG_AFTER(n)
 #endif
+
+// fnxf_xiii (2026-10-22, tooling): UAM_PRESSURE_DUMP set: the point of most live GPR words after optimizeSSA, and what
+// is live there (the PC tool, single-threaded). Not in the console's compiles (the variable is never set there).
+struct BanjoLiveness
+{
+   Function *fn;
+   std::vector<BasicBlock *> blocks;
+   std::vector<std::vector<uint8_t>> liveIn, liveOut;
+   size_t n = 0;
+
+   static bool gpr(Value *v) { return v && v->asLValue() && v->reg.file == FILE_GPR; }
+   static unsigned words(const Value *v) { return (v->reg.size + 3) / 4; }
+
+   void build(Function *f)
+   {
+      fn = f;
+      n = f->allLValues.getSize();
+      for (IteratorRef it = f->cfg.iteratorCFG(); !it->end(); it->next())
+         blocks.push_back(BasicBlock::get(reinterpret_cast<Graph::Node *>(it->get())));
+      std::unordered_map<BasicBlock *, size_t> index;
+      for (size_t b = 0; b < blocks.size(); ++b)
+         index[blocks[b]] = b;
+      liveIn.assign(blocks.size(), std::vector<uint8_t>(n, 0));
+      liveOut.assign(blocks.size(), std::vector<uint8_t>(n, 0));
+      for (bool changed = true; changed;) {
+         changed = false;
+         for (size_t b = blocks.size(); b-- > 0;) {
+            BasicBlock *bb = blocks[b];
+            std::vector<uint8_t> out(n, 0);
+            for (Graph::EdgeIterator ei = bb->cfg.outgoing(); !ei.end(); ei.next()) {
+               BasicBlock *s = BasicBlock::get(ei.getNode());
+               auto f2 = index.find(s);
+               if (f2 == index.end())
+                  continue;
+               const auto &in = liveIn[f2->second];
+               for (size_t k = 0; k < n; ++k)
+                  out[k] |= in[k];
+               // the phis' sources from this edge (phi source j is the j-th incident edge's)
+               int j = 0, mine = -1;
+               for (Graph::EdgeIterator ii = s->cfg.incident(); !ii.end(); ii.next(), ++j)
+                  if (BasicBlock::get(ii.getNode()) == bb)
+                     mine = j;
+               for (Instruction *p = s->getPhi(); p && p->op == OP_PHI; p = p->next) {
+                  if (gpr(p->getDef(0)))
+                     out[p->getDef(0)->id] = 0;
+                  if (mine >= 0 && p->srcExists(mine) && gpr(p->getSrc(mine)))
+                     out[p->getSrc(mine)->id] = 1;
+               }
+            }
+            std::vector<uint8_t> in = out;
+            for (Instruction *i = bb->getExit(); i; i = i->prev) {
+               if (i->op == OP_PHI) {
+                  if (gpr(i->getDef(0)))
+                     in[i->getDef(0)->id] = 0;
+                  continue;
+               }
+               for (int d = 0; i->defExists(d); ++d)
+                  if (gpr(i->getDef(d)))
+                     in[i->getDef(d)->id] = 0;
+               for (int s = 0; i->srcExists(s); ++s) {
+                  if (gpr(i->getSrc(s)))
+                     in[i->getSrc(s)->id] = 1;
+                  const ValueRef &r = i->src(s);
+                  for (int d = 0; d < 2; ++d)
+                     if (r.isIndirect(d) && gpr(i->getIndirect(s, d)))
+                        in[i->getIndirect(s, d)->id] = 1;
+               }
+            }
+            // phi defs live in from the top: they were cleared above; a phi def is defined on entry
+            for (Instruction *p = bb->getPhi(); p && p->op == OP_PHI; p = p->next)
+               if (gpr(p->getDef(0)))
+                  in[p->getDef(0)->id] = 1;
+            if (in != liveIn[b] || out != liveOut[b]) {
+               liveIn[b].swap(in);
+               liveOut[b].swap(out);
+               changed = true;
+            }
+         }
+      }
+   }
+};
+
+// fnxf_xiii (2026-10-22, banjo flag 65536): PressureSink across blocks. An instruction whose uses are all in later
+// blocks (a phi's use counts in the block it comes from) moves to the start of the nearest block that dominates them
+// all, but never into a loop it is not already in: its result is no longer held through the blocks in between (or
+// on the paths that do not use it), and PressureSink then moves it down to its first use there. When each of its
+// register sources is alive at that block's start anyway (or the cost in registers is at most its own result's).
+// Pure, per-lane operations only: not texture fetches, derivatives or other cross-lane reads (they would move into
+// control flow where fewer lanes are active).
+class GlobalSink
+{
+public:
+   PressureSink *rules = nullptr;
+   unsigned moved = 0;
+   bool run(Function *fn);
+};
+
+bool
+GlobalSink::run(Function *fn)
+{
+   if (!fn->domTree)
+      return true;
+   BanjoLiveness L;
+   L.build(fn);
+   const size_t nb = L.blocks.size();
+   if (nb < 2)
+      return true;
+   std::unordered_map<BasicBlock *, size_t> index;
+   for (size_t b = 0; b < nb; ++b)
+      index[L.blocks[b]] = b;
+   // the loops each block is in: a back edge t -> h's body is h and what reaches t without passing h
+   std::vector<std::vector<uint8_t>> inLoop(nb);
+   size_t nloops = 0;
+   for (size_t b = 0; b < nb; ++b) {
+      for (Graph::EdgeIterator ei = L.blocks[b]->cfg.outgoing(); !ei.end(); ei.next()) {
+         if (ei.getType() != Graph::Edge::BACK)
+            continue;
+         auto h = index.find(BasicBlock::get(ei.getNode()));
+         if (h == index.end())
+            continue;
+         const size_t loop = nloops++;
+         for (auto &v : inLoop)
+            v.resize(nloops, 0);
+         std::vector<size_t> work{b};
+         inLoop[h->second][loop] = 1;
+         while (!work.empty()) {
+            const size_t x = work.back();
+            work.pop_back();
+            if (inLoop[x][loop])
+               continue;
+            inLoop[x][loop] = 1;
+            for (Graph::EdgeIterator pi = L.blocks[x]->cfg.incident(); !pi.end(); pi.next()) {
+               auto p = index.find(BasicBlock::get(pi.getNode()));
+               if (p != index.end() && !inLoop[p->second][loop])
+                  work.push_back(p->second);
+            }
+         }
+      }
+   }
+   for (auto &v : inLoop)
+      v.resize(nloops, 0);
+   auto loopsWithin = [&](size_t inner, size_t outer) {
+      for (size_t l = 0; l < nloops; ++l)
+         if (inLoop[inner][l] && !inLoop[outer][l])
+            return false;
+      return true;
+   };
+   // the block of a use: a phi's is the predecessor its source comes from
+   auto useBlock = [&](const ValueRef *u) -> BasicBlock * {
+      Instruction *ui = u->getInsn();
+      if (!ui)
+         return nullptr;
+      if (ui->op != OP_PHI)
+         return ui->bb;
+      int s = 0;
+      while (ui->srcExists(s) && &ui->src(s) != u)
+         ++s;
+      int j = 0;
+      for (Graph::EdgeIterator ii = ui->bb->cfg.incident(); !ii.end(); ii.next(), ++j)
+         if (j == s)
+            return BasicBlock::get(ii.getNode());
+      return nullptr;
+   };
+   auto commonDom = [](BasicBlock *a, BasicBlock *b) {
+      while (!b->dominatedBy(a))
+         a = a->idom();
+      return a;
+   };
+   // blocks last to first (CFG order), each bottom-up: a chain feeding a later block follows its last member
+   for (size_t bi = nb; bi-- > 0;) {
+      BasicBlock *bb = L.blocks[bi];
+      Instruction *prev;
+      for (Instruction *i = bb->getExit(); i; i = prev) {
+         prev = i->prev;
+         if (!rules->canMove(i) || PressureSink::isCrossLane(i) || isTextureOp(i->op))
+            continue;
+         Value *def = i->getDef(0);
+         if (def->uses.empty())
+            continue;
+         BasicBlock *target = nullptr;
+         bool ok = true;
+         for (ValueRef *u : def->uses) {
+            BasicBlock *ub = useBlock(u);
+            if (!ub || ub == bb || index.find(ub) == index.end()) {
+               ok = false;
+               break;
+            }
+            target = target ? commonDom(target, ub) : ub;
+            if (!target) {
+               ok = false;
+               break;
+            }
+         }
+         if (!ok || !target || target == bb || !target->dominatedBy(bb))
+            continue;
+         auto ti = index.find(target);
+         while (target != bb && !loopsWithin(ti->second, bi)) {
+            target = target->idom();
+            if (!target || (ti = index.find(target)) == index.end()) {
+               target = nullptr;
+               break;
+            }
+         }
+         if (!target || target == bb)
+            continue;
+         const auto &liveAt = L.liveIn[ti->second];
+         unsigned extended = 0;
+         for (int s = 0; i->srcExists(s); ++s) {
+            Value *v = i->getSrc(s);
+            if (!BanjoLiveness::gpr(v) || (size_t(v->id) < L.n && liveAt[v->id]))
+               continue;
+            bool counted = false;
+            for (int t = 0; t < s && !counted; ++t)
+               counted = i->getSrc(t) == v;
+            if (!counted)
+               extended += BanjoLiveness::words(v);
+         }
+         for (int s = 0; i->srcExists(s); ++s) {
+            const ValueRef &r = i->src(s);
+            for (int d = 0; d < 2; ++d)
+               if (r.isIndirect(d) && BanjoLiveness::gpr(i->getIndirect(s, d)) &&
+                   !(size_t(i->getIndirect(s, d)->id) < L.n && liveAt[i->getIndirect(s, d)->id]))
+                  extended += 1;
+         }
+         if (extended > BanjoLiveness::words(def))
+            continue;
+         Instruction *pos = target->getEntry();
+         // port 163: never past a fixed register's write (banjoWritesFixedGpr)
+         while (pos && (pos->join || pos->op == OP_JOIN || pos->fixed) && !banjoWritesFixedGpr(pos))
+            pos = pos->next;
+         bb->remove(i);
+         if (pos)
+            target->insertBefore(pos, i);
+         else
+            target->insertTail(i);
+         // its sources are now alive into the target
+         for (int s = 0; i->srcExists(s); ++s)
+            if (BanjoLiveness::gpr(i->getSrc(s)) && size_t(i->getSrc(s)->id) < L.n)
+               L.liveIn[ti->second][i->getSrc(s)->id] = 1;
+         ++moved;
+      }
+   }
+   return true;
+}
+
+// fnxf_xiii (2026-10-22, banjo flag 262144): rematerialisation, for a shader above 64 registers (CompileBest's second
+// try). A value that costs one instruction to compute again and reads no register that is not alive there anyway (an
+// immediate or constant buffer word moved or negated into a register, an input's interpolation, whose 1/w is alive
+// through the shader) is computed again just before each group of its uses that is far from where it was computed
+// (another block, or more than `near` instructions on): it no longer holds a register in between. The original goes
+// when no use is left (DeadCodeElim). One instruction more per group: only for the shaders whose registers it brings
+// back under a step.
+class Remat
+{
+public:
+   unsigned near = 6;
+   bool alu = false;  // banjo flag 524288: also one arithmetic operation whose register sources are alive there anyway
+   unsigned cloned = 0;
+   bool run(Function *fn);
+};
+
+bool
+Remat::run(Function *fn)
+{
+   BanjoLiveness L;
+   L.build(fn);
+   std::unordered_map<BasicBlock *, size_t> index;
+   for (size_t b = 0; b < L.blocks.size(); ++b)
+      index[L.blocks[b]] = b;
+   std::unordered_map<const Instruction *, int> pos;
+   for (BasicBlock *bb : L.blocks) {
+      int k = 0;
+      for (Instruction *i = bb->getFirst(); i; i = i->next)
+         pos[i] = k++;
+   }
+   // is v alive just after instruction at (bb, position p)? (used at or after p in bb, or live out of bb)
+   // (a value made after the liveness, a copy of this pass: not in it; banjo 2026-10-22, the console's crash after a
+   // full pre-pass: the index read past the end of the block's set)
+   auto aliveAfter = [&](Value *v, BasicBlock *bb, int p) {
+      auto b = index.find(bb);
+      if (b != index.end() && size_t(v->id) < L.n && L.liveOut[b->second][v->id])
+         return true;
+      for (ValueRef *u : v->uses) {
+         const Instruction *ui = u->getInsn();
+         if (ui && ui->bb == bb && pos[ui] >= p)
+            return true;
+      }
+      return false;
+   };
+   std::vector<Instruction *> candidates;
+   for (BasicBlock *bb : L.blocks) {
+      for (Instruction *i = bb->getEntry(); i; i = i->next) {
+         if (i->fixed || i->isPredicated() || i->join || i->exit || !i->defExists(0) || i->defExists(1) ||
+             i->flagsDef >= 0 || i->flagsSrc >= 0 || i->getDef(0)->reg.file != FILE_GPR || i->getDef(0)->uses.size() < 1)
+            continue;
+         bool ok, alu = false;
+         switch (i->op) {
+         case OP_MOV: case OP_NEG: case OP_ABS: case OP_LINTERP: case OP_PINTERP:
+            ok = true;
+            break;
+         case OP_ADD: case OP_SUB: case OP_MUL: case OP_MAD: case OP_FMA: case OP_MIN: case OP_MAX: case OP_SLCT:
+         case OP_AND: case OP_OR: case OP_XOR: case OP_SHL: case OP_SHR: case OP_SET: case OP_CVT: case OP_SAT:
+            ok = alu = this->alu;
+            break;
+         default:
+            ok = false;
+         }
+         int gprSrcs = 0;
+         for (int s = 0; ok && i->srcExists(s); ++s) {
+            const ValueRef &r = i->src(s);
+            if (r.isIndirect(0) || r.isIndirect(1))
+               ok = false;
+            else if (r.getFile() == FILE_GPR)
+               ++gprSrcs;
+            else if (r.getFile() != FILE_IMMEDIATE && r.getFile() != FILE_MEMORY_CONST &&
+                     r.getFile() != FILE_SHADER_INPUT)
+               ok = false;
+         }
+         if (!ok || i->getDef(0)->defs.size() != 1)
+            continue;
+         for (int s = 0; ok && i->srcExists(s); ++s)
+            if (BanjoLiveness::gpr(i->getSrc(s)) && i->getSrc(s)->defs.size() > 1)
+               ok = false;
+         if (!ok)
+            continue;
+         if (!alu && gprSrcs && i->op != OP_PINTERP && i->op != OP_LINTERP)
+            continue;
+         if (!alu && gprSrcs > 1)
+            continue;
+         if (alu && i->getDef(0)->reg.size != 4)
+            continue;
+         candidates.push_back(i);
+      }
+   }
+   for (Instruction *i : candidates) {
+      Value *def = i->getDef(0);
+      // the uses, in groups: by block, in order; a use near the previous group's head joins it
+      std::vector<ValueRef *> uses(def->uses.begin(), def->uses.end());
+      std::sort(uses.begin(), uses.end(), [&](ValueRef *a, ValueRef *b) {
+         const Instruction *x = a->getInsn(), *y = b->getInsn();
+         if (x->bb != y->bb)
+            return x->bb->getId() < y->bb->getId();
+         return pos[x] < pos[y];
+      });
+      Instruction *groupHead = nullptr;
+      Value *groupValue = nullptr;
+      for (ValueRef *u : uses) {
+         Instruction *ui = u->getInsn();
+         if (!ui || ui->op == OP_PHI)
+            continue;
+         // port 163: no copy after a fixed register's write in its block (banjoWritesFixedGpr): the copy could be
+         // given that register
+         {
+            bool afterFixed = false;
+            for (const Instruction *j = ui->bb->getEntry(); j && j != ui && !afterFixed; j = j->next)
+               afterFixed = banjoWritesFixedGpr(j);
+            if (afterFixed)
+               continue;
+         }
+         if (ui->bb == i->bb && pos[ui] > pos[i] && pos[ui] - pos[i] <= int(near))
+            continue;  // close to the original: it stays
+         if (groupHead && groupHead->bb == ui->bb && pos[ui] - pos[groupHead] <= int(near)) {
+            u->set(groupValue);
+            continue;
+         }
+         // its register source must be alive there anyway
+         bool srcAlive = true;
+         for (int s = 0; i->srcExists(s); ++s)
+            if (BanjoLiveness::gpr(i->getSrc(s)) && !aliveAfter(i->getSrc(s), ui->bb, pos[ui]))
+               srcAlive = false;
+         if (!srcAlive)
+            continue;
+         Instruction *c = cloneForward(fn, i);
+         ui->bb->insertBefore(ui, c);
+         pos[c] = pos[ui];
+         groupHead = ui;
+         groupValue = c->getDef(0);
+         u->set(groupValue);
+         ++cloned;
+      }
+   }
+   return true;
+}
+
+// fnxf_xiii (2026-10-22, tooling): UAM_VERIFY set: every register source defined before it is read (in its block,
+// or in a block that dominates it; a phi's source by the end of the block it comes from). The PC tool's check of the
+// passes that move and copy instructions.
+static unsigned
+banjoVerifySSA(Function *fn)
+{
+   unsigned bad = 0;
+   std::unordered_map<const Instruction *, int> pos;
+   for (IteratorRef it = fn->cfg.iteratorCFG(); !it->end(); it->next()) {
+      BasicBlock *bb = BasicBlock::get(reinterpret_cast<Graph::Node *>(it->get()));
+      int k = 0;
+      for (Instruction *i = bb->getFirst(); i; i = i->next)
+         pos[i] = k++;
+   }
+   for (IteratorRef it = fn->cfg.iteratorCFG(); !it->end(); it->next()) {
+      BasicBlock *bb = BasicBlock::get(reinterpret_cast<Graph::Node *>(it->get()));
+      for (Instruction *i = bb->getFirst(); i; i = i->next) {
+         for (int s = 0; i->srcExists(s); ++s) {
+            Value *v = i->getSrc(s);
+            if (!BanjoLiveness::gpr(v) || v->defs.size() != 1)
+               continue;
+            Instruction *d = v->getUniqueInsn();
+            if (!d || !d->bb)
+               continue;
+            BasicBlock *at = bb;
+            int p = pos[i];
+            if (i->op == OP_PHI) {
+               int j = 0;
+               at = nullptr;
+               for (Graph::EdgeIterator ii = bb->cfg.incident(); !ii.end(); ii.next(), ++j)
+                  if (j == s)
+                     at = BasicBlock::get(ii.getNode());
+               if (!at)
+                  continue;
+               p = 1 << 30;
+            }
+            const bool ok = d->bb == at ? pos[d] < p : at->dominatedBy(d->bb);
+            if (!ok) {
+               ++bad;
+               fprintf(stderr, "VERIFY: %%%d used in BB:%d before its definition in BB:%d\n", v->id, at->getId(),
+                       d->bb->getId());
+            }
+         }
+      }
+   }
+   return bad;
+}
+
+static void
+banjoPrintInsn(const Instruction *i)
+{
+   extern const char *operationStr[];
+   std::string o = operationStr[i->op];
+   char b[64];
+   for (int d = 0; i->defExists(d); ++d) {
+      snprintf(b, sizeof b, " %%%d", i->getDef(d)->id);
+      o += b;
+   }
+   o += " <-";
+   for (int s = 0; i->srcExists(s); ++s) {
+      const Value *v = i->getSrc(s);
+      switch (v->reg.file) {
+      case FILE_IMMEDIATE: snprintf(b, sizeof b, " imm"); break;
+      case FILE_MEMORY_CONST: snprintf(b, sizeof b, " c%d[0x%x]", v->reg.fileIndex, v->reg.data.offset); break;
+      case FILE_SHADER_INPUT: snprintf(b, sizeof b, " in[0x%x]", v->reg.data.offset); break;
+      case FILE_GPR: snprintf(b, sizeof b, " %%%d", v->id); break;
+      case FILE_PREDICATE: snprintf(b, sizeof b, " p%%%d", v->id); break;
+      default: snprintf(b, sizeof b, " f%d", int(v->reg.file)); break;
+      }
+      o += b;
+   }
+   fprintf(stderr, "%s\n", o.c_str());
+}
+
+static void
+banjoPressureDump(Function *fn)
+{
+   BanjoLiveness L;
+   L.build(fn);
+   unsigned best = 0;
+   size_t bestB = 0;
+   Instruction *bestI = nullptr;
+   std::vector<uint8_t> bestSet;
+   for (size_t b = 0; b < L.blocks.size(); ++b) {
+      BasicBlock *bb = L.blocks[b];
+      std::vector<uint8_t> live = L.liveOut[b];
+      for (Instruction *i = bb->getExit(); i && i->op != OP_PHI; i = i->prev) {
+         std::vector<uint8_t> at = live;
+         for (int d = 0; i->defExists(d); ++d)
+            if (BanjoLiveness::gpr(i->getDef(d)))
+               at[i->getDef(d)->id] = 1;
+         unsigned p = 0;
+         for (size_t k = 0; k < L.n; ++k)
+            if (at[k])
+               p += BanjoLiveness::words(reinterpret_cast<Value *>(fn->allLValues.get(k)));
+         if (p > best) {
+            best = p; bestB = b; bestI = i; bestSet = at;
+         }
+         for (int d = 0; i->defExists(d); ++d)
+            if (BanjoLiveness::gpr(i->getDef(d)))
+               live[i->getDef(d)->id] = 0;
+         for (int s = 0; i->srcExists(s); ++s)
+            if (BanjoLiveness::gpr(i->getSrc(s)))
+               live[i->getSrc(s)->id] = 1;
+      }
+   }
+   fprintf(stderr, "PRESSURE %u words at BB:%d (of %zu blocks) before:\n", best, L.blocks[bestB]->getId(),
+           L.blocks.size());
+   if (bestI)
+      banjoPrintInsn(bestI);
+   for (size_t k = 0; k < L.n; ++k) {
+      if (!bestSet[k])
+         continue;
+      Value *v = reinterpret_cast<Value *>(fn->allLValues.get(k));
+      Instruction *d = v->getUniqueInsn();
+      int gprSrcs = 0;
+      if (d)
+         for (int s = 0; d->srcExists(s); ++s)
+            gprSrcs += BanjoLiveness::gpr(d->getSrc(s));
+      fprintf(stderr, "  %%%d w%u def BB:%d uses %zu gprsrcs %d : ", v->id, BanjoLiveness::words(v),
+              d && d->bb ? d->bb->getId() : -1, v->uses.size(), gprSrcs);
+      if (d)
+         banjoPrintInsn(d);
+      else
+         fprintf(stderr, "\n");
+   }
+}
 
 #define RUN_PASS(l, n, f)                       \
    if (level >= (l)) {                          \
@@ -5096,12 +5921,50 @@ Program::optimizeSSA(int level)
       RUN_PASS(2, UniformJoins, run);  // banjo-nx (2026-10-18)
    if (banjoFlags & 512)
       RUN_PASS(2, TexCluster, run);  // banjo-nx (2026-10-19)
+   if (banjoFlags & 2048) {  // port 163 (from fnxf_xiii, 2026-10-21): the pressure passes
+      PressureSink sink;
+      sink.textures = (banjoFlags & 4096) != 0;
+      sink.allowNeutral = (banjoFlags & 8192) != 0;
+      sink.passTextures = (banjoFlags & 131072) != 0;
+      if (level >= 2 && (banjoFlags & 65536)) {
+         GlobalSink gs;
+         gs.rules = &sink;
+         for (ArrayList::Iterator fi = allFuncs.iterator(); !fi.end(); fi.next())
+            gs.run(reinterpret_cast<Function *>(fi.get()));
+      }
+      if (level >= 2 && !sink.run(this, false, true))
+         return false;
+      if (banjoFlags & 16384) {
+         PressureHoist hoist;
+         hoist.rules = &sink;
+         hoist.allowNeutral = (banjoFlags & 32768) != 0;
+         if (level >= 2 && !hoist.run(this, false, true))
+            return false;
+      }
+   }
    // banjo-nx (2026-10-18): after MemoryOpt, which makes the two loads of a word the shifts read one.
    if (getTarget()->getChipset() >= NVISA_GM107_CHIPSET && (banjoFlags & 1)) {
       RUN_PASS(2, PermuteOpt, run);
       RUN_PASS(2, LocalCSE, run);  // the selector selects of one fetch's words, and their immediates
    }
+   if (level >= 2 && (banjoFlags & 262144)) {  // port 163 (fnxf_xiii, 2026-10-22): after the last LocalCSE
+      Remat remat;
+      remat.alu = (banjoFlags & 524288) != 0;
+      for (ArrayList::Iterator fi = allFuncs.iterator(); !fi.end(); fi.next())
+         remat.run(reinterpret_cast<Function *>(fi.get()));
+      static const bool dump = getenv("UAM_PRESSURE_DUMP") != nullptr;  // once (the PC tool)
+      if (dump)
+         fprintf(stderr, "REMAT %u\n", remat.cloned);
+   }
    RUN_PASS(0, DeadCodeElim, buryAll);
+   static const bool verify = getenv("UAM_VERIFY") != nullptr;  // port 163 (fnxf_xiii): the PC tool's checks
+   if (verify)
+      for (ArrayList::Iterator fi = allFuncs.iterator(); !fi.end(); fi.next())
+         banjoVerifySSA(reinterpret_cast<Function *>(fi.get()));
+   static const bool pdump = getenv("UAM_PRESSURE_DUMP") != nullptr;
+   if (pdump)
+      for (ArrayList::Iterator fi = allFuncs.iterator(); !fi.end(); fi.next())
+         banjoPressureDump(reinterpret_cast<Function *>(fi.get()));
 
    return true;
 }

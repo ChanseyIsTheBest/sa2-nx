@@ -19,6 +19,17 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
 
+#include <atomic>
+#include <chrono>
+
+#include <rex/cvar.h>
+
+// peggle2-nx (2026-10-20): which users the game asks for its controllers' state (local multiplayer: player 2 had no
+// control in a duel on the console). Off by default (a diagnostic).
+REXCVAR_DEFINE_BOOL(input_diag_users, false, "Input",
+                    "Diagnostic: every 10 s, XamInputGetState's calls by the user asked for (0-3, any) with how "
+                    "many found a controller and how many had a button or trigger held");
+
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 namespace rex {
@@ -92,7 +103,10 @@ u32 XamInputGetCapabilitiesEx_entry(u32 unk, u32 user_index, u32 flags,
 }
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetstate(v=vs.85).aspx
+void SwitchKeyboardTestTick();  // xam_ui.cpp (banjo-nx, switch_software_keyboard_test)
+
 u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> input_state) {
+  SwitchKeyboardTestTick();
   // Games call this with a NULL state ptr, probably as a query.
   static int call_count = 0;
   if (++call_count <= 5) {
@@ -112,7 +126,38 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   }
 
   auto* is = input_system();
-  return is->GetState(actual_user_index, input_state);
+  if (!REXCVAR_GET(input_diag_users)) {
+    return is->GetState(actual_user_index, input_state);
+  }
+  // peggle2-nx (input_diag_users): [user][0] calls, [1] connected, [2] something held; user 4 = any.
+  static std::atomic<uint32_t> counts[5][3];
+  static std::atomic<int64_t> window_start{0};
+  const uint32_t slot = ((user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) ? 4 : (user_index & 3);
+  const X_RESULT result = is->GetState(actual_user_index, input_state);
+  counts[slot][0].fetch_add(1, std::memory_order_relaxed);
+  if (result == X_ERROR_SUCCESS) {
+    counts[slot][1].fetch_add(1, std::memory_order_relaxed);
+    if (input_state && (uint16_t(input_state->gamepad.buttons) || uint8_t(input_state->gamepad.left_trigger) ||
+                        uint8_t(input_state->gamepad.right_trigger)))
+      counts[slot][2].fetch_add(1, std::memory_order_relaxed);
+  }
+  const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch()).count();
+  int64_t start = window_start.load(std::memory_order_relaxed);
+  if (start == 0) {
+    window_start.compare_exchange_strong(start, now);
+  } else if (now - start >= 10000 && window_start.compare_exchange_strong(start, now)) {
+    std::string line;
+    for (uint32_t u = 0; u < 5; ++u) {
+      const uint32_t calls = counts[u][0].exchange(0), found = counts[u][1].exchange(0),
+                     held = counts[u][2].exchange(0);
+      if (calls)
+        line += fmt::format("{}user {}: {} calls, {} connected, {} with input", line.empty() ? "" : "; ",
+                            u == 4 ? std::string("any") : std::to_string(u), calls, found, held);
+    }
+    REXKRNL_INFO("[input] 10 s of XamInputGetState: {}", line.empty() ? std::string("no calls") : line);
+  }
+  return result;
 }
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx
@@ -188,11 +233,15 @@ i32 XamUserGetDeviceContext_entry(u32 user_index, u32 unk, mapped_u32 out_ptr) {
   // If this function fails they assume zero, so let's fail AND
   // set zero just to be safe.
   *out_ptr = 0;
-  if (!user_index || (user_index & 0xFF) == 0xFF) {
-    return X_E_SUCCESS;
-  } else {
-    return X_E_DEVICE_NOT_CONNECTED;
+  const i32 result = (!user_index || (user_index & 0xFF) == 0xFF) ? X_E_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+  if (REXCVAR_GET(input_diag_users)) {
+    // peggle2-nx (input_diag_users): every call while the diagnostic is on (few: the game asks at sign-in changes).
+    static std::atomic<uint32_t> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 400)
+      REXKRNL_INFO("[input] XamUserGetDeviceContext(user {}, {}) -> 0x{:08X}, context 0x{:08X}", uint32_t(user_index),
+                   uint32_t(unk), uint32_t(result), uint32_t(*out_ptr));
   }
+  return result;
 }
 
 }  // namespace xam

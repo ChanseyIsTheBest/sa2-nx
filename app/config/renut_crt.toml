@@ -1,0 +1,2 @@
+# katamari-nx: the SDK's native CRT is not used (not included in the codegen; read by tools/post_codegen.py).
+[rexcrt]

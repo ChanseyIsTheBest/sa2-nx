@@ -1,0 +1,1336 @@
+diff --git a/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/banjo_bool_spec.h b/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/banjo_bool_spec.h
+new file mode 100644
+index 0000000..e4e51c1
+--- /dev/null
++++ b/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/banjo_bool_spec.h
+@@ -0,0 +1,91 @@
++// banjo-nx (2026-10-17, package 27): the bool constants as specialization constants, for Renut's translator (banjo-nx's
++// banjo_gpu_bool_spec, rewritten for this translator's output; docs/renut-renderer-port.md).
++//
++// The translator tests a Xenos bool constant as BOOL_BIT(N) (N the unified index: vertex shader bools 0-127, pixel
++// shader bools 128-255), a read of the draw's SharedConstants. The tests are uniform branches around the light blocks
++// and the like (41,090 in the library's pixel shaders): the driver compiles every block, and allocates registers for
++// the largest path. Here each bool a shader tests gets a specialization constant of its own, 1000 + N:
++//
++//     [[vk::constant_id(1005)]] const uint g_banjoBool5 = 2;
++//     BOOL_BIT(5)   ->   BANJO_BOOL_5 = select(g_banjoBool5 == 2u, BOOL_BIT(5), g_banjoBool5 != 0u)
++//
++// Value 2 (the default, a pipeline created without the constant) reads the bool at run time, as before; 0 or 1 is the
++// bool's value in the pipeline, which the driver folds, dropping the block the draw does not run. The renderer gives
++// a pipeline the values of the draws it serves (the pipeline key holds them); the result is the same either way. SPIR-V
++// only: DXIL has no specialization constants and keeps BOOL_BIT. Off with BANJO_RENUT_BOOL_SPEC=0 in the build's
++// environment (the shader cache is rebuilt).
++#pragma once
++
++#include <atomic>
++#include <cctype>
++#include <cstdlib>
++#include <set>
++#include <string>
++
++namespace banjo_bool_spec {
++
++// Shaders given specialization constants, and the constants, over the run (main.cpp prints them).
++inline std::atomic<size_t> g_shaders{0}, g_constants{0};
++
++// Rewrites 'hlsl' (the shader's text up to the end of main's body). Returns the number of bools specialised.
++inline size_t Specialise(std::string &hlsl) {
++    if (const char *off = std::getenv("BANJO_RENUT_BOOL_SPEC"); off && off[0] == '0')
++        return 0;
++    const size_t main = hlsl.find("\nvoid main(");
++    if (main == std::string::npos)
++        return 0;
++    static const std::string kCall = "BOOL_BIT(";
++    std::set<unsigned> used;
++    std::string out;
++    out.reserve(hlsl.size() + 256);
++    size_t at = 0;
++    for (;;) {
++        const size_t k = hlsl.find(kCall, at);
++        if (k == std::string::npos)
++            break;
++        size_t e = k + kCall.size();
++        unsigned n = 0;
++        size_t digits = 0;
++        while (e < hlsl.size() && std::isdigit(static_cast<unsigned char>(hlsl[e]))) {
++            n = n * 10 + unsigned(hlsl[e] - '0');
++            ++e;
++            ++digits;
++        }
++        // Only a literal index (the macro's own definition, BOOL_BIT(n), is left alone) of a real bool.
++        const bool literal = digits > 0 && e < hlsl.size() && hlsl[e] == ')' && n < 256 &&
++                             (k == 0 || !(std::isalnum(static_cast<unsigned char>(hlsl[k - 1])) || hlsl[k - 1] == '_'));
++        out.append(hlsl, at, k - at);
++        if (literal) {
++            used.insert(n);
++            out += "BANJO_BOOL_" + std::to_string(n);
++            at = e + 1;
++        } else {
++            out += kCall;
++            at = k + kCall.size();
++        }
++    }
++    if (used.empty())
++        return 0;
++    out.append(hlsl, at, std::string::npos);
++    std::string decls = "\n// banjo-nx: bool constants as specialization constants (banjo_bool_spec.h)\n#ifdef __spirv__\n";
++    for (const unsigned n : used) {
++        const std::string s = std::to_string(n);
++        decls += "[[vk::constant_id(" + std::to_string(1000 + n) + ")]] const uint g_banjoBool" + s + " = 2;\n";
++        decls += "#define BANJO_BOOL_" + s + " select(g_banjoBool" + s + " == 2u, BOOL_BIT(" + s + "), g_banjoBool" + s +
++                 " != 0u)\n";
++    }
++    decls += "#else\n";
++    for (const unsigned n : used)
++        decls += "#define BANJO_BOOL_" + std::to_string(n) + " BOOL_BIT(" + std::to_string(n) + ")\n";
++    decls += "#endif\n";
++    // Before the first use: the named bool defines the translator writes ahead of main may already refer to them, but
++    // a macro is expanded where it is used, so in front of main is early enough for every use.
++    const size_t insert = out.find("\nvoid main(");
++    out.insert(insert, decls);
++    hlsl.swap(out);
++    g_shaders.fetch_add(1, std::memory_order_relaxed);
++    g_constants.fetch_add(used.size(), std::memory_order_relaxed);
++    return used.size();
++}
++
++}  // namespace banjo_bool_spec
+diff --git a/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/banjo_pred_select.h b/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/banjo_pred_select.h
+new file mode 100644
+index 0000000..42bad92
+--- /dev/null
++++ b/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/banjo_pred_select.h
+@@ -0,0 +1,297 @@
++// banjo-nx (2026-10-17): predicated blocks without a branch, for Renut's translator (banjo-nx's banjo_gpu_pred_select
++// and banjo_gpu_pred_select_ps, rewritten for this translator's output; docs/renut-renderer-port.md).
++//
++// The translator writes each predicated instruction, and each predicated exec block, as `if (p0)` / `if (!p0)` around
++// its statements. NAK keeps those branches (a heavy pixel shader has a few hundred), and a branch costs more than the
++// arithmetic it skips. A block whose statements are all plain register arithmetic becomes straight-line code:
++//
++//     if (p0) { r6.xy = A; ps = B; }   ->   { const bool pb1 = p0;
++//                                             r6.xy = select(pb1, (float2)(A), r6.xy);
++//                                             ps = select(pb1, (float)(B), ps); }
++//
++// Exact: each statement still runs in order when the predicate holds, and each target keeps its value when it does
++// not (so later statements read what they read before). The predicate is taken once, at the block's entry, as the
++// `if` took it; a block nested in a converted one takes `and(outer, p0)`, the current p0 (an earlier statement of the
++// outer block may have set it) under the outer block's own condition. Only side-effect-free statements qualify: the
++// targets are temporaries (rN, ps, p0), and anything that fetches, loads, kills, writes an output or the address
++// register, takes a derivative or indexes keeps its branch (the block stays as written; blocks inside it are still
++// converted). At most kMaxStatements statements per converted block, as banjo-nx's pixel shader rule.
++#pragma once
++
++#include <atomic>
++#include <cctype>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace banjo_pred_select {
++
++constexpr size_t kMaxStatements = 12;
++
++// Blocks converted, over every shader of the run (main.cpp prints it), and memory fetches among their statements.
++inline std::atomic<size_t> g_blocks{0}, g_fetches{0};
++
++inline std::string_view Trim(std::string_view s) {
++    const size_t b = s.find_first_not_of(" \t\r");
++    if (b == std::string_view::npos)
++        return {};
++    const size_t e = s.find_last_not_of(" \t\r");
++    return s.substr(b, e - b + 1);
++}
++
++struct Statement {
++    std::string lhs, rhs, type;
++};
++
++// banjo-nx (package 27): a vertex fetch from memory (bone palettes, instance data) may run unconditionally in its
++// clamped form (vfetchMemoryClamped in shader_common.h: the address stays inside the draw's fetch data, so a fetch
++// whose predicate does not hold reads something there and the select drops it), as banjo-nx's bone padding lets its
++// translator do. Off with BANJO_RENUT_PRED_FETCH=0 in the build's environment.
++inline bool FetchesAllowed() {
++    static const bool on = [] {
++        const char *off = std::getenv("BANJO_RENUT_PRED_FETCH");
++        return !(off && off[0] == '0');
++    }();
++    return on;
++}
++
++// The rhs with its memory fetches' names and their slot arguments taken out, for the forbidden-token test below.
++inline std::string WithoutMemoryFetches(std::string_view rhs) {
++    std::string s(rhs);
++    for (const char *name : {"vfetchMemory(", "g_VertexFetchSlot("}) {
++        const size_t n = std::strlen(name);
++        for (size_t k = s.find(name); k != std::string::npos; k = s.find(name, k))
++            s.replace(k, n, "(");
++    }
++    return s;
++}
++
++// `lhs = rhs;` with lhs rN, rN.mask, ps or p0 and a side-effect-free rhs.
++inline bool ParseStatement(std::string_view t, Statement &st) {
++    if (t.size() < 6 || t.back() != ';')
++        return false;
++    const size_t eq = t.find(" = ");
++    if (eq == std::string_view::npos)
++        return false;
++    const std::string_view lhs = t.substr(0, eq);
++    const std::string_view rhs = t.substr(eq + 3, t.size() - eq - 4);
++    if (rhs.empty())
++        return false;
++    if (lhs == "ps") {
++        st.type = "float";
++    } else if (lhs == "p0") {
++        st.type = "bool";
++    } else {
++        if (lhs.size() < 2 || lhs[0] != 'r' || !std::isdigit(static_cast<unsigned char>(lhs[1])))
++            return false;
++        size_t i = 1;
++        while (i < lhs.size() && std::isdigit(static_cast<unsigned char>(lhs[i])))
++            ++i;
++        if (i == lhs.size()) {
++            st.type = "float4";
++        } else {
++            if (lhs[i] != '.')
++                return false;
++            const size_t n = lhs.size() - i - 1;
++            if (n < 1 || n > 4)
++                return false;
++            for (size_t k = i + 1; k < lhs.size(); ++k)
++                if (!std::strchr("xyzw", lhs[k]))
++                    return false;
++            st.type = n == 1 ? std::string("float") : "float" + std::to_string(n);
++        }
++    }
++    // Anything that is not register arithmetic on constants and inputs keeps its branch.
++    const std::string checked = FetchesAllowed() ? WithoutMemoryFetches(rhs) : std::string(rhs);
++    static constexpr std::string_view kForbidden[] = {
++        "fetch", "Fetch", "Sample", "Load", "getTexture", "getCompTex", "getWeights", "texelToUV", "cubeMap",
++        "clip", "discard", "ddx", "ddy", "fwidth", "a0", "aL", "oC", "oPos", "oD", "oT", "oKill", "oPts", "oFog",
++        "emExport", "Interlocked", "?", "++", "--", "+=", "-=", "*=", "/=", "{", "}", "[", ";", "return", "break"};
++    for (const std::string_view f : kForbidden)
++        if (checked.find(f) != std::string::npos)
++            return false;
++    // No assignment inside the rhs (comparisons only).
++    for (size_t k = 0; k < rhs.size(); ++k) {
++        if (rhs[k] != '=')
++            continue;
++        const char before = k ? rhs[k - 1] : 0, after = k + 1 < rhs.size() ? rhs[k + 1] : 0;
++        if (!(before == '=' || before == '!' || before == '<' || before == '>' || after == '='))
++            return false;
++    }
++    st.lhs = std::string(lhs);
++    st.rhs = std::string(rhs);
++    return true;
++}
++
++struct Node {
++    enum Kind { Raw, Group, PredBlock } kind = Raw;
++    std::string line;            // Raw: the line; PredBlock: the `if` line (its indentation is kept)
++    std::string openLine, closeLine;  // Group / PredBlock: the brace lines as written
++    bool negated = false;
++    bool keep = false;           // PredBlock: an `else` follows (a control-flow region): the branch stays
++    std::vector<Node> children;
++};
++
++// Parses until the closing brace of the current group (consumed) or the end.
++inline void ParseLevel(const std::vector<std::string_view> &lines, size_t &i, std::vector<Node> &out, bool inGroup,
++                       std::string *closeLine) {
++    while (i < lines.size()) {
++        const std::string_view t = Trim(lines[i]);
++        if (t == "}" && inGroup) {
++            if (closeLine)
++                *closeLine = std::string(lines[i]);
++            ++i;
++            return;
++        }
++        if ((t == "if (p0)" || t == "if (!p0)") && i + 1 < lines.size() && Trim(lines[i + 1]) == "{") {
++            Node b;
++            b.kind = Node::PredBlock;
++            b.negated = t[4] == '!';
++            b.line = std::string(lines[i]);
++            b.openLine = std::string(lines[i + 1]);
++            i += 2;
++            ParseLevel(lines, i, b.children, true, &b.closeLine);
++            b.keep = i < lines.size() && Trim(lines[i]).substr(0, 4) == "else";
++            out.push_back(std::move(b));
++            continue;
++        }
++        if (t == "{") {
++            Node g;
++            g.kind = Node::Group;
++            g.openLine = std::string(lines[i]);
++            ++i;
++            ParseLevel(lines, i, g.children, true, &g.closeLine);
++            out.push_back(std::move(g));
++            continue;
++        }
++        Node r;
++        r.line = std::string(lines[i]);
++        out.push_back(std::move(r));
++        ++i;
++    }
++}
++
++// Statements in a block made only of statements and convertible blocks; SIZE_MAX if it cannot be converted.
++inline size_t ConvertibleStatements(const Node &b) {
++    if (b.keep)
++        return SIZE_MAX;
++    size_t n = 0;
++    for (const Node &c : b.children) {
++        if (c.kind == Node::PredBlock) {
++            const size_t m = ConvertibleStatements(c);
++            if (m == SIZE_MAX)
++                return SIZE_MAX;
++            n += m;
++        } else if (c.kind == Node::Raw) {
++            Statement st;
++            if (!ParseStatement(Trim(c.line), st))
++                return SIZE_MAX;
++            ++n;
++        } else {
++            return SIZE_MAX;
++        }
++        if (n > kMaxStatements)
++            return SIZE_MAX;
++    }
++    return n;
++}
++
++inline std::string IndentOf(const std::string &line) {
++    return line.substr(0, line.find_first_not_of('\t') == std::string::npos ? line.size()
++                                                                              : line.find_first_not_of('\t'));
++}
++
++struct Emitter {
++    std::string out;
++    size_t next = 0;
++    size_t blocks = 0;
++
++    // A convertible block, with the predicate of the converted block around it ('outer'; empty at a real branch).
++    void Converted(const Node &b, const std::string &outer) {
++        const std::string indent = IndentOf(b.line);
++        const std::string name = "pb" + std::to_string(++next);
++        const std::string pred = b.negated ? "!p0" : "p0";
++        out += indent + "{\n";
++        out += indent + "\tconst bool " + name + " = " + (outer.empty() ? pred : "and(" + outer + ", " + pred + ")") +
++               ";\n";
++        for (const Node &c : b.children) {
++            if (c.kind == Node::PredBlock) {
++                Converted(c, name);
++                continue;
++            }
++            Statement st;
++            ParseStatement(Trim(c.line), st);
++            // A memory fetch runs in its clamped form (see FetchesAllowed).
++            for (size_t k = st.rhs.find("vfetchMemory("); k != std::string::npos;
++                 k = st.rhs.find("vfetchMemory(", k + 1)) {
++                st.rhs.replace(k, 13, "vfetchMemoryClamped(");
++                g_fetches.fetch_add(1, std::memory_order_relaxed);
++            }
++            out += indent + "\t" + st.lhs + " = select(" + name + ", (" + st.type + ")(" + st.rhs + "), " + st.lhs +
++                   ");\n";
++        }
++        out += indent + "}\n";
++        ++blocks;
++    }
++
++    void Emit(const std::vector<Node> &nodes) {
++        for (const Node &n : nodes) {
++            switch (n.kind) {
++            case Node::Raw:
++                out += n.line;
++                out += '\n';
++                break;
++            case Node::Group:
++                out += n.openLine + "\n";
++                Emit(n.children);
++                out += n.closeLine + "\n";
++                break;
++            case Node::PredBlock:
++                if (ConvertibleStatements(n) != SIZE_MAX) {
++                    Converted(n, std::string());
++                } else {
++                    out += n.line + "\n" + n.openLine + "\n";
++                    Emit(n.children);
++                    out += n.closeLine + "\n";
++                }
++                break;
++            }
++        }
++    }
++};
++
++// Rewrites the body of `void main(...)` in 'hlsl' (everything after its opening brace line, which the translator has
++// not closed yet). Returns the number of blocks converted.
++inline size_t Flatten(std::string &hlsl) {
++    const size_t main = hlsl.find("\nvoid main(");
++    if (main == std::string::npos)
++        return 0;
++    const size_t open = hlsl.find("\n{\n", main);
++    if (open == std::string::npos)
++        return 0;
++    const size_t bodyStart = open + 3;
++    std::string body = hlsl.substr(bodyStart);
++    const bool trailingNewline = !body.empty() && body.back() == '\n';
++    std::vector<std::string_view> lines;
++    size_t at = 0;
++    while (at < body.size()) {
++        size_t end = body.find('\n', at);
++        if (end == std::string::npos)
++            end = body.size();
++        lines.push_back(std::string_view(body).substr(at, end - at));
++        at = end + 1;
++    }
++    std::vector<Node> nodes;
++    size_t i = 0;
++    ParseLevel(lines, i, nodes, false, nullptr);
++    Emitter e;
++    e.Emit(nodes);
++    if (!trailingNewline && !e.out.empty() && e.out.back() == '\n')
++        e.out.pop_back();
++    hlsl.replace(bodyStart, std::string::npos, e.out);
++    return e.blocks;
++}
++
++}  // namespace banjo_pred_select
+diff --git a/reNut/thirdparty/reblue-XenosRecomp/XenosRecomp/main.cpp b/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/main.cpp
+index c41e9da..2aecb6b 100644
+--- a/reNut/thirdparty/reblue-XenosRecomp/XenosRecomp/main.cpp
++++ b/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/main.cpp
+@@ -1,6 +1,14 @@
+ #include "shader.h"
+ #include "shader_recompiler.h"
+ #include "dxc_compiler.h"
++#ifdef RENUT_RECOMP
++#include "banjo_pred_select.h"
++#include "banjo_bool_spec.h"
++#include <atomic>
++// banjo-nx: rewritten shaders (BANJO_HLSL_OVERRIDE) that fell back to their own text.
++static std::atomic<size_t> banjoOverrideFallbacks{0};
++static std::atomic<size_t> banjoKillShaders{0}, banjoDepthShaders{0};  // banjo-nx (banjo_gpu_depth_only)
++#endif
+ 
+ #include <mutex>
+ #include <vector>
+@@ -35,6 +43,8 @@ struct RecompiledShader
+     uint32_t textureFetchMask = 0;
+     uint32_t memExportConstants[8] = {};
+     uint32_t floatConstants[8] = {};
++    uint32_t shaderFlags = 0;  // banjo-nx (banjo_gpu_depth_only): ShaderRecompiler::shaderFlags
++    std::vector<std::array<uint32_t, 5>> cbufLiterals;  // banjo-nx (banjo_gpu_literals_cbuf)
+     std::vector<ShaderRecompiler::VertexInput> vertexInputs;
+     // The file (and container index) the shader came from, naming its HLSL dump.
+     std::string sourceName;
+@@ -189,9 +199,30 @@ int main(int argc, char** argv)
+                     std::begin(shader.memExportConstants));
+                 std::copy(std::begin(recompiler.floatConstants), std::end(recompiler.floatConstants),
+                     std::begin(shader.floatConstants));
++                shader.cbufLiterals = recompiler.cbufLiterals;  // banjo-nx
++                shader.shaderFlags = recompiler.shaderFlags;    // banjo-nx (banjo_gpu_depth_only)
++                if (recompiler.isPixelShader)
++                {
++                    // banjo-nx (banjo_gpu_depth_only): the flags against the shader's own text (a kill is its only
++                    // clip(); the alpha test, the blend skip and the early alpha discard in shader_common.h). A draw
++                    // without its pixel shader must not lose a kill or a depth export the flags missed.
++                    const bool kills = recompiler.out.find("clip(") != std::string::npos;
++                    const bool depth = recompiler.out.find("SV_Depth") != std::string::npos;
++                    if (kills != ((shader.shaderFlags & ShaderRecompiler::SHADER_FLAG_PIXEL_KILL) != 0))
++                        recordFailure("banjo_gpu_depth_only: the kill flag does not match the shader's clip()");
++                    if (depth != ((shader.shaderFlags & ShaderRecompiler::SHADER_FLAG_PIXEL_DEPTH) != 0))
++                        recordFailure("banjo_gpu_depth_only: the depth flag does not match the shader's SV_Depth");
++                    if (kills)
++                        ++banjoKillShaders;
++                    if (depth)
++                        ++banjoDepthShaders;
++                }
+                 shader.vertexInputs = recompiler.vertexInputs;
+ 
+-                if (!hlslDumpDir.empty())
++                // banjo-nx (package 27): the first of the two runs around tools/renut_early_alpha.py only dumps the
++                // pixel shaders (BANJO_HLSL_DUMP_ONLY): no compile, and its cache file is thrown away.
++                const bool dumpOnly = std::getenv("BANJO_HLSL_DUMP_ONLY") != nullptr;
++                if (!hlslDumpDir.empty() && (recompiler.isPixelShader || !dumpOnly))
+                 {
+                     auto path = std::filesystem::path(hlslDumpDir) /
+                         (shader.sourceName.empty()
+@@ -206,12 +237,50 @@ int main(int argc, char** argv)
+                     contents.append(recompiler.out);
+                     writeAllBytes(path.string().c_str(), contents.data(), contents.size());
+                 }
++                if (dumpOnly)
++                    return;
++
++                // banjo-nx (package 27): a pass over the HLSL between two runs of this tool (tools/renut_early_alpha.py,
++                // banjo_gpu_early_alpha): the first run dumps (XENOS_RECOMP_HLSL_DUMP), the pass rewrites the dumps,
++                // and the second run compiles the file of BANJO_HLSL_OVERRIDE with this shader's dump name instead of
++                // its own text where there is one. If the rewritten text does not compile, the shader's own text is
++                // compiled instead (a shader is never lost to the pass).
++                std::string originalHlsl;
++                if (const char* overrideDir = std::getenv("BANJO_HLSL_OVERRIDE"); overrideDir && *overrideDir)
++                {
++                    auto path = std::filesystem::path(overrideDir) /
++                        (shader.sourceName.empty()
++                            ? fmt::format("{}_{:016X}", recompiler.isPixelShader ? "ps" : "vs", hash)
++                            : shader.sourceName);
++                    path += ".hlsl";
++                    std::error_code ec;
++                    if (std::filesystem::is_regular_file(path, ec))
++                    {
++                        size_t size = 0;
++                        auto bytes = readAllBytes(path.string().c_str(), size);
++                        if (bytes && size)
++                        {
++                            originalHlsl = std::move(recompiler.out);
++                            recompiler.out.assign(reinterpret_cast<const char*>(bytes.get()), size);
++                        }
++                    }
++                }
+ #endif
+ 
+                 thread_local DxcCompiler dxcCompiler;
+ 
+ #ifdef XENOS_RECOMP_DXIL
+                 shader.dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, recompiler.specConstantsMask != 0, false);
++#ifdef RENUT_RECOMP
++                if (shader.dxil == nullptr && !originalHlsl.empty())
++                {
++                    // banjo-nx: the override did not compile; the shader's own text (above).
++                    recompiler.out = std::move(originalHlsl);
++                    originalHlsl.clear();
++                    banjoOverrideFallbacks.fetch_add(1, std::memory_order_relaxed);
++                    shader.dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, recompiler.specConstantsMask != 0, false);
++                }
++#endif
+                 if (shader.dxil == nullptr)
+                 {
+                     recordFailure("dxc-dxil-compile-failed");
+@@ -225,6 +294,19 @@ int main(int argc, char** argv)
+ #endif
+ 
+                 IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
++#ifdef RENUT_RECOMP
++                if (spirv == nullptr && !originalHlsl.empty())
++                {
++                    // banjo-nx: as above, for SPIR-V (and the DXIL is the override's: compile both from the original).
++                    recompiler.out = std::move(originalHlsl);
++                    originalHlsl.clear();
++                    banjoOverrideFallbacks.fetch_add(1, std::memory_order_relaxed);
++#ifdef XENOS_RECOMP_DXIL
++                    shader.dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, recompiler.specConstantsMask != 0, false);
++#endif
++                    spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
++                }
++#endif
+                 if (spirv == nullptr)
+                 {
+                     recordFailure("dxc-spirv-compile-failed");
+@@ -253,6 +335,16 @@ int main(int argc, char** argv)
+             return 2;
+         }
+ 
++#ifdef RENUT_RECOMP
++        fmt::println("banjo-nx: {} predicated blocks without a branch, {} memory fetches in them (banjo_pred_select.h)",
++                     banjo_pred_select::g_blocks.load(), banjo_pred_select::g_fetches.load());
++        fmt::println("banjo-nx: {} bool specialization constants in {} shaders (banjo_bool_spec.h)",
++                     banjo_bool_spec::g_constants.load(), banjo_bool_spec::g_shaders.load());
++        fmt::println("banjo-nx: {} rewritten shaders (BANJO_HLSL_OVERRIDE) did not compile and kept their own text",
++                     banjoOverrideFallbacks.load());
++        fmt::println("banjo-nx: {} pixel shaders kill pixels, {} write depth (banjo_gpu_depth_only keeps them)",
++                     banjoKillShaders.load(), banjoDepthShaders.load());
++#endif
+         fmt::println("Creating shader cache...");
+ 
+         StringBuffer f;
+@@ -268,6 +360,8 @@ int main(int argc, char** argv)
+ #ifdef RENUT_RECOMP
+         StringBuffer vertexInputs;
+         size_t vertexInputCount = 0;
++        StringBuffer literals;     // banjo-nx (banjo_gpu_literals_cbuf): g_shaderLiterals
++        size_t literalCount = 0;
+ #endif
+ 
+         for (auto& [hash, shader] : shaders)
+@@ -276,12 +370,16 @@ int main(int argc, char** argv)
+             const uint32_t* me = shader.memExportConstants;
+             const uint32_t* fc = shader.floatConstants;
+             f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {}, 0x{:X}, 0x{:X}, {{ 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X} }}, "
+-                "{{ 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X} }}, {}, {} }},",
++                "{{ 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X} }}, {}, {}, {}, {}, 0x{:X} }},",
+                 hash, dxil.size(), (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0, spirv.size(), shader.spirv.size(), shader.specConstantsMask,
+                 shader.vertexFetchMemoryMask, shader.textureFetchMask,
+                 me[0], me[1], me[2], me[3], me[4], me[5], me[6], me[7],
+                 fc[0], fc[1], fc[2], fc[3], fc[4], fc[5], fc[6], fc[7],
+-                vertexInputCount, shader.vertexInputs.size());
++                vertexInputCount, shader.vertexInputs.size(), literalCount, shader.cbufLiterals.size(),
++                shader.shaderFlags);
++            for (const auto& l : shader.cbufLiterals)
++                literals.println("\t{{ {}, {{ 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X} }} }},", l[0], l[1], l[2], l[3], l[4]);
++            literalCount += shader.cbufLiterals.size();
+             for (const auto& input : shader.vertexInputs)
+             {
+                 vertexInputs.println("\t{{ {}, {}, {}, {}, {}, {}, {} }},", input.usage, input.usageIndex, input.fetchIndex,
+@@ -310,6 +408,11 @@ int main(int argc, char** argv)
+         f.out += vertexInputs.out;
+         f.println("\t{{ 0, 0, 0, 0, 0, 0, 0 }},");
+         f.println("}};");
++        // banjo-nx (banjo_gpu_literals_cbuf): the literal registers the shaders read from their constant buffers.
++        f.println("ShaderLiteral g_shaderLiterals[] = {{");
++        f.out += literals.out;
++        f.println("\t{{ 0, {{ 0, 0, 0, 0 }} }},");
++        f.println("}};");
+ #endif
+ 
+         fmt::println("Compressing DXIL cache...");
+@@ -348,8 +451,9 @@ int main(int argc, char** argv)
+ #ifdef RENUT_RECOMP
+         // Entries carry vertexFetchMemoryMask, textureFetchMask, memExportConstants,
+         // floatConstants and their range of g_shaderVertexInputs; 6: shaders with the
+-        // screen-space viewport epilogue and the rewritten memExport.
+-        f.println("extern const uint32_t g_shaderCacheLayout = 6;");
++        // screen-space viewport epilogue and the rewritten memExport; 7 (banjo-nx, package 28):
++        // shaderFlags.
++        f.println("extern const uint32_t g_shaderCacheLayout = 7;");
+ #endif
+ 
+         writeAllBytes(output, f.out.data(), f.out.size());
+diff --git a/reNut/thirdparty/reblue-XenosRecomp/XenosRecomp/pch.h b/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/pch.h
+index 03d740d..633f344 100644
+--- a/reNut/thirdparty/reblue-XenosRecomp/XenosRecomp/pch.h
++++ b/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/pch.h
+@@ -8,6 +8,7 @@
+ 
+ #ifdef RENUT_RECOMP
+ #include <algorithm>
++#include <array>
+ #include <functional>
+ #include <unordered_set>
+ #include <vector>
+diff --git a/reNut/thirdparty/reblue-XenosRecomp/XenosRecomp/shader_common.h b/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/shader_common.h
+index 11520f3..910d492 100644
+--- a/reNut/thirdparty/reblue-XenosRecomp/XenosRecomp/shader_common.h
++++ b/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/shader_common.h
+@@ -61,6 +61,9 @@
+ 
+ #ifdef __spirv__
+ 
++// banjo-nx: 16-byte vectors of SharedConstants (render/draw.h, kSharedConstantsUboBytes / 16).
++#define RENUT_SHARED_VECTORS 84
++
+ struct PushConstants
+ {
+     uint64_t VertexShaderConstants;
+@@ -94,27 +97,51 @@ struct PushConstants
+ // vertex fetch constant's range into one per-draw allocation: 560 is that allocation's device
+ // address, and 576..959 hold one word per Xenos vertex fetch index (0..95): the byte offset of
+ // that constant's copy, with the constant's 2-bit endian mode in the low bits.
+-#define g_Booleans(i)              vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 512 + (i)*4)
+-#define g_ScreenOffset             vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 544)
+-#define g_ScreenScale              vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 568)
+-#define g_ScreenSpace              vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 968)
+-#define g_ViewportSize             vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 1328)
++// banjo-nx (2026-10-17): the constants come from three dynamic uniform buffers (the vertex shader's
++// float constants in set 5, the pixel shader's in set 6, SharedConstants in set 7), which NVK keeps in Maxwell's
++// constant banks: a constant is a free operand of the instruction that reads it. Renut read them with
++// vk::RawBufferLoad through the 64-bit addresses in g_PushConstants, which NAK compiles to global memory loads.
++// Same bytes, same offsets. The host shaders (point_sprite_gs) still read SharedConstants through the push constant.
++struct RenutUboFloat { float4 v[256]; };
++struct RenutUboShared { uint4 v[RENUT_SHARED_VECTORS]; };
++[[vk::binding(0, 5)]] ConstantBuffer<RenutUboFloat> g_UboVertex;
++[[vk::binding(0, 6)]] ConstantBuffer<RenutUboFloat> g_UboPixel;
++[[vk::binding(0, 7)]] ConstantBuffer<RenutUboShared> g_UboShared;
++#define RENUT_SHARED_UINT(o)       (g_UboShared.v[uint(o) >> 4][(uint(o) >> 2) & 3u])
++#define RENUT_SHARED_FLOAT(o)      asfloat(RENUT_SHARED_UINT(o))
++#define RENUT_SHARED_FLOAT2(o)     float2(RENUT_SHARED_FLOAT(o), RENUT_SHARED_FLOAT((o) + 4))
++#define RENUT_SHARED_UINT4(o)      (g_UboShared.v[uint(o) >> 4])
++#define RENUT_SHARED_UINT64(o)     ((uint64_t(RENUT_SHARED_UINT((o) + 4)) << 32) | uint64_t(RENUT_SHARED_UINT(o)))
++#define g_Booleans(i)              RENUT_SHARED_UINT(512 + (i)*4)
++#define g_ScreenOffset             RENUT_SHARED_FLOAT2(544)
++#define g_ScreenScale              RENUT_SHARED_FLOAT2(568)
++#define g_ScreenSpace              RENUT_SHARED_UINT(968)
++#define g_ViewportSize             RENUT_SHARED_FLOAT2(1328)
+ // 1336: host pixels per guest pixel on each axis (the render targets are that multiple of their
+ // guest size; g_ViewportSize and the screen-space values are in guest pixels).
+-#define g_ResolutionScale          vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 1336)
+-#define g_AlphaThreshold           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 552)
+-#define g_AlphaTestFunc            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 556)
+-// 64-bit loads through a physical pointer need their alignment stated (the default is 4).
+-#define g_VertexFetchDataAddress   vk::RawBufferLoad<uint64_t>(g_PushConstants.SharedConstants + 560, 8)
+-#define g_VertexFetchSlot(i)       vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 576 + (i)*4)
++#define g_ResolutionScale          RENUT_SHARED_FLOAT(1336)
++#define g_AlphaThreshold           RENUT_SHARED_FLOAT(552)
++#define g_AlphaTestFunc            RENUT_SHARED_UINT(556)
++#define g_VertexFetchDataAddress   RENUT_SHARED_UINT64(560)
++#define g_VertexFetchSlot(i)       RENUT_SHARED_UINT(576 + (i)*4)
++// banjo-nx (package 27): 972 (was padding), the byte size of the draw's fetch data from g_VertexFetchDataAddress: the
++// bound of vfetchMemoryClamped.
++#define g_VertexFetchBytes         RENUT_SHARED_UINT(972)
+ // Memexport: 960 is the device address of the draw's export buffer, 976..1039 four stream
+ // windows (see memExport).
+-#define g_MemExportAddress         vk::RawBufferLoad<uint64_t>(g_PushConstants.SharedConstants + 960, 8)
+-#define g_MemExportStream(i)       vk::RawBufferLoad<uint4>(g_PushConstants.SharedConstants + 976 + (i)*16)
++#define g_MemExportAddress         RENUT_SHARED_UINT64(960)
++#define g_MemExportStream(i)       RENUT_SHARED_UINT4(976 + (i)*16)
+ // 1040: tessellated draws (see renutVertexRegisters).
+-#define g_Tessellation             vk::RawBufferLoad<uint4>(g_PushConstants.SharedConstants + 1040)
++#define g_Tessellation             RENUT_SHARED_UINT4(1040)
+ // 1056..1311: one element description per vertex input vfetchBound reads (see there).
+-#define g_BoundFetch(i)            vk::RawBufferLoad<uint4>(g_PushConstants.SharedConstants + 1056 + (i)*16)
++#define g_BoundFetch(i)            RENUT_SHARED_UINT4(1056 + (i)*16)
++// banjo-nx: the Xenos clamps' bounds (RCP, RSQ, LOG...: clamp(x, FLT_MIN, FLT_MAX), FLT_MIN being -FLT_MAX here)
++// from SharedConstants' word at 1340, which the renderer sets to FLT_MAX: a constant-bank operand of NAK's min / max
++// (with a negate modifier for FLT_MIN) instead of a 32-bit immediate NAK moves into a register before every clamp.
++#undef FLT_MIN
++#undef FLT_MAX
++#define FLT_MAX                    RENUT_SHARED_FLOAT(1340)
++#define FLT_MIN                    (-RENUT_SHARED_FLOAT(1340))
+ #else
+ #define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
+ #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
+@@ -152,6 +179,7 @@ struct PushConstants
+     float2 g_ScreenScale : packoffset(c35.z); \
+     uint4 g_VertexFetchSlotsArr[24] : packoffset(c36); \
+     uint g_ScreenSpace : packoffset(c60.z); \
++    uint g_VertexFetchBytes : packoffset(c60.w); \
+     uint4 g_MemExportStreamsArr[4] : packoffset(c61); \
+     uint4 g_Tessellation : packoffset(c65); \
+     uint4 g_BoundFetchArr[16] : packoffset(c66); \
+@@ -217,14 +245,14 @@ uint renutDescriptor(uint resourceDescriptorIndex)
+ float renutTextureScale(uint resourceDescriptorIndex)
+ {
+     const uint code = (resourceDescriptorIndex >> RENUT_RESOLUTION_SCALE_SHIFT) & 7u;
+-    return code == 1u ? 2.0 / 3.0
+-         : code == 2u ? 1.5
+-         : code == 3u ? 2.0
+-         : code == 4u ? 3.0
+-         : code == 5u ? 4.0
+-         : code == 6u ? 6.0
+-         : code == 7u ? 4.0 / 3.0
+-         : 1.0;
++    // banjo-nx: select(), not a chain of ?: (a branch each; the code is the descriptor's, known only at run time).
++    return select(code == 1u, 2.0 / 3.0,
++           select(code == 2u, 1.5,
++           select(code == 3u, 2.0,
++           select(code == 4u, 3.0,
++           select(code == 5u, 4.0,
++           select(code == 6u, 6.0,
++           select(code == 7u, 4.0 / 3.0, 1.0)))))));
+ }
+ 
+ // A scaled texture's guest width and height from its host ones.
+@@ -563,35 +591,108 @@ float4 tfetchCubeLevel(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+ }
+ 
+ // Xenos rcpf / rsqf: infinities become 0 rather than clamping to FLT_MAX.
++// banjo-nx: select(), not ?: (HLSL 2021 short-circuits ?:, which DXC writes as a branch).
+ float rcpf(float value)
+ {
+     float result = 1.0 / value;
+-    return isinf(result) ? 0.0 : result;
++    return select(isinf(result), 0.0, result);
+ }
+ 
+ float rsqf(float value)
+ {
+     float result = rsqrt(value);
+-    return isinf(result) ? 0.0 : result;
++    return select(isinf(result), 0.0, result);
+ }
+ 
+ // Xenos alpha test (fixed-function in the ROP): RB_COLORCONTROL ALPHA_FUNC, 0 NEVER, 1 LESS,
+ // 2 EQUAL, 3 LEQUAL, 4 GREATER, 5 NOTEQUAL, 6 GEQUAL, 7 ALWAYS. The host passes 7 when the
+ // test is disabled. Arguments rather than globals: the cbuffer is declared after this file.
++// banjo-nx (2026-10-17): the function picked with select() instead of a switch on it (a branch per case in every pixel
++// shader with the test; the function is the draw's, from the shared constants). The same comparisons, NaN included.
++// banjo-nx (banjo_gpu_early_alpha, package 27): what the early alpha copies tools/renut_early_alpha.py adds to the
++// pixel shaders call (tools/early_alpha.py's forms, banjo-nx's translator): a copy of the statements the alpha needs,
++// run where the shader has what it needs, and a 2x2 quad whose four pixels all fail the alpha test there is discarded
++// before the rest of the shader (no pixel still shaded loses a neighbour its derivatives need).
++#define banjoAnd(a, b) and(a, b)
++#define banjoOr(a, b) or(a, b)
++#define banjoSel(c, a, b) select(c, a, b)
++#define BANJO_BOOL(n) BANJO_BOOL_##n
++
++// Fails a pixel only when the test fails for every alpha within (|alpha| + |reference|) * 2^-12 + 1e-30 of the copy's
++// (a multiply-add fused in one place and not the other, a flushed denormal): banjo-nx's banjoAlphaFailsEarly, with the
++// draw's function and reference given at run time (Renut's renderer does not specialise them). Functions as the alpha
++// test's (0 never ... 7 always); not-equal and always never fail early; NaN never does.
++bool banjoAlphaFailsEarlyRt(float alpha, uint func, float reference)
++{
++    const float d = (abs(alpha) + abs(reference)) * (1.0 / 4096.0) + 1.0e-30;
++    return select(func == 0u, true,
++           select(func == 1u, alpha - d >= reference,
++           select(func == 2u, abs(alpha - reference) > d,
++           select(func == 3u, alpha - d > reference,
++           select(func == 4u, alpha + d <= reference,
++           select(func == 6u, alpha + d < reference, false))))));
++}
++
++// Discards the 2x2 quad when its four pixels all fail: fine derivatives of a 0/1 value, first along x (a pixel and its
++// horizontal neighbour), then of that pair along y.
++void banjoEarlyAlphaQuad(bool fails)
++{
++    const float f = select(fails, 1.0, 0.0);
++    const float dx = ddx_fine(f);
++    const float pair = select(and(f == 1.0, dx == 0.0), 1.0, 0.0);
++    const float dy = ddy_fine(pair);
++    if (pair == 1.0 && dy == 0.0)
++        discard;
++}
++
++// banjo-nx (banjo_gpu_blend_skip, package 27, from banjo-nx's renderer / sa2-nx): the pipeline's blend would leave its
++// one target exactly as it was, so the pixel is discarded before the blend. Specialization constant 900, set by the
++// renderer from the pipeline key (BlendSkipMode in render/pipeline.cpp): 1 when the target keeps its value for a
++// source alpha of 0 or less, 2 when it does for a whole source of 0 or less (a UNORM target, which clamps the source to
++// [0, 1] before the blend; no depth or stencil write; no alpha to coverage). A NaN output is never discarded. Called at
++// every exit of a pixel shader (shader_recompiler.cpp, after the alpha test). SPIR-V only.
++#ifdef __spirv__
++[[vk::constant_id(900)]] const uint g_banjoBlendSkip = 0;
++#endif
++void banjoBlendSkip(float4 c)
++{
++#ifdef __spirv__
++    if ((g_banjoBlendSkip == 1u && c.w <= 0.0 && !any(isnan(c.xyz))) || (g_banjoBlendSkip == 2u && all(c <= 0.0)))
++        discard;
++#endif
++}
++
++// banjo-nx (banjo_gpu_output_trim, package 28; Unleashed / Marathon's trimmed pixel outputs): the colour channels the
++// pipeline never uses are 0 from the shader's exits on, so the driver, which specialises the constant, drops what
++// computed only them. Specialization constant 901, 4 bits a target (RGBA as the colour write mask), set by the renderer
++// from the pipeline key (OutputTrimMask in render/pipeline.cpp): a channel the write mask or the target's format leaves
++// out, and the alpha only when no written colour channel blends with it and there is no alpha to coverage. Called at
++// every exit of a pixel shader after the alpha test and the blend skip. SPIR-V only.
++#ifdef __spirv__
++[[vk::constant_id(901)]] const uint g_banjoOutputTrim = 0;
++// The test (banjo_renut_diag_trim_poison): the trimmed channels are 60000 instead of 0, so one trimmed wrongly shows.
++[[vk::constant_id(902)]] const uint g_banjoTrimPoison = 0;
++#endif
++float4 banjoTrim(float4 c, uint target)
++{
++#ifdef __spirv__
++    const uint m = (g_banjoOutputTrim >> (target * 4u)) & 0xFu;
++    const float v = g_banjoTrimPoison != 0u ? 60000.0 : 0.0;
++    return select(bool4((m & 1u) != 0u, (m & 2u) != 0u, (m & 4u) != 0u, (m & 8u) != 0u), float4(v, v, v, v), c);
++#else
++    return c;
++#endif
++}
++
+ void alphaTest(float alpha, uint func, float reference)
+ {
+-    bool pass;
+-    switch (func)
+-    {
+-    case 0: pass = false; break;
+-    case 1: pass = alpha < reference; break;
+-    case 2: pass = alpha == reference; break;
+-    case 3: pass = alpha <= reference; break;
+-    case 4: pass = alpha > reference; break;
+-    case 5: pass = alpha != reference; break;
+-    case 6: pass = alpha >= reference; break;
+-    default: pass = true; break;
+-    }
++    const bool pass = select(func == 0u, false,
++                      select(func == 1u, alpha < reference,
++                      select(func == 2u, alpha == reference,
++                      select(func == 3u, alpha <= reference,
++                      select(func == 4u, alpha > reference,
++                      select(func == 5u, alpha != reference,
++                      select(func == 6u, alpha >= reference, true)))))));
+     if (!pass)
+         discard;
+ }
+@@ -609,15 +710,27 @@ uint loadVertexFetchData(uint byteOffset)
+ #endif
+ }
+ 
++// banjo-nx (package 27, banjo-nx's banjo_gpu_vfetch_block): four words in one 16-byte load. Only at a 16-byte aligned
++// address: every copy of the draw's fetch data starts 16-byte aligned (UploadVertexFetchData), so a fetch whose offset
++// and stride are whole rows (multiples of four words) is aligned at every index.
++uint4 loadVertexFetchData4(uint byteOffset)
++{
++#ifdef __spirv__
++    return vk::RawBufferLoad<uint4>(g_VertexFetchDataAddress + byteOffset, 16);
++#else
++    return g_VertexFetchData.Load4(byteOffset);
++#endif
++}
++
++// banjo-nx (2026-10-17): without a branch. The endian mode comes from the draw's constants, so the if-chain was a
++// branch per word (four words a fetch, twelve bone fetches in a skinning vertex shader); all three swaps are a few
++// shifts, and select() keeps the one the mode names. Same value for every mode.
+ uint vfetchSwap(uint value, uint endian)
+ {
+-    if (endian == 1) // 8in16
+-        value = ((value & 0x00FF00FF) << 8) | ((value >> 8) & 0x00FF00FF);
+-    else if (endian == 2) // 8in32
+-        value = (value << 24) | ((value << 8) & 0x00FF0000) | ((value >> 8) & 0x0000FF00) | (value >> 24);
+-    else if (endian == 3) // 16in32
+-        value = (value << 16) | (value >> 16);
+-    return value;
++    const uint swap8in16 = ((value & 0x00FF00FFu) << 8) | ((value >> 8) & 0x00FF00FFu);
++    const uint swap16in32 = (value << 16) | (value >> 16);
++    const uint swap8in32 = (swap8in16 << 16) | (swap8in16 >> 16);
++    return select(endian == 1u, swap8in16, select(endian == 2u, swap8in32, select(endian == 3u, swap16in32, value)));
+ }
+ 
+ // One packed integer component: signed/unsigned, normalized ("fraction") or integer.
+@@ -640,18 +753,39 @@ float vfetchComponent(uint value, uint shift, uint bits, bool isSigned, bool isI
+ // slot = g_VertexFetchSlot(fetch index): copy byte offset | endian mode. Packed components count
+ // from the low bits of the swapped word, 16-bit ones too: under the usual 8in32 swap x is the
+ // second halfword in memory, which N&B's shaders swizzle back (.yx, .yxwz on 16-bit fetches).
+-float4 vfetchMemory(uint slot, float indexValue, bool roundIndex, int offsetDwords, uint strideDwords,
+-    uint format, bool isSigned, bool isInteger, bool signedRfMode, int expAdjust)
++// banjo-nx (package 27): 'rowsAllowed' (vfetchMemory, vfetchMemoryClamped: their offset and stride are literals at the
++// call site, so the test below folds there) loads a whole-row fetch in one 16-byte load (BANJO_VFETCH_ROWS, on unless
++// the build turns it off); 'clampAddress' (vfetchMemoryClamped) keeps the address inside the draw's fetch data
++// ('fetchBytes', g_VertexFetchBytes, passed by the macro below: on DXIL the shared constants are declared after this
++// header), so the predicated-block pass can run the fetch for every vertex and keep its result only where the
++// predicate holds (banjo_pred_select.h): where it holds the address is already inside, and where it does not the value
++// is discarded.
++#ifndef BANJO_VFETCH_ROWS
++#define BANJO_VFETCH_ROWS 1
++#endif
++float4 vfetchMemoryImpl(uint slot, float indexValue, bool roundIndex, int offsetDwords, uint strideDwords,
++    uint format, bool isSigned, bool isInteger, bool signedRfMode, int expAdjust, bool rowsAllowed, bool clampAddress,
++    uint fetchBytes)
+ {
+     int index = int(roundIndex ? floor(indexValue + 0.5) : floor(indexValue));
+     uint address = (slot & ~0x3u) + uint(index * int(strideDwords) + offsetDwords) * 4u;
++    if (clampAddress)
++        address = min(address, max(fetchBytes, 16u) - 16u);
+     uint endian = slot & 0x3u;
+ 
+     uint4 w;
+-    w.x = vfetchSwap(loadVertexFetchData(address), endian);
+-    w.y = vfetchSwap(loadVertexFetchData(address + 4), endian);
+-    w.z = vfetchSwap(loadVertexFetchData(address + 8), endian);
+-    w.w = vfetchSwap(loadVertexFetchData(address + 12), endian);
++    if (BANJO_VFETCH_ROWS && rowsAllowed && ((uint(offsetDwords) | strideDwords) & 3u) == 0u)
++    {
++        const uint4 v = loadVertexFetchData4(address);
++        w = uint4(vfetchSwap(v.x, endian), vfetchSwap(v.y, endian), vfetchSwap(v.z, endian), vfetchSwap(v.w, endian));
++    }
++    else
++    {
++        w.x = vfetchSwap(loadVertexFetchData(address), endian);
++        w.y = vfetchSwap(loadVertexFetchData(address + 4), endian);
++        w.z = vfetchSwap(loadVertexFetchData(address + 8), endian);
++        w.w = vfetchSwap(loadVertexFetchData(address + 12), endian);
++    }
+ 
+     float4 result = float4(0.0, 0.0, 0.0, 1.0);
+     bool isFloat = false;
+@@ -722,6 +856,18 @@ float4 vfetchMemory(uint slot, float indexValue, bool roundIndex, int offsetDwor
+     return result;
+ }
+ 
++float4 vfetchMemory(uint slot, float indexValue, bool roundIndex, int offsetDwords, uint strideDwords,
++    uint format, bool isSigned, bool isInteger, bool signedRfMode, int expAdjust)
++{
++    return vfetchMemoryImpl(slot, indexValue, roundIndex, offsetDwords, strideDwords, format, isSigned, isInteger,
++        signedRfMode, expAdjust, true, false, 0u);
++}
++
++#define vfetchMemoryClamped(slot, indexValue, roundIndex, offsetDwords, strideDwords, format, isSigned, isInteger, \
++    signedRfMode, expAdjust) \
++    vfetchMemoryImpl(slot, indexValue, roundIndex, offsetDwords, strideDwords, format, isSigned, isInteger, \
++        signedRfMode, expAdjust, true, true, g_VertexFetchBytes)
++
+ // Vertex fetch of a bound declaration's element by an index other than the vertex index (N&B's
+ // leaf cards read their per-card position and rotation at vertex index / 4). D3D patches the
+ // element's format, swizzle and stride into the fetch at bind time, so the microcode has none;
+@@ -731,8 +877,9 @@ float4 vfetchMemory(uint slot, float indexValue, bool roundIndex, int offsetDwor
+ // slot = g_VertexFetchSlot(element.x).
+ float4 vfetchBound(uint4 element, uint slot, float indexValue, bool roundIndex, bool signedRfMode, int expAdjust)
+ {
+-    float4 value = vfetchMemory(slot, indexValue, roundIndex, int(element.y), element.z, element.w & 0x3Fu,
+-        (element.w & 0x100u) != 0, (element.w & 0x200u) != 0, signedRfMode, expAdjust);
++    // banjo-nx: word by word (its offset and stride come from the draw's constants, not the call site).
++    float4 value = vfetchMemoryImpl(slot, indexValue, roundIndex, int(element.y), element.z, element.w & 0x3Fu,
++        (element.w & 0x100u) != 0, (element.w & 0x200u) != 0, signedRfMode, expAdjust, false, false, 0u);
+     float4 result;
+     [unroll] for (uint i = 0; i < 4; i++)
+     {
+@@ -767,6 +914,32 @@ void renutVertexRegisters(uint vertexId, uint instanceId, uint4 tessellation, ou
+ 
+     uint level = max(tessellation.y, 1u);
+     float patchIndex = float(tessellation.z + instanceId);
++    // banjo-nx (banjo_gpu_tess_grid, package 27, from banjo-nx's renderer): kinds 3 and 4 are kinds 1 and 2 drawn
++    // indexed, the vertex ID a grid vertex rather than a triangle corner, so the shader runs once per grid vertex instead
++    // of once per corner (about six times). The host's index list (TessellationGrid in render/draw.cpp) names the same
++    // triangles in the same order with the same corners, and each grid vertex gets the same values as below.
++    if (tessellation.x == 3u)
++    {
++        // Vertex (a, b), b <= a <= level, numbered a (a + 1) / 2 + b.
++        uint a = uint((sqrt(float(8u * vertexId + 1u)) - 1.0) * 0.5);
++        if (a * (a + 1u) / 2u > vertexId)
++            --a;
++        else if ((a + 1u) * (a + 2u) / 2u <= vertexId)
++            ++a;
++        uint2 vertex = uint2(a, vertexId - a * (a + 1u) / 2u);
++        float3 weights = float3(level - vertex.x, vertex.x - vertex.y, vertex.y) / float(level);
++        r0.xyz = weights.zyx;
++        r1.x = patchIndex;
++        return;
++    }
++    if (tessellation.x == 4u)
++    {
++        // Vertex (u, v), numbered v (level + 1) + u.
++        uint2 position = uint2(vertexId % (level + 1u), vertexId / (level + 1u));
++        float2 uv = float2(position) / float(level);
++        r0 = float4(patchIndex, uv, 0.0);
++        return;
++    }
+     uint triangleIndex = vertexId / 3u;
+     uint corner = vertexId % 3u;
+     if (tessellation.x == 1u)
+diff --git a/reNut/thirdparty/reblue-XenosRecomp/XenosRecomp/shader_recompiler.cpp b/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/shader_recompiler.cpp
+index 6bd9389..ed6ebdb 100644
+--- a/reNut/thirdparty/reblue-XenosRecomp/XenosRecomp/shader_recompiler.cpp
++++ b/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/shader_recompiler.cpp
+@@ -1,5 +1,9 @@
+ #include "shader_recompiler.h"
+ #include "shader_common.h"
++#ifdef RENUT_RECOMP
++#include "banjo_pred_select.h"  // banjo-nx: predicated blocks without a branch
++#include "banjo_bool_spec.h"    // banjo-nx: bool constants as specialization constants
++#endif
+ 
+ #ifdef RENUT_RECOMP
+ // Stands in the vertex shader's parameter list for the kill output (hasVertexKill).
+@@ -1005,23 +1009,28 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+     switch (instr.vectorOpcode)
+     {
+     case AluVectorOpcode::KillEq:
++        shaderFlags |= SHADER_FLAG_PIXEL_KILL;  // banjo-nx (banjo_gpu_depth_only): the four vector kills
+         indent();
+-        println("clip(any({} == {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
++        // banjo-nx: select(), not ?: (HLSL 2021 short-circuits ?:, DXC writes a branch NAK keeps); same values.
++        println("clip(select(any({} == {}), -1.0, 1.0));", op(VECTOR_0), op(VECTOR_1));
+         break;
+     
+     case AluVectorOpcode::KillGt:
++        shaderFlags |= SHADER_FLAG_PIXEL_KILL;
+         indent();
+-        println("clip(any({} > {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
++        println("clip(select(any({} > {}), -1.0, 1.0));", op(VECTOR_0), op(VECTOR_1));
+         break;
+     
+     case AluVectorOpcode::KillGe:
++        shaderFlags |= SHADER_FLAG_PIXEL_KILL;
+         indent();
+-        println("clip(any({} >= {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
++        println("clip(select(any({} >= {}), -1.0, 1.0));", op(VECTOR_0), op(VECTOR_1));
+         break;
+     
+     case AluVectorOpcode::KillNe:
++        shaderFlags |= SHADER_FLAG_PIXEL_KILL;
+         indent();
+-        println("clip(any({} != {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
++        println("clip(select(any({} != {}), -1.0, 1.0));", op(VECTOR_0), op(VECTOR_1));
+         break;
+     }
+ 
+@@ -1047,6 +1056,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+                 exportRegister = "oC3";
+                 break;           
+             case ExportRegister::PSDepth:
++                shaderFlags |= SHADER_FLAG_PIXEL_DEPTH;  // banjo-nx (banjo_gpu_depth_only)
+                 exportRegister = "oDepth";
+                 break;
+             }
+@@ -1241,14 +1251,21 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             print("{} * {}", op(VECTOR_0), op(VECTOR_1));
+             break;
+ 
++        // banjo-nx (2026-10-17, from banjo-nx's translator): the Xenos has no move; the assembler writes MAX dst, src,
++        // src (MAXs for the scalar channel), so the library had 38,482 max(a, a) (33,213 in the pixel shaders), which
++        // NIR keeps as an operation. max(a, a) == a exactly, NaN and both zeros included (the only cases where IEEE
++        // min and max differ), so the operand is written as it is. MaxA's a0 update is handled apart, unchanged.
+         case AluVectorOpcode::Max:
+         case AluVectorOpcode::MaxA:
+-            print("max({}, {})", op(VECTOR_0), op(VECTOR_1));
+-            break;
+-
+         case AluVectorOpcode::Min:
+-            print("min({}, {})", op(VECTOR_0), op(VECTOR_1));
++        {
++            const std::string a = op(VECTOR_0), b = op(VECTOR_1);
++            if (a == b)
++                out += a;
++            else
++                print("{}({}, {})", instr.vectorOpcode == AluVectorOpcode::Min ? "min" : "max", a, b);
+             break;
++        }
+ 
+         case AluVectorOpcode::Seq:
+             print("{} == {}", op(VECTOR_0), op(VECTOR_1));
+@@ -1439,15 +1456,19 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             print("{} * ps", op(SCALAR_0));
+             break;
+ 
++        // banjo-nx: the scalar move, as above.
+         case AluScalarOpcode::Maxs:
+         case AluScalarOpcode::MaxAs:
+         case AluScalarOpcode::MaxAsf:
+-            print("max({}, {})", op(SCALAR_0), op(SCALAR_1));
+-            break;
+-
+         case AluScalarOpcode::Mins:
+-            print("min({}, {})", op(SCALAR_0), op(SCALAR_1));
++        {
++            const std::string a = op(SCALAR_0), b = op(SCALAR_1);
++            if (a == b)
++                out += a;
++            else
++                print("{}({}, {})", instr.scalarOpcode == AluScalarOpcode::Mins ? "min" : "max", a, b);
+             break;
++        }
+ 
+         case AluScalarOpcode::Seqs:
+             print("{} == 0.0", op(SCALAR_0));
+@@ -1524,20 +1545,20 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+         case AluScalarOpcode::SetpNe:
+         case AluScalarOpcode::SetpGt:
+         case AluScalarOpcode::SetpGe:
+-            out += "p0 ? 0.0 : 1.0";
++            out += "select(p0, 0.0, 1.0)";  // banjo-nx: select(), as the kills
+             break;
+ 
+         case AluScalarOpcode::SetpInv:
+ #if defined(REBLUE_RECOMP) || defined(RENUT_RECOMP)
+             // PRED_SETINV: src==1 -> 0, src==0 -> 1, else passthrough.
+-            print("{0} == 1.0 ? 0.0 : ({0} == 0.0 ? 1.0 : {0})", op(SCALAR_0));
++            print("select({0} == 1.0, 0.0, select({0} == 0.0, 1.0, {0}))", op(SCALAR_0));
+ #else
+             print("{0} == 0.0 ? 1.0 : {0}", op(SCALAR_0));
+ #endif
+             break;
+ 
+         case AluScalarOpcode::SetpPop:
+-            print("p0 ? 0.0 : ({} - 1.0)", op(SCALAR_0));
++            print("select(p0, 0.0, {} - 1.0)", op(SCALAR_0));
+             break;
+ 
+         case AluScalarOpcode::SetpClr:
+@@ -1545,7 +1566,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+             break;
+ 
+         case AluScalarOpcode::SetpRstr:
+-            print("p0 ? 0.0 : {}", op(SCALAR_0));
++            print("select(p0, 0.0, {})", op(SCALAR_0));
+             break;
+ 
+         case AluScalarOpcode::KillsEq:
+@@ -1715,8 +1736,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+ 
+     if (instr.scalarOpcode >= AluScalarOpcode::KillsEq && instr.scalarOpcode <= AluScalarOpcode::KillsOne)
+     {
++        shaderFlags |= SHADER_FLAG_PIXEL_KILL;  // banjo-nx (banjo_gpu_depth_only)
+         indent();
+-        out += "clip(ps != 0.0 ? -1 : 1);\n";
++        out += "clip(select(ps != 0.0, -1.0, 1.0));\n";  // banjo-nx: select(), as above
+     }
+ 
+     if (closeIfBracket)
+@@ -1785,7 +1807,7 @@ void ShaderRecompiler::recompileConstants(const uint8_t* shaderData)
+ 
+     out += "#ifdef __spirv__\n\n";
+ 
+-    println("#define g_C(INDEX) select((uint)(INDEX) < 256u, vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + min((uint)(INDEX), 255u) * 16, 0x10), 0.0)",
++    println("#define g_C(INDEX) select((uint)(INDEX) < 256u, g_Ubo{}.v[min((uint)(INDEX), 255u)], 0.0)",
+         shaderName);
+ 
+     for (uint32_t r = 0; r < SAMPLER_COUNT; r++)
+@@ -1793,10 +1815,10 @@ void ShaderRecompiler::recompileConstants(const uint8_t* shaderData)
+         const std::string name = samplerName(r);
+         for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+         {
+-            println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
++            println("#define {}_Texture{}DescriptorIndex RENUT_SHARED_UINT({})",
+                 name, TEXTURE_DIMENSIONS[j], j * SAMPLER_COUNT * 4 + r * 4);
+         }
+-        println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
++        println("#define {}_SamplerDescriptorIndex RENUT_SHARED_UINT({})",
+             name, std::size(TEXTURE_DIMENSIONS) * SAMPLER_COUNT * 4 + r * 4);
+     }
+ 
+@@ -1917,13 +1939,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             {
+                 uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
+ 
+-                println("#define {}(INDEX) select((INDEX) < {}, vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10), 0.0)",
++                println("#define {}(INDEX) select((INDEX) < {}, g_Ubo{}.v[{} + min(INDEX, {})], 0.0)",
+                     constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1);
+             }
+             else
+             {
+-                println("#define {} vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + {}, 0x10)",
+-                    constantName, shaderName, constantInfo->registerIndex * 16);
++                println("#define {} g_Ubo{}.v[{}]",
++                    constantName, shaderName, constantInfo->registerIndex.get());
+             }
+             
+ #ifdef REBLUE_RECOMP
+@@ -1947,11 +1969,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         {
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
+-                println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
++                println("#define {}_Texture{}DescriptorIndex RENUT_SHARED_UINT({})",
+                     constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
+             }
+ 
+-            println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
++            println("#define {}_SamplerDescriptorIndex RENUT_SHARED_UINT({})",
+                 constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
+ 
+             samplers.emplace(constantInfo->registerIndex, constantName);
+@@ -1969,10 +1991,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             continue;
+         for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+         {
+-            println("#define s{}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
++            println("#define s{}_Texture{}DescriptorIndex RENUT_SHARED_UINT({})",
+                 r, TEXTURE_DIMENSIONS[j], j * 64 + r * 4);
+         }
+-        println("#define s{}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
++        println("#define s{}_SamplerDescriptorIndex RENUT_SHARED_UINT({})",
+             r, std::size(TEXTURE_DIMENSIONS) * 64 + r * 4);
+     }
+ #endif
+@@ -2121,6 +2143,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         out += "#endif\n";
+ 
+         auto pixelShader = reinterpret_cast<const PixelShader*>(shader);
++        pixelOutputs = pixelShader->outputs;  // banjo-nx (banjo_gpu_output_trim)
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR0)
+             out += ",\n\tout float4 oC0 : SV_Target0";
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR1)
+@@ -2130,7 +2153,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR3)
+             out += ",\n\tout float4 oC3 : SV_Target3";
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_DEPTH)
++        {
++            shaderFlags |= SHADER_FLAG_PIXEL_DEPTH;  // banjo-nx (banjo_gpu_depth_only): declared, so written
+             out += ",\n\tout float oDepth : SV_Depth";
++        }
+     }
+     else
+     {
+@@ -2279,6 +2305,45 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     definition->registerIndex + i - (isPixelShader ? 256 : 0),
+                     shadowKernelComponent(value[0].get()), shadowKernelComponent(value[1].get()),
+                     shadowKernelComponent(value[2].get()), shadowKernelComponent(value[3].get()));
++#elif defined(RENUT_RECOMP)
++                {
++                    // banjo-nx (banjo_gpu_literals_cbuf, package 27, from banjo-nx's translator): a component NAK cannot
++                    // encode as an immediate (any of the low 12 mantissa bits set: the shadow taps' offsets and the
++                    // like) is read from the shader's own constant register instead, a free constant-bank operand,
++                    // where NAK moves a 32-bit immediate into a register before each use. The renderer writes the
++                    // shader's literal values into those registers of every draw's constants (UploadFloatConstants),
++                    // as the console's Direct3D loads them at SetShader, so the value read is the literal. Off with
++                    // BANJO_RENUT_LITERALS_CBUF=0 in the build's environment.
++                    static const bool literalsCbuf = [] {
++                        const char *off = std::getenv("BANJO_RENUT_LITERALS_CBUF");
++                        return !(off && off[0] == '0');
++                    }();
++                    const uint32_t reg = definition->registerIndex + i - (isPixelShader ? 256 : 0);
++                    const uint32_t words[4] = { value[0].get(), value[1].get(), value[2].get(), value[3].get() };
++                    std::string comps[4];
++                    bool fromBuffer = false;
++                    for (uint32_t k = 0; k < 4; ++k)
++                    {
++                        if (literalsCbuf && (words[k] & 0xFFFu) != 0 && reg < 256)
++                        {
++                            comps[k] = fmt::format("g_C({}).{}", reg, "xyzw"[k]);
++                            fromBuffer = true;
++                        }
++                        else
++                        {
++                            comps[k] = fmt::format("asfloat(0x{:X}u)", words[k]);
++                        }
++                    }
++                    if (fromBuffer)
++                    {
++                        println("\tfloat4 c{} = float4({}, {}, {}, {});", reg, comps[0], comps[1], comps[2], comps[3]);
++                        cbufLiterals.push_back({ reg, words[0], words[1], words[2], words[3] });
++                    }
++                    else
++                    {
++                        println("\tfloat4 c{} = asfloat(uint4(0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}));", reg, words[0], words[1], words[2], words[3]);
++                    }
++                }
+ #else
+                 println("\tfloat4 c{} = asfloat(uint4(0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}));",
+                     definition->registerIndex + i - (isPixelShader ? 256 : 0), value[0].get(), value[1].get(), value[2].get(), value[3].get());
+@@ -3054,6 +3119,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 {
+                     indent();
+                     out += "alphaTest(oC0.w, g_AlphaTestFunc, g_AlphaThreshold);\n";
++                    // banjo-nx (banjo_gpu_blend_skip, package 27): shader_common.h, banjoBlendSkip.
++                    indent();
++                    out += "banjoBlendSkip(oC0);\n";
++                    // banjo-nx (banjo_gpu_output_trim, package 28): shader_common.h, banjoTrim; after the alpha test
++                    // and the blend skip, which read the outputs as the shader made them.
++                    for (uint32_t target = 0; target < 4; ++target)
++                    {
++                        if (pixelOutputs & (PIXEL_SHADER_OUTPUT_COLOR0 << target))
++                        {
++                            indent();
++                            println("oC{0} = banjoTrim(oC{0}, {0}u);", target);
++                        }
++                    }
+                 }
+                 else
+             #else
+@@ -3195,6 +3273,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         out.replace(at, KILL_OUTPUT_PLACEHOLDER.size(),
+             hasVertexKill ? "\n#ifndef __spirv__\n\t, out float oKill : SV_CullDistance0\n#endif\n" : "");
+     }
++
++    // banjo-nx (2026-10-17): predicated blocks of register arithmetic as select() (banjo_pred_select.h). Off with
++    // BANJO_RENUT_PRED_SELECT=0 in the environment of the build (the shader cache is rebuilt).
++    if (const char *off = std::getenv("BANJO_RENUT_PRED_SELECT"); !(off && off[0] == '0'))
++        banjo_pred_select::g_blocks.fetch_add(banjo_pred_select::Flatten(out), std::memory_order_relaxed);
++    // banjo-nx (package 27): the bools the shader tests as specialization constants (banjo_bool_spec.h).
++    banjo_bool_spec::Specialise(out);
+ #endif
+ 
+     out += "}";
+diff --git a/reNut/thirdparty/reblue-XenosRecomp/XenosRecomp/shader_recompiler.h b/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/shader_recompiler.h
+index be28435..d773e35 100644
+--- a/reNut/thirdparty/reblue-XenosRecomp/XenosRecomp/shader_recompiler.h
++++ b/banjo-nx/app/thirdparty/reblue-XenosRecomp/XenosRecomp/shader_recompiler.h
+@@ -51,6 +51,10 @@ struct ShaderRecompiler : StringBuffer
+ #ifdef RENUT_RECOMP
+     // Registers defined by the definition table; they are locals, not constant buffer reads.
+     std::unordered_set<uint32_t> literalConstants;
++    // banjo-nx (banjo_gpu_literals_cbuf, package 27): the literal registers some component of which the shader reads
++    // from its constant buffer (register, then its four words), for the renderer to write there (main.cpp's
++    // g_shaderLiterals).
++    std::vector<std::array<uint32_t, 5>> cbufLiterals;
+     uint32_t loopDepth = 0;
+     // Mini vertex fetches reuse the fetch constant, stride and index of the last full fetch.
+     VertexFetchInstruction lastFullVertexFetch{};
+@@ -90,6 +94,14 @@ struct ShaderRecompiler : StringBuffer
+     // sets PA_CL_CLIP_CNTL.vtx_kill_or). The grass kills its blades where the density map is
+     // below their threshold.
+     bool hasVertexKill = false;
++    // banjo-nx (banjo_gpu_depth_only, package 28): what a pixel shader does besides its colours, which a draw without
++    // it would lose: SHADER_FLAG_PIXEL_KILL a kill instruction (clip), SHADER_FLAG_PIXEL_DEPTH a depth export (SV_Depth).
++    // The alpha test and banjoBlendSkip are the draw's (the renderer knows them); memexport is memExportConstants.
++    static constexpr uint32_t SHADER_FLAG_PIXEL_KILL = 1;
++    static constexpr uint32_t SHADER_FLAG_PIXEL_DEPTH = 2;
++    uint32_t shaderFlags = 0;
++    // banjo-nx (banjo_gpu_output_trim, package 28): the pixel shader's PIXEL_SHADER_OUTPUT_* (its declared outputs).
++    uint32_t pixelOutputs = 0;
+     // Each vertex element the shader fetches, as its vfetch describes it: what a vertex
+     // declaration would say. N&B draws bundle meshes with no declaration set; the host builds
+     // their input layout from this.

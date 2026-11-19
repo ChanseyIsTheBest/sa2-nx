@@ -9,8 +9,16 @@
  */
 #include <cstring>
 
+#include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/system/xmemory.h>
+
+// renut-ultimate (2026-11-16, port 146; tw2de_nx's, from nx-mod/rexglue-sdk-nx; off by default at the user's word).
+REXCVAR_DEFINE_BOOL(crt_xmemcpy_as_memmove, false, "Kernel",
+                    "tw2de_nx (exact): the native XMemCpy (rexcrt_XMemCpy, which a game maps its own block copy to) "
+                    "is a memmove: a game's forward block copy may be called with overlapping ranges, which memcpy "
+                    "leaves undefined. false: memcpy, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::kernel::crt {
 
@@ -18,7 +26,7 @@ namespace rex::kernel::crt {
 // Standard memory operations
 // ---------------------------------------------------------------------------
 
-// sa2-nx (2026-10-20, from banjo-nx): every write of guest memory here marks its store cards (rex/system/xmemory.h), as the guest
+// banjo-nx (2026-10-19): every write of guest memory here marks its store cards (rex/system/xmemory.h), as the guest
 // routines' stores would have.
 using rex::memory::MarkStoreCardsHost;
 
@@ -47,6 +55,11 @@ static void* native_memchr(const void* ptr, int val, size_t n) {
 
 static void* native_XMemCpy(void* dst, const void* src, size_t n) {
   MarkStoreCardsHost(dst, n);
+  // Port 146 (crt_xmemcpy_as_memmove): a game's own block copy hooked here may be called with overlapping ranges
+  // that its forward copy handled.
+  static const bool as_memmove = REXCVAR_GET(crt_xmemcpy_as_memmove);
+  if (as_memmove)
+    return std::memmove(dst, src, n);
   return std::memcpy(dst, src, n);
 }
 

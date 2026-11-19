@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """banjo-nx (2026-10-16): read-only constants found over a function's control-flow graph (post-codegen step, after
 tools/vec_unaligned_stores.py; docs/codegen-enhancements.md). From the estimate of the CPU codegen agent
 (out/cpu_proposals/ro_cfg_estimate.py). Works on any ReXGlue port.

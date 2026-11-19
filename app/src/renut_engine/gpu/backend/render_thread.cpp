@@ -2,9 +2,12 @@
  * @file    gpu/backend/render_thread.cpp
  */
 #include "renut_engine/gpu/backend/render_thread.h"
+#include "renut_engine/gpu/stage_census.h"  // blur-nx (2026-11-17, the Renut audit's census)
+#include "renut_engine/gpu/host_batch.h"  // blur-nx (2026-11-18, the Renut host batch)
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -12,43 +15,66 @@
 #include <fmt/format.h>
 #include <string>
 #include <rex/frame_latency.h>
-#include <rex/input/read_hook.h>  // sa2-nx (2026-10-20): late input on SA2's reads
 #include <vector>
 
-#include "renut_engine/display_sync.h"  // sa2-nx (2026-10-28): the late input's margin (sa2_renut_queue_drain)
 #include "renut_engine/perf/frame_stats.h"
 #include "renut_engine/gpu/guest/guest_memory.h"
 #include "renut_engine/gpu/log.h"
 #include "renut_engine/gpu/backend/video.h"
 #include "renut_engine/gpu/banjo_renut_tuning.h"
+#include "renut_engine/display_sync.h"  // sa2-nx (2026-10-28): LateInputGuardUs
 
 #include <rex/cvar.h>
 
-// sa2-nx (2026-10-20): see g_done_waiters and Run.
-REXCVAR_DEFINE_BOOL(sa2_renut_done_notify_waiters, true, "SA2/Renderer",
+// banjo-nx (2026-10-20, from sa2-nx): see g_done_waiters and Run.
+// rr6-nx (2026-11-03, from sasrt-nx, which found this on its console): the game running ahead of the render thread can
+// rewrite data before the render thread reads it. Ryujinx rarely shows it; a slow GPU shows it constantly.
+REXCVAR_DEFINE_INT32(rr6_frames_ahead, 1, "Banjo/Enhancements",
+                     "How many frames the game may run ahead of Renut's render thread. 0: the game waits at its Swap "
+                     "until the render thread has done the frame. 1: one frame ahead. 2 (blur-nx #37, near-exact): two "
+                     "frames ahead (the game may rewrite data the render thread has yet to read)")
+    .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(rr6_diag_render_delay_ms, 0, "Banjo/Enhancements",
+                     "Diagnostic: each frame's work on the render thread waits this long first, so the PC lags behind "
+                     "the game as a console does")
+    .range(0, 500)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(banjo_renut_done_notify_waiters, true, "Banjo/Enhancements",
                     "Renut's render thread signals its work done (frames, fences, drains) only when a thread waits for "
                     "it: a signal is a kernel call on the Switch even with nobody waiting, and it made one after every "
                     "batch of work. Off: after every batch, as before")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(sa2_renut_prefetch_next, true, "SA2/Renderer",
+REXCVAR_DEFINE_BOOL(blur_renut_render_address_wait, true, "Banjo/Renut",
+                    "blur-nx (the Renut audit's #11, exact; the Switch): with the lock-free ring, the render thread sleeps "
+                    "on an address (svcWaitForAddress) and a push wakes it with svcSignalToAddress, without g_mutex on "
+                    "either side (Blur's Game Master: 0.88 % in notify_one waking it). false: g_work_cv, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(blur_renut_done_lockfree, true, "Banjo/Renut",
+                    "blur-nx (the Renut audit's #12, exact): the lock-free ring's batch end counts its items and reads "
+                    "the done waiters as atomics, taking g_mutex only to wake one (with banjo_renut_done_notify_waiters). "
+                    "false: g_mutex at every batch end, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(banjo_renut_prefetch_next, true, "Banjo/Enhancements",
                     "Renut's render thread asks for the next draw's capture (written on the game thread's core) to be "
                     "brought into its cache while it does the draw before it")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_INT32(sa2_renut_wake_batch, 16, "SA2/Renderer",
+REXCVAR_DEFINE_INT32(banjo_renut_wake_batch, 16, "Banjo/Enhancements",
                      "Renut's render thread, when it has caught up and sleeps, is woken by the game's draws only once "
                      "this many are queued (each wake is a kernel call on both threads; the fourth console run woke it "
                      "for almost every draw). Every other item (frames, fences, resources), every wait for it and a "
                      "2 ms timer still wake it at once. 1 or less: every draw wakes it, as before")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(sa2_renut_batch_clock, true, "SA2/Renderer",
+REXCVAR_DEFINE_BOOL(banjo_renut_batch_clock, true, "Banjo/Enhancements",
                     "Renut's render thread reads the clock once per batch of work instead of once per item (about "
                     "1,800 items a frame in City Escape); its busy time per frame is the same sum")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(sa2_renut_lockfree_queue, true, "SA2/Renderer",
-                    "Renut's render thread takes its work from a lock-free ring (one compare-and-swap a push) instead "
-                    "of a vector under the queue's mutex, which every draw of the game thread took and the render "
-                    "thread took back (two lock round trips a draw on two cores, and the wake decision under the lock). "
-                    "Same order, same wakes. Off: the mutex and the vector")
+// dishonored-nx (sa2-nx's of 2026-10-28; port 105): the render queue as a lock-free ring.
+REXCVAR_DEFINE_BOOL(dishonored_renut_lockfree_queue, true, "Banjo/Enhancements",
+                    "From dishonored-nx (sa2-nx's): Renut's render thread takes its work from a lock-free ring (one "
+                    "compare-and-swap a push) instead of a vector under the queue's mutex, which every draw of the game "
+                    "thread took and the render thread took back (two lock round trips a draw on two cores, and the "
+                    "wake decision under the lock). Same order, same wakes. Off: the mutex and the vector")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 #if defined(_WIN32)
@@ -61,6 +87,16 @@ REXCVAR_DEFINE_BOOL(sa2_renut_lockfree_queue, true, "SA2/Renderer",
 #include <windows.h>
 #endif
 
+#if defined(__SWITCH__)
+// blur-nx (2026-11-17, the Renut audit's #11): the SDK's address-wait helpers (threading_switch.cpp).
+extern "C" bool RexSwitchWaitIfEqual(volatile uint32_t* word, uint32_t value, int64_t ns);
+extern "C" void RexSwitchWakeAddress(volatile uint32_t* word, int32_t count);
+#endif
+
+namespace renut::gpu {
+void SettleExportsForFence();  // port 170: render/draw.cpp (banjo_fence_waits_exports)
+}
+
 namespace renut::gpu::render_thread {
 
 namespace {
@@ -70,14 +106,20 @@ using Clock = std::chrono::steady_clock;
 struct Item {
   std::function<void()> work;
   bool locked = true;  // run with State().mutex held
-  const void *prefetch[2] = {};  // sa2-nx (2026-10-20, sa2_renut_prefetch_next): fetched while the item before runs
+  const void *prefetch[2] = {};  // banjo-nx (2026-10-20, from sa2-nx, banjo_renut_prefetch_next): fetched while the item before runs
 };
 
-// sa2-nx (2026-10-20, sa2_renut_prefetch_next): the next item's data into the cache (its first lines).
+// banjo-nx (2026-10-20, from sa2-nx, banjo_renut_prefetch_next): the next item's data into the cache (its first lines).
 inline void PrefetchItem(const Item &item) {
   if (const auto *a = static_cast<const char *>(item.prefetch[0])) {
     __builtin_prefetch(a);
     __builtin_prefetch(a + 64);
+    // sasrt-nx (2026-11-12, batch C/D, item C8; port 93): prefetch[0] is a draw's capture (QueuePrefetched's only
+    // caller, QueueCapture): its call's second line (with its binding) and its stack headers' count (blur-nx's, port 76),
+    // which the lambda reads first. (sasrt-nx's +320 and +384, its recorded surfaces' headers, are the stack headers'
+    // own here, read only when the count is not 0: not fetched.)
+    __builtin_prefetch(a + 128);
+    __builtin_prefetch(a + 256);
   }
   if (const auto *b = static_cast<const char *>(item.prefetch[1])) {
     __builtin_prefetch(b);
@@ -95,56 +137,84 @@ std::condition_variable g_work_cv;  // work queued, or stopping
 // it has not seen is never missed.
 bool g_render_waiting = false;
 std::condition_variable g_done_cv;  // work done: frames, fences, drains; or stopped
-// sa2-nx (2026-10-20, sa2_renut_done_notify_waiters): threads in g_done_cv's waits (under g_mutex). A done signal goes
+// banjo-nx (2026-10-20, from sa2-nx, banjo_renut_done_notify_waiters): threads in g_done_cv's waits (under g_mutex). A done signal goes
 // only when there is one: a waiter checks its condition under g_mutex before it counts itself and sleeps, and the
 // state it waits for changes under g_mutex too, so no signal it needs is skipped.
-int g_done_waiters = 0;
+// blur-nx (2026-11-17, the Renut audit's #12): atomics (sequentially consistent), so the ring's batch end can count
+// its items and read the waiters without g_mutex (blur_renut_done_lockfree, RunRing); every other access is still
+// under g_mutex as before.
+std::atomic<int> g_done_waiters{0};
 bool DoneNotifyAll() {
-  static const bool on = REXCVAR_GET(sa2_renut_done_notify_waiters);
+  static const bool on = REXCVAR_GET(banjo_renut_done_notify_waiters);
   return !on;
 }
-// sa2-nx (2026-10-20, sa2_renut_wake_batch): the draws queued before a sleeping render thread is woken (1: each).
+// blur-nx (2026-11-17, the Renut audit's #11, blur_renut_render_address_wait; the Switch): the ring's sleep on an
+// address instead of g_work_cv. The render thread reads g_wake_word, looks at the ring once more and sleeps while the
+// word is unchanged (svcWaitForAddress); a push that publishes, then reads g_waiting true, adds to the word and wakes
+// the address (svcSignalToAddress): no g_mutex on either side, and the woken thread does not take a mutex first (a
+// condition variable's wake on Horizon hands it the mutex). Either the push's add comes before the render thread's read
+// of the word (then its look at the ring, after that read, sees the item) or after it (then the wait sees the word
+// changed, or is woken). g_stop_flag: g_stopping for the sleeper, which holds no g_mutex.
+std::atomic<uint32_t> g_wake_word{0};
+std::atomic<bool> g_stop_flag{false};
+// blur-nx (2026-11-17, audit #11): blur_renut_render_address_wait (the Switch only).
+bool AddressWakeOn() {
+#if defined(__SWITCH__)
+  static const bool on = REXCVAR_GET(blur_renut_render_address_wait);
+  return on;
+#else
+  return false;
+#endif
+}
+// A push's wake of the sleeping render thread (g_waiting read true): the address, or g_work_cv (taking g_mutex first,
+// so the notify cannot come between the render thread's last look and its wait; Locked: the caller holds g_mutex).
+void WakeRenderAddress() {
+#if defined(__SWITCH__)
+  g_wake_word.fetch_add(1, std::memory_order_seq_cst);
+  RexSwitchWakeAddress(reinterpret_cast<volatile uint32_t *>(&g_wake_word), 1);
+#endif
+}
+// banjo-nx (2026-10-20, from sa2-nx, banjo_renut_wake_batch): the draws queued before a sleeping render thread is woken (1: each).
 size_t WakeBatch() {
-  static const size_t n = size_t(std::max(1, int(REXCVAR_GET(sa2_renut_wake_batch))));
+  static const size_t n = size_t(std::max(1, int(REXCVAR_GET(banjo_renut_wake_batch))));
   return n;
 }
 std::vector<Item> g_queue;
 
-// sa2-nx (2026-10-28, sa2_renut_lockfree_queue): the queue as a bounded ring of kRingSlots items (D. Vyukov's bounded
-// MPMC queue, with the render thread its one consumer). A push claims the next position with a compare-and-swap, moves
-// its item into the slot and publishes it by the slot's sequence (release); the render thread takes the positions in
-// order (acquire), runs each item in its slot and gives the slot back for the push kRingSlots positions later. The
-// order is the order of the claims, as it was the order of the lock. The 2P console profile had the queue's mutex and
-// vector at 1.4 % of the game thread and its share of the locks (2.5 %) besides, with the render thread on the same
-// lock's cache line at every batch. A full ring (kRingSlots items queued, more than the game thread can be ahead by
-// with one frame queued) would make a pusher wait for the render thread; the render thread itself would run its own item
-// at once instead (logged: never expected).
-// Latched by Start before the thread is made and before g_started's release, which every Push reads first: a plain
-// load (a function-local static's guard is an ldar a call on AArch64; the ARM audit).
+// dishonored-nx (sa2-nx's of 2026-10-28, dishonored_renut_lockfree_queue; port 105): the queue as a bounded ring of
+// kRingSlots items (D. Vyukov's bounded MPMC queue, with the render thread its one consumer). A push claims the next
+// position with a compare-and-swap, moves its item into the slot and publishes it by the slot's sequence (release); the
+// render thread takes the positions in order (acquire), runs each item in its slot and gives the slot back for the push
+// kRingSlots positions later. The order is the order of the claims, as it was the order of the lock. sa2-nx's 2P console
+// profile had the queue's mutex and vector at 1.4 % of the game thread and its share of the locks (2.5 %) besides, with
+// the render thread on the same lock's cache line at every batch. A full ring (kRingSlots items queued, more than the
+// game thread can be ahead by with one frame queued) makes a pusher wait for the render thread; the render thread itself
+// runs its own item at once instead (logged: never expected).
+// Latched by Start before the thread is made and before g_started's release, which every Push reads first (acquire): a
+// plain load per push.
 bool g_lockfree = false;
 bool LockfreeOn() {
   return g_lockfree;
 }
-// The same for the two PushRing reads at every push (banjo-nx's latch is an acquire load each, WakeBatch's static a
-// guard): QueueNotifyIdleOn and WakeBatch, latched by Start.
+// The same for the two PushRing reads at every push: QueueNotifyIdleOn and WakeBatch, latched by Start.
 bool g_notify_idle = true;
 size_t g_wake_batch = 16;
 // sa2-nx (2026-10-28, the console's first run of the ring): with 32,768 slots (2 MB) every push's slot was a line from
-// memory (a slot came round again nine frames later, long out of the caches): 30 of PushRing's 86 samples were the
-// load of its sequence. A push now prefetches the slot kRingAhead positions on for writing, a few draws before it
-// needs it, and the ring is 16,384 slots (1 MB): still more than two frames of the two-player race's items (about
-// 3,500 a frame), so that a pusher never waits on a full ring while it may hold a lock the render thread's item needs.
+// memory (a slot came round again nine frames later, long out of the caches): 30 of PushRing's 86 samples were the load
+// of its sequence. A push now prefetches the slot kRingAhead positions on for writing, a few draws before it needs it,
+// and the ring is 16,384 slots (1 MB): still more than two frames of the two-player race's items (about 3,500 a frame),
+// so that a pusher never waits on a full ring while it may hold a lock the render thread's item needs.
 constexpr uint64_t kRingSlots = uint64_t(1) << 14;
 constexpr uint64_t kRingAhead = 8;
 struct alignas(64) RingSlot {
   std::atomic<uint64_t> seq{0};
   Item item;
 };
-RingSlot *g_ring = nullptr;                       // made by Start, before the thread runs
-alignas(64) std::atomic<uint64_t> g_enqueue{0};   // the next position a push claims (the items queued)
-alignas(64) std::atomic<uint64_t> g_dequeue{0};   // the next position the render thread takes (its own)
-std::atomic<bool> g_waiting{false};               // the render thread is going to sleep, or asleep, in g_work_cv
-std::atomic<bool> g_accepting{false};             // started and not stopping: pushes go to the ring
+RingSlot *g_ring = nullptr;                      // made by Start, before the thread runs
+alignas(64) std::atomic<uint64_t> g_enqueue{0};  // the next position a push claims (the items queued)
+alignas(64) std::atomic<uint64_t> g_dequeue{0};  // the next position the render thread takes (its own)
+std::atomic<bool> g_waiting{false};              // the render thread is going to sleep, or asleep, in g_work_cv
+std::atomic<bool> g_accepting{false};            // started and not stopping: pushes go to the ring
 // The slot at 'pos' holds a published item.
 inline bool RingReady(uint64_t pos) {
   return g_ring[pos & (kRingSlots - 1)].seq.load(std::memory_order_acquire) == pos + 1;
@@ -154,13 +224,16 @@ inline bool RingReady(uint64_t pos) {
 inline bool RingReadySc(uint64_t pos) {
   return g_ring[pos & (kRingSlots - 1)].seq.load(std::memory_order_seq_cst) == pos + 1;
 }
-
 std::once_flag g_start_once;
+// bangaio-nx (2026-10-29, v6): set once Start's call_once has run (relaxed: Push then takes g_mutex, under which Start
+// set g_running). Push checks it first: std::call_once was a pthread_once call at every queued draw on the game thread
+// (0.6 % of it in the v4 console storm).
+std::atomic<bool> g_started{false};
 std::thread::id g_thread_id;
 bool g_running = false;   // the thread takes work
 bool g_stopping = false;  // Stop: finish what is queued, then end
 uint64_t g_items_queued = 0;
-uint64_t g_items_done = 0;
+std::atomic<uint64_t> g_items_done{0};  // blur-nx (2026-11-17, audit #12): see g_done_waiters
 uint64_t g_frames_queued = 0;
 uint64_t g_frames_done = 0;
 uint64_t g_fences_done = 0;  // fence completions written, plus callbacks reached
@@ -189,6 +262,7 @@ Clock::duration g_waited{};
 thread_local bool t_render_thread = false;
 
 void Execute(Item &item) {
+  ::renut::gpu::census::Scope census_scope(::renut::gpu::census::kRunItem);  // blur-nx (2026-11-17)
   if (item.locked) {
     std::lock_guard lock(State().mutex);
     item.work();
@@ -197,26 +271,42 @@ void Execute(Item &item) {
   }
 }
 
-// sa2-nx (2026-10-28, sa2_renut_lockfree_queue): Run with the ring. The items are taken in order as long as they are
-// published, at most kRingRun before the done bookkeeping (Drain's count, the done waiters); with none ready the thread
-// says it is going to sleep (g_waiting), looks once more, and sleeps in g_work_cv under g_mutex: a push that read
-// g_waiting false after publishing (both sides store, then load, sequentially consistent: no store-load reordering) is
-// seen by that last look, and one that read it true takes g_mutex before it notifies, so it cannot notify between the
-// look and the wait.
+// dishonored-nx (sa2-nx's of 2026-10-28, dishonored_renut_lockfree_queue; port 105): Run with the ring. The items are
+// taken in order as long as they are published, at most kRingRun before the done bookkeeping (Drain's count, the done
+// waiters); with none ready the thread says it is going to sleep (g_waiting), looks once more, and sleeps in g_work_cv
+// under g_mutex: a push that read g_waiting false after publishing (both sides store, then load, sequentially
+// consistent: no store-load reordering) is seen by that last look, and one that read it true takes g_mutex before it
+// notifies, so it cannot notify between the look and the wait.
 constexpr size_t kRingRun = 256;
 void RunRing() {
-  static const bool batch_clock = REXCVAR_GET(sa2_renut_batch_clock);
-  static const bool prefetch = REXCVAR_GET(sa2_renut_prefetch_next);
+  static const bool batch_clock = REXCVAR_GET(banjo_renut_batch_clock);
+  static const bool prefetch = REXCVAR_GET(banjo_renut_prefetch_next);
   uint64_t pos = g_dequeue.load(std::memory_order_relaxed);
   for (;;) {
     if (!RingReady(pos)) {
       g_waiting.store(true, std::memory_order_seq_cst);
       bool stopping = false;
-      if (!RingReadySc(pos)) {
+      if (AddressWakeOn()) {
+        // blur-nx (2026-11-17, audit #11): the word read before the last look (see g_wake_word). With a wake batch,
+        // draws queued without a wake are taken within 2 ms, as with g_work_cv; otherwise a 100 ms net.
+        const int64_t slice_ns = WakeBatch() > 1 ? 2'000'000 : 100'000'000;
+        for (;;) {
+          const uint32_t word = g_wake_word.load(std::memory_order_seq_cst);
+          if (RingReadySc(pos) || g_stop_flag.load(std::memory_order_acquire))
+            break;
+#if defined(__SWITCH__)
+          RexSwitchWaitIfEqual(reinterpret_cast<volatile uint32_t *>(&g_wake_word), word, slice_ns);
+#else
+          (void)word;
+          (void)slice_ns;
+#endif
+        }
+        stopping = g_stop_flag.load(std::memory_order_acquire);
+      } else if (!RingReadySc(pos)) {
         std::unique_lock lock(g_mutex);
         g_render_waiting = true;
         if (WakeBatch() > 1) {
-          // sa2-nx (sa2_renut_wake_batch): draws queued without a wake are taken within 2 ms at the latest.
+          // banjo-nx (from sa2-nx) (banjo_renut_wake_batch): draws queued without a wake are taken within 2 ms at the latest.
           while (!RingReady(pos) && !g_stopping)
             g_work_cv.wait_for(lock, std::chrono::milliseconds(2));
         } else {
@@ -258,7 +348,18 @@ void RunRing() {
     if (batch_clock)
       g_busy += Clock::now() - start;
     bool wake;
-    {
+    // blur-nx (2026-11-17, the Renut audit's #12, blur_renut_done_lockfree): the count added and the waiters read
+    // without g_mutex (both sequentially consistent). A waiter counts itself under g_mutex before it tests its
+    // condition: either this load sees it (and the wake takes g_mutex once, so the waiter is asleep in g_done_cv or
+    // has not yet tested), or its test comes after this add and sees the new count.
+    static const bool lockfree = REXCVAR_GET(blur_renut_done_lockfree);
+    if (lockfree && !DoneNotifyAll()) {
+      g_items_done.fetch_add(n, std::memory_order_seq_cst);
+      wake = g_done_waiters.load(std::memory_order_seq_cst) > 0;
+      if (wake) {
+        std::lock_guard lock(g_mutex);
+      }
+    } else {
       std::lock_guard lock(g_mutex);
       g_items_done += n;
       wake = g_done_waiters > 0 || DoneNotifyAll();
@@ -285,7 +386,7 @@ void Run() {
 #endif
   banjo::renut_gpu::OnRenderThreadStart();  // banjo-nx: its core and priority on the Switch
   t_render_thread = true;
-  if (LockfreeOn()) {
+  if (LockfreeOn()) {  // dishonored-nx (port 105, dishonored_renut_lockfree_queue)
     RunRing();
     return;
   }
@@ -295,7 +396,7 @@ void Run() {
       std::unique_lock lock(g_mutex);
       g_render_waiting = true;
       if (WakeBatch() > 1) {
-        // sa2-nx (sa2_renut_wake_batch): draws queued without a wake are taken within 2 ms at the latest.
+        // banjo-nx (from sa2-nx) (banjo_renut_wake_batch): draws queued without a wake are taken within 2 ms at the latest.
         while (g_queue.empty() && !g_stopping)
           g_work_cv.wait_for(lock, std::chrono::milliseconds(2));
       } else {
@@ -311,12 +412,12 @@ void Run() {
     // first loading screen (a game thread's hook waits on the lock while the render thread's next item waits on it):
     // each item takes the lock on its own, as before.
     Clock::time_point start = Clock::now();
-    static const bool batch_clock = REXCVAR_GET(sa2_renut_batch_clock);
+    static const bool batch_clock = REXCVAR_GET(banjo_renut_batch_clock);
     if (batch_clock) {
-      // sa2-nx (2026-10-20): the batch's start for every item (QueueFrame's item counts its frame up to itself from
+      // banjo-nx (2026-10-20, from sa2-nx): the batch's start for every item (QueueFrame's item counts its frame up to itself from
       // there and leaves the rest of the batch to the next frame), one clock read at the end.
       g_item_start = start;
-      static const bool prefetch = REXCVAR_GET(sa2_renut_prefetch_next);
+      static const bool prefetch = REXCVAR_GET(banjo_renut_prefetch_next);
       const size_t n = batch.size();
       for (size_t i = 0; i < n; ++i) {
         if (prefetch && i + 1 < n)
@@ -350,26 +451,17 @@ void Run() {
   g_done_cv.notify_all();
 }
 
-// sa2-nx (2026-10-28): set once the thread is started; every Push calls Start, and std::call_once was a libc
-// pthread_once call per draw (0.7 % of the game thread in the 2P console profile). The flag is set after call_once
-// returns (release), so a thread that sees it (acquire) also sees the start's effects, as call_once's return does.
-std::atomic<bool> g_started{false};
-
 void Start() {
-  if (g_started.load(std::memory_order_acquire)) [[likely]]
-    return;
-  struct SetStarted {
-    ~SetStarted() { g_started.store(true, std::memory_order_release); }
-  };
-  const SetStarted set_started;
   std::call_once(g_start_once, [] {
     InstallLateInput();  // banjo-nx (2026-10-19, banjo_late_input): the delay function (it reads the key per frame)
     std::lock_guard lock(g_mutex);
     g_running = true;
-    g_lockfree = REXCVAR_GET(sa2_renut_lockfree_queue);
+    // dishonored-nx (port 105, dishonored_renut_lockfree_queue): latched before the thread is made and before
+    // g_started's release; the ring, each slot free for its position.
+    g_lockfree = REXCVAR_GET(dishonored_renut_lockfree_queue);
     g_notify_idle = banjo::renut_gpu::QueueNotifyIdleOn();
     g_wake_batch = WakeBatch();
-    if (LockfreeOn()) {  // sa2-nx (2026-10-28, sa2_renut_lockfree_queue): the ring, each slot free for its position
+    if (LockfreeOn()) {
       g_ring = new RingSlot[kRingSlots];
       for (uint64_t i = 0; i < kRingSlots; ++i)
         g_ring[i].seq.store(i, std::memory_order_relaxed);
@@ -383,12 +475,20 @@ void Start() {
     banjo::renut_gpu::StartLongLivedThread(Run, 1024 * 1024);
     RGPU_INFO("Render thread started");
   });
+  // dishonored-nx (port 105): release, read with acquire by Push: the ring's latch and the ring itself are seen with it
+  // (a push into the ring takes no g_mutex, which made relaxed enough before).
+  g_started.store(true, std::memory_order_release);
 }
 
-// sa2-nx (2026-10-20, sa2_renut_wake_batch): before a thread waits for the render thread, the draws queued without a
+// banjo-nx (2026-10-20, from sa2-nx, banjo_renut_wake_batch): before a thread waits for the render thread, the draws queued without a
 // wake are handed over. Requires g_mutex.
 void WakeForWaitLocked() {
-  if (LockfreeOn()) {  // sa2-nx (sa2_renut_lockfree_queue)
+  if (LockfreeOn()) {  // dishonored-nx (port 105, dishonored_renut_lockfree_queue)
+    if (AddressWakeOn()) {  // blur-nx (2026-11-17, audit #11): the sleeper holds no g_mutex; g_waiting says it sleeps
+      if (g_waiting.load(std::memory_order_seq_cst) && g_ring && RingReady(g_dequeue.load(std::memory_order_relaxed)))
+        WakeRenderAddress();
+      return;
+    }
     if (g_render_waiting && g_ring && RingReady(g_dequeue.load(std::memory_order_relaxed)))
       g_work_cv.notify_one();
     return;
@@ -397,9 +497,18 @@ void WakeForWaitLocked() {
     g_work_cv.notify_one();
 }
 
-// sa2-nx (2026-10-28, sa2_renut_lockfree_queue): Push with the ring; false when the item was not queued (the ring is
-// full and this is the render thread, which cannot wait for itself). The wake decision is Push's: a non-draw item, or
-// WakeBatch draws not yet taken, wakes a render thread that is going to sleep (RunRing says why no wake is lost).
+// vivapinata-nx (2026-11-11, vivapinata_tiles_once): SetBeforePushHook's function.
+std::atomic<void (*)()> g_before_push{nullptr};
+
+[[gnu::always_inline]] inline void BeforePush() {
+  if (void (*hook)() = g_before_push.load(std::memory_order_relaxed); hook && !t_render_thread) [[unlikely]]
+    hook();
+}
+
+// dishonored-nx (sa2-nx's of 2026-10-28, dishonored_renut_lockfree_queue; port 105): Push with the ring; false when the
+// item was not queued (the ring is full and this is the render thread, which cannot wait for itself). The wake decision
+// is Push's: a non-draw item, or WakeBatch draws not yet taken, wakes a render thread that is going to sleep (RunRing
+// says why no wake is lost).
 bool PushRing(Item &&item, bool draw) {
   uint64_t pos = g_enqueue.load(std::memory_order_relaxed);
   RingSlot *slot;
@@ -416,14 +525,18 @@ bool PushRing(Item &&item, bool draw) {
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true))
           RGPU_WARN("Render thread queue full ({} items): the render thread's own item ran at once "
-                    "(sa2_renut_lockfree_queue)", kRingSlots);
+                    "(dishonored_renut_lockfree_queue)", kRingSlots);
         return false;
       }
       if (g_waiting.load(std::memory_order_seq_cst)) {  // (a signal is a kernel call on the Switch: only to a sleeper)
-        {
-          std::lock_guard lock(g_mutex);
+        if (AddressWakeOn()) {
+          WakeRenderAddress();  // blur-nx (2026-11-17, audit #11)
+        } else {
+          {
+            std::lock_guard lock(g_mutex);
+          }
+          g_work_cv.notify_one();
         }
-        g_work_cv.notify_one();
       }
       std::this_thread::yield();
       pos = g_enqueue.load(std::memory_order_relaxed);
@@ -437,22 +550,39 @@ bool PushRing(Item &&item, bool draw) {
   slot->item = std::move(item);
   // Published, then g_waiting read: a sequentially consistent store and load (stlr, ldar: no dmb), RunRing's order.
   slot->seq.store(pos + 1, std::memory_order_seq_cst);
+  // blur-nx (2026-11-18, the Renut host batch's #28, blur_renut_wake_batch_all / A/B 238): with a wake batch (the render
+  // thread then looks every 2 ms by itself), any item may wait for the batch as draws do: command buffer runs and
+  // resolves woke it at once, each a kernel call on the pushing thread (the Game Master's), with the render thread idle
+  // half the time.
+  const bool as_draw = draw || (g_wake_batch > 1 && ::renut::gpu::host_batch::On(::renut::gpu::host_batch::kWakeBatchAll));
   const bool wake = (g_waiting.load(std::memory_order_seq_cst) &&
-                     (!draw || pos + 1 - g_dequeue.load(std::memory_order_relaxed) >= g_wake_batch)) ||
+                     (!as_draw || pos + 1 - g_dequeue.load(std::memory_order_relaxed) >= g_wake_batch)) ||
                     !g_notify_idle;
   if (wake) {
-    {
-      std::lock_guard lock(g_mutex);
+    const bool hb_census = ::renut::gpu::host_batch::CensusOn();  // blur-nx (2026-11-18, the census's #28)
+    const uint64_t t0 = hb_census ? ::renut::gpu::host_batch::Ticks() : 0;
+    if (AddressWakeOn()) {
+      WakeRenderAddress();  // blur-nx (2026-11-17, audit #11)
+    } else {
+      {
+        std::lock_guard lock(g_mutex);
+      }
+      g_work_cv.notify_one();
     }
-    g_work_cv.notify_one();
+    if (hb_census) {
+      ::renut::gpu::host_batch::Add(draw ? ::renut::gpu::host_batch::kWakesDraw : ::renut::gpu::host_batch::kWakesOther);
+      ::renut::gpu::host_batch::Add(::renut::gpu::host_batch::kWakeTicks, ::renut::gpu::host_batch::Ticks() - t0);
+    }
   }
   return true;
 }
 
 void Push(std::function<void()> work, bool locked, const void *prefetch0 = nullptr,
           const void *prefetch1 = nullptr, bool draw = false) {
-  Start();
-  if (LockfreeOn()) {  // sa2-nx (sa2_renut_lockfree_queue)
+  BeforePush();  // vivapinata-nx (2026-11-11): a held tile run goes in first
+  if (!g_started.load(std::memory_order_acquire)) [[unlikely]]
+    Start();  // bangaio-nx (2026-10-29, v6): only until it has run (g_started; acquire since port 105's ring)
+  if (LockfreeOn()) {  // dishonored-nx (port 105, dishonored_renut_lockfree_queue)
     Item item{std::move(work), locked, {prefetch0, prefetch1}};
     if (g_accepting.load(std::memory_order_acquire) && PushRing(std::move(item), draw))
       return;
@@ -466,7 +596,7 @@ void Push(std::function<void()> work, bool locked, const void *prefetch0 = nullp
     if (g_running && !g_stopping) {
       g_queue.push_back({std::move(work), locked, {prefetch0, prefetch1}});
       ++g_items_queued;
-      // sa2-nx (sa2_renut_wake_batch): a draw wakes a sleeping render thread once enough are queued.
+      // banjo-nx (from sa2-nx) (banjo_renut_wake_batch): a draw wakes a sleeping render thread once enough are queued.
       const bool wake = (g_render_waiting && (!draw || g_queue.size() >= WakeBatch())) ||
                         !banjo::renut_gpu::QueueNotifyIdleOn();
       lock.unlock();
@@ -482,6 +612,10 @@ void Push(std::function<void()> work, bool locked, const void *prefetch0 = nullp
 
 } // namespace
 
+void SetBeforePushHook(void (*hook)()) {
+  g_before_push.store(hook, std::memory_order_relaxed);
+}
+
 void Queue(std::function<void()> work) {
   Push(std::move(work), true);
 }
@@ -491,11 +625,12 @@ void QueueUnlocked(std::function<void()> work) {
 }
 
 void QueuePrefetched(const void *prefetch0, const void *prefetch1, std::function<void()> work) {
-  Push(std::move(work), true, prefetch0, prefetch1, true);  // sa2-nx: the game's draws (sa2_renut_wake_batch)
+  Push(std::move(work), true, prefetch0, prefetch1, true);  // banjo-nx (from sa2-nx): the game's draws (banjo_renut_wake_batch)
 }
 
 void QueueFenceCompletion(u32 completion_va, u32 fence, uint64_t after_callback) {
   QueueUnlocked([completion_va, fence, after_callback] {
+    ::renut::gpu::SettleExportsForFence();  // port 170 (banjo_fence_waits_exports; nothing when off)
     bool wake;
     {
       std::lock_guard lock(g_mutex);
@@ -504,7 +639,7 @@ void QueueFenceCompletion(u32 completion_va, u32 fence, uint64_t after_callback)
         WriteFence(completion_va, fence);
       else
         g_pending_fences.push_back({completion_va, fence, after_callback});
-      wake = g_done_waiters > 0 || DoneNotifyAll();  // sa2-nx
+      wake = g_done_waiters > 0 || DoneNotifyAll();  // banjo-nx (from sa2-nx)
     }
     if (wake)
       g_done_cv.notify_all();
@@ -518,7 +653,7 @@ void QueueCallbackMarker(uint64_t seq) {
       std::lock_guard lock(g_mutex);
       g_callbacks_reached = std::max(g_callbacks_reached, seq);
       ++g_fences_done;  // wakes WaitForFenceProgress: there is a callback to run
-      wake = g_done_waiters > 0 || DoneNotifyAll();  // sa2-nx
+      wake = g_done_waiters > 0 || DoneNotifyAll();  // banjo-nx (from sa2-nx)
     }
     if (wake)
       g_done_cv.notify_all();
@@ -543,19 +678,20 @@ void CallbacksRun(uint64_t seq) {
       WriteFence(p.completion_va, p.fence);
     }
     g_pending_fences.erase(g_pending_fences.begin(), g_pending_fences.begin() + written);
-    wake = g_done_waiters > 0 || DoneNotifyAll();  // sa2-nx
+    wake = g_done_waiters > 0 || DoneNotifyAll();  // banjo-nx (from sa2-nx)
   }
   if (wake)
     g_done_cv.notify_all();
 }
 
 bool WaitForFenceProgress(std::chrono::milliseconds timeout) {
+  BeforePush();  // vivapinata-nx (2026-11-11): nothing waits on work still held back
   std::unique_lock lock(g_mutex);
   if (!g_running || g_stopping)
     return false;
   const uint64_t seen = g_fences_done;
-  WakeForWaitLocked();  // sa2-nx (sa2_renut_wake_batch)
-  ++g_done_waiters;  // sa2-nx (sa2_renut_done_notify_waiters)
+  WakeForWaitLocked();  // banjo-nx (from sa2-nx) (banjo_renut_wake_batch)
+  ++g_done_waiters;  // banjo-nx (from sa2-nx) (banjo_renut_done_notify_waiters)
   g_done_cv.wait_for(lock, timeout,
                      [seen] { return g_fences_done != seen || !g_running || g_stopping; });
   --g_done_waiters;
@@ -584,6 +720,10 @@ uint32_t g_slack_count = 0;
 std::atomic<uint32_t> g_applied_delay_us{0};
 std::atomic<uint64_t> g_delay_total_us{0}, g_delay_frames{0};
 
+// banjo-nx (2026-10-20, package 36s): banjo_late_input_gpu (36l-36r), a second slack from the GPU queue's wait, is gone:
+// on the console it gained nothing at the 30 fps cap and, in scenes just able to hold 30, its delay ratcheted up to
+// 29 ms and cost about 6 fps (36q). docs/deko3d-renderer.md section 25.
+
 uint32_t LateInputDelay() {
   if (!banjo::renut_gpu::LateInputOn() || g_slack_count < kSlackFrames) {
     g_applied_delay_us.store(0, std::memory_order_relaxed);
@@ -608,12 +748,6 @@ uint32_t LateInputDelay() {
 
 void InstallLateInput() {
   rex::latency::SetFrameReadDelayFunction(&LateInputDelay);
-  // sa2-nx (2026-10-20): SA2's SDK did not call the delay or the probe at the controller reads (banjo-nx's input system
-  // does), so late input never ran on SA2: the read hook does both now.
-  rex::input::SetReadHook([] {
-    rex::latency::BeforeInputRead();
-    rex::latency::NoteInputRead();
-  });
 }
 
 std::string LateInputReport() {
@@ -631,6 +765,8 @@ uint64_t QueueFrame(std::function<void()> work) {
     ++g_frames_queued;
   }
   QueueUnlocked([work = std::move(work)] {
+    if (static const int32_t delay = REXCVAR_GET(rr6_diag_render_delay_ms); delay > 0)  // rr6-nx
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay));
     work();
     // The frame's work includes this item's (the present); Run adds the whole
     // item afterwards, so what is left of it counts to the next frame.
@@ -644,23 +780,24 @@ uint64_t QueueFrame(std::function<void()> work) {
     {
       std::lock_guard lock(g_mutex);
       ++g_frames_done;
-      wake = g_done_waiters > 0 || DoneNotifyAll();  // sa2-nx
+      wake = g_done_waiters > 0 || DoneNotifyAll();  // banjo-nx (from sa2-nx)
     }
     if (wake)
       g_done_cv.notify_all();
   });
   const auto waiting = std::chrono::steady_clock::now();
   std::unique_lock lock(g_mutex);
-  WakeForWaitLocked();  // sa2-nx (sa2_renut_wake_batch)
-  ++g_done_waiters;  // sa2-nx (sa2_renut_done_notify_waiters)
+  WakeForWaitLocked();  // banjo-nx (from sa2-nx) (banjo_renut_wake_batch)
+  ++g_done_waiters;  // banjo-nx (from sa2-nx) (banjo_renut_done_notify_waiters)
   g_done_cv.wait(lock, [] {
-    return !g_running || g_stopping || g_frames_queued - g_frames_done <= kMaxFramesAhead;
+    static const uint64_t ahead = std::min<uint64_t>(uint64_t(REXCVAR_GET(rr6_frames_ahead)), kMaxFramesAhead);  // rr6-nx
+    return !g_running || g_stopping || g_frames_queued - g_frames_done <= ahead;
   });
   --g_done_waiters;
   const uint64_t done = g_frames_done;
   lock.unlock();
   const auto waited = std::chrono::steady_clock::now() - waiting;
-  frame_stats::OnGameThreadWait(std::chrono::duration<double, std::milli>(waited).count());
+  frame_stats::OnGameThreadWait(std::chrono::duration<double, std::milli>(waited).count(), 1);  // blur-nx: #37
   // banjo-nx (2026-10-19, banjo_late_input): this frame's slack (the game thread only: one Swap at a time).
   {
     // The game's frame interval (the game thread only), averaged over about 16 frames.
@@ -688,13 +825,14 @@ uint64_t FramesDone() {
 }
 
 void Drain() {
+  BeforePush();  // vivapinata-nx (2026-11-11): nothing waits on work still held back
   std::unique_lock lock(g_mutex);
   if (!g_running || std::this_thread::get_id() == g_thread_id)
     return;
-  // sa2-nx (sa2_renut_lockfree_queue): with the ring, the items queued are its claimed positions.
+  // dishonored-nx (port 105, dishonored_renut_lockfree_queue): with the ring, the items queued are its claimed positions.
   const uint64_t target = LockfreeOn() ? g_enqueue.load(std::memory_order_acquire) : g_items_queued;
-  WakeForWaitLocked();  // sa2-nx (sa2_renut_wake_batch)
-  ++g_done_waiters;  // sa2-nx (sa2_renut_done_notify_waiters)
+  WakeForWaitLocked();  // banjo-nx (from sa2-nx) (banjo_renut_wake_batch)
+  ++g_done_waiters;  // banjo-nx (from sa2-nx) (banjo_renut_done_notify_waiters)
   g_done_cv.wait(lock, [target] { return !g_running || g_items_done >= target; });
   --g_done_waiters;
 }
@@ -712,8 +850,11 @@ void Stop() {
     if (!g_running || g_stopping)
       return;
     g_stopping = true;
+    g_stop_flag.store(true, std::memory_order_release);  // blur-nx (2026-11-17, audit #11)
   }
-  g_accepting.store(false, std::memory_order_release);  // sa2-nx (sa2_renut_lockfree_queue): later pushes run inline
+  g_accepting.store(false, std::memory_order_release);  // dishonored-nx (port 105): later pushes run inline
+  if (AddressWakeOn())
+    WakeRenderAddress();  // blur-nx (2026-11-17, audit #11)
   g_work_cv.notify_all();
   g_done_cv.notify_all();
 }

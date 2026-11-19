@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """Guest register writes no instruction can read, left out (post-codegen step; banjo-nx, 2026-10-15). Works on any
 ReXGlue port that runs tools/leaf_dead_stores.py (it reuses that tool's guest-level analysis).
 
@@ -179,7 +178,6 @@ def analysis(gen, image, abi_indirect=False):
     if os.path.exists(hand):
         natives = set(int(m.group(1), 16) for m in re.finditer(r'^([0-9A-Fa-f]{8})\b',
                                                                  open(hand, encoding='utf-8').read(), re.M))
-    natives |= lds.transparent_copies()  # sa2-nx (2026-10-28): the bulk localized copies
     for nodes in parsed.values():
         for node in nodes:
             if node.call and not node.call[1] and node.call[0] in natives:
@@ -355,7 +353,7 @@ def removable(node, chunk):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--gen', required=True)
-    ap.add_argument('--image', default=os.path.join(lds.ROOT, 'out', 'default_image.bin'))
+    ap.add_argument('--image', default=os.path.join(lds.ROOT, 'out', 'renut_image.bin'))
     ap.add_argument('--check', action='store_true', help='count only, write nothing')
     ap.add_argument('--list', help='write the dead writes per function to this file')
     ap.add_argument('--abi-indirect', action='store_true',
@@ -438,9 +436,8 @@ MARKER = '// rexglue ports: guest register writes nothing reads (tools/dead_ctx_
 END = '// (end of the macros of tools/dead_ctx_defs.py)\n'
 MACROS = MARKER + '''
 #ifndef REX_DEAD_DEF
-// REX_DEAD_REC: a record form whose register is dead: the value goes to a temporary for cr0. (sa2-nx, 2026-10-19:
-// the last parameter was named `compare`, which also replaced the `.compare` of the switch-back form: it did not
-// compile with REX_DEAD_DEFS_KEEP.)
+// REX_DEAD_REC: a record form whose register is dead: the value goes to a temporary for cr0. (The last parameter is
+// 'record', not 'compare': the keep form's body calls cr0.compare, which a parameter of that name would replace.)
 #if defined(REX_DEAD_DEFS_KEEP)
 #define REX_DEAD_DEF(reg, statement) statement
 #define REX_DEAD_REC(reg, statement, dead, record)   do { statement; cr0.compare<int32_t>(ctx.reg.s32, 0, xer); } while (0)

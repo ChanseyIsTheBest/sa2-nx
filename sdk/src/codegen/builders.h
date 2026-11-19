@@ -428,6 +428,48 @@ bool build_mtmsrd(BuilderContext& ctx);
 bool build_mtfsf(BuilderContext& ctx);
 bool build_mtxer(BuilderContext& ctx);
 
+// renut-ultimate (2026-11-16, port 144; tw2de_nx's): the FPSCR moves the generator had no builder for (system.cpp;
+// in the table with fpscr_moves_exact or extra_instructions) and builders/extra.cpp (with extra_instructions).
+// renut-ultimate (2026-11-19, port 187; found by sasrt-nx's sync): port 144's builders are in their own namespace,
+// so a port that has its own build_ldbrx (or any other of these) in rex::codegen still links; the dispatch table
+// names them as extra_insn::build_*.
+namespace extra_insn {
+bool build_mtfsfi(BuilderContext& ctx);
+bool build_mtfsb0(BuilderContext& ctx);
+bool build_mtfsb1(BuilderContext& ctx);
+bool build_mcrfs(BuilderContext& ctx);
+bool build_vaddcuw(BuilderContext& ctx);
+bool build_vsubcuw(BuilderContext& ctx);
+bool build_vavguw(BuilderContext& ctx);
+bool build_vmaxuw(BuilderContext& ctx);
+bool build_vrlb(BuilderContext& ctx);
+bool build_vpkpx(BuilderContext& ctx);
+bool build_lmw(BuilderContext& ctx);
+bool build_ldbrx(BuilderContext& ctx);
+bool build_stdbrx(BuilderContext& ctx);
+bool build_rotld(BuilderContext& ctx);
+bool build_mcrxr(BuilderContext& ctx);
+bool build_mfvscr(BuilderContext& ctx);
+bool build_mtvscr(BuilderContext& ctx);
+bool build_addo(BuilderContext& ctx);
+bool build_addco(BuilderContext& ctx);
+bool build_addeo(BuilderContext& ctx);
+bool build_addmeo(BuilderContext& ctx);
+bool build_addzeo(BuilderContext& ctx);
+bool build_subfo(BuilderContext& ctx);
+bool build_subfco(BuilderContext& ctx);
+bool build_subfeo(BuilderContext& ctx);
+bool build_subfmeo(BuilderContext& ctx);
+bool build_subfzeo(BuilderContext& ctx);
+bool build_nego(BuilderContext& ctx);
+bool build_mullwo(BuilderContext& ctx);
+bool build_mulldo(BuilderContext& ctx);
+bool build_divwo(BuilderContext& ctx);
+bool build_divwuo(BuilderContext& ctx);
+bool build_divdo(BuilderContext& ctx);
+bool build_divduo(BuilderContext& ctx);
+}  // namespace extra_insn
+
 // Clear left double word immediate
 bool build_clrldi(BuilderContext& ctx);
 

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """cpu_aggressive: proof that the epilogue's `mtlr` (REX_LR_WRITE, tools/frame_traffic.py's mark) writes back the value
 ctx.lr already holds, in Banjo's executable, so it can compile to nothing WITHOUT changing any guest-visible state.
 
@@ -35,13 +34,13 @@ import os
 import re
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, 'D:/Banjo kazooie port/banjo-nx/tools')
 import leaf_dead_stores as lds  # noqa: E402
 import dead_ctx_defs as dcd  # noqa: E402
 
 DFORM = re.compile(r'^(-?\d+)\((r\d+)\)$')
 ASSIGN = re.compile(r'^(?:REX_DEAD_DEF\()?((?:ctx\.)?[rf]\d+)\.(?:u64|s64|u32|s32|u8|u16|s8|s16|f64)\s*=')
-NORETURN = {'827F2E48'}  # sa2-nx: the C++ throw
+NORETURN = {'82BB59B0', '822B27A0', '822B8648', '82BAEAB8', '82BB1130', '82BB4AE0', '82BB4D00', '82BB9B78', '82BCDC10'}
 
 
 def instructions(lines):

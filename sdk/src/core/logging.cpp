@@ -49,6 +49,8 @@
 #include <unistd.h>
 #include <switch.h>
 #include <spdlog/sinks/base_sink.h>
+// blur-nx (2026-11-18): sdk/src/ui/switch_crash_hooks.c's (weak: an executable without the crash hooks has none).
+extern "C" __attribute__((weak)) void RexSwitchStderrToFile(int on);
 #endif
 
 #if REX_PLATFORM_WIN32
@@ -59,15 +61,12 @@
 
 REXCVAR_DEFINE_STRING(log_network, "", "Log",
                       "Switch: also send every log line (and stdout/stderr, e.g. NVK's messages) over TCP to this "
-                      "host:port, for watching a run live (e.g. 192.168.1.76:28771). Empty = off");
+                      "host:port, for watching a run live (e.g. YOUR_PC_IP:28771). Empty = off");
 REXCVAR_DEFINE_STRING(log_level, "info", "Log",
                       "Global log level: trace, debug, info, warn, error, critical, off")
     .allowed({"trace", "debug", "info", "warn", "error", "critical", "off"});
 
 REXCVAR_DEFINE_STRING(log_file, "", "Log", "Log file path (empty = auto sequential naming)");
-// sa2-nx: false = no log file (with log_file empty): nothing is written to logs/.
-REXCVAR_DEFINE_BOOL(log_to_file, true, "Log", "Write the log to a file in logs/ (false = no log file)")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(log_verbose, false, "Log", "Enable verbose logging (sets level to trace)")
     .debug_only();
@@ -140,7 +139,8 @@ REXCVAR_DEFINE_INT32(log_async_queue, 8192, "Log", "Messages that fit in the asy
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 /*
- * log_file_writer: the file log is written by a thread of its own (WriterFileSink below).
+ * log_file_writer: the file log is written by a thread of its own (WriterFileSink below). From futari-nx
+ * (2026-10-07), adopted by banjo-nx unchanged.
  *
  * futari-nx console run of 2026-10-07 (every CPU enhancement on): one frame of 1,022 ms and one of 277 ms
  * came exactly while the ring thread wrote its 10-second report (~40 lines). Each line took 50-150 ms
@@ -582,6 +582,20 @@ void InitLogging(const LogConfig& config) {
                                           : std::filesystem::path(config.log_dir);
     resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
   }
+  // katamari-nx (2026-11-02, the user: "turn off all logging besides crash logging"): with every level off no file is
+  // made (an empty log a run, and the writer thread's buffer). rex_crash.log and the crash hooks' rex_stderr.log are
+  // written by the crash handler, not by this logger.
+  const bool every_level_off =
+      config.default_level == spdlog::level::off &&
+      std::all_of(config.category_levels.begin(), config.category_levels.end(),
+                  [](const auto& category) { return category.second == spdlog::level::off; });
+  if (every_level_off)
+    resolved_path.clear();
+#ifdef __SWITCH__
+  // blur-nx (2026-11-18): stderr to logs/rex/rex_stderr.log only when something is logged; with every level off it
+  // stays in memory and only a crash report carries it (sdk/src/ui/switch_crash_hooks.c).
+  if (RexSwitchStderrToFile) RexSwitchStderrToFile(every_level_off ? 0 : 1);
+#endif
   if (!resolved_path.empty()) {
     const size_t max_size = static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024;
     const size_t max_files = static_cast<size_t>(REXCVAR_GET(log_max_files));

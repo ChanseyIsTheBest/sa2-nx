@@ -278,7 +278,7 @@ bool build_rotldi(BuilderContext& ctx) {
 
 namespace {
 // rotate_word_shifts (see config.h): the 32-bit value of rotl32(rS, sh) & mask (mask within the low word, not
-// wrapping) as the cheapest exact expression (from banjo-nx; its sdk/tests/rotate_word_test.cpp checks the rules).
+// wrapping) as the cheapest exact expression. sdk/tests/rotate_word_test.cpp checks the same rules.
 std::string RotateWordShiftForm(const std::string& rs, uint32_t sh, uint32_t mask) {
   if (sh == 0)
     return fmt::format("({}.u32 & 0x{:X}u)", rs, mask);
@@ -301,7 +301,7 @@ bool build_rlwimi(BuilderContext& ctx) {
   if (ctx.config().rotateWordShifts && ctx.insn.operands[3] <= ctx.insn.operands[4]) {
     // rotate_word_shifts: the inserted bits as a 32-bit expression (zero-extended in the OR, as the masked 64-bit
     // form was); the kept bits of the destination (all of its upper word) are unchanged.
-    ctx.println("\t{}.u64 = {} | ({}.u64 & 0x{:X});", ctx.r(ctx.insn.operands[0]),
+    ctx.println("	{}.u64 = {} | ({}.u64 & 0x{:X});", ctx.r(ctx.insn.operands[0]),
                 RotateWordShiftForm(ctx.r(ctx.insn.operands[1]), ctx.insn.operands[2], static_cast<uint32_t>(mask)),
                 ctx.r(ctx.insn.operands[0]), ~mask);
     emitRecordFormCompare(ctx);
@@ -328,7 +328,7 @@ bool build_rlwimi(BuilderContext& ctx) {
 bool build_rlwinm(BuilderContext& ctx) {
   if (ctx.config().rotateWordShifts && ctx.insn.operands[3] <= ctx.insn.operands[4]) {
     // rotate_word_shifts: the u32 result is zero-extended, as the masked 64-bit form was.
-    ctx.println("\t{}.u64 = {};", ctx.r(ctx.insn.operands[0]),
+    ctx.println("	{}.u64 = {};", ctx.r(ctx.insn.operands[0]),
                 RotateWordShiftForm(ctx.r(ctx.insn.operands[1]), ctx.insn.operands[2],
                                     static_cast<uint32_t>(compute_mask(ctx.insn.operands[3] + 32,
                                                                        ctx.insn.operands[4] + 32))));

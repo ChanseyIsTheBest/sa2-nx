@@ -3,14 +3,14 @@
 // through this shader, which emits each rectangle as a two-triangle strip.
 //
 // The three corners do not come in a fixed order. N&B's D3D writes its own
-// (ClearRects_D3D, 0x822043D8) as (left, top), (right, top), (right, bottom),
+// (ClearRects_D3D, 0x821D3D20) as (left, top), (right, top), (right, bottom),
 // the right angle at the second; N&B's full-screen passes draw (-1, 1),
 // (1, 1), (-1, -1), the right angle at the first. So the shader finds the
 // corner whose two edges are perpendicular, and the fourth corner is the one
 // across the diagonal from it.
 //
 // The vertex layout is what XenosRecomp (RENUT_RECOMP) writes for every vertex
-// shader and pixel shader: the position, then the 23 interpolators in this
+// shader and pixel shader: the position, then the 25 interpolators in this
 // order, then the point sprite coordinate and size (see point_sprite_gs.hlsl).
 // SPIR-V matches stages by location, which follows the order.
 
@@ -22,8 +22,12 @@ struct Vertex
     float4 normal[3] : NORMAL0;
     float4 tangent : TANGENT0;
     float4 binormal : BINORMAL0;
+    float4 fog : FOG0;  // kameo-nx (2026-11-04): see point_sprite_gs.hlsl
+    float4 position2 : POSITION2;  // renut-ultimate: see point_sprite_gs.hlsl
     float2 pointCoord : POINTCOORD;
     float pointSize : POINTSIZE;
+    // renut-ultimate (the user clip plane, every vertex shader writes it): passed through, so the GPU clips the sprite with it.
+    float clipDistance : SV_ClipDistance0;
 };
 
 // a + b - c for every output: the corner across the diagonal a-b from c.
@@ -39,8 +43,11 @@ Vertex Opposite(Vertex a, Vertex b, Vertex c)
         d.normal[k] = a.normal[k] + b.normal[k] - c.normal[k];
     d.tangent = a.tangent + b.tangent - c.tangent;
     d.binormal = a.binormal + b.binormal - c.binormal;
+    d.fog = a.fog + b.fog - c.fog;
+    d.position2 = a.position2 + b.position2 - c.position2;
     d.pointCoord = a.pointCoord + b.pointCoord - c.pointCoord;
     d.pointSize = a.pointSize + b.pointSize - c.pointSize;
+    d.clipDistance = a.clipDistance + b.clipDistance - c.clipDistance;  // renut-ultimate
     return d;
 }
 
@@ -54,6 +61,15 @@ float2 ScreenPosition(Vertex v)
 float Skew(float2 p, float2 a, float2 b)
 {
     return abs(dot(a - p, b - p));
+}
+
+// The strip from the right angle c, then a and b, then the corner across the diagonal a-b.
+void EmitRectangle(Vertex c, Vertex a, Vertex b, inout TriangleStream<Vertex> output)
+{
+    output.Append(c);
+    output.Append(a);
+    output.Append(b);
+    output.Append(Opposite(a, b, c));
 }
 
 [maxvertexcount(4)]
@@ -73,11 +89,13 @@ void main(triangle Vertex input[3], inout TriangleStream<Vertex> output)
 
     // Starting the strip from the right angle, in the given cyclic order,
     // keeps the winding of the three given vertices for both triangles.
-    const Vertex c = input[corner];
-    const Vertex a = input[(corner + 1) % 3];
-    const Vertex b = input[(corner + 2) % 3];
-    output.Append(c);
-    output.Append(a);
-    output.Append(b);
-    output.Append(Opposite(a, b, c));
+    // Port 164 (from fnxf_xiii, its note of 2026-10-27): each corner by a constant index, one branch per right angle.
+    // input[corner] with a run-time index made SPIRV-Cross copy the three vertices into a local array of structs
+    // (fnxf_xiii: 52 KB of scratch a warp and 255 registers in uam's GS). The same vertices in the same order.
+    if (corner == 0)
+        EmitRectangle(input[0], input[1], input[2], output);
+    else if (corner == 1)
+        EmitRectangle(input[1], input[2], input[0], output);
+    else
+        EmitRectangle(input[2], input[0], input[1], output);
 }

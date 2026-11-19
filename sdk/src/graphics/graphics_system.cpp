@@ -12,16 +12,15 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cctype>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <thread>
 #include <utility>
 
 #include <rex/cvar.h>
+#include <rex/platform.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/kernel/xboxkrnl/video.h>
@@ -36,6 +35,11 @@
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// Port 172: banjo_vblank_from_display, defined with the native system's vblank loop (app/src/me/me_native_system.cpp:
+// that object is in every build of a title, this one only where the SDK's graphics system is linked).
+#if REX_PLATFORM_SWITCH  // (on the PC this is a plugin DLL, which cannot reach the title's symbols; no display there)
+REXCVAR_DECLARE(bool, banjo_vblank_from_display);
+#endif
 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
@@ -62,6 +66,11 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
 
 namespace rex::graphics {
 
+// Port 172 (from fnxf_xiii): the display's refresh count, waited for (app/src/me/me_native_system.cpp defines it; set
+// by app/src/renut_engine/display_sync.cpp). See the vsync worker below.
+#if REX_PLATFORM_SWITCH
+extern uint64_t (*g_display_refresh_wait)(uint64_t seen, uint64_t timeout_ns);
+#endif
 
 // Nvidia Optimus/AMD PowerXpress support.
 // These exports force the process to trigger the discrete GPU in multi-GPU
@@ -161,13 +170,33 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
-        uint64_t last_swap = kernel::xboxkrnl::VdSwapCount();
+        // Port 172 (banjo_vblank_from_display): a vblank at each of the display's refreshes (two counted at once after
+        // a late wake: one, as the display shows one image); the timer's vblanks only while none comes for 1.5
+        // periods (the display asleep).
+        // (Looked for at every tick: the display's thread may publish its count after this worker starts.)
+#if REX_PLATFORM_SWITCH
+        static const bool follow_display = REXCVAR_GET(banjo_vblank_from_display);
+#endif
         while (vsync_worker_running_) {
-          if (kernel::xboxkrnl::VblankPerSwap()) {
-            if (kernel::xboxkrnl::WaitSwapForVblank(last_swap, vsync_worker_running_)) MarkVblank();
-            last_frame_time = chrono::Clock::QueryGuestTickCount();
-            continue;
+#if REX_PLATFORM_SWITCH
+          if (follow_display && g_display_refresh_wait && REXCVAR_GET(vsync)) {
+            const uint64_t period_ns = uint64_t(1e9 / refresh_rate_hz);
+            uint64_t seen = g_display_refresh_wait(UINT64_MAX, 0);
+            while (vsync_worker_running_) {
+              const uint64_t count = g_display_refresh_wait(seen, period_ns * 3 / 2);
+              const uint64_t now = chrono::Clock::QueryGuestTickCount();
+              if (count != seen) {
+                seen = count;
+                MarkVblank();
+                last_frame_time = now;
+              } else if (now - last_frame_time >= vsync_interval_ticks) {
+                MarkVblank();
+                last_frame_time = now;
+              }
+            }
+            return 0;
           }
+#endif
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;

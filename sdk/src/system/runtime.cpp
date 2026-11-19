@@ -11,10 +11,8 @@
 
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
-#include <rex/platform.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/null_device.h>
-#include <rex/filesystem/devices/pack_device.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/perf/counter.h>
@@ -35,19 +33,6 @@ REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
 REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
 REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
-// The asset cache (filesystem/devices/pack_device.h, ported from Fruit Ninja NX): the game data folder as one pack
-// file, <game_data_root>.nxpack + .nxidx next to it. On the Switch every file open on the SD card is costly and the
-// pack turns thousands of them into one.
-REXCVAR_DEFINE_BOOL(asset_pack, true, "Runtime",
-                    "Mount the game data from <game_data_root>.nxpack/.nxidx (the asset cache) when they exist");
-#if REX_PLATFORM_SWITCH
-#define REX_ASSET_PACK_BUILD_DEFAULT true
-#else
-#define REX_ASSET_PACK_BUILD_DEFAULT false
-#endif
-REXCVAR_DEFINE_BOOL(asset_pack_build, REX_ASSET_PACK_BUILD_DEFAULT, "Runtime",
-                    "With no asset pack but a game data folder, build the pack from the folder at startup (first "
-                    "boot; minutes on the Switch) and use it. The folder is left as it is");
 
 namespace rex {
 
@@ -313,46 +298,18 @@ bool Runtime::SetupVfs() {
   }
 
   auto abs_game_root = std::filesystem::absolute(game_data_root_);
-  // The asset cache: the pack is read-only, so not with game-relative writes allowed.
-  bool use_pack = REXCVAR_GET(asset_pack) && !REXCVAR_GET(allow_game_relative_writes);
-  if (use_pack && !rex::filesystem::PackDevice::Exists(abs_game_root) && REXCVAR_GET(asset_pack_build) &&
-      std::filesystem::is_directory(abs_game_root)) {
-    REXSYS_INFO("[pack] no asset pack yet: building {} from the game folder (first boot, this takes a while)",
-                rex::filesystem::PackDevice::PackPath(abs_game_root).string());
-    std::string error;
-    const bool built = rex::filesystem::PackDevice::Build(
-        abs_game_root, &error, [](const char* stage, uint32_t percent) {
-          if (percent % 10 == 0) REXSYS_INFO("[pack] {} {} %", stage, percent);
-        });
-    if (built) {
-      REXSYS_INFO("[pack] asset pack built; the game_root folder is no longer read and can be deleted");
-    } else {
-      REXSYS_WARN("[pack] asset pack not built ({}): using the game folder", error);
-    }
-  }
-  use_pack = use_pack && rex::filesystem::PackDevice::Exists(abs_game_root);
-  if (!use_pack && !std::filesystem::exists(abs_game_root)) {
+  if (!std::filesystem::exists(abs_game_root)) {
     REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}", abs_game_root.string());
     return false;
   }
 
   // Mount game_data_root as \Device\Harddisk0\Partition1
   auto mount_path = "\\Device\\Harddisk0\\Partition1";
-  std::unique_ptr<rex::filesystem::Device> device;
-  if (use_pack) {
-    device = std::make_unique<rex::filesystem::PackDevice>(mount_path, abs_game_root);
-    if (!device->Initialize()) {
-      REXSYS_WARN("Runtime::SetupVfs: the asset pack is unusable, using the game folder");
-      device.reset();
-    }
-  }
-  if (!device) {
-    device = std::make_unique<rex::filesystem::HostPathDevice>(mount_path, abs_game_root,
-                                                               !REXCVAR_GET(allow_game_relative_writes));
-    if (!device->Initialize()) {
-      REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
-      return false;
-    }
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>(
+      mount_path, abs_game_root, !REXCVAR_GET(allow_game_relative_writes));
+  if (!device->Initialize()) {
+    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
+    return false;
   }
   if (!file_system_->RegisterDevice(std::move(device))) {
     REXSYS_ERROR("Runtime::SetupVfs: Failed to register host path device");

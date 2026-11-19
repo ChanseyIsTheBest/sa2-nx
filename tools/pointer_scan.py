@@ -12,8 +12,8 @@ The code range defaults to SA2's (the runtime logs it: "Function table initializ
 """
 import re, struct, sys
 IMAGE_BASE = 0x82000000
-CODE_BASE = int(sys.argv[3], 16) if len(sys.argv) > 3 else 0x82120000
-CODE_SIZE = (int(sys.argv[4], 16) if len(sys.argv) > 4 else 0x82970600) - CODE_BASE
+CODE_BASE = int(sys.argv[3], 16) if len(sys.argv) > 3 else 0x82140000
+CODE_SIZE = (int(sys.argv[4], 16) if len(sys.argv) > 4 else 0x828AF6A8) - CODE_BASE
 image = open(sys.argv[1], "rb").read()
 gaps = []
 for l in open(sys.argv[2]):

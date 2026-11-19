@@ -6,10 +6,10 @@
  *
  * - renut_shadow_resolution: the shadow maps' render scale. The sun's two
  *   cascades are 1024x1024 and 768x768 D24S8 targets (512x512 in split
- *   screen; sub_822998C8), and the local lights render 512x512 D24S8 depth
+ *   screen; sub_82267458), and the local lights render 512x512 D24S8 depth
  *   converted in a 512x512 16_16_FLOAT target into a 2048x2048 atlas
- *   (sub_823B3CE0); by default they follow the render resolution.
- * - renut_ambient_occlusion: the SSAO pass (sub_8235FA90) renders at half
+ *   (sub_82380818); by default they follow the render resolution.
+ * - renut_ambient_occlusion: the SSAO pass (sub_8232E488) renders at half
  *   the screen, into 640x360 targets at EDRAM base 1864; Full renders it at
  *   the screen's resolution.
  * - renut_anisotropic_filtering: the least a texture's linear minification
@@ -45,5 +45,15 @@ plume::RenderFormat SurfaceColorFormat(const d3d::SurfaceDesc &desc);
 
 // The anisotropy linear minification gets at least (1 = the game's own).
 uint32_t MinAnisotropy();
+// banjo-nx (2026-10-28, GPU block): banjo_renut_anisotropy_cap (0: the game's own).
+uint32_t AnisotropyCap();
+// banjo-nx (2026-10-28, GPU block): dynamic resolution's keys (render/surfaces.cpp).
+bool DynamicResolutionOn();
+int32_t DynamicHeight(bool docked, bool high);  // the range's ends, as set (not rounded)
+double DynamicGpuMs();  // banjo-nx (2026-10-28): a decimal key (34.5)
+double DynamicUpSeconds();  // banjo-nx (2026-10-28): banjo_renut_dynamic_up_s (1 s)
+int32_t DynamicTestSeconds();
+int32_t DynamicSteps();  // banjo-nx (2026-10-28, night_gpu5): banjo_renut_dynamic_steps, the heights between the ends
+int32_t DynamicStepLines(bool docked);  // sasrt-nx (2026-11-09): sasrt_dynamic_lines_handheld / _docked (the grid)
 
 } // namespace renut::gpu

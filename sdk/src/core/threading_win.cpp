@@ -484,3 +484,7 @@ void Thread::Exit(int exit_code) {
 }
 
 }  // namespace rex::thread
+
+// blur-nx (2026-11-13, #34 of Blur's docs/cpu-near-exact-50-1113.md): the title's progress report; only the Switch's yield
+// backoff (threading_posix.cpp) sleeps on it, so here it does nothing.
+extern "C" void RexProgressBump() {}

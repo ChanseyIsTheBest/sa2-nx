@@ -10,7 +10,9 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <queue>
 
 #include <rex/math.h>
@@ -127,9 +129,22 @@ class XSocket : public XObject {
   // Queue a packet into our internal buffer.
   bool QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf, size_t len);
 
+  // peggle2-nx (2026-10-13): a socket with no host socket behind it (cvar net_offline_sockets, the default on the
+  // Switch; see xsocket.cpp). Every call succeeds as it does on a machine with a network and no traffic; a datagram
+  // sent to a port another offline socket of the process is bound to is delivered to it.
+  bool offline() const { return offline_; }
+  // The Winsock error of the last failed call on an offline socket (the exports' WSAGetLastError).
+  uint32_t last_error() const { return last_error_; }
+
  private:
   XSocket(KernelState* kernel_state, uint64_t native_handle);
   uint64_t native_handle_ = -1;
+
+  bool offline_ = false;
+  bool closed_ = false;       // offline: Close() ran (a blocked RecvFrom returns)
+  bool nonblocking_ = false;  // offline: FIONBIO
+  uint32_t last_error_ = 0;
+  std::condition_variable incoming_cv_;  // offline: a packet was queued or the socket was closed
 
   AddressFamily af_;    // Address family
   Type type_;           // Type (DGRAM/Stream/etc)

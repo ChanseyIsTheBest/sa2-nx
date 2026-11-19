@@ -28,10 +28,6 @@ if(PLUME_PLATFORM_SWITCH)
     set(PLUME_SWITCH_NVK_ROOT "/opt/nvk-switch" CACHE PATH "Mesa/NVK Switch build or install root")
     set(PLUME_SWITCH_NVK_LIBRARY "${PLUME_SWITCH_NVK_ROOT}/lib/libvulkan.a"
         CACHE FILEPATH "Mesa/NVK Switch Vulkan static archive")
-    # sa2-nx (2026-10-20): the driver not linked (the parent defines vk_icdGetInstanceProcAddr and
-    # vk_icdNegotiateLoaderICDInterfaceVersion as "no driver": ReXGlue's REXGLUE_SWITCH_NO_NVK); the Vulkan back end
-    # still compiles, and cannot start.
-    option(PLUME_SWITCH_NO_NVK "Do not link the NVK driver (the parent provides failing ICD entry points)" OFF)
 endif()
 
 # Windows-specific definitions
@@ -157,12 +153,12 @@ if(PLUME_PLATFORM_SWITCH)
     endforeach()
     message(STATUS "plume: NVK driver ${PLUME_SWITCH_NVK_LIBRARY}, extra libraries: ${PLUME_SWITCH_NVK_EXTRA_LIBRARIES}")
 
+    # banjo-nx (2026-10-20): PLUME_SWITCH_NVK_LINK OFF links no Vulkan driver (the parent links stubs that answer "not
+    # available": banjo-nx's sdk/src/ui/switch_vulkan_stubs.c); the deko3d back end below is then the only one.
+    option(PLUME_SWITCH_NVK_LINK "Link the static NVK driver into the Switch build" ON)
+    if(PLUME_SWITCH_NVK_LINK)
     # One group, so the linker rescans the driver and its dependencies until nothing new
     # resolves (the driver and its helper archives reference each other).
-    if(PLUME_SWITCH_NO_NVK)
-        message(STATUS "plume: NVK driver not linked (PLUME_SWITCH_NO_NVK)")
-        target_link_libraries(plume PUBLIC zstd z nx)
-    else()
     target_link_libraries(plume PUBLIC
         "-Wl,-u,vk_icdGetInstanceProcAddr"
         "-Wl,-u,vk_icdNegotiateLoaderICDInterfaceVersion"
@@ -174,6 +170,8 @@ if(PLUME_PLATFORM_SWITCH)
         nx
         "-Wl,--end-group"
     )
+    else()
+        target_link_libraries(plume PUBLIC zstd z nx)
     endif()
 
     # banjo-nx (2026-10-17): the deko3d back end (plume_deko3d*.cpp, banjo-nx docs/deko3d-renderer.md): devkitPro's
@@ -193,6 +191,10 @@ if(PLUME_PLATFORM_SWITCH)
             "${CMAKE_CURRENT_SOURCE_DIR}/plume_deko3d.cpp"
             "${CMAKE_CURRENT_SOURCE_DIR}/plume_deko3d_commands.cpp")
         target_compile_definitions(plume PUBLIC PLUME_DEKO3D=1)
+        # blur-nx (2026-11-18, the map-load crashes): libnx's gpfifo kickoff ioctl wrapped, so nvservices' refusals
+        # of a GPU submission are logged and the submission sent again in parts (plume_deko3d.cpp,
+        # __wrap_nvioctlChannel_KickoffPb).
+        target_link_options(plume INTERFACE "LINKER:--wrap=nvioctlChannel_KickoffPb")
         # uam's Mesa (19) and the static NVK's (a newer Mesa) define functions of the same names with other signatures
         # (ralloc, the linear allocator, hash tables): the linker gave uam's preprocessor NVK's linear_alloc_child, which
         # returned null (banjo-nx's first emulator runs, 2026-10-17). uam is linked into one object whose strong symbols

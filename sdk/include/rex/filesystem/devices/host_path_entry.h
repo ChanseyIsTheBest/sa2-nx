@@ -31,6 +31,9 @@ class HostPathEntry : public Entry {
                                rex::filesystem::FileInfo file_info);
 
   const std::filesystem::path& host_path() const { return host_path_; }
+  // rr6-nx (2026-11-10): host_path_ is an LZ4 block file (NAME.lz4b, rex/filesystem/lz4_blocks.h) shown as NAME with
+  // the size of the file it holds; opened through OpenLz4Blocks, never mapped or written.
+  bool lz4_blocks() const { return lz4_blocks_; }
 
   /*
    * "All the children of this directory are already known."
@@ -53,7 +56,7 @@ class HostPathEntry : public Entry {
   X_STATUS Open(uint32_t desired_access, File** out_file) override;
   bool Truncate() override;
 
-  bool can_map() const override { return true; }
+  bool can_map() const override { return !lz4_blocks_; }
   std::unique_ptr<memory::MappedMemory> OpenMapped(memory::MappedMemory::Mode mode, size_t offset,
                                                    size_t length) override;
   void update() override;
@@ -72,6 +75,7 @@ class HostPathEntry : public Entry {
 
   std::filesystem::path host_path_;
   bool children_complete_ = false;
+  bool lz4_blocks_ = false;
 };
 
 }  // namespace rex::filesystem

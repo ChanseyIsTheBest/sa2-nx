@@ -11,7 +11,7 @@ namespace renut::gpu {
 namespace {
 
 // Bits per pixel of each GPU texture format: the low byte of the game's
-// per-format table at 0x820052F8.
+// per-format table at 0x82005200.
 constexpr u8 kBitsPerPixel[64] = {
     1,  1,  8,  16, 16, 16, 32, 32, 8,  8,  16, 16, 16, 32, 32, 16,  // 0-15
     32, 32, 4,  8,  8,  64, 32, 32, 16, 32, 64, 16, 32, 64, 16, 32,  // 16-31
@@ -35,7 +35,7 @@ u32 AlignMask(u32 v, u32 a) {
   return (v + a - 1) & ~(a - 1);
 }
 
-// AlignTextureDimensions (0x82207C28): pads a level's size to what its
+// AlignTextureDimensions (0x821D7140): pads a level's size to what its
 // storage takes and returns its bytes. Rows are 32 blocks at least (for a
 // linear texture as many as fill 256 bytes, if more); rows of blocks come in
 // 32s but for 1D textures, depth slices in 4s for 3D textures; a 2D slice is
@@ -58,7 +58,7 @@ u32 AlignTextureDimensions(u32 &width, u32 &height, u32 &depth, u32 bpp, GpuText
   return dimension == TextureDimension::Tex3D ? Align4K(depth * plane) : Align4K(plane) * depth;
 }
 
-// GetMipTailLevelOffsetCoords (0x826555E0): where level 'level' of a packed
+// GetMipTailLevelOffsetCoords (0x8263DD48): where level 'level' of a packed
 // tail starts in the tail level (w x h x d, powers of two). The first three
 // levels line up along the tail's shorter side, 16 >> level texels in; the
 // rest along the other side, at its size >> (level - 2), and once that is
@@ -103,13 +103,6 @@ u32 LevelBytes(const TextureLevelLayout &level, TextureDimension dimension, u32 
 
 } // namespace
 
-TextureFetch TextureFetch::FromGuest(const d3d::TextureFetchConstant &guest) {
-  TextureFetch fetch;
-  for (u32 i = 0; i < 6; ++i)
-    fetch.dword[i] = guest.dword[i];
-  return fetch;
-}
-
 TextureFetch TextureFetch::FromHeader(const d3d::TextureFetchConstant &header) {
   TextureFetch fetch = FromGuest(header);
   if (fetch.BasePage())
@@ -145,7 +138,7 @@ u32 FormatBitsPerPixel(GpuTextureFormat format) {
   return kBitsPerPixel[u32(format) & 0x3F];
 }
 
-// BlockSizeOfGpuFormat (0x82207B90).
+// BlockSizeOfGpuFormat (0x821D70A8).
 void FormatBlockSize(GpuTextureFormat format, u32 &block_width, u32 &block_height) {
   const u32 f = u32(format) & 0x3F;
   block_width = block_height = 1;
@@ -158,7 +151,7 @@ void FormatBlockSize(GpuTextureFormat format, u32 &block_width, u32 &block_heigh
   }
 }
 
-// The subresource layout (0x82207680) for slice 0 of 'level'. The base level
+// The subresource layout (0x8263DFA0) for slice 0 of 'level'. The base level
 // has the header's size and pitch at the base address. Mip levels follow one
 // another from the mip address, each padded from the base size rounded up
 // to powers of two, every slice of one before the next. With packed mips,
@@ -233,7 +226,7 @@ TextureLevelLayout GetTextureLevelLayout(const TextureFetch &fetch, u32 level) {
   return out;
 }
 
-// FindTextureSize (0x82287E60): the base level with all its slices, and the
+// FindTextureSize (0x82255DC0): the base level with all its slices, and the
 // mip levels up to (and with) the packed tail.
 void GetTextureDataSizes(const TextureFetch &fetch, u32 &base_bytes, u32 &mip_bytes) {
   const u32 bpp = FormatBitsPerPixel(fetch.Format());
@@ -257,7 +250,7 @@ void GetTextureDataSizes(const TextureFetch &fetch, u32 &base_bytes, u32 &mip_by
   }
 }
 
-// XGRAPHICS::UntileSurface (0x8280A050): tiles of 32 x 32 blocks, 'pitch'
+// XGRAPHICS::UntileSurface (0x827E4CE8): tiles of 32 x 32 blocks, 'pitch'
 // rounded up to whole tiles, the blocks inside a tile interleaved.
 u32 TiledOffset2D(u32 x, u32 y, u32 pitch_blocks, u32 log2_block_bytes) {
   const u32 tiles_per_row = AlignMask(pitch_blocks, 32) >> 5;
@@ -271,7 +264,7 @@ u32 TiledOffset2D(u32 x, u32 y, u32 pitch_blocks, u32 log2_block_bytes) {
          (a & 0x3F);
 }
 
-// XGAddress3DTiledOffset (0x8280D318), in bytes rather than elements.
+// XGAddress3DTiledOffset (0x827E7F68), in bytes rather than elements.
 u32 TiledOffset3D(u32 x, u32 y, u32 z, u32 width_blocks, u32 height_blocks,
                   u32 log2_block_bytes) {
   const uint64_t shift = log2_block_bytes;

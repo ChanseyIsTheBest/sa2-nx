@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Guest loads/stores without `volatile` in a generated pch (post-codegen step of the "optimised" codegen flavour,
+"""banjo-nx: copied from sa2-nx (GPL-3.0, same project family).
+Guest loads/stores without `volatile` in a generated pch (post-codegen step of the "optimised" codegen flavour,
 tools\\codegen.ps1; from masseffect-nx's tools/pch_no_volatile.py, measured there at +15-20 % fps).
 
 The generated REX_LOAD_*/REX_STORE_* (and the D-form variants) read guest memory through volatile pointers, which stops

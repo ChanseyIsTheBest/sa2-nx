@@ -20,11 +20,12 @@
 
 namespace renut::gpu {
 
-// sa2-nx (2026-10-20, sa2_renut_snapshot_deltas: queued.cpp): a draw keeps only what changed in the device since the
+// banjo-nx (2026-10-20, from sa2-nx, banjo_renut_snapshot_deltas: queued.cpp): a draw keeps only what changed in the device since the
 // previous one. At each Swap: the frame's first draw keeps the whole device again.
 void SnapshotDeltasNewFrame();
-// Something else consumed the device's dirty masks (a command buffer's op): the next draw keeps the whole device.
-void ForgetSnapshotDeltas();
+// Something else consumed the dirty masks of 'device' (a command buffer's op): when it is the chain's device, the next
+// draw keeps the whole device.
+void ForgetSnapshotDeltas(const void *device);
 // The 10 s "[renut] device snapshots" line (empty with the deltas off); resets its counts.
 std::string SnapshotDeltaReport();
 

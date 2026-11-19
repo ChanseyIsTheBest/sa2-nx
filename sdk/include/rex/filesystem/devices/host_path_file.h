@@ -41,7 +41,7 @@ struct StatsWindow {
 StatsWindow ReadStatsWindow();
 
 /*
- * Exact-range read cache. See sa2_io_ranges_mb in the .cpp.
+ * Exact-range read cache. See masseffect_io_ranges_mb in the .cpp.
  *
  * Everything is cumulative since startup, not per interval: there are few events and the total is
  * what matters.
@@ -73,6 +73,10 @@ struct StatsRanges {
   bool no_memory = false;
 };
 StatsRanges ReadStatsRanges();
+// sasrt-nx (2026-11-09, the user: "more memory improvements"): the range cache's least recently used entries dropped
+// until it holds no more than keep_bytes (0: all); the bytes freed. The title's memory governor calls it while the heap
+// is short (the cache is up to masseffect_io_ranges_mb of heap: 64 MB). A dropped range is read from the SD again.
+uint64_t TrimRangeCache(uint64_t keep_bytes);
 
 class HostPathFile : public File {
  public:
@@ -128,7 +132,7 @@ class HostPathFile : public File {
   bool FillWindow(size_t byte_offset, size_t request, std::span<uint8_t> buffer,
                        size_t* out_bytes_read, X_STATUS* out_status);
 
-  // Direct read split into chunks. See the comment on sa2_io_chunk_mb in the .cpp.
+  // Direct read split into chunks. See the comment on masseffect_io_chunk_mb in the .cpp.
   X_STATUS DirectRead(std::span<uint8_t> buffer, size_t byte_offset, size_t* out_bytes_read);
 
   std::unique_ptr<rex::filesystem::FileHandle> file_handle_;
@@ -144,7 +148,7 @@ class HostPathFile : public File {
   bool active_window_ = false;
   bool counted_window_ = false;
   // File id inside the RAM cache (0 = this file is not cached). See
-  // sa2_io_cache_mb.
+  // masseffect_io_cache_mb.
   uint32_t cache_id_ = 0;
   // Tag in the startup trace (0 = not traced). See startup_trace.cpp.
   uint32_t trace_tag_ = 0;

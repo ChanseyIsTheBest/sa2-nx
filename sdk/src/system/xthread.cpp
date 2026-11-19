@@ -49,40 +49,49 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
 REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
                     "Ignores game-specified thread affinities");
 
+// sasrt-nx (2026-11-09; port 58): a guest thread's host stack, 16 MB (Xenia's) unless the key says less: on the Switch
+// it is heap (SASRT's 31 guest threads at once held ~500 MB). The profiler's thread lines give each thread's deepest
+// sampled stack (switch_profile_stacks) to choose from: measure a game before lowering it. threading_posix.cpp pools
+// stacks of this size and more.
+// renut-ultimate (2026-11-12, port 112, the user's choice: "8mb is meant to be a good trade off for the base"): 8 MB by
+// default, half the heap a guest thread held (SASRT's 31 threads at once: ~250 MB instead of ~500). A game that needs
+// more (a deep recursion: its deepest sampled stack near 8 MB) sets 16, Xenia's, in its toml.
+REXCVAR_DEFINE_INT32(switch_guest_stack_mb, 8, "Threading",
+                     "The host stack of each guest thread, in MB (8 by default, the base's trade-off; 16 as Xenia for a "
+                     "game that needs more; heap on the Switch). Lower only after the profiler's deepest sampled stack "
+                     "says so, with a wide margin")
+    .range(2, 64)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+static size_t GuestHostStackBytes() {
+  static const size_t bytes = size_t(REXCVAR_GET(switch_guest_stack_mb)) << 20;
+  return bytes;
+}
+
 #if REX_PLATFORM_SWITCH
 namespace {
-// sa2-nx (2026-10-20, RexSetGuestThreadCoreLayout): the guest threads' cores besides the main thread's (0: the
+// banjo-nx (2026-10-20, from sa2-nx, RexSetGuestThreadCoreLayout): the guest threads' cores besides the main thread's (0: the
 // process's, as before), and the preferred one among them, for the threads created from then on.
 std::atomic<uint32_t> g_guest_core_mask{0};
 std::atomic<int32_t> g_guest_core_preferred{-1};
-// sa2-nx (2026-10-20): each guest thread applies the layout itself (RexSetGuestThreadCoreLayout below): the layout's
-// generation (0: none set), the main thread's core, and per thread the generation it applied and what it is (0 not a
-// guest thread, 1 the main thread, 2 another guest thread).
+// bejeweled3-nx (2026-10-22, RexSetGuestThreadCoresAtStart): the core the guest main thread pins itself to when it
+// starts (-1: none).
+std::atomic<int32_t> g_guest_main_core{-1};
+// dishonored-nx (sa2-nx's, 2026-10-20; port 103): each guest thread applies RexSetGuestThreadCoreLayout's layout itself:
+// the layout's generation (0: none set), and per thread the generation it applied and what it is (0 not a guest thread,
+// 1 the main thread, 2 another guest thread).
 std::atomic<uint32_t> g_guest_layout_gen{0};
-std::atomic<int32_t> g_guest_main_core{0};
 thread_local uint32_t t_layout_applied = 0;
 thread_local uint8_t t_guest_kind = 0;
 }  // namespace
 #endif
 
-namespace rex::system {
+// renut-ultimate (2026-11-16, port 144; tw2de_nx's rex_spin_hint of 2026-10-22): the Xenon's spin-wait hints with the
+// codegen option spin_hint_yield (off by default; rex/ppc/context.h). The base's yield: on the Switch MaybeYield, whose
+// backoff (switch_yield_backoff) turns a long run of them into short sleeps, so a spinning thread gives its core to the
+// one it waits for.
+extern "C" void rex_spin_hint(void) { rex::thread::MaybeYield(); }
 
-// sa2-nx (2026-10-20): RexSetGuestThreadCoreLayout's layout applied by the calling thread to itself, once per layout
-// (a guest thread's own svcSetThreadCoreMask: it never waits for another thread). Called at every guest wait.
-void ApplyGuestCoreLayoutAtWait() {
-#if REX_PLATFORM_SWITCH
-  const uint32_t gen = g_guest_layout_gen.load(std::memory_order_acquire);
-  if (gen == 0 || gen == t_layout_applied) return;
-  t_layout_applied = gen;
-  if (t_guest_kind == 1) {
-    const int core = g_guest_main_core.load(std::memory_order_relaxed);
-    RexSwitchSetCurrentThreadMask(core, 1ull << core);
-  } else if (t_guest_kind == 2) {
-    const uint32_t mask = g_guest_core_mask.load(std::memory_order_relaxed);
-    if (mask) RexSwitchSetCurrentThreadMask(g_guest_core_preferred.load(std::memory_order_relaxed), mask);
-  }
-#endif
-}
+namespace rex::system {
 
 const uint32_t XAPC::kSize;
 const uint32_t XAPC::kDummyKernelRoutine;
@@ -497,23 +506,36 @@ X_STATUS XThread::Create() {
   RetainHandle();
 
   rex::thread::Thread::CreationParameters params;
-  params.stack_size = 16_MiB;  // Allocate a big host stack.
+  params.stack_size = GuestHostStackBytes();  // Allocate a big host stack (port 58: switch_guest_stack_mb).
   params.create_suspended = true;
   thread_ = rex::thread::Thread::Create(params, [this]() {
     rex::initialize_seh_thread();
 #if REX_PLATFORM_SWITCH
     RexSwitchSetCurrentThreadPriority(SwitchPriorityFor(guest_thread_, thread_name_));
-    // sa2-nx (2026-10-20): known to the pthread layer by its kernel handle, so another thread can set its cores
+    // banjo-nx (2026-10-27): with four cores granted, the audio threads go to the system core (NetherSX2_nx's
+    // layout: threading_switch.h, banjo_system_core), at the same priority (0x2B; the output thread is above them).
+    // (The XMA Decoder only with banjo_system_core_xma: the first four-core console run had core 3 full.)
+    if (!guest_thread_ && (std::string_view(thread_name_).starts_with("Audio Worker") ||
+                           (std::string_view(thread_name_).starts_with("XMA Decoder") && RexSwitchSystemCoreXma()))) {
+      (void)RexSwitchMoveCurrentThreadToSystemCore(REX_SWITCH_PRIO_AUDIO);
+    }
+    // banjo-nx (2026-10-20, from sa2-nx): known to the pthread layer by its kernel handle, so another thread can set its cores
     // (RexSetGuestThreadCoreLayout: the registry was empty, and setting another thread's mask failed quietly).
     RexSwitchRegisterCurrentThread();
-    // sa2-nx (2026-10-20): a guest thread made after the layout was set takes the other guest threads' cores.
+    // banjo-nx (2026-10-20, from sa2-nx): a guest thread made after the layout was set takes the other guest threads' cores.
     if (guest_thread_ && !main_thread_) {
-      t_layout_applied = g_guest_layout_gen.load(std::memory_order_acquire);
+      t_layout_applied = g_guest_layout_gen.load(std::memory_order_acquire);  // dishonored-nx (port 103): applied here
       const uint32_t mask = g_guest_core_mask.load(std::memory_order_acquire);
       if (mask)
         RexSwitchSetCurrentThreadMask(g_guest_core_preferred.load(std::memory_order_relaxed), mask);
     }
-    t_guest_kind = guest_thread_ ? (main_thread_ ? 1 : 2) : 0;  // sa2-nx: ApplyGuestCoreLayoutAtWait
+    // bejeweled3-nx (2026-10-22): the guest main thread takes its own core, set by itself as it starts (no thread is
+    // moved while it runs: RexSetGuestThreadCoreLayout's way of moving them hung Peggle and Banjo on the console).
+    if (guest_thread_ && main_thread_) {
+      const int32_t core = g_guest_main_core.load(std::memory_order_acquire);
+      if (core >= 0) RexSwitchSetCurrentThreadMask(core, uint64_t(1) << core);
+    }
+    t_guest_kind = guest_thread_ ? (main_thread_ ? 1 : 2) : 0;  // dishonored-nx (port 103): ApplyGuestCoreLayoutAtWait
 #endif
     runtime::ThreadState::Bind(thread_state_.get());
 
@@ -537,7 +559,7 @@ X_STATUS XThread::Create() {
     PROFILE_THREAD_EXIT();
 
 #if REX_PLATFORM_SWITCH
-    RexSwitchUnregisterCurrentThread();  // sa2-nx (2026-10-20): see RexSwitchRegisterCurrentThread above
+    RexSwitchUnregisterCurrentThread();  // banjo-nx (2026-10-20, from sa2-nx): see RexSwitchRegisterCurrentThread above
 #endif
 
     // Release the self-reference to the thread.
@@ -811,6 +833,16 @@ void XThread::DeliverAPCs() {
   auto* ctx = thread_state_->context();
   auto kthread = guest_object<X_KTHREAD>();
   auto* dispatcher = kernel_state_->function_dispatcher();
+
+  // blur-nx (2026-11-16, the 15 ms batch, #171): every alertable wait calls this twice, almost always with nothing
+  // queued, and the guest spinlock (an interlocked loop on the KTHREAD plus the PCR's IRQL bookkeeping, twice) was
+  // taken just to see that. An empty queue is now seen by one read of its head's forward link first. Exact: a read
+  // that sees it empty is the same as taking the lock just before another thread queues an APC (the queueing thread
+  // holds the lock while it links the entry, and the link word changes in one aligned store); one that sees an entry
+  // takes the locked path below, which checks again.
+  if (kthread->apc_lists[1].empty(mem)) {
+    return;
+  }
 
   auto old_irql = kernel::xboxkrnl::xeKeKfAcquireSpinLock(ctx, &kthread->apc_lock);
   auto& user_apc_queue = kthread->apc_lists[1];
@@ -1092,8 +1124,27 @@ uint32_t XThread::SelfSuspend() {
 }
 #endif
 
+// dishonored-nx (sa2-nx's, 2026-10-20; port 103): RexSetGuestThreadCoreLayout's layout applied by the calling guest
+// thread itself, once per new layout (one atomic load and compare otherwise): from XObject::Wait / SignalAndWait /
+// WaitMultiple and XThread::Delay, so no thread's cores are set while it runs elsewhere.
+void ApplyGuestCoreLayoutAtWait() {
+#if REX_PLATFORM_SWITCH
+  const uint32_t gen = g_guest_layout_gen.load(std::memory_order_acquire);
+  if (gen == 0 || gen == t_layout_applied) [[likely]]
+    return;
+  t_layout_applied = gen;
+  if (t_guest_kind == 1) {
+    const int32_t core = g_guest_main_core.load(std::memory_order_relaxed);
+    if (core >= 0) RexSwitchSetCurrentThreadMask(core, uint64_t(1) << core);
+  } else if (t_guest_kind == 2) {
+    const uint32_t mask = g_guest_core_mask.load(std::memory_order_relaxed);
+    if (mask) RexSwitchSetCurrentThreadMask(g_guest_core_preferred.load(std::memory_order_relaxed), mask);
+  }
+#endif
+}
+
 X_STATUS XThread::Delay(uint32_t processor_mode, uint32_t alertable, uint64_t interval) {
-  ApplyGuestCoreLayoutAtWait();  // sa2-nx (2026-10-20)
+  ApplyGuestCoreLayoutAtWait();  // dishonored-nx (sa2-nx's; port 103)
   int64_t timeout_ticks = interval;
   uint32_t timeout_ms;
   if (timeout_ticks > 0) {
@@ -1487,7 +1538,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
 
     rex::thread::Thread::CreationParameters params;
     params.create_suspended = true;  // Not done restoring yet.
-    params.stack_size = 16_MiB;
+    params.stack_size = GuestHostStackBytes();  // port 58: switch_guest_stack_mb
     thread->thread_ = rex::thread::Thread::Create(params, [thread, state]() {
       // Set thread ID override. This is used by logging.
       rex::thread::set_current_thread_id(thread->handle());
@@ -1553,18 +1604,35 @@ void XHostThread::Execute() {
 
 }  // namespace rex::system
 
-// sa2-nx (2026-10-20): the Switch's core layout for a game whose main thread does the game's work and its drawing (SA2
-// with Renut's renderer: sa2_renut_core_layout). The guest main thread is pinned to 'main_core', every other guest
+// bejeweled3-nx (2026-10-22; port 55, from feedingfrenzy2-nx's SDK): the same layout as RexSetGuestThreadCoreLayout
+// below, for the guest threads started from now on, each thread setting its own cores as it starts (XThread's thread
+// body above). Called before the module is launched, it moves no running thread: RexSetGuestThreadCoreLayout re-masked
+// the running guest threads under the object table's lock and hung Peggle's first frames on the console (and Banjo's
+// first Swap in Ryujinx: banjo_renut_core_layout is off for it). A no-op elsewhere.
+extern "C" void RexSetGuestThreadCoresAtStart(int main_core, uint32_t others_mask, int others_preferred) {
+#if REX_PLATFORM_SWITCH
+  g_guest_core_preferred.store(others_preferred, std::memory_order_relaxed);
+  g_guest_core_mask.store(others_mask, std::memory_order_release);
+  g_guest_main_core.store(main_core, std::memory_order_release);
+#else
+  (void)main_core;
+  (void)others_mask;
+  (void)others_preferred;
+#endif
+}
+
+// banjo-nx (2026-10-20, from sa2-nx): the Switch's core layout for a game whose main thread does the game's work and its drawing (N&B and SA2
+// with Renut's renderer: banjo_renut_core_layout). The guest main thread is pinned to 'main_core', every other guest
 // thread, now and to come, gets 'others_mask' (preferring 'others_preferred'), so none of them shares the main
 // thread's core: at the game threads' priority (0x3B) Horizon time-slices threads of a core in 10 ms slices. The host
-// threads keep their own placement (the render thread on core 1). Returns the threads moved. A no-op elsewhere.
+// threads keep their own placement (the render thread on core 1). Returns the guest threads that will move. A no-op
+// elsewhere.
 //
-// sa2-nx (2026-10-20, after banjo-nx's Ryujinx runs: 4 of 10 froze at the first Swap with the layout on, none with it
-// off): no thread's cores are set by another thread any more (svcSetThreadCoreMask on a thread running elsewhere waits
-// for it to leave its core, and the game's loader threads were busy). The layout is recorded with a new generation;
-// the calling thread (the main thread, at its Swap) applies its own at once, every other guest thread its own at its
-// next wait (ApplyGuestCoreLayoutAtWait, from XObject::Wait / SignalAndWait / WaitMultiple and XThread::Delay), and
-// threads made later at their start. Returns the guest threads that will move.
+// dishonored-nx (sa2-nx's, 2026-10-20, after banjo-nx's Ryujinx runs: 4 of 10 froze at the first Swap with the layout
+// on, none with it off; port 103): no thread's cores are set by another thread any more (svcSetThreadCoreMask on a
+// thread running elsewhere waits for it to leave its core, and the game's loader threads were busy). The layout is
+// recorded with a new generation; the calling thread (the main thread, at its Swap) applies its own at once, every
+// other guest thread its own at its next wait (ApplyGuestCoreLayoutAtWait), threads made later at their start.
 extern "C" uint32_t RexSetGuestThreadCoreLayout(int main_core, uint32_t others_mask, int others_preferred) {
 #if REX_PLATFORM_SWITCH
   using rex::system::XThread;
@@ -1585,4 +1653,45 @@ extern "C" uint32_t RexSetGuestThreadCoreLayout(int main_core, uint32_t others_m
   (void)others_preferred;
   return 0;
 #endif
+}
+
+// Port 167 (from fnxf_xiii, its note of 2026-11-11): each guest thread's guest call chain, for the on-demand stall dump
+// (app/src/profiler/stall_watch_switch.cpp, the file stall_dump: a game stuck while it still draws). Its r1 (current
+// while it waits in a kernel call: the import reads its arguments from the context), then the back chain ([sp]) and
+// each frame's saved lr ([back - 8]), only inside the thread's own guest stack (its KTHREAD's base and limit: fnxf_xiii's
+// first walk read past a stack into an unmapped page and crashed). Lines into out (NUL-terminated); their length.
+extern "C" size_t RexGuestCallChains(char* out, size_t cap) {
+  if (!out || cap == 0)
+    return 0;
+  out[0] = 0;
+  auto* ks = rex::system::kernel_state();
+  if (!ks || !ks->object_table())
+    return 0;
+  auto* mem = ks->memory();
+  size_t n = 0;
+  for (const auto& t : ks->object_table()->GetObjectsByType<rex::system::XThread>()) {
+    if (!t->is_guest_thread() || !t->thread_state() || !t->thread_state()->context())
+      continue;
+    const uint32_t r1 = uint32_t(t->thread_state()->context()->r1.u64);
+    const auto* kt = t->guest_object() ? t->guest_object<rex::system::X_KTHREAD>() : nullptr;
+    const uint32_t base = kt ? uint32_t(kt->stack_base) : 0, limit = kt ? uint32_t(kt->stack_limit) : 0;
+    std::string chain;
+    uint32_t sp = r1;
+    for (int i = 0; i < 32 && limit && sp >= limit && sp + 4 <= base; ++i) {
+      const uint32_t back = __builtin_bswap32(*mem->TranslateVirtual<const uint32_t*>(sp));
+      if (back <= sp || back > base || back - 8 < limit)
+        break;
+      const uint32_t lr = __builtin_bswap32(*mem->TranslateVirtual<const uint32_t*>(back - 8));
+      chain += fmt::format(" {:08X}", lr);
+      sp = back;
+    }
+    const std::string line = fmt::format("[stall]   guest {:08X} \"{}\" r1 {:08X} (stack {:08X}-{:08X}):{}\n", t->handle(),
+                                         t->name(), r1, limit, base, chain);
+    if (n + line.size() + 1 > cap)
+      break;
+    std::memcpy(out + n, line.data(), line.size());
+    n += line.size();
+    out[n] = 0;
+  }
+  return n;
 }

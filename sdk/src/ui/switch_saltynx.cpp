@@ -120,7 +120,7 @@ uint64_t g_frames = 0;    // same
 std::atomic<BlockReverseNx*> g_reverse{nullptr};
 std::atomic<bool> g_reverse_in_base{false};
 std::atomic<bool> g_reverse_active{false};
-/* Turned on by the game (cvar sa2_switch_saltynx). On by default. */
+/* Turned on by the game (cvar masseffect_switch_saltynx). On by default. */
 std::atomic<int> g_enabled{1};
 /*
  * Connection attempts left. The sysmodule may take longer than us to start, so if it is not there at
@@ -191,6 +191,49 @@ void* SearchMarkIn(uint8_t* base, size_t bytes, uint32_t mark) {
 void* SearchMark(uint32_t mark) { return SearchMarkIn(g_base, g_bytes, mark); }
 
 /*
+ * Port 159 (from fnxf_xiii, its note of 2026-10-24): the page cleaned before use. SaltySD's allocation counter only
+ * goes back to zero when it injects into a game, and it never injects into us, so the page keeps what earlier boots
+ * (ours or another title's) left there: blocks with an old magic further on, which the overlay's 4-byte scan can find
+ * before ours, and old fields in a block we take over (fps_blocked, fps_mode, buffers, force_suspension, a Reverse-NX
+ * mode chosen last time).
+ *
+ * - From the offset SaltySD hands out to the end of the page: nothing there is allocated (the counter is past
+ *   everything that is), so it is all zeroed before our blocks are written there.
+ * - A block of ours found by its magic (an earlier boot's, reused so the page does not run out): zeroed whole and set
+ *   up again, once per boot for each block.
+ * Always on: it only touches SaltySD's page, past what SaltySD has handed out, and our own blocks.
+ */
+const BlockFps* g_cleaned_fps = nullptr;
+const BlockReverseNx* g_cleaned_reverse = nullptr;
+
+void ClearFrom(uint64_t offset) {
+  if (!g_base || offset >= g_bytes) {
+    return;
+  }
+  std::memset(g_base + offset, 0, g_bytes - size_t(offset));
+  WarningNum("[saltynx] shared memory zeroed from SaltySD's offset", (long long)offset);
+}
+
+BlockFps* AdoptFps(BlockFps* block) {
+  if (block && block != g_cleaned_fps) {
+    std::memset(block, 0, sizeof(*block));
+    block->magic = kMagicFps;
+    g_cleaned_fps = block;
+  }
+  return block;
+}
+
+BlockReverseNx* AdoptReverse(BlockReverseNx* reverse) {
+  if (reverse && reverse != g_cleaned_reverse) {
+    std::memset(reverse, 0, sizeof(*reverse));
+    reverse->magic = kMagicReverseNx;
+    reverse->by_default = true;  // the system decides until the player says otherwise
+    g_cleaned_reverse = reverse;
+  }
+  return reverse;
+}
+
+/*
  * The block is only valid while it keeps its magic. The SaltySD page is shared by several clients
  * and its allocation is not reset when we start, so a good pointer can go bad. Checking it is a
  * 4-byte read, and it is done on every use.
@@ -255,14 +298,14 @@ void WarnPublished(const BlockFps* block) {
  * second while the block is missing. Returns true if there is an FPS block.
  */
 bool Hook() {
-  auto* block = static_cast<BlockFps*>(SearchMark(kMagicFps));
+  auto* block = AdoptFps(static_cast<BlockFps*>(SearchMark(kMagicFps)));
   if (block) {
     g_fps.store(block, std::memory_order_release);
     SeedBlock(block);
     WarnPublished(block);
   }
   if (!g_reverse.load(std::memory_order_acquire)) {
-    if (auto* reverse = static_cast<BlockReverseNx*>(SearchMark(kMagicReverseNx))) {
+    if (auto* reverse = AdoptReverse(static_cast<BlockReverseNx*>(SearchMark(kMagicReverseNx)))) {
       g_reverse.store(reverse, std::memory_order_release);
     }
   }
@@ -284,7 +327,10 @@ bool SearchSharedOwnMemory() {
     if (info.size == 0) {
       return false;
     }
-    if (info.type == MemType_SharedMem && (info.perm & Perm_R) != 0 && info.size >= kSharedSize) {
+    // mk9-nx (2026-11-08; port 56): readable AND writable. The block found here is written every second; a region
+    // mapped read-only that held the magic ended the game ("FPS block already present: writing over it", then a data
+    // abort in Update on the profiler thread).
+    if (info.type == MemType_SharedMem && (info.perm & Perm_Rw) == Perm_Rw && info.size >= kSharedSize) {
       auto* base = reinterpret_cast<uint8_t*>(uintptr_t(info.addr));
       const size_t bytes = size_t(info.size) < 0x10000 ? size_t(info.size) : 0x10000;
       if (SearchMarkIn(base, bytes, kMagicFps) || SearchMarkIn(base, bytes, kMagicReverseNx)) {
@@ -573,10 +619,12 @@ void Start() {
         ready = true;
         name = candidate;
         if (!SearchMark(kMagicFps)) {
-          reserved = R_SUCCEEDED(ReserveMemory(&service, sizeof(BlockFps), &displacement));
+          reserved = R_SUCCEEDED(ReserveMemory(&service, sizeof(BlockFps), &displacement)) &&
+                     displacement + sizeof(BlockFps) <= g_bytes;  // port 159: inside the page
         }
         if (!SearchMark(kMagicReverseNx)) {
-          reserved_nx = R_SUCCEEDED(ReserveMemory(&service, sizeof(BlockReverseNx), &nx_displacement));
+          reserved_nx = R_SUCCEEDED(ReserveMemory(&service, sizeof(BlockReverseNx), &nx_displacement)) &&
+                        nx_displacement + sizeof(BlockReverseNx) <= g_bytes;
         }
       }
 
@@ -597,6 +645,12 @@ void Start() {
   if (return_value.active) {  // room again: bring "sm:" back without waiting for the end
     smInitialize();
     return_value.active = false;
+  }
+
+  // Port 159 (fnxf_xiii): what SaltySD handed out, and everything after it, zeroed before the blocks go there.
+  if (reserved || reserved_nx) {
+    ClearFrom(reserved && reserved_nx ? (displacement < nx_displacement ? displacement : nx_displacement)
+                                      : (reserved ? displacement : nx_displacement));
   }
 
   if (name && !g_warned_connection) {
@@ -630,7 +684,7 @@ void Start() {
 
   // The FPS block: if SaltyNX already left one in this process it is overwritten (its fields would be
   // 0, since it has nothing to hook); otherwise the slot allocated through IPC is used.
-  auto* existing = static_cast<BlockFps*>(SearchMark(kMagicFps));
+  auto* existing = AdoptFps(static_cast<BlockFps*>(SearchMark(kMagicFps)));
   if (existing) {
     g_fps.store(existing, std::memory_order_release);
     if (!g_warned_block) {
@@ -638,9 +692,7 @@ void Start() {
       Warning("[saltynx] FPS block already present: writing over it");
     }
   } else if (reserved) {
-    auto* block = reinterpret_cast<BlockFps*>(g_base + displacement);
-    std::memset(block, 0, sizeof(*block));
-    block->magic = kMagicFps;
+    auto* block = AdoptFps(reinterpret_cast<BlockFps*>(g_base + displacement));
     g_fps.store(block, std::memory_order_release);
     WarningNum("[saltynx] FPS block created at offset", (long long)displacement);
   } else if (!g_warned_no_site) {
@@ -666,12 +718,9 @@ void Start() {
    * for the "NXRT" magic), but it does require `pluginActive` to show the controls, and that means
    * "the game has asked for the mode": it is set in BaseMode.
    */
-  auto* reverse = static_cast<BlockReverseNx*>(SearchMark(kMagicReverseNx));
+  auto* reverse = AdoptReverse(static_cast<BlockReverseNx*>(SearchMark(kMagicReverseNx)));
   if (!reverse && reserved_nx) {
-    reverse = reinterpret_cast<BlockReverseNx*>(g_base + nx_displacement);
-    std::memset(reverse, 0, sizeof(*reverse));
-    reverse->magic = kMagicReverseNx;
-    reverse->by_default = true;  // the system decides until the player says otherwise
+    reverse = AdoptReverse(reinterpret_cast<BlockReverseNx*>(g_base + nx_displacement));
     WarningNum("[saltynx] Reverse-NX block created at offset", (long long)nx_displacement);
   } else if (!g_warned_reverse) {
     g_warned_reverse = true;  // once, since this is retried every second

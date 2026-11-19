@@ -29,7 +29,7 @@ enum : unsigned {
   kMultiPoll = 45,        // legacy WaitMultiple 1 ms sleep polls (thread_wait_blocking = false)
   kTimestampTick = 46,    // KeTimeStampBundle timer callbacks
   kClockCall = 47,        // UpdateGuestClock calls
-  kClockBlocked = 48,     // ... that found the clock mutex taken
+  kClockBlocked = 48,     // ... that found the clock mutex taken (clock_lock_free = false only)
   kObjLookup = 49,        // ObjectTable::LookupObject calls
   kObjBlocked = 50,       // ... that found the global critical region taken
   kVolumeMask = 51,       // XAudioGetVoiceCategoryVolumeChangeMask calls
@@ -63,7 +63,19 @@ enum : unsigned {
   kCensusRoundNearest = 76,   // guest FPSCR writes with RN = round to nearest
   kCensusRoundZero = 77,      // ... RN = toward zero
   kCensusRoundUpDown = 78,    // ... RN = toward +infinity or -infinity
-  kCensusCount = 79,
+  // blur-nx (2026-11-12, codegen-ideas-3 CG-13's census; PC game code only, REX_DIET_CENSUS_ON): the scalar FPU code
+  // that one flush mode for all code would change. An FPU-mode region is the guest code between a switch of the flush
+  // mode off and the next switch on; at that switch the host's sticky flags tell whether any operation in it met a
+  // denormal operand or gave an underflow (x86 MXCSR DE / UE; a lower bound: x86 raises UE only on an inexact tiny
+  // result). The any-mode helpers' cold paths (rex/ppc/diet_ops.h) are counted as before (g_rex_diet_census[3]).
+  kCensusFpuRegions = 79,     // FPU-mode regions ended by a switch of the flush mode on
+  kCensusFpuDenormal = 80,    // ... of those, with a denormal operand or an underflow inside
+  // blur-nx (2026-11-13, #57 / #34 of Blur's docs/cpu-near-exact-50-1113.md): single-object waits with a zero timeout
+  // (polls), and of those the ones that timed out (each then yields: MaybeYield).
+  kCensusWaitPoll = 81,
+  kCensusWaitPollTimeout = 82,
+  kCensusWaitSignalled = 83,  // single-object waits of any timeout that succeeded
+  kCensusCount = 84,
 };
 
 #if !defined(__SWITCH__)
@@ -75,6 +87,14 @@ uint64_t CensusRead(unsigned id);
 void CensusSite(unsigned id);
 void CensusSitesEnable(bool on);
 size_t CensusSites(uint64_t* addresses, uint64_t* counts, size_t capacity);
+// blur-nx (2026-11-12, CG-13's census): the code addresses where a scalar result met a denormal, in a table of their
+// own (a flush-mode switch site and a denormal site are different questions). CensusDenormalSite counts one at
+// `address` (the any-mode helpers' cold paths pass their return address); CensusFpuRegionEnd is called by the switch
+// of the flush mode on with the host's status word, counts the region and, when its flags show a denormal operand or
+// an underflow, the code address the switch was called from. CensusDenormalSites copies the most counted.
+void CensusDenormalSite(uint64_t address);
+void CensusFpuRegionEnd(uint32_t csr);
+size_t CensusDenormalSites(uint64_t* addresses, uint64_t* counts, size_t capacity);
 // Calls per kernel export (third survey, 2026-10-12): every REX_HOOK / REX_EXPORT counts itself here in PC builds,
 // so a run shows which host functions the game calls most. ExportCounter returns the export's counter (created
 // on first use; call it once per export and keep the pointer); ExportCensus copies the `capacity` most called.

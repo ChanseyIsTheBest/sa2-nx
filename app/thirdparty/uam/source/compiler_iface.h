@@ -55,6 +55,10 @@ public:
 	// in steps of 8 (the per-thread allocation unit, which sets how many warps an SM holds), then less code. nullptr
 	// when it does not compile.
 	static std::unique_ptr<DekoCompiler> CompileBest(pipeline_stage stage, const char* glsl, int optLevel = 3);
+	// Port 163 (from fnxf_xiii): with the pressure passes (banjo flag 2048), a shader above 56 registers compiled again
+	// with the register-saving passes that cost instructions; the one with the fewest register steps kept.
+	static std::unique_ptr<DekoCompiler> TryRescue(std::unique_ptr<DekoCompiler> best, pipeline_stage stage,
+		int optLevel, unsigned flags, const char* glsl);
 
 	// banjo-nx (2026-10-18): the codegen of another compiler's TGSI (its GLSL program must outlive this one, or be
 	// handed over: TakeGlslProgram).

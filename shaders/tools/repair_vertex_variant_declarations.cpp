@@ -1,7 +1,7 @@
 // Offline, fail-closed DECL repair. Does not modify sequencer code or packages.
 // Usage: repair_vertex_variant_declarations template.bin actual.bin fresh-output.bin
-#include "../../app/src/me/me_shader_identity.h"
-#include "../../app/src/me/me_vertex_fetch_selection.h"
+#include "../../app/src/native/me_shader_identity.h"
+#include "../../app/src/native/me_vertex_fetch_selection.h"
 
 #include <array>
 #include <cerrno>
@@ -147,12 +147,8 @@ bool AdjacentFetchOnlyRegion(unsigned old, unsigned next,
   }
   return true;
 }
-#ifndef O_BINARY
-#define O_BINARY 0  // POSIX has no text mode
-#endif
 void ExclusiveWrite(const char* path, const Bytes& b) {
-  // O_BINARY: on Windows open() defaults to text mode and turns every 0x0A byte into 0D 0A, corrupting the container.
-  const int fd=open(path,O_WRONLY|O_CREAT|O_EXCL|O_BINARY,0600);
+  const int fd=open(path,O_WRONLY|O_CREAT|O_EXCL,0600);
   if(fd<0) Reject("exclusive output creation failed: "+std::string(std::strerror(errno)));
   size_t written=0;
   while(written<b.size()) {

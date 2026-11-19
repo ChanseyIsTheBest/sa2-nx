@@ -18,6 +18,7 @@
 #include <fmt/format.h>
 
 #include <rex/codegen/config.h>
+#include <rex/codegen/function_scanner.h>
 #include <rex/logging.h>
 
 #include "codegen_logging.h"
@@ -433,6 +434,8 @@ VoidResult registerEntryPoints(CodegenContext& ctx) {
   for (uint32_t addr : config.knownIndirectCallHints) {
     state.knownIndirectCalls.insert(addr);
   }
+  // katamari-nx (2026-11-01): the jump-table detection honours them (they were loaded and never read).
+  FunctionScanner::setForcedIndirectCalls(config.knownIndirectCallHints);
   for (uint32_t addr : config.exceptionHandlerFuncHints) {
     state.exceptionHandlerFuncs.push_back(addr);
   }

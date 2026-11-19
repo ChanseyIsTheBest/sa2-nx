@@ -146,6 +146,11 @@ namespace plume {
             return DXGI_FORMAT_R32G8X24_TYPELESS;
         case RenderFormat::D24_UNORM_S8_UINT:  // banjo-nx (2026-10-19): typeless, as above
             return DXGI_FORMAT_R24G8_TYPELESS;
+        // sasrt-nx (2026-11-11, port 75; its formats batch, rows 6, 8, 10, 74, 93 and 7, 66, 73, 95, 96)
+        case RenderFormat::R10G10B10A2_UNORM:
+            return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case RenderFormat::R11G11B10_FLOAT:
+            return DXGI_FORMAT_R11G11B10_FLOAT;
         case RenderFormat::R32_FLOAT:
             return DXGI_FORMAT_R32_FLOAT;
         case RenderFormat::R32_UINT:
@@ -3120,6 +3125,7 @@ namespace plume {
 
         switch (desc.cullMode) {
         case RenderCullMode::NONE:
+        case RenderCullMode::FRONT_AND_BACK:  // kameo-nx (2026-11-04): D3D12 has none
             psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
             break;
         case RenderCullMode::FRONT:

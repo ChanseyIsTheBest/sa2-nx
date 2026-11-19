@@ -22,6 +22,13 @@
 // Only the syscall header: switch.h drags typedefs that collide with rex.
 extern "C" {
 #include <switch/types.h>
+
+// banjo-nx (2026-10-27): the system core (core/threading_switch.cpp).
+extern "C" int RexSwitchInitSystemCore(void);
+extern "C" unsigned RexSwitchProcessCoreMask(void);
+extern "C" int RexSwitchSystemCoreMode(void);
+extern "C" unsigned RexSwitchAppCoreMask(void);
+extern "C" int RexSwitchEnsureForwarderNpdm(void);
 // libnx runtime internals used for the exit below.
 extern u32 __nx_applet_exit_mode;
 NX_NORETURN void __libnx_exit(int rc);
@@ -61,6 +68,14 @@ int main(int argc, char* argv[]) {
   auto remaining = rex::cvar::Init(argc, argv);
   rex::cvar::ApplyEnvironment();
   rex::InitLoggingEarly();
+  // banjo-nx (2026-10-27): the system core (NetherSX2_nx's 4-core mode; core/threading_switch.h), once the cvars are
+  // read and before any thread of ours starts; the main thread leaves it.
+  {
+    const int system_core = RexSwitchInitSystemCore();
+    RexSwitchEnsureForwarderNpdm();  // banjo-nx (2026-10-27): the forwarder's four-core NPDM (render thread logs it)
+    REXLOG_INFO("Switch: process cores 0x{:X}; system core {} (banjo_system_core {}; game threads on 0x{:X})",
+                RexSwitchProcessCoreMask(), system_core, RexSwitchSystemCoreMode(), RexSwitchAppCoreMask());
+  }
 
   int result;
   {

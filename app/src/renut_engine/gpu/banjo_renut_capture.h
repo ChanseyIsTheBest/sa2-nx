@@ -12,10 +12,4 @@ namespace renut::gpu {
 // Returns false when no frame was presented within 'timeout_ms' or the renderer is not running.
 bool CaptureFrame(rex::ui::RawImage &out, int timeout_ms = 1000);
 
-// sa2-nx (2026-10-20, lockstep captures): CaptureFrame in two halves. The ticket asks the next Present for its image;
-// asked by the Swap hook before it queues its frame, that Present is the frame's own (the overlay's re-present only
-// runs while the guest stalls).
-uint64_t RequestFrameCapture();
-bool WaitFrameCapture(uint64_t ticket, rex::ui::RawImage &out, int timeout_ms);
-
 } // namespace renut::gpu

@@ -154,6 +154,10 @@ void AudioSystem::WorkerThreadMain() {
       auto global_lock = global_critical_region_.Acquire();
       uint32_t client_callback = clients_[index].callback;
       uint32_t client_callback_arg = clients_[index].wrapped_callback_arg;
+      if (client_callback) {  // (UnregisterClient waits for this callback: see there)
+        dispatch_thread_ = std::this_thread::get_id();
+        dispatching_client_.store(int(index), std::memory_order_release);
+      }
       global_lock.unlock();
 
       if (client_callback) {
@@ -168,6 +172,7 @@ void AudioSystem::WorkerThreadMain() {
         uint64_t args[] = {client_callback_arg};
         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                       rex::countof(args));
+        dispatching_client_.store(-1, std::memory_order_release);
         if (diag_pump_count < 10) {
           REXAPU_DEBUG("AudioWorker: callback returned for client {}", index);
         }
@@ -272,6 +277,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
   clients_[index] = {driver, callback, callback_arg, ptr, true};
+  REXLOG_INFO("[audio] render driver client {} registered (callback {:08X})", index, callback);
 
   if (out_index) {
     *out_index = index;
@@ -292,7 +298,16 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
 
   auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
-  assert_true(clients_[index].driver != NULL);
+  // banjo-nx: a frame for a client that is no longer registered has nowhere to go. Banjo destroys and recreates
+  // its audio renderer about ten seconds into start-up; a callback of the old client that was still running when
+  // it was unregistered arrived here and called through a null driver (the console's start-up crash of 2026-10-14,
+  // twice out of two starts at 1020 MHz, where that callback takes longest).
+  if (index >= kMaximumClientCount || clients_[index].driver == nullptr) [[unlikely]] {
+    static std::atomic<uint32_t> dropped{0};
+    if (dropped.fetch_add(1, std::memory_order_relaxed) < 8)
+      REXLOG_WARN("[audio] frame for render driver client {} dropped: it is not registered", index);
+    return;
+  }
   (clients_[index].driver)->SubmitFrame(samples_ptr);
 }
 
@@ -301,6 +316,34 @@ void AudioSystem::UnregisterClient(size_t index) {
 
   auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
+  // banjo-nx: the console's kernel does not return from this call while the client's callback is running; here the
+  // worker thread may be in the middle of it (it took the callback under this lock and released the lock to run
+  // it). Wait for that callback to return before the driver and the callback's argument go away: the lock is given
+  // up while waiting, since the callback itself submits its frame under it. Bounded, in case the callback is
+  // waiting for something the caller holds, and not when the callback itself unregisters.
+  if (dispatching_client_.load(std::memory_order_acquire) == int(index) &&
+      std::this_thread::get_id() != dispatch_thread_) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    bool returned = false;
+    for (;;) {
+      global_lock.unlock();
+      rex::thread::Sleep(std::chrono::microseconds(200));
+      global_lock.lock();
+      if (dispatching_client_.load(std::memory_order_acquire) != int(index)) {
+        returned = true;
+        break;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) break;
+    }
+    REXLOG_INFO("[audio] render driver client {}: unregistered while its callback was running; {}", index,
+                returned ? "waited for it to return" : "it did not return within 250 ms");
+  }
+  REXLOG_INFO("[audio] render driver client {} unregistered (callback {:08X}, driver {})", index,
+              clients_[index].callback, clients_[index].driver ? "present" : "none");
+  if (clients_[index].driver == nullptr) {  // (not registered: nothing to destroy)
+    clients_[index] = {nullptr, 0, 0, 0, false};
+    return;
+  }
   DestroyDriver(clients_[index].driver);
   memory()->SystemHeapFree(clients_[index].wrapped_callback_arg);
   clients_[index] = {nullptr, 0, 0, 0, false};

@@ -9,10 +9,42 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
+
+#include <rex/cvar.h>
 #include <rex/kernel/xam/apps/xmp_app.h>
 #include <rex/logging.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
+
+// renut-ultimate (2026-11-16, port 143; tw2de_nx's, from nx-mod/rexglue-sdk-nx; ON at the user's word: "port the speed ups as on by default").
+REXCVAR_DEFINE_BOOL(xmp_poll_throttle, true, "Kernel",
+                    "tw2de_nx: the delay Xenia puts on XMPGetStatus (1 ms) and XMPGetPlaybackController (10 ms) from "
+                    "any thread but the title's main one, kept only for a real tight loop: more than 8 calls from one "
+                    "thread within 16 ms. A game that calls it from its loop a few times a frame on another thread "
+                    "lost the delay every call (Halo 3: a third of its frame). false: the delay on every such call, "
+                    "as before");
+
+namespace {
+// Port 143 (xmp_poll_throttle): the sleep only past kCallsPerWindow calls of this thread in a window.
+void XmpPollDelay(std::chrono::milliseconds delay) {
+  static const bool throttle = REXCVAR_GET(xmp_poll_throttle);
+  if (throttle) {
+    constexpr auto kWindow = std::chrono::milliseconds(16);
+    constexpr uint32_t kCallsPerWindow = 8;
+    thread_local std::chrono::steady_clock::time_point window_start;
+    thread_local uint32_t calls = 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window_start >= kWindow) {
+      window_start = now;
+      calls = 0;
+    }
+    if (++calls <= kCallsPerWindow)
+      return;
+  }
+  rex::thread::Sleep(delay);
+}
+}  // namespace
 
 namespace rex {
 namespace kernel {
@@ -39,7 +71,7 @@ X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
   if (!XThread::GetCurrentThread()->main_thread()) {
     // Some stupid games will hammer this on a thread - induce a delay
     // here to keep from starving real threads.
-    rex::thread::Sleep(std::chrono::milliseconds(1));
+    XmpPollDelay(std::chrono::milliseconds(1));  // port 143
   }
 
   REXKRNL_TRACE("XMPGetStatus({:08X})", state_ptr);
@@ -410,7 +442,7 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       if (!XThread::GetCurrentThread()->main_thread()) {
         // Atrain spawns a thread 82437FD0 to call this in a tight loop forever.
-        rex::thread::Sleep(std::chrono::milliseconds(10));
+        XmpPollDelay(std::chrono::milliseconds(10));  // port 143
       }
 
       return X_E_SUCCESS;

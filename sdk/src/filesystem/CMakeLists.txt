@@ -13,12 +13,11 @@ add_library(rexfilesystem OBJECT
     devices/null_device.cpp
     devices/null_entry.cpp
     devices/null_file.cpp
-    devices/pack_device.cpp
-    devices/pack_storage_switch.cpp
     devices/startup_trace.cpp
     devices/stfs_container_device.cpp
     devices/stfs_container_entry.cpp
     devices/stfs_container_file.cpp
+    lz4_blocks.cpp
 )
 add_library(rex::filesystem ALIAS rexfilesystem)
 

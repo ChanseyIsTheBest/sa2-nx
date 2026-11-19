@@ -36,6 +36,11 @@ constexpr float kPack2101010_Max10 = std::bit_cast<float>(0x404001FFu);
 constexpr float kPack2101010_Min2 = std::bit_cast<float>(0x40400000u);
 constexpr float kPack2101010_Max2 = std::bit_cast<float>(0x40400003u);
 
+// renut-ultimate (2026-11-16, port 144; tw2de_nx's): the Xenon's spin-wait hints (db16cyc, or r1,r1,r1) with the
+// codegen option spin_hint_yield call this (sdk/src/system/xthread.cpp): the thread yields its core, so a spinning
+// thread lets the one it waits for run (the 360 had six hardware threads; the Switch gives a game three cores).
+extern "C" void rex_spin_hint(void);
+
 namespace rex::ppc {
 
 //=============================================================================
@@ -78,9 +83,9 @@ struct CRRegister {
     uint8_t un;
   };
 
-  inline uint32_t raw() const noexcept { return (lt << 3) | (gt << 2) | (eq << 1) | so; }
+  REX_SMALL_HELPER uint32_t raw() const noexcept { return (lt << 3) | (gt << 2) | (eq << 1) | so; }
 
-  inline void set_raw(uint32_t value) noexcept {
+  REX_SMALL_HELPER void set_raw(uint32_t value) noexcept {
     lt = (value >> 3) & 1;
     gt = (value >> 2) & 1;
     eq = (value >> 1) & 1;
@@ -88,18 +93,28 @@ struct CRRegister {
   }
 
   template <typename T>
-  inline void compare(T left, T right, const XERRegister& xer) noexcept {
+  REX_SMALL_HELPER void compare(T left, T right, const XERRegister& xer) noexcept {  // (diet_ops.h: forced inline)
     lt = left < right;
     gt = left > right;
     eq = left == right;
+    REX_NX_CENSUS_IF(xer.so, 11);
+#if defined(REX_NX_XER_SO_ZERO)
+    so = 0;  // blur-nx (2026-11-13, #5 of docs/cpu-near-exact-50-1113.md): diet_ops.h
+#else
     so = xer.so;
+#endif
   }
 
-  inline void compare(double left, double right) noexcept {
+  REX_SMALL_HELPER void compare(double left, double right) noexcept {
 #ifndef REX_NO_FAST_FCMP
-    // Codegen diet: same truth table, but the quiet comparison builtins let one fcmp serve all four
+    // Mass Effect diet: same truth table, but the quiet comparison builtins let one fcmp serve all four
     // flags (the relational operators and == compiled to fcmpe and fcmp pairs plus NaN tests).
+    REX_NX_CENSUS_IF(__builtin_isunordered(left, right), 5);
+#if defined(REX_NX_FCMP_NO_UN)
+    un = 0;  // blur-nx (2026-11-13, #41): diet_ops.h (lt, gt and eq are 0 for a NaN either way)
+#else
     un = __builtin_isunordered(left, right);
+#endif
     lt = __builtin_isless(left, right);
     gt = __builtin_isgreater(left, right);
     eq = left == right;
@@ -112,6 +127,23 @@ struct CRRegister {
   }
 
   inline void setFromMask(simde__m128 mask, int imm) noexcept {
+#if (defined(__aarch64__) || defined(_M_ARM64)) && !defined(REX_SETFROMMASK_MOVEMASK)
+    // sasrt-nx (2026-11-11, port 71; its idea 43 B4): cr6 of a vcmp*fp. with the all-lanes immediate (the only one the
+    // generator emits): lt when every lane's sign bit is set, eq when none is, for any mask. Each lane to all-ones /
+    // zero by its sign (an arithmetic shift), narrowed to 16 bits, read as one 64-bit word: all-ones exactly when all
+    // four are set, zero exactly when none is. movemask's shifts, `addv` and constant go. REX_SETFROMMASK_MOVEMASK:
+    // the movemask form.
+    if (imm == 0xF) {  // (exact for any imm; folds when inlined)
+      const uint64_t s = vget_lane_u64(vreinterpret_u64_u16(vmovn_u32(vreinterpretq_u32_s32(
+                                           vshrq_n_s32(vreinterpretq_s32_f32(simde__m128_to_neon_f32(mask)), 31)))),
+                                       0);
+      lt = s == ~uint64_t(0);
+      gt = 0;
+      eq = s == 0;
+      so = 0;
+      return;
+    }
+#endif
     int m = simde_mm_movemask_ps(mask);
     lt = m == imm;
     gt = 0;
@@ -120,6 +152,20 @@ struct CRRegister {
   }
 
   inline void setFromMask(simde__m128i mask, int imm) noexcept {
+#if (defined(__aarch64__) || defined(_M_ARM64)) && !defined(REX_SETFROMMASK_MOVEMASK)
+    // (Port 71, the byte form: vcmp*. on integers, immediate 0xFFFF.) Each byte to all-ones / zero by its sign, two
+    // bytes' halves into one byte (shift right by 4 and narrow), read as one 64-bit word.
+    if (imm == 0xFFFF) {
+      const uint64_t s = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_s8(
+                                           vshrq_n_s8(simde__m128i_to_neon_i8(mask), 7)), 4)),
+                                       0);
+      lt = s == ~uint64_t(0);
+      gt = 0;
+      eq = s == 0;
+      so = 0;
+      return;
+    }
+#endif
     int m = simde_mm_movemask_epi8(mask);
     lt = m == imm;
     gt = 0;
@@ -155,6 +201,36 @@ constexpr uint32_t kRoundUp = 0x02;
 constexpr uint32_t kRoundDown = 0x03;
 constexpr uint32_t kRoundMask = 0x03;
 
+// blur-nx (2026-11-12, codegen-ideas-3 CG-13's census; PC game code only: REX_DIET_CENSUS_ON, x86): an FPU-mode region
+// (the guest code between a switch of the flush mode off and the next switch on) ends at that switch; the host's
+// sticky status flags then say whether an operation in it met a denormal operand or gave an underflow
+// (rex::syscount::CensusFpuRegionEnd). So that the flags are the region's own, the cached word every switch writes
+// back keeps them clear (InitHost, loadFromHost): each switch then clears what the previous region raised.
+#if defined(REX_DIET_CENSUS_ON) && !defined(__SWITCH__) && (defined(__x86_64__) || defined(_M_X64))
+#define REX_FPU_CENSUS_REGION_END() ::rex::syscount::CensusFpuRegionEnd(uint32_t(getcsr()))
+#define REX_FPU_CENSUS_CLEAN(word) ((word) &= ~decltype(word)(0x3F))
+#else
+#define REX_FPU_CENSUS_REGION_END() ((void)0)
+#define REX_FPU_CENSUS_CLEAN(word) ((void)0)
+#endif
+
+// blur-nx (2026-11-12, codegen-ideas-3 CG-13, the user: "build CG 13 ... it probably should be off by default"): CMake
+// BLUR_FPCR_ONE_MODE (REX_FPCR_ONE_MODE) keeps the host's flush mode on for all guest code: a guest thread sets it at
+// start (InitHost), any other thread at its first switch on (enableFlushMode still writes it once when the cached word
+// says off), and every switch off is nothing, so there is no `msr fpcr` in the game code after the first. The VMX unit
+// flushes denormals as the Xenon's does; the scalar FPU now flushes them too, which the Xenon's does not: NOT
+// bit-exact for scalar values below FLT_MIN / DBL_MIN (the census, REX_DIET_CENSUS_ON, counts them on the PC).
+#if defined(REX_FPCR_ONE_MODE)
+#ifndef REX_FLUSH_KNOWN_ON
+#define REX_FLUSH_KNOWN_ON() ((void)0)
+#define REX_FLUSH_KNOWN_OFF() ((void)0)
+#endif
+#ifndef REX_FLUSH_HOIST_KNOWN_ON
+#define REX_FLUSH_HOIST_KNOWN_ON() ((void)0)
+#define REX_FLUSH_HOIST_KNOWN_OFF() ((void)0)
+#endif
+#endif
+
 struct FPSCRRegister {
   uint32_t csr;
 
@@ -174,11 +250,16 @@ struct FPSCRRegister {
   // Restoring the whole word would unmask every FP exception when csr is 0.
   inline void restoreGuestBits(uint32_t saved) noexcept {
     csr = (getcsr() & ~GuestMask) | (saved & GuestMask);
+#if defined(REX_FPCR_ONE_MODE)
+    csr |= FlushMask;  // CG-13
+#endif
     setcsr(csr);
   }
 
   inline uint32_t loadFromHost() noexcept {
+    REX_NX_CENSUS(10);  // blur-nx (2026-11-13, #4)
     csr = getcsr();
+    REX_FPU_CENSUS_CLEAN(csr);
     return HostToGuest[(csr & RoundMaskVal) >> RoundShift];
   }
 
@@ -187,34 +268,62 @@ struct FPSCRRegister {
                    : (value & kRoundMask) == kRoundTowardZero ? rex::syscount::kCensusRoundZero
                                                               : rex::syscount::kCensusRoundUpDown,
                    1);
-    csr &= ~RoundMaskVal;
-    csr |= Platform::GuestToHost[value & kRoundMask];
+    // blur-nx (2026-11-13, docs/cpu-near-exact-50-1113.md #3): the census of the writes; the write itself (an `msr fpcr`,
+    // dozens of cycles on the A57) skipped when the host's word already is what it would write (exact: read back with
+    // `mrs`, not taken from the cached copy, which a thread-context restore sets without writing the host's;
+    // REX_FPSCR_WRITE_ALWAYS: every write, as before). REX_NX_RN_ONLY (near-exact, NOT for Blur: its census shows
+    // round-toward-zero selected, 11,776 times against 23,629 to nearest): the rounding mode stays round-to-nearest.
+    const uint32_t next = uint32_t((csr & ~RoundMaskVal) | Platform::GuestToHost[value & kRoundMask]);
+    REX_NX_CENSUS(7);
+    REX_NX_CENSUS_IF(next != csr, 8);
+    REX_NX_CENSUS_IF((value & kRoundMask) != kRoundNearest, 9);
+#if defined(REX_NX_RN_ONLY)
+    return;
+#endif
+    csr = next;
+#if !defined(REX_FPSCR_WRITE_ALWAYS)
+    if (next == getcsr()) {
+      return;
+    }
+#endif
     setcsr(csr);
   }
 
-  inline void enableFlushModeUnconditional() noexcept {
+  REX_SMALL_HELPER void enableFlushModeUnconditional() noexcept {
+#if defined(REX_FPCR_ONE_MODE)
+    enableFlushMode();
+    return;
+#endif
+    REX_FPU_CENSUS_REGION_END();
     REX_SYS_CENSUS_SITE(rex::syscount::kCensusFlushWrite);
     if ((csr & FlushMask) == FlushMask) REX_SYS_CENSUS(rex::syscount::kCensusFlushSame, 1);
     csr |= FlushMask;
     setcsr(csr);
   }
 
-  inline void disableFlushModeUnconditional() noexcept {
+  REX_SMALL_HELPER void disableFlushModeUnconditional() noexcept {
+#if defined(REX_FPCR_ONE_MODE)
+    return;
+#endif
     REX_SYS_CENSUS_SITE(rex::syscount::kCensusFlushWrite);
     if ((csr & FlushMask) == 0) REX_SYS_CENSUS(rex::syscount::kCensusFlushSame, 1);
     csr &= ~FlushMask;
     setcsr(csr);
   }
 
-  inline void enableFlushMode() noexcept {
+  REX_SMALL_HELPER void enableFlushMode() noexcept {
     if ((csr & FlushMask) != FlushMask) [[unlikely]] {
+      REX_FPU_CENSUS_REGION_END();
       REX_SYS_CENSUS_SITE(rex::syscount::kCensusFlushWrite);
       csr |= FlushMask;
       setcsr(csr);
     }
   }
 
-  inline void disableFlushMode() noexcept {
+  REX_SMALL_HELPER void disableFlushMode() noexcept {
+#if defined(REX_FPCR_ONE_MODE)
+    return;
+#endif
     if ((csr & FlushMask) != 0) [[unlikely]] {
       REX_SYS_CENSUS_SITE(rex::syscount::kCensusFlushWrite);
       csr &= ~FlushMask;
@@ -223,12 +332,20 @@ struct FPSCRRegister {
   }
 
   // tools/flush_mode_flow.py: the test of a check the control flow proved redundant (PC builds keep it).
-  inline bool flushModeIsOn() const noexcept { return (csr & FlushMask) == FlushMask; }
-  inline bool flushModeIsOff() const noexcept { return (csr & FlushMask) == 0; }
+  REX_SMALL_HELPER bool flushModeIsOn() const noexcept { return (csr & FlushMask) == FlushMask; }
+#if defined(REX_FPCR_ONE_MODE)
+  REX_SMALL_HELPER bool flushModeIsOff() const noexcept { return true; }  // CG-13: no mode to check
+#else
+  REX_SMALL_HELPER bool flushModeIsOff() const noexcept { return (csr & FlushMask) == 0; }
+#endif
 
   inline void InitHost() noexcept {
     csr = getcsr();
+    REX_FPU_CENSUS_CLEAN(csr);
     Platform::InitHostExceptions(csr);
+#if defined(REX_FPCR_ONE_MODE)
+    csr |= FlushMask;  // CG-13: the flush mode on for the thread's whole life
+#endif
     setcsr(csr);
   }
 };
@@ -294,6 +411,9 @@ struct alignas(0x40) PPCContext {
   PPCCRRegister cr7;
   PPCFPSCRRegister fpscr;
   uint8_t vscr_sat = 0;  // VSCR saturation flag (for vector ops)
+  // renut-ultimate (2026-11-16, port 144; tw2de_nx's): VSCR NJ as mtvscr wrote it (1 at reset), for mfvscr
+  // (codegen option extra_instructions). In the padding after vscr_sat: no field moves. The vector unit always flushes.
+  uint8_t vscr_nj = 1;
 
   /**
    * Last indirect call target address. Set by REX_CALL_INDIRECT_FUNC before

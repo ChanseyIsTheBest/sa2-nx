@@ -46,6 +46,14 @@ class NativeDrawExtentEstimator {
   // sa2-nx: the reason is kept only as a pointer to its literal (Diagnostics::reason_text), not copied into
   // Diagnostics::reason: a heap allocation per call for the reasons over 15 characters, the success one included.
   void ReasonAsPointer(bool on) { reason_pointer_ = on; }
+  // banjo-nx (banjo_gpu_proof_tess_leftover): VGT_OUTPUT_PATH_CNTL selects the tessellator only in the explicit major
+  // mode (the reference renderer's rule, sdk primitive_processor.cpp and draw_extent_estimator.cpp: "there are cases
+  // in games when this register is left over after usage of tessellation in draws that don't need it"). Nuts & Bolts
+  // tessellates its water and leaves the register set, so every Direct3D Clear after the first water draw was
+  // refused here (16 a frame in gameplay) and drawn as an ordinary draw that may keep what was there.
+  void TessellationOnlyExplicit(bool on) { tess_only_explicit_ = on; }
+  // banjo-nx (banjo_gpu_proof_triangle): one auto-indexed triangle (see Estimate).
+  void AllowTriangle(bool on) { allow_triangle_ = on; }
 
   explicit NativeDrawExtentEstimator(const rex::memory::Memory& memory) : memory_(memory) {}
 
@@ -97,9 +105,13 @@ class NativeDrawExtentEstimator {
     const bool strip = allow_quad_triangles_ && draw.prim_type == xenos::PrimitiveType::kTriangleStrip &&
                       draw.num_indices == 4;
     const bool dma = (list || strip) && draw.source_select == xenos::SourceSelect::kDMA;
-    if ((draw.source_select != xenos::SourceSelect::kAutoIndex && !dma) || !(rect || list || strip) ||
-        regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select == xenos::VGTOutputPath::kTessellationEnable)
+    const bool one_triangle = allow_triangle_ && draw.prim_type == xenos::PrimitiveType::kTriangleList &&
+                              draw.num_indices == 3 && draw.source_select == xenos::SourceSelect::kAutoIndex;
+    if ((draw.source_select != xenos::SourceSelect::kAutoIndex && !dma) || !(rect || list || strip || one_triangle))
       return reject("not-three-auto-rectangle");
+    if (regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select == xenos::VGTOutputPath::kTessellationEnable &&
+        (!tess_only_explicit_ || xenos::IsMajorModeExplicit(draw.major_mode, draw.prim_type)))
+      return reject("tessellated");
     const uint32_t n_vertices = draw.num_indices;
     const auto clip = regs.Get<reg::PA_CL_CLIP_CNTL>();
     const bool clip_on = !clip.clip_disable;
@@ -373,7 +385,7 @@ class NativeDrawExtentEstimator {
     d.interpolator0_valid = interpolator0_all;
     if (rect) {
       for (uint32_t i = 0; i < 3; ++i) d.position[i] = vertices[i];
-    } else {
+    } else if (!one_triangle) {
       // Exactly two distinct x and two distinct y, every vertex a corner, equal z and w everywhere.
       float xa = vertices[0][0], xb = xa, ya = vertices[0][1], yb = ya;
       for (uint32_t i = 0; i < n_vertices; ++i) {
@@ -400,74 +412,156 @@ class NativeDrawExtentEstimator {
       d.position[1] = {xb, ya, z, w};
       d.position[2] = {xa, yb, z, w};
     }
-    // The SDK estimator sees only the three input vertices, not native rectangle
-    // expansion's fourth vertex. Exact axis-aligned corners with equal positive
-    // W prove that missing corner cannot add a larger Y. No epsilon admission.
-    if (!(d.position[0][3] > 0) || d.position[0][3] != d.position[1][3] ||
-        d.position[0][3] != d.position[2][3]) return reject("rectangle-w");
-    unsigned horizontal = 0, vertical = 0;
-    for (uint32_t i = 0; i < 3; ++i) for (uint32_t j = i + 1; j < 3; ++j) {
-      if (d.position[i][0] == d.position[j][0] && d.position[i][1] != d.position[j][1]) ++vertical;
-      if (d.position[i][1] == d.position[j][1] && d.position[i][0] != d.position[j][0]) ++horizontal;
-    }
-    if (horizontal != 1 || vertical != 1) return reject("not-axis-aligned-corners");
-    std::array<float, 3> length{};
-    for (uint32_t i = 0; i < 3; ++i) {
-      const float dx = d.position[(i + 1) % 3][0] - d.position[(i + 2) % 3][0];
-      const float dy = d.position[(i + 1) % 3][1] - d.position[(i + 2) % 3][1];
-      // Volatile splits reproduce the wrapper's individual binary32 operations
-      // rather than a host FMA. Reject ties/overflow, don't approximate rotation.
-      volatile float xx = dx * dx, yy = dy * dy;
-      length[i] = xx + yy;
-      if (!std::isfinite(length[i])) return reject("rectangle-distance-range");
-    }
-    const uint32_t first = length[0] > length[1] && length[0] > length[2] ? 0 :
-                            (length[1] > length[2] ? 1 : 2);
-    if (!(length[first] > length[(first + 1) % 3] &&
-          length[first] > length[(first + 2) % 3])) return reject("rectangle-distance-tie");
-    volatile float fourth_delta_y = d.position[(first + 1) % 3][1] - d.position[first][1];
-    const float fourth_y = fourth_delta_y + d.position[(first + 2) % 3][1];
-    const float min_y = std::min({d.position[0][1], d.position[1][1], d.position[2][1]});
-    const float max_y = std::max({d.position[0][1], d.position[1][1], d.position[2][1]});
-    if (!std::isfinite(fourth_y) || fourth_y < min_y || fourth_y > max_y)
-      return reject("rectangle-fourth-y-outside");
     const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
     const bool vport = vte.vport_x_scale_ena || vte.vport_x_offset_ena ||
                        vte.vport_y_scale_ena || vte.vport_y_offset_ena;
-    if (vport && !(allow_clip_inside_ && vte.vport_x_scale_ena && vte.vport_x_offset_ena &&
-                   vte.vport_y_scale_ena && vte.vport_y_offset_ena)) return reject("xy-viewport-transform");
-    // Clipping: Z must be inside (a constant-Z rectangle is then either whole or gone); X/Y past the clip
-    // planes only crop the rectangle to the viewport box (applied after the viewport transform below).
-    bool clip_xy = false;
-    if (clip_on) {
-      for (const auto& p : d.position) {
-        const float w = p[3];
-        if (!(w > 0) || (clip.dx_clip_space_def ? (p[2] < 0 || p[2] > w) : std::abs(p[2]) > w))
-          return reject("clip-outside");
-        if (std::abs(p[0]) > w || std::abs(p[1]) > w) clip_xy = true;
-      }
-      if (clip_xy && !vport) return reject("clip-outside");
-    }
-    if (vport) {
+    if (one_triangle) {
+      // banjo_gpu_proof_triangle: one triangle that covers everything it could reach (the game's post-processing
+      // and composite passes: three vertices, the hypotenuse far outside the target). The covered pixels are then a
+      // rectangle, and it is handed on as one (three corners in raster space), for the same proofs as a rectangle.
+      const auto& v = vertices;
+      if (!(v[0][3] > 0) || v[0][3] != v[1][3] || v[0][3] != v[2][3]) return reject("triangle-w");
+      if (vport && !(vte.vport_x_scale_ena && vte.vport_x_offset_ena && vte.vport_y_scale_ena &&
+                     vte.vport_y_offset_ena)) return reject("xy-viewport-transform");
+      if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable &&
+          (regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_x_offset || regs.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset))
+        return reject("triangle-window-offset");
       const auto f = [&](uint32_t r) { return std::bit_cast<float>(regs.values[r]); };
-      const float xs = f(XE_GPU_REG_PA_CL_VPORT_XSCALE), xo = f(XE_GPU_REG_PA_CL_VPORT_XOFFSET);
-      const float ys = f(XE_GPU_REG_PA_CL_VPORT_YSCALE), yo = f(XE_GPU_REG_PA_CL_VPORT_YOFFSET);
-      for (auto& p : d.position) {
-        const float x = vte.vtx_xy_fmt ? p[0] : p[0] / p[3];
-        const float y = vte.vtx_xy_fmt ? p[1] : p[1] / p[3];
-        p[0] = x * xs + xo;
-        p[1] = y * ys + yo;
-        if (!std::isfinite(p[0]) || !std::isfinite(p[1])) return reject("viewport-nonfinite");
-        if (clip_xy) {
-          // The clip planes x = ±w / y = ±w are the viewport box edges in raster space. With D3D pixel centers
-          // on integers the box [a, b) passes through centers; the top-left rule takes the left/top ones, so it
-          // covers exactly the pixels a..b-1, i.e. [a - 0.5, b - 0.5] in the proofs' pixel-edge convention.
-          const float off = regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
-          p[0] = std::clamp(p[0], xo - std::abs(xs) - off, xo + std::abs(xs) - off);
-          p[1] = std::clamp(p[1], yo - std::abs(ys) - off, yo + std::abs(ys) - off);
+      const float xs = vport ? f(XE_GPU_REG_PA_CL_VPORT_XSCALE) : 1.0f, xo = vport ? f(XE_GPU_REG_PA_CL_VPORT_XOFFSET) : 0.0f;
+      const float ys = vport ? f(XE_GPU_REG_PA_CL_VPORT_YSCALE) : 1.0f, yo = vport ? f(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.0f;
+      double tx[3], ty[3];  // raster space
+      for (uint32_t i = 0; i < 3; ++i) {
+        const float w = v[i][3];
+        if (clip_on && (clip.dx_clip_space_def ? (v[i][2] < 0 || v[i][2] > w) : std::abs(v[i][2]) > w))
+          return reject("clip-outside");
+        const float x = vte.vtx_xy_fmt ? v[i][0] : v[i][0] / w;
+        const float y = vte.vtx_xy_fmt ? v[i][1] : v[i][1] / w;
+        const float rx = x * xs + xo, ry = y * ys + yo;
+        if (!std::isfinite(rx) || !std::isfinite(ry) || std::abs(rx) > 65536 || std::abs(ry) > 65536)
+          return reject("viewport-nonfinite");
+        tx[i] = rx;
+        ty[i] = ry;
+      }
+      // The rectangle the triangle has to cover, in raster space. off: where a pixel's left / top edge is (pixel i
+      // spans [i - off, i + 1 - off)).
+      const double off = regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5 : 0.0;
+      double bx0, by0, bx1, by1, margin;
+      if (clip_on) {
+        // Clipping cuts the triangle at the viewport box: what is drawn is (triangle and box), which is the box
+        // itself when the box lies inside the triangle. An edge of the triangle may lie ON an edge of the box (the
+        // usual (-1,-1) (3,-1) (-1,3) triangle): it is then that edge of the clipped polygon either way. No margin,
+        // and no tolerance: the test below is exact for these inputs (float coordinates, double arithmetic).
+        if (!vport) return reject("clip-outside");
+        bx0 = double(xo) - std::abs(double(xs));
+        bx1 = double(xo) + std::abs(double(xs));
+        by0 = double(yo) - std::abs(double(ys));
+        by1 = double(yo) + std::abs(double(ys));
+        margin = 0.0;
+      } else {
+        // Not clipped: the scissor rectangle, with a pixel to spare on every side, has to be inside.
+        const auto window = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+        const auto tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+        const auto br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+        const auto stl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
+        const auto sbr = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
+        const int32_t wx = tl.window_offset_disable ? 0 : int32_t(window.window_x_offset);
+        const int32_t wy = tl.window_offset_disable ? 0 : int32_t(window.window_y_offset);
+        const int32_t sx0 = std::max({0, int32_t(tl.tl_x) + wx, int32_t(stl.tl_x)});
+        const int32_t sy0 = std::max({0, int32_t(tl.tl_y) + wy, int32_t(stl.tl_y)});
+        const int32_t sx1 = std::min(int32_t(br.br_x) + wx, int32_t(sbr.br_x));
+        const int32_t sy1 = std::min(int32_t(br.br_y) + wy, int32_t(sbr.br_y));
+        if (sx1 <= sx0 || sy1 <= sy0 || sx1 > 8192 || sy1 > 8192) return reject("triangle-scissor");
+        bx0 = sx0 - off;
+        bx1 = sx1 - off;
+        by0 = sy0 - off;
+        by1 = sy1 - off;
+        margin = 1.0;
+      }
+      if (!(bx1 > bx0) || !(by1 > by0)) return reject("triangle-box");
+      const double area = (tx[1] - tx[0]) * (ty[2] - ty[0]) - (ty[1] - ty[0]) * (tx[2] - tx[0]);
+      if (area == 0.0) return reject("triangle-degenerate");
+      const double side = area > 0.0 ? 1.0 : -1.0;
+      const double cx[4] = {bx0 - margin, bx1 + margin, bx0 - margin, bx1 + margin};
+      const double cy[4] = {by0 - margin, by0 - margin, by1 + margin, by1 + margin};
+      for (uint32_t e = 0; e < 3; ++e) {
+        const double ax = tx[e], ay = ty[e], ex = tx[(e + 1) % 3] - ax, ey = ty[(e + 1) % 3] - ay;
+        for (uint32_t c = 0; c < 4; ++c) {
+          const double edge = (ex * (cy[c] - ay) - ey * (cx[c] - ax)) * side;
+          if (!(margin > 0.0 ? edge > 0.0 : edge >= 0.0)) return reject("triangle-does-not-cover");
         }
       }
+      // Constant depth only if the three vertices agree; otherwise each keeps its own (the caller's test fails).
+      d.position[0] = {float(bx0 - (clip_on ? off : 0.0)), float(by0 - (clip_on ? off : 0.0)), v[0][2], v[0][3]};
+      d.position[1] = {float(bx1 - (clip_on ? off : 0.0)), float(by0 - (clip_on ? off : 0.0)), v[1][2], v[1][3]};
+      d.position[2] = {float(bx0 - (clip_on ? off : 0.0)), float(by1 - (clip_on ? off : 0.0)), v[2][2], v[2][3]};
       d.xy_raster = true;
+    } else {
+      // The SDK estimator sees only the three input vertices, not native rectangle
+      // expansion's fourth vertex. Exact axis-aligned corners with equal positive
+      // W prove that missing corner cannot add a larger Y. No epsilon admission.
+      if (!(d.position[0][3] > 0) || d.position[0][3] != d.position[1][3] ||
+          d.position[0][3] != d.position[2][3]) return reject("rectangle-w");
+      unsigned horizontal = 0, vertical = 0;
+      for (uint32_t i = 0; i < 3; ++i) for (uint32_t j = i + 1; j < 3; ++j) {
+        if (d.position[i][0] == d.position[j][0] && d.position[i][1] != d.position[j][1]) ++vertical;
+        if (d.position[i][1] == d.position[j][1] && d.position[i][0] != d.position[j][0]) ++horizontal;
+      }
+      if (horizontal != 1 || vertical != 1) return reject("not-axis-aligned-corners");
+      std::array<float, 3> length{};
+      for (uint32_t i = 0; i < 3; ++i) {
+        const float dx = d.position[(i + 1) % 3][0] - d.position[(i + 2) % 3][0];
+        const float dy = d.position[(i + 1) % 3][1] - d.position[(i + 2) % 3][1];
+        // Volatile splits reproduce the wrapper's individual binary32 operations
+        // rather than a host FMA. Reject ties/overflow, don't approximate rotation.
+        volatile float xx = dx * dx, yy = dy * dy;
+        length[i] = xx + yy;
+        if (!std::isfinite(length[i])) return reject("rectangle-distance-range");
+      }
+      const uint32_t first = length[0] > length[1] && length[0] > length[2] ? 0 :
+                              (length[1] > length[2] ? 1 : 2);
+      if (!(length[first] > length[(first + 1) % 3] &&
+            length[first] > length[(first + 2) % 3])) return reject("rectangle-distance-tie");
+      volatile float fourth_delta_y = d.position[(first + 1) % 3][1] - d.position[first][1];
+      const float fourth_y = fourth_delta_y + d.position[(first + 2) % 3][1];
+      const float min_y = std::min({d.position[0][1], d.position[1][1], d.position[2][1]});
+      const float max_y = std::max({d.position[0][1], d.position[1][1], d.position[2][1]});
+      if (!std::isfinite(fourth_y) || fourth_y < min_y || fourth_y > max_y)
+        return reject("rectangle-fourth-y-outside");
+      if (vport && !(allow_clip_inside_ && vte.vport_x_scale_ena && vte.vport_x_offset_ena &&
+                     vte.vport_y_scale_ena && vte.vport_y_offset_ena)) return reject("xy-viewport-transform");
+      // Clipping: Z must be inside (a constant-Z rectangle is then either whole or gone); X/Y past the clip
+      // planes only crop the rectangle to the viewport box (applied after the viewport transform below).
+      bool clip_xy = false;
+      if (clip_on) {
+        for (const auto& p : d.position) {
+          const float w = p[3];
+          if (!(w > 0) || (clip.dx_clip_space_def ? (p[2] < 0 || p[2] > w) : std::abs(p[2]) > w))
+            return reject("clip-outside");
+          if (std::abs(p[0]) > w || std::abs(p[1]) > w) clip_xy = true;
+        }
+        if (clip_xy && !vport) return reject("clip-outside");
+      }
+      if (vport) {
+        const auto f = [&](uint32_t r) { return std::bit_cast<float>(regs.values[r]); };
+        const float xs = f(XE_GPU_REG_PA_CL_VPORT_XSCALE), xo = f(XE_GPU_REG_PA_CL_VPORT_XOFFSET);
+        const float ys = f(XE_GPU_REG_PA_CL_VPORT_YSCALE), yo = f(XE_GPU_REG_PA_CL_VPORT_YOFFSET);
+        for (auto& p : d.position) {
+          const float x = vte.vtx_xy_fmt ? p[0] : p[0] / p[3];
+          const float y = vte.vtx_xy_fmt ? p[1] : p[1] / p[3];
+          p[0] = x * xs + xo;
+          p[1] = y * ys + yo;
+          if (!std::isfinite(p[0]) || !std::isfinite(p[1])) return reject("viewport-nonfinite");
+          if (clip_xy) {
+            // The clip planes x = ±w / y = ±w are the viewport box edges in raster space. With D3D pixel centers
+            // on integers the box [a, b) passes through centers; the top-left rule takes the left/top ones, so it
+            // covers exactly the pixels a..b-1, i.e. [a - 0.5, b - 0.5] in the proofs' pixel-edge convention.
+            const float off = regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
+            p[0] = std::clamp(p[0], xo - std::abs(xs) - off, xo + std::abs(xs) - off);
+            p[1] = std::clamp(p[1], yo - std::abs(ys) - off, yo + std::abs(ys) - off);
+          }
+        }
+        d.xy_raster = true;
+      }
     }
     float raster_max_y = -8192.0f;
     for (const auto& p : d.position) {
@@ -500,6 +594,8 @@ class NativeDrawExtentEstimator {
   bool allow_quad_triangles_ = false;
   bool allow_alu_ = false;
   bool reason_pointer_ = false;
+  bool tess_only_explicit_ = false;
+  bool allow_triangle_ = false;
 };
 
 }  // namespace me::native

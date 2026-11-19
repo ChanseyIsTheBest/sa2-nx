@@ -20,6 +20,9 @@
 // native renderer checks this marker to read Extensions::ext_EXT_extended_dynamic_state3 and its
 // three properties.
 #define REX_UI_VULKAN_DYNAMIC_STATE3 1
+// banjo-nx (package 25): VK_EXT_pipeline_robustness and its feature (Extensions::ext_EXT_pipeline_robustness,
+// Properties::pipelineRobustness), for the native renderer's banjo_gpu_robustness_off.
+#define REX_UI_VULKAN_PIPELINE_ROBUSTNESS 1
 
 namespace rex {
 namespace ui {
@@ -95,8 +98,6 @@ class VulkanDevice {
     VkSampleCountFlags sampledImageStencilSampleCounts =
         VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
     bool standardSampleLocations = false;
-    // sa2-nx: the native renderer draws guest lines lineWidth = render scale wide (wideLines).
-    float lineWidthRange[2] = {1.0f, 1.0f};
     VkDeviceSize optimalBufferCopyOffsetAlignment = 1;
     VkDeviceSize optimalBufferCopyRowPitchAlignment = 1;
     VkDeviceSize nonCoherentAtomSize = 256;
@@ -107,7 +108,6 @@ class VulkanDevice {
     bool geometryShader = false;
     bool tessellationShader = false;
     bool sampleRateShading = false;
-    bool wideLines = false;  // sa2-nx: lines wider than 1 (the native renderer's scaled render resolution)
     bool depthClamp = false;
     bool fillModeNonSolid = false;
     bool samplerAnisotropy = false;
@@ -193,6 +193,11 @@ class VulkanDevice {
     bool extendedDynamicState3ColorBlendEnable = false;
     bool extendedDynamicState3ColorBlendEquation = false;
     bool extendedDynamicState3ColorWriteMask = false;
+
+    // VK_KHR_pipeline_executable_properties (#270), diagnostic only (vulkan_pipeline_executable_info):
+    // the driver's statistics of each compiled shader (registers, instructions, cycles).
+    bool pipelineExecutableInfo = false;
+    bool pipelineRobustness = false;  // VK_EXT_pipeline_robustness
   };
 
   // Properties of the core API and enabled extensions, and enabled features.
@@ -226,6 +231,10 @@ class VulkanDevice {
     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
     // Native renderer (dynamic blending and color write masks).
     bool ext_EXT_extended_dynamic_state3 = false;  // #456
+    // Native renderer (banjo_gpu_robustness_off): robustness chosen per pipeline.
+    bool ext_EXT_pipeline_robustness = false;  // #69
+    // Diagnostic: per-shader driver statistics (vulkan_pipeline_executable_info).
+    bool ext_KHR_pipeline_executable_properties = false;  // #270
   };
 
   const Extensions& extensions() const { return extensions_; }

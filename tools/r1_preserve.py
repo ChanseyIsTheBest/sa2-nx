@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """cpu_aggressive: which guest functions of Banjo's executable provably return with r1 (the guest stack pointer) equal
 to its value at entry, from the instruction comments of a generated tree.
 
@@ -16,9 +15,14 @@ A function PRESERVES r1 when d == 0 at every exit (a return, falling off the end
 must preserve too). Greatest fixed point over the call graph (sound for this partial-correctness property: by
 induction on the call depth of any finished call).
 
-  python r1_preserve.py --gen <tree> --out <dir> [--indirect-preserve]
+  python r1_preserve.py --gen <tree> --out <dir> [--indirect-preserve] [--near-exact]
 --indirect-preserve: an indirect call, an import or a hooked call counts as preserving (the assumption the PC check
 REX_R1_CHECK verifies); without it they make d unknown.
+--near-exact (blur-nx, 2026-11-13, #9 of Blur's docs/cpu-near-exact-50-1113.md; post_codegen.py passes it to the
+assumed proof only, when the environment has BLUR_NX_R1_ASSUME=1, so REX_R1_CHECK tests every call it assumes): a
+function counts as preserving unless its own body fails the proof with every callee taken as preserving (an r1 write
+the flow cannot follow, exits that disagree, setjmp / longjmp): the functions left unproven only through what they
+call (1,440 of Blur's 1,486) are assumed. NOT a proof; REX_R1_CHECK (PC) tests every assumed call.
 Writes <dir>/r1_preserve.json: {"preserving": [names], "not": {name: reason}}.
 """
 import argparse
@@ -28,13 +32,15 @@ import os
 import re
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, 'D:/Banjo kazooie port/banjo-nx/tools')
 import leaf_dead_stores as lds  # noqa: E402
 import dead_ctx_defs as dcd  # noqa: E402
 
 DFORM = re.compile(r'^(-?\d+)\((r\d+)\)$')
 # no-return functions (tools/non_argument_audit.py's list in docs/codegen-enhancements.md)
-NORETURN = ['827F2E48']  # sa2-nx: the C++ throw
+NORETURN = ['82BB59B0', '822B27A0', '822B8648', '82BAEAB8', '82BB1130', '82BB4AE0', '82BB4D00', '82BB9B78', '82BCDC10',
+            'rex_longjmp', 'rex_exit', 'rex_j_std___Throw', 'rex_std___Throw', 'rex_abort', 'rex_amsg_exit',
+            'rex_exit_1', 'rex_ExitThread']
 
 
 def instructions(lines):
@@ -158,6 +164,7 @@ def main():
     ap.add_argument('--gen', required=True)
     ap.add_argument('--out', required=True)
     ap.add_argument('--indirect-preserve', action='store_true')
+    ap.add_argument('--near-exact', action='store_true')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     lds.load_mid_asm_hooks(a.gen)
@@ -179,6 +186,15 @@ def main():
         for nd in nodes:
             if nd.call:
                 callers[nd.call[0]].add(addr)
+    intrinsic = set()
+    if a.near_exact:
+        # The functions whose own body fails with every callee preserving (no-return ones as they are).
+        for addr, (nodes, ins, chunks, sj) in parsed.items():
+            if addr in noret:
+                continue
+            dl, _ = flow(nodes, ins, chunks, lambda x: 'noreturn' if x in noret else 0, a.indirect_preserve)
+            if sj or dl != 0:
+                intrinsic.add(addr)
     work = set(parsed)
     flips = collections.Counter()
     rounds = 0
@@ -188,7 +204,11 @@ def main():
         if addr in noret:
             continue
         nodes, ins, chunks, sj = parsed[addr]
-        dl, why = flow(nodes, ins, chunks, lambda x: delta.get(x), a.indirect_preserve)
+        if a.near_exact:
+            of = lambda x: delta.get(x) if (x in intrinsic or x in noret or x not in delta) else 0
+        else:
+            of = lambda x: delta.get(x)
+        dl, why = flow(nodes, ins, chunks, of, a.indirect_preserve)
         if sj:
             dl, why = None, 'setjmp / longjmp'
         if flips[addr] > 6:
@@ -209,8 +229,9 @@ def main():
     reason.update({x: 'delta %s' % delta[x] for x in delta if isinstance(delta[x], int) and delta[x] != 0})
     json.dump(out, open(os.path.join(a.out, 'r1_preserve.json'), 'w'), indent=0)
     kinds = collections.Counter(r.split(' at ')[0] for r in reason.values())
-    print('r1_preserve: %d functions, %d preserve r1 (%d rounds); not: %d %s' % (
-        len(parsed), len(preserving), rounds, len(reason), dict(kinds)))
+    print('r1_preserve: %d functions, %d preserve r1 (%d rounds); not: %d %s%s' % (
+        len(parsed), len(preserving), rounds, len(reason), dict(kinds),
+        '; near-exact: %d unproven in their own body' % len(intrinsic) if a.near_exact else ''))
 
 
 if __name__ == '__main__':

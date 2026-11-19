@@ -5,25 +5,101 @@
 
 #include "renut_engine/gpu/backend/backend.h"      // banjo-nx (2026-10-19): IsDeko3D
 #include "renut_engine/gpu/banjo_renut_tuning.h"  // banjo-nx (2026-10-19): Depth24On
+#include "renut_engine/gpu/ultimate.h"  // renut-ultimate: Fixed16FloatOn
 
 #include <cstring>
 
+#include <rex/cvar.h>
+
+// renut-ultimate (2026-11-16, port 145; tw2de_nx's tw2de_deko3d_native_formats of 2026-10-25, ON at the user's word:
+// "port the speed ups as on by default").
+REXCVAR_DEFINE_BOOL(banjo_deko3d_native_16bit, true, "Banjo/Renut",
+                    "tw2de_nx (exact): the game's unsigned 5:6:5, 1:5:5:5 and 4:4:4:4 textures in the GPU's own 16-bit "
+                    "formats (deko3d RGB565, RGB5A1, RGBA4: the same bit layout), the guest's words copied. false: "
+                    "expanded on the CPU to RGBA8 at upload, twice the memory and the GPU's reads, as before. deko3d only")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace renut::gpu {
+
+namespace {
+// Port 145: banjo_deko3d_native_16bit, read once.
+bool Native16Bit() {
+  static const bool on = IsDeko3D() && REXCVAR_GET(banjo_deko3d_native_16bit);
+  return on;
+}
+}  // namespace
+
+// sasrt-nx (2026-11-11, port 75; its formats batch, row 38 and the diagnostic): the 32-bit float formats the Xenos
+// cannot filter (renut_float32_point_filter), and the formats' names for renut_diag_formats' lines.
+bool IsFloat32TextureFormat(GpuTextureFormat format) {
+  return format == GpuTextureFormat::Fmt32_Float || format == GpuTextureFormat::Fmt32_32_Float ||
+         format == GpuTextureFormat::Fmt32_32_32_32_Float || format == GpuTextureFormat::Fmt32_32_32_Float;
+}
+const char *GpuTextureFormatName(u32 format) {
+  switch (format & 0x3F) {
+  case 2: return "8";
+  case 6: return "8_8_8_8";
+  case 7: return "2_10_10_10";
+  case 10: return "8_8";
+  case 18: return "DXT1";
+  case 19: return "DXT2_3";
+  case 20: return "DXT4_5";
+  case 22: return "24_8 (D24S8)";
+  case 23: return "24_8_FLOAT (D24FS8)";
+  case 25: return "16_16";
+  case 26: return "16_16_16_16";
+  case 31: return "16_16_FLOAT";
+  case 32: return "16_16_16_16_FLOAT";
+  case 36: return "32_FLOAT";
+  case 37: return "32_32_FLOAT";
+  case 38: return "32_32_32_32_FLOAT";
+  case 49: return "DXN";
+  case 54: return "2_10_10_10_AS_16_16_16_16";
+  case 58: return "DXT3A";
+  case 59: return "DXT5A";
+  case 60: return "CTX1";
+  case 57: return "32_32_32_FLOAT";
+  case 62: return "8_8_8_8_GAMMA_EDRAM";
+  case 63: return "2_10_10_10_FLOAT (7e3)";
+  default: return "?";
+  }
+}
 
 plume::RenderFormat ColorTargetFormat(GpuColorFormat format) {
   switch (format) {
   case GpuColorFormat::Fmt8_8_8_8:
   case GpuColorFormat::Fmt8_8_8_8_Gamma:
     return plume::RenderFormat::R8G8B8A8_UNORM;
+  // sasrt-nx (2026-11-11, port 75; its formats batch, rows 6, 8, 10, 74, 93: renut_format_10bit_exact): the console's
+  // own 32 bits; 16 bits a channel before.
   case GpuColorFormat::Fmt2_10_10_10:
-    return plume::RenderFormat::R16G16B16A16_UNORM;
+    return banjo::renut_gpu::Format10BitExactOn() ? plume::RenderFormat::R10G10B10A2_UNORM
+                                                  : plume::RenderFormat::R16G16B16A16_UNORM;
+  // sasrt-nx (2026-11-11, port 75; its formats batch, rows 7, 66, 73, 95, 96: renut_format_7e3_rg11b10, NOT exact,
+  // off): 7e3 in 32 bits without alpha.
   case GpuColorFormat::Fmt2_10_10_10_Float:
+    return banjo::renut_gpu::Format7e3Rg11b10On() ? plume::RenderFormat::R11G11B10_FLOAT
+                                                  : plume::RenderFormat::R16G16B16A16_FLOAT;
   case GpuColorFormat::Fmt16_16_16_16_Float:
     return plume::RenderFormat::R16G16B16A16_FLOAT;
+  // sasrt-nx (2026-11-11, port 75; its formats batch, found on the way: renut_format_edram_as_variants): these two fell
+  // to the default (8-bit RGBA) before. Format 12 follows format 3, one storage format (its audit's finding 7).
+  case GpuColorFormat::Fmt2_10_10_10_As10_10_10_10:
+    if (!banjo::renut_gpu::FormatEdramAsVariantsOn())
+      return plume::RenderFormat::R8G8B8A8_UNORM;
+    return banjo::renut_gpu::Format10BitExactOn() ? plume::RenderFormat::R10G10B10A2_UNORM
+                                                  : plume::RenderFormat::R16G16B16A16_UNORM;
+  case GpuColorFormat::Fmt2_10_10_10_Float_As16_16_16_16:
+    if (!banjo::renut_gpu::FormatEdramAsVariantsOn())
+      return plume::RenderFormat::R8G8B8A8_UNORM;
+    return banjo::renut_gpu::Format7e3Rg11b10On() ? plume::RenderFormat::R11G11B10_FLOAT
+                                                  : plume::RenderFormat::R16G16B16A16_FLOAT;
+  // sasrt-nx (2026-10-20, sasrt_renut_fixed16_float): Xenos' 16-bit fixed-point targets span -32..32; FP16 holds that
+  // range, SNORM clipped it at 1.
   case GpuColorFormat::Fmt16_16:
-    return plume::RenderFormat::R16G16_SNORM;
+    return banjo::renut_gpu::Fixed16FloatOn() ? plume::RenderFormat::R16G16_FLOAT : plume::RenderFormat::R16G16_SNORM;
   case GpuColorFormat::Fmt16_16_16_16:
-    return plume::RenderFormat::R16G16B16A16_SNORM;
+    return banjo::renut_gpu::Fixed16FloatOn() ? plume::RenderFormat::R16G16B16A16_FLOAT : plume::RenderFormat::R16G16B16A16_SNORM;
   case GpuColorFormat::Fmt16_16_Float:
     return plume::RenderFormat::R16G16_FLOAT;
   case GpuColorFormat::Fmt32_Float:
@@ -168,13 +244,21 @@ TextureFormatInfo GetTextureFormatInfo(GpuTextureFormat format, bool is_signed) 
   case T::Fmt8_8_8_8_A:
   case T::Fmt8_8_8_8_As16_16_16_16:
     return plain(is_signed ? F::R8G8B8A8_SNORM : F::R8G8B8A8_UNORM, 4);
+  // renut-ultimate (2026-11-16, port 145; tw2de_nx's, banjo_deko3d_native_16bit): the unsigned ones as the GPU's own
+  // formats, the guest's words copied (the signed ones as before: the expansion makes them unsigned too).
   case T::Fmt1_5_5_5:
-    return expand(F::R8G8B8A8_UNORM, C::R5G5B5A1, 2, 4);
+    return Native16Bit() && !is_signed ? plain(F::R5G5B5A1_UNORM, 2) : expand(F::R8G8B8A8_UNORM, C::R5G5B5A1, 2, 4);
   case T::Fmt5_6_5:
-    return expand(F::R8G8B8A8_UNORM, C::R5G6B5, 2, 4);
+    return Native16Bit() && !is_signed ? plain(F::R5G6B5_UNORM, 2) : expand(F::R8G8B8A8_UNORM, C::R5G6B5, 2, 4);
   case T::Fmt4_4_4_4:
-    return expand(F::R8G8B8A8_UNORM, C::R4G4B4A4, 2, 4);
+    return Native16Bit() && !is_signed ? plain(F::R4G4B4A4_UNORM, 2) : expand(F::R8G8B8A8_UNORM, C::R4G4B4A4, 2, 4);
+  // sasrt-nx (2026-11-11, port 75; its formats batch, rows 6, 8, 10, 74, 93: renut_format_10bit_exact): 2_10_10_10
+  // copied as it is into 10:10:10:2 (X in bits 0-9 is the host's R, as the expansion below read it); the
+  // _AS_16_16_16_16 form (filtered at 16 bits on the console) keeps 16.
   case T::Fmt2_10_10_10:
+    if (banjo::renut_gpu::Format10BitExactOn())
+      return plain(F::R10G10B10A2_UNORM, 4);
+    return expand(F::R16G16B16A16_UNORM, C::R10G10B10A2, 4, 8);
   case T::Fmt2_10_10_10_As16_16_16_16:
     return expand(F::R16G16B16A16_UNORM, C::R10G10B10A2, 4, 8);
   case T::Fmt11_11_10:
@@ -194,6 +278,11 @@ TextureFormatInfo GetTextureFormatInfo(GpuTextureFormat format, bool is_signed) 
     return bc(F::BC3_UNORM, 16);
   case T::FmtDXT5A:
     return bc(F::BC4_UNORM, 8);
+  case T::FmtDXT3A: {  // vivapinata-nx (2026-11-02): Viva Pinata's 512x512 masks; no host format holds it alone
+    TextureFormatInfo info{F::R8_UNORM, C::DXT3A, 4, 8, 4 * 4, false};
+    info.decoded_blocks = true;
+    return info;
+  }
   case T::FmtDXN:
     return bc(F::BC5_UNORM, 16);
   case T::FmtCTX1: {
@@ -318,6 +407,7 @@ void ConvertTexels(TexelConversion conversion, const uint8_t *src, uint8_t *dst,
     }
     break;
   case TexelConversion::CTX1:
+  case TexelConversion::DXT3A:
   case TexelConversion::Unsupported:
     break;
   }
@@ -325,9 +415,22 @@ void ConvertTexels(TexelConversion conversion, const uint8_t *src, uint8_t *dst,
 
 void DecodeBlockRow(TexelConversion conversion, const uint8_t *src, uint8_t *dst, uint32_t count,
                     uint32_t dst_row_pitch) {
+  if (conversion == TexelConversion::DXT3A) {
+    // vivapinata-nx (2026-11-02): DXT3's alpha block: after the fetch's 8in16 swap, as BC2 reads it on the host, four
+    // little-endian rows of 16 bits, texel x in bits 4x. A value v is v * 17 in 8 bits.
+    for (uint32_t b = 0; b < count; ++b, src += 8) {
+      for (uint32_t y = 0; y < 4; ++y) {
+        const uint32_t row = uint32_t(src[y * 2]) | (uint32_t(src[y * 2 + 1]) << 8);
+        uint8_t *out = dst + size_t(y) * dst_row_pitch + size_t(b) * 4;
+        for (uint32_t x = 0; x < 4; ++x)
+          out[x] = uint8_t(((row >> (4 * x)) & 15) * 17);
+      }
+    }
+    return;
+  }
   if (conversion != TexelConversion::CTX1)
     return;
-  // CTX1, as the game's own encoder writes it (EncodeBlockCTX1, 0x828D1580):
+  // CTX1, as the game's own encoder writes it (EncodeBlockCTX1, 0x828AC7A8):
   // two endpoints A and B of two components, then a 2-bit palette entry per
   // texel, one byte per row, texel x in bits 2x. Entries 0 and 1 are A and B,
   // 2 and 3 its 168:88 and 88:168 blends of them. In memory the block is
@@ -355,19 +458,36 @@ void DecodeBlockRow(TexelConversion conversion, const uint8_t *src, uint8_t *dst
   }
 }
 
+// Port 164 (from fnxf_xiii, its note of 2026-11-06): eight bytes at a time (the texture uploads' untile swaps every
+// byte of a DXT level 8in16, one byte pair at a time before); the same bytes in the same places, the tail as before.
+// src and dst may be the same.
 void SwapEndian(u32 endian, const void *src, void *dst, size_t bytes) {
   const auto *s = static_cast<const uint8_t *>(src);
   auto *d = static_cast<uint8_t *>(dst);
+  size_t i = 0;
   switch (endian & 3) {
   case 1:  // 8in16
-    for (size_t i = 0; i + 1 < bytes; i += 2) {
+    for (; i + 8 <= bytes; i += 8) {
+      uint64_t v;
+      std::memcpy(&v, s + i, 8);
+      v = ((v & 0x00FF00FF00FF00FFull) << 8) | ((v >> 8) & 0x00FF00FF00FF00FFull);
+      std::memcpy(d + i, &v, 8);
+    }
+    for (; i + 1 < bytes; i += 2) {
       const uint8_t a = s[i], b = s[i + 1];
       d[i] = b;
       d[i + 1] = a;
     }
     break;
   case 2:  // 8in32
-    for (size_t i = 0; i + 3 < bytes; i += 4) {
+    for (; i + 8 <= bytes; i += 8) {
+      uint64_t v;
+      std::memcpy(&v, s + i, 8);
+      v = __builtin_bswap64(v);
+      v = (v >> 32) | (v << 32);  // each 32-bit word swapped in place
+      std::memcpy(d + i, &v, 8);
+    }
+    for (; i + 3 < bytes; i += 4) {
       uint32_t v;
       std::memcpy(&v, s + i, 4);
       v = __builtin_bswap32(v);
@@ -375,7 +495,13 @@ void SwapEndian(u32 endian, const void *src, void *dst, size_t bytes) {
     }
     break;
   case 3:  // 16in32
-    for (size_t i = 0; i + 3 < bytes; i += 4) {
+    for (; i + 8 <= bytes; i += 8) {
+      uint64_t v;
+      std::memcpy(&v, s + i, 8);
+      v = ((v & 0x0000FFFF0000FFFFull) << 16) | ((v >> 16) & 0x0000FFFF0000FFFFull);
+      std::memcpy(d + i, &v, 8);
+    }
+    for (; i + 3 < bytes; i += 4) {
       uint32_t v;
       std::memcpy(&v, s + i, 4);
       v = (v >> 16) | (v << 16);

@@ -26,6 +26,17 @@ REXCVAR_DEFINE_INT32(global_lock_spin, 48, "Kernel",
                      "Handle-table lookups and guest-object resolution try the global critical region this many "
                      "times (CPU yield between tries, ~1 us in total) before blocking in the kernel. 0 = block at "
                      "once (the original behaviour)");
+REXCVAR_DEFINE_BOOL(kernel_handle_lookup_own_lock, true, "Kernel",
+                    "blur-nx (#56, exact): a handle lookup takes the handle table's own lock, held only while an entry "
+                    "is read or written, not the global critical region (Blur: 11,700 lookups a second, 218 of them "
+                    "finding the global region taken). false: the global critical region, as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+REXCVAR_DEFINE_BOOL(kernel_handle_lookup_spin, true, "Kernel",
+                    "blur-nx (the Renut audit's #9, exact): a handle lookup finding the handle table's own lock taken "
+                    "(kernel_handle_lookup_own_lock) tries it global_lock_spin times more, a CPU yield between tries, "
+                    "before it blocks in the kernel, as the global region's lookups did. false: it blocks at once")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::system::util {
 
@@ -38,18 +49,27 @@ ObjectTable::~ObjectTable() {
 void ObjectTable::Reset() {
   auto global_lock = global_critical_region_.Acquire();
 
+  // blur-nx (2026-11-13, #56): the table taken out under table_mutex_, its objects released after (a release may
+  // destroy an object, whose teardown may look a handle up).
+  ObjectTableEntry* old_table;
+  uint32_t old_capacity;
+  {
+    std::lock_guard<std::mutex> table_lock(table_mutex_);
+    old_table = table_;
+    old_capacity = table_capacity_;
+    table_capacity_ = 0;
+    last_free_entry_ = 0;
+    table_ = nullptr;
+  }
+
   // Release all objects.
-  for (uint32_t n = 0; n < table_capacity_; n++) {
-    ObjectTableEntry& entry = table_[n];
+  for (uint32_t n = 0; n < old_capacity; n++) {
+    ObjectTableEntry& entry = old_table[n];
     if (entry.object) {
       entry.object->Release();
     }
   }
-
-  table_capacity_ = 0;
-  last_free_entry_ = 0;
-  free(table_);
-  table_ = nullptr;
+  free(old_table);
 }
 
 X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot) {
@@ -87,6 +107,7 @@ X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot) {
 bool ObjectTable::Resize(uint32_t new_capacity) {
   uint32_t new_size = new_capacity * sizeof(ObjectTableEntry);
   uint32_t old_size = table_capacity_ * sizeof(ObjectTableEntry);
+  std::lock_guard<std::mutex> table_lock(table_mutex_);  // blur-nx (2026-11-13, #56): realloc may move the table
   auto new_table = reinterpret_cast<ObjectTableEntry*>(realloc(table_, new_size));
   if (!new_table) {
     return false;
@@ -117,9 +138,12 @@ X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
 
     // Stash.
     if (XSUCCEEDED(result)) {
-      ObjectTableEntry& entry = table_[slot];
-      entry.object = object;
-      entry.handle_ref_count = 1;
+      {
+        std::lock_guard<std::mutex> table_lock(table_mutex_);  // blur-nx (2026-11-13, #56)
+        ObjectTableEntry& entry = table_[slot];
+        entry.object = object;
+        entry.handle_ref_count = 1;
+      }
       handle = XObject::kHandleBase + (slot << 2);
       object->handles().push_back(handle);
 
@@ -192,15 +216,19 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
     return X_STATUS_INVALID_HANDLE;
   }
 
+  // blur-nx (2026-11-13, #56): the global region taken before the entry is found (a resize between moved it).
+  auto global_lock = global_critical_region_.Acquire();
   ObjectTableEntry* entry = LookupTable(handle);
   if (!entry) {
     return X_STATUS_INVALID_HANDLE;
   }
 
-  auto global_lock = global_critical_region_.Acquire();
   if (entry->object) {
     auto object = entry->object;
-    entry->object = nullptr;
+    {
+      std::lock_guard<std::mutex> table_lock(table_mutex_);  // blur-nx (2026-11-13, #56)
+      entry->object = nullptr;
+    }
     assert_zero(entry->handle_ref_count);
     entry->handle_ref_count = 0;
 
@@ -240,14 +268,21 @@ std::vector<object_ref<XObject>> ObjectTable::GetAllObjects() {
 
 void ObjectTable::PurgeAllObjects() {
   auto lock = global_critical_region_.Acquire();
-  for (uint32_t slot = 0; slot < table_capacity_; slot++) {
-    auto& entry = table_[slot];
-    if (entry.object && !entry.object->is_host_object()) {
-      entry.handle_ref_count = 0;
-      entry.object->Release();
-
-      entry.object = nullptr;
+  // blur-nx (2026-11-13, #56): the entries cleared under table_mutex_, their objects released after.
+  std::vector<XObject*> purged;
+  {
+    std::lock_guard<std::mutex> table_lock(table_mutex_);
+    for (uint32_t slot = 0; slot < table_capacity_; slot++) {
+      auto& entry = table_[slot];
+      if (entry.object && !entry.object->is_host_object()) {
+        entry.handle_ref_count = 0;
+        purged.push_back(entry.object);
+        entry.object = nullptr;
+      }
     }
+  }
+  for (XObject* object : purged) {
+    object->Release();
   }
 }
 
@@ -283,8 +318,31 @@ XObject* ObjectTable::LookupObject(X_HANDLE handle, bool already_locked) {
   }
 
   XObject* object = nullptr;
+  // blur-nx (2026-11-13, #56, kernel_handle_lookup_own_lock): the table's own lock (see table_mutex_); a lookup
+  // finding it taken counts as kObjBlocked, as one finding the global region taken did.
+  static const bool own_lock = REXCVAR_GET(kernel_handle_lookup_own_lock);
   std::unique_lock<std::recursive_mutex> region;
-  if (!already_locked) {
+  std::unique_lock<std::mutex> table_lock;
+  if (own_lock) {
+    table_lock = std::unique_lock<std::mutex>(table_mutex_, std::try_to_lock);
+    if (!table_lock.owns_lock()) {
+      REX_SYS_COUNT(rex::syscount::kObjBlocked, 1);
+      // blur-nx (2026-11-17, the Renut audit's #9, kernel_handle_lookup_spin): the bounded spin the global region's
+      // lookups had (global_lock_spin tries, a CPU yield between them) before the kernel wait: the lock is held for
+      // a few loads and a retain, and Horizon's mutex hands a released lock to the waiter it wakes (Blur's race: 296
+      // of 14,193 lookups a second found it taken).
+      static const bool spin = REXCVAR_GET(kernel_handle_lookup_spin);
+      bool got = false;
+      if (spin) {
+        for (int32_t i = REXCVAR_GET(global_lock_spin); i > 0 && !got; --i) {
+          CpuRelax();
+          got = table_lock.try_lock();
+        }
+      }
+      if (!got)
+        table_lock.lock();
+    }
+  } else if (!already_locked) {
     region = AcquireGlobalSpin(global_critical_region_.mutex(), rex::syscount::kObjBlocked);
   }
   REX_SYS_COUNT(rex::syscount::kObjLookup, 1);
@@ -406,8 +464,10 @@ X_STATUS ObjectTable::RestoreHandle(X_HANDLE handle, XObject* object) {
   assert_true(table_capacity_ > slot);
 
   if (table_capacity_ > slot) {
-    auto& entry = table_[slot];
-    entry.object = object;
+    {
+      std::lock_guard<std::mutex> table_lock(table_mutex_);  // blur-nx (2026-11-13, #56)
+      table_[slot].object = object;
+    }
     object->Retain();
   }
 

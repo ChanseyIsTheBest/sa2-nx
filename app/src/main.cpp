@@ -1,7 +1,10 @@
-// Sonic Adventure 2 (Xbox Live Arcade): application entry point.
 
-#include "generated/default/sa2_init.h"
+// renut - ReXGlue Recompiled Project
+//
+// This file is yours to edit. 'rexglue migrate' will NOT overwrite it.
 
-#include "sa2_app.h"
+#include "generated/renut_init.h"
 
-REX_DEFINE_APP(sa2, Sa2App::Create)
+#include "renut_app.h"
+
+REX_DEFINE_APP(renut, RenutApp::Create)

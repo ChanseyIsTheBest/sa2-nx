@@ -104,12 +104,6 @@ endfunction()
 #     [SOURCE_DIR <path>])    # defaults to CMAKE_SOURCE_DIR
 #
 # Runs git in the working tree, then delegates to rex_compute_version.
-#
-# The tags are the SDK's own, so git is asked only when the SDK is the root of its
-# repository. As a folder of another repository (a port that carries the SDK, like
-# sa2-nx) the tags found would be that port's: its v1.0.0 is "ahead" of the SDK's
-# floor and stopped the configure. There the version is the floor, as in a tree
-# without git: MAJOR.MINOR.0.0-dev.unknown.
 #==========================================================
 function(rex_resolve_version out_var)
     set(one_value FLOOR_MAJOR FLOOR_MINOR SOURCE_DIR)
@@ -119,33 +113,10 @@ function(rex_resolve_version out_var)
         set(ARG_SOURCE_DIR "${CMAKE_SOURCE_DIR}")
     endif()
 
-    find_program(GIT_EXECUTABLE git)
-    set(sdk_is_repository_root FALSE)
-    if(GIT_EXECUTABLE)
-        get_filename_component(sdk_root "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/.." REALPATH)
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} rev-parse --show-toplevel
-            WORKING_DIRECTORY "${sdk_root}"
-            OUTPUT_VARIABLE git_toplevel
-            ERROR_QUIET
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            RESULT_VARIABLE git_toplevel_rc)
-        if(git_toplevel_rc EQUAL 0 AND NOT "${git_toplevel}" STREQUAL "")
-            get_filename_component(git_toplevel "${git_toplevel}" REALPATH)
-            string(TOLOWER "${git_toplevel}" git_toplevel_key)
-            string(TOLOWER "${sdk_root}" sdk_root_key)
-            if(git_toplevel_key STREQUAL sdk_root_key)
-                set(sdk_is_repository_root TRUE)
-            endif()
-        endif()
-    endif()
-    if(GIT_EXECUTABLE AND NOT sdk_is_repository_root)
-        message(STATUS
-            "rex_resolve_version: the SDK is not the root of a git repository; "
-            "version ${ARG_FLOOR_MAJOR}.${ARG_FLOOR_MINOR}.0.0-dev.unknown (the floor)")
-        set(${out_var} "${ARG_FLOOR_MAJOR}.${ARG_FLOOR_MINOR}.0.0-dev.unknown" PARENT_SCOPE)
-        return()
-    endif()
+    # kameo-nx (2026-11-05): the v* tags of this repository are the game's releases, not the SDK's. Read as SDK versions
+    # they stop the configure ("floor version (0.10) is behind tag version (1.0)"), in any clone that has fetched them.
+    # So the SDK's version always comes from its floor, the same string as in a checkout with no tags.
+    set(GIT_EXECUTABLE "")
     if(NOT GIT_EXECUTABLE)
         rex_compute_version(result
             FLOOR_MAJOR ${ARG_FLOOR_MAJOR}

@@ -4,12 +4,13 @@
  *          submit and present.
  */
 #include <algorithm>
-#include <atomic>
+#include <array>
 #include <bit>
+#include <atomic>
 #include <chrono>
+#include "renut_engine/gpu/sasrt_gpu_round.h"  // sasrt-nx (2026-11-08): the GPU round
 #include <condition_variable>
 #include <cstdlib>
-#include <cstring>
 #include <mutex>
 #include <string>
 
@@ -22,6 +23,9 @@
 #include "renut_engine/gpu/render/draw.h"
 #include "renut_engine/gpu/render/textures.h"
 #include "renut_engine/gpu/log.h"
+#if defined(PLUME_DEKO3D)
+#include "renut_engine/gpu/banjo_renut_deko3d.h"  // sasrt-nx (2026-11-08, sasrt_deko3d_diag_trace)
+#endif
 #include "renut_engine/gpu/overlay/overlay_ui.h"
 #include "renut_engine/gpu/overlay/overlay_drawer.h"  // banjo-nx (2026-10-19): HasLatest
 #include "renut_engine/gpu/banjo_renut_tuning.h"
@@ -47,19 +51,28 @@ REXCVAR_DEFINE_STRING(banjo_renut_diag_show_texture, "", "Banjo/Renut",
 REXCVAR_DEFINE_DOUBLE(banjo_renut_diag_show_gamma, 1.0, "Banjo/Renut",
                       "Diagnostic: banjo_renut_diag_show_texture's exponent (depth near 1 shows with 64 or so)");
 
-// sa2-nx (2026-10-20): SA2's display gamma ramp at scan-out. Its Direct3D sets the ramp once at boot through the
-// display's curve (VdGetCurrentDisplayGamma: [64] = 193, [128] = 462 of 1023, not the identity), and the Xbox 360's
-// display controller applies it to every pixel it sends; the emulated GPU and sa2-nx's native renderer do the same
-// (DC_LUT registers). Renut presented without it: every frame came out lighter than both (12-16 levels in the
-// midtones, renut-renderer.md). Same lookup as theirs: each channel's 8-bit value picks its entry.
-REXCVAR_DEFINE_BOOL(sa2_renut_gamma_ramp, true, "SA2/Renderer",
-                    "Renut's renderer: apply the game's display gamma ramp at scan-out, as the Xbox 360's display "
-                    "controller, the emulated GPU and the native renderer do (off: the frame as rendered, lighter)");
+// banjo-nx (2026-10-20): see GameGamma below.
+REXCVAR_DEFINE_BOOL(banjo_renut_game_gamma, false, "Banjo/Renut",
+                    "Apply the gamma ramp the game loads to the output, as the Xbox 360's display and banjo-nx's own "
+                    "renderer do (N&B's darkens the midtones, about x^1.17). Off: Renut's output as before");
 
 REXCVAR_DEFINE_BOOL(renut_vsync, true, "Nuts&Bolts/Graphics",
                     "Show each frame at the display's refresh: no tearing, and the game runs at "
                     "the refresh rate (frame_cap then only limits below it). Off shows frames at "
                     "once, with tearing.");
+
+REXCVAR_DEFINE_BOOL(vivapinata_present_lut, true, "Banjo/Enhancements",
+                    "vivapinata-nx (2026-11-12, the GPU round; A/B 89): the scan-out with the game's gamma ramp "
+                    "(banjo_renut_game_gamma), when it loads the frame's texels at one to one with no pow and the frame is "
+                    "8-bit, reads the ramp from a 256 x 256 table of its own entries (two fetches a pixel) instead of the "
+                    "ramp texture (three): each channel's entry depends on its 8-bit value alone. The same values: same "
+                    "pixels. Off: the three fetches")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(vivapinata_present_lut_check, false, "Banjo/Diagnostics",
+                    "vivapinata-nx (2026-11-12): a capture (banjo_renut_capture) that went through the gamma table "
+                    "(vivapinata_present_lut) is drawn again through the plain scan-out and the two compared byte for "
+                    "byte; the log says how many pixels differ")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace renut::gpu {
 
@@ -124,91 +137,189 @@ FrameFit FitFrame(uint32_t out_w, uint32_t out_h, uint32_t src_w, uint32_t src_h
   return fit;
 }
 
-// sa2-nx (2026-10-20, sa2_renut_gamma_ramp): the game's display gamma ramp (Video::SetGammaRamp), a 256 x 1 float
-// texture in a bindless slot that the present shader reads.
-struct GammaRamp {
-  // The game thread's last copy (SetGammaRamp's compare, that thread only).
-  uint8_t seen[1536] = {};
-  bool seen_any = false;
-  // Handed to the render thread.
+// banjo-nx (2026-10-20, banjo_renut_game_gamma): the gamma ramp the game loads, which the 360's display applies to
+// every 8-bit value it scans out (N&B's is about x^1.17: entries [64] = 192, [128] = 459, [255] = 1019 of 1023) and
+// Renut's present never did. Off by default (it changes the picture); on, the present looks the ramp up by the value.
+struct GameGamma {
   std::mutex mutex;
-  uint8_t words[1536] = {};
-  std::atomic<uint64_t> version{0};
-  // Render thread, under State().mutex.
-  uint64_t uploaded = 0;  // the version the texels below hold
-  float texels[256 * 4] = {};
-  std::unique_ptr<plume::RenderTexture> texture;
+  // halo3-nx (2026-11-03): by the 10-bit value (NoteGameGamma expands either form the game loads): red, green, blue.
+  std::array<uint16_t, 3 * 1024> ramp{};
+  uint32_t version = 0;
+  // Render thread.
+  uint32_t uploaded = 0;
+  uint32_t uploads = 0;  // kameo-nx (2026-11-03, banjo_renut_gamma_upload_once): copies of the ramp so far
+  std::unique_ptr<plume::RenderTexture> texture;  // 1024 x 1, RGBA8 (kameo-nx: 8 bits; halo3-nx: 1024 entries)
   std::unique_ptr<plume::RenderTextureView> view;
   uint32_t slot = kInvalidDescriptor;
+  float param = 0.0f;  // UtilityPush::param1 of the scan-outs: the slot as raw bits, 0 = no ramp
+  // sasrt-nx (2026-11-08, sasrt_gpu_identity_ramp), in this renderer's 1024-entry form: every channel's entry i stores the
+  // level entry i would store if it were i (the texels are level(entry)): the scan-out then computes level(v) for its
+  // 10-bit value v without the three texture loads (present_ps.hlsl, param1 = 1). Exact for any input, not only 8-bit
+  // ones. Ridge Racer 6's ramp is not one (entry 256 is 193): only for games that load the linear ramp.
+  bool identity = false;
+  uint32_t identity_version = 0;  // the ramp version 'identity' was worked out for
+  // vivapinata-nx (2026-11-12, vivapinata_present_lut): the ramp by 8-bit value as a 256 x 256 RGBA8 table, texel (i, j)
+  // = (red's entry for i, green's for j, blue's for i), made with the ramp's texels and uploaded with them.
+  std::unique_ptr<plume::RenderTexture> lut_texture;
+  std::unique_ptr<plume::RenderTextureView> lut_view;
+  uint32_t lut_slot = kInvalidDescriptor;
+  uint32_t lut_version = 0;  // the ramp version the table holds (0: none)
 };
-GammaRamp g_gamma;
+GameGamma g_gamma;
+bool g_scanout_force_plain = false;  // vivapinata-nx (2026-11-12): vivapinata_present_lut_check's second drawing
+bool g_scanout_used_lut = false;     // the last RecordScanOut went through the table
 
-constexpr plume::RenderFormat kGammaRampFormat = plume::RenderFormat::R32G32B32A32_FLOAT;
+bool PresentLutOn() {
+  static const bool on = REXCVAR_GET(vivapinata_present_lut);
+  return on && banjo::renut_gpu::g_ab_off.load(std::memory_order_relaxed) != 89;
+}
 
-// Before the frame's scan-out: the ramp goes to the texture. Every frame (4 KB), not only when the game changes it
-// (SA2: once, at boot): banjo-nx found a frame's command list can be dropped at start-up, and its one upload with it
-// (its run 78: black output until the ramp changed again).
-void UpdateGammaRampLocked(VideoState &s) {
-  GammaRamp &g = g_gamma;
-  const uint64_t version = g.version.load(std::memory_order_acquire);
-  if (!version || !REXCVAR_GET(sa2_renut_gamma_ramp))
-    return;
-  if (!g.texture) {
-    g.texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(256, 1, 1, kGammaRampFormat));
-    if (!g.texture)
+// vivapinata-nx (2026-11-12, vivapinata_present_lut): the 256 x 256 table present_lut_ps.hlsl reads, from the ramp's own
+// texel values (the levels below are those of the ramp texture). present_ps's index for an 8-bit value n is
+// round(n / 255 * 1023), which is (n * 2046 + 255) / 510: n * 1023 / 255 is never within 1 / 510 of a tie, far more than a
+// float's error. Caller holds s.mutex, outside a pass.
+void UploadGammaLutLocked(VideoState &s, const std::array<uint16_t, 3 * 1024> &ramp, uint32_t version) {
+  constexpr plume::RenderFormat kFormat = plume::RenderFormat::R8G8B8A8_UNORM;
+  if (!g_gamma.lut_texture) {
+    g_gamma.lut_texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(256, 256, 1, kFormat));
+    if (!g_gamma.lut_texture)
       return;
-    g.texture->setName("sa2-nx gamma ramp");
-    g.view = g.texture->createTextureView(plume::RenderTextureViewDesc::Texture2D(kGammaRampFormat));
-    g.slot = Video::AllocateTextureSlotLocked();
-    if (!g.view || g.slot == kInvalidDescriptor) {
-      g.view.reset();
-      g.texture.reset();
-      g.slot = kInvalidDescriptor;
+    g_gamma.lut_texture->setName("vivapinata game gamma table");
+    g_gamma.lut_view = g_gamma.lut_texture->createTextureView(plume::RenderTextureViewDesc::Texture2D(kFormat));
+    g_gamma.lut_slot = g_gamma.lut_view ? Video::AllocateTextureSlotLocked() : kInvalidDescriptor;
+    if (g_gamma.lut_slot == kInvalidDescriptor) {
+      g_gamma.lut_view.reset();
+      g_gamma.lut_texture.reset();
       return;
     }
-    Video::SetTextureSlotLocked(g.slot, g.texture.get(), g.view.get());
+    Video::SetTextureSlotLocked(g_gamma.lut_slot, g_gamma.lut_texture.get(), g_gamma.lut_view.get());
+    g_gamma.lut_version = 0;
   }
-  if (!Video::EnsureCommandListLocked())
-    return;
-  UploadAllocation staging = s.uploads[s.frame].Allocate(256 * 16, 512);
+  UploadAllocation staging = s.uploads[s.frame].Allocate(256 * 256 * 4, 512);
   if (!staging)
     return;
-  const bool changed = version != g.uploaded;
-  if (changed) {
-    uint8_t words[1536];
-    {
-      std::lock_guard lock(g.mutex);
-      std::memcpy(words, g.words, sizeof(words));
-    }
-    // The native renderer's table (sa2_native_targets.cpp RecomputeRamp): the 10-bit value / 1023, alpha 1.
+  const auto level = [](uint16_t entry) {
+    return uint8_t((std::min<uint32_t>(entry, 1023u) * 510u + 1023u) / 2046u);
+  };
+  uint8_t r[256], g[256], b[256];
+  for (uint32_t n = 0; n < 256; ++n) {
+    const uint32_t v = (n * 2046u + 255u) / 510u;
+    r[n] = level(ramp[v]);
+    g[n] = level(ramp[1024 + v]);
+    b[n] = level(ramp[2048 + v]);
+  }
+  auto *texels = static_cast<uint8_t *>(staging.cpu);
+  for (uint32_t j = 0; j < 256; ++j) {
     for (uint32_t i = 0; i < 256; ++i) {
-      for (uint32_t c = 0; c < 3; ++c) {
-        const uint8_t *w = words + (c * 256 + i) * 2;
-        const uint32_t value = ((uint32_t(w[0]) << 8 | w[1]) >> 6) & 0x3FF;
-        g.texels[i * 4 + c] = float(value) / 1023.0f;
-      }
-      g.texels[i * 4 + 3] = 1.0f;
+      uint8_t *p = texels + (j * 256 + i) * 4;
+      p[0] = r[i];
+      p[1] = g[j];
+      p[2] = b[i];
+      p[3] = 255;
     }
   }
-  std::memcpy(staging.cpu, g.texels, sizeof(g.texels));
-  const float *texels = g.texels;
   plume::RenderCommandList *cmd = s.command_list;
   cmd->barriers(plume::RenderBarrierStage::COPY,
-                plume::RenderTextureBarrier(g.texture.get(), plume::RenderTextureLayout::COPY_DEST));
-  cmd->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(g.texture.get(), 0),
-                         plume::RenderTextureCopyLocation::PlacedFootprint(staging.ref.ref, kGammaRampFormat, 256, 1,
-                                                                           1, 256, staging.ref.offset));
+                plume::RenderTextureBarrier(g_gamma.lut_texture.get(), plume::RenderTextureLayout::COPY_DEST));
+  cmd->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(g_gamma.lut_texture.get(), 0, 0),
+                         plume::RenderTextureCopyLocation::PlacedFootprint(staging.ref.ref, kFormat, 256, 256, 1, 256,
+                                                                           staging.ref.offset),
+                         0, 0, 0, nullptr);
   cmd->barriers(plume::RenderBarrierStage::GRAPHICS,
-                plume::RenderTextureBarrier(g.texture.get(), plume::RenderTextureLayout::SHADER_READ));
-  if (changed)
-    RGPU_INFO("sa2-nx: the game's display gamma ramp at scan-out (sa2_renut_gamma_ramp): [0] {:.0f}, [64] {:.0f}, "
-              "[128] {:.0f}, [255] {:.0f} of 1023 (red)",
-              texels[0] * 1023.0f, texels[64 * 4] * 1023.0f, texels[128 * 4] * 1023.0f, texels[255 * 4] * 1023.0f);
-  g.uploaded = version;
+                plume::RenderTextureBarrier(g_gamma.lut_texture.get(), plume::RenderTextureLayout::SHADER_READ));
+  g_gamma.lut_version = version;
+}
+
+// Before the frame's passes (a copy may not be recorded inside one). Caller holds s.mutex.
+void PrepareGameGammaLocked(VideoState &s) {
+  g_gamma.param = 0.0f;
+  if (!REXCVAR_GET(banjo_renut_game_gamma))
+    return;
+  std::array<uint16_t, 3 * 1024> ramp;
+  uint32_t version;
+  {
+    std::lock_guard lock(g_gamma.mutex);
+    ramp = g_gamma.ramp;
+    version = g_gamma.version;
+  }
+  if (!version || !Video::EnsureCommandListLocked())
+    return;
+  // kameo-nx (2026-11-03): 8 bits, not 32-bit floats: a quarter of the bytes for each of a pixel's three fetches. Each entry
+  // is what the 8-bit swapchain would make of its float: n / 1023 is never nearer an 8-bit rounding tie than 0.0014 of a
+  // level (checked for all 1024 values), so round() and the render output agree.
+  constexpr plume::RenderFormat kFormat = plume::RenderFormat::R8G8B8A8_UNORM;
+  if (!g_gamma.texture) {
+    g_gamma.texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(1024, 1, 1, kFormat));
+    if (!g_gamma.texture)
+      return;
+    g_gamma.texture->setName("banjo game gamma ramp");
+    g_gamma.view = g_gamma.texture->createTextureView(plume::RenderTextureViewDesc::Texture2D(kFormat));
+    g_gamma.slot = g_gamma.view ? Video::AllocateTextureSlotLocked() : kInvalidDescriptor;
+    if (g_gamma.slot == kInvalidDescriptor) {
+      g_gamma.view.reset();
+      g_gamma.texture.reset();
+      return;
+    }
+    Video::SetTextureSlotLocked(g_gamma.slot, g_gamma.texture.get(), g_gamma.view.get());
+    g_gamma.uploaded = 0;
+    g_gamma.uploads = 0;
+  }
+  // Every frame at first: a frame's list can be dropped at start-up (run 78's first upload never arrived: black output).
+  // kameo-nx (2026-11-03, banjo_renut_gamma_upload_once): after that, when it changes. The copy, every frame, cost a full
+  // barrier before it and a full barrier with an L2 invalidate after it, right before the scan-out reads the frame.
+  const bool upload = !banjo::renut_gpu::GammaUploadOnceOn() || g_gamma.uploaded != version || g_gamma.uploads < 300;
+  if (upload) {
+    ++g_gamma.uploads;
+    UploadAllocation staging = s.uploads[s.frame].Allocate(1024 * 4, 512);
+    if (!staging)
+      return;
+    auto *texels = static_cast<uint8_t *>(staging.cpu);
+    // round(entry * 255 / 1023); an entry over 1023 was over 1.0 as a float, which the 8-bit output clamps.
+    const auto level = [](uint16_t entry) {
+      return uint8_t((std::min<uint32_t>(entry, 1023u) * 510u + 1023u) / 2046u);
+    };
+    for (uint32_t i = 0; i < 1024; ++i) {
+      texels[i * 4 + 0] = level(ramp[i]);
+      texels[i * 4 + 1] = level(ramp[1024 + i]);
+      texels[i * 4 + 2] = level(ramp[2048 + i]);
+      texels[i * 4 + 3] = 255;
+    }
+    plume::RenderCommandList *cmd = s.command_list;
+    cmd->barriers(plume::RenderBarrierStage::COPY,
+                  plume::RenderTextureBarrier(g_gamma.texture.get(), plume::RenderTextureLayout::COPY_DEST));
+    cmd->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(g_gamma.texture.get(), 0, 0),
+                           plume::RenderTextureCopyLocation::PlacedFootprint(staging.ref.ref, kFormat, 1024, 1, 1, 1024,
+                                                                             staging.ref.offset),
+                           0, 0, 0, nullptr);
+    cmd->barriers(plume::RenderBarrierStage::GRAPHICS,
+                  plume::RenderTextureBarrier(g_gamma.texture.get(), plume::RenderTextureLayout::SHADER_READ));
+    if (REXCVAR_GET(vivapinata_present_lut))  // vivapinata-nx (2026-11-12): the table, with the ramp
+      UploadGammaLutLocked(s, ramp, version);
+    if (g_gamma.uploaded != version) {
+      REXLOG_INFO("[renut] game gamma ramp applied (banjo_renut_game_gamma): [0]={}/{}/{} [64]={}/{}/{} [128]={}/{}/{} "
+                  "[255]={}/{}/{} (of 1024)", ramp[0], ramp[1024], ramp[2048], ramp[256], ramp[1280], ramp[2304], ramp[512],
+                  ramp[1536], ramp[2560], ramp[1023], ramp[2047], ramp[3071]);
+    }
+    g_gamma.uploaded = version;
+  }
+  g_gamma.param = std::bit_cast<float>(g_gamma.slot);  // the slot's bits (present_ps.hlsl); never 0, a dynamic slot
+  // sasrt-nx (2026-11-08, sasrt_gpu_identity_ramp): worked out once a ramp version, as the texels are made above.
+  if (g_gamma.identity_version != version) {
+    g_gamma.identity_version = version;
+    const auto level = [](uint32_t entry) { return (std::min<uint32_t>(entry, 1023u) * 510u + 1023u) / 2046u; };
+    bool identity = true;
+    for (uint32_t i = 0; i < 3 * 1024 && identity; ++i)
+      identity = level(ramp[i]) == level(i % 1024);
+    g_gamma.identity = identity;
+  }
 }
 
 void RecordScanOut(VideoState &s, const PresentImage &image, uint32_t out_w, uint32_t out_h) {
   plume::RenderCommandList *cmd = s.command_list;
+#if defined(PLUME_DEKO3D)
+  if (IsDeko3D())
+    banjo::renut_gpu::deko3d::TraceFrameBoundary();  // sasrt-nx (2026-11-08, sasrt_deko3d_diag_trace)
+#endif
   if (image.layout && *image.layout != plume::RenderTextureLayout::SHADER_READ) {
     cmd->barriers(plume::RenderBarrierStage::GRAPHICS,
                   plume::RenderTextureBarrier(image.texture, plume::RenderTextureLayout::SHADER_READ));
@@ -224,9 +335,6 @@ void RecordScanOut(VideoState &s, const PresentImage &image, uint32_t out_w, uin
                                      int32_t(vp.y + vp.height)));
 
   cmd->setGraphicsPipelineLayout(s.utility_layout.get());
-  cmd->setPipeline(s.present_pipeline.get());
-  cmd->setGraphicsDescriptorSet(s.texture_set.get(), 0);
-  cmd->setGraphicsDescriptorSet(s.sampler_set.get(), 1);
 
   UtilityPush push{};
   // The frame's share of the texture, less what the fit trims from its edges.
@@ -238,14 +346,44 @@ void RecordScanOut(VideoState &s, const PresentImage &image, uint32_t out_w, uin
   push.translate[1] = frame_v * (1.0f - fit.visible[1]) * 0.5f;
   push.texture_index = image.descriptor;
   push.sampler_index = kLinearClampSamplerSlot;
+  // kameo-nx (2026-11-03, banjo_renut_present_texel_load): one texel for each output pixel, from the texture's corner: the
+  // texel itself, which is what filtering at its centre gives. All ones in the sampler index (present_ps.hlsl).
+  if (banjo::renut_gpu::PresentTexelLoadOn() && image.width == src_w && image.height == src_h && vp.x == 0.0f &&
+      vp.y == 0.0f && vp.width == float(src_w) && vp.height == float(src_h) && fit.visible[0] == 1.0f &&
+      fit.visible[1] == 1.0f)
+    push.sampler_index = UINT32_MAX;
   push.param0 = image.gamma > 0.0f ? image.gamma : s.output_gamma;
-  // sa2-nx: the game's gamma ramp (not on banjo_renut_diag_show_texture's texture): its slot as param1's bits, 0 =
-  // none (slots 0-2 are the null textures, never the ramp's).
-  const uint32_t ramp_slot = image.gamma <= 0.0f && g_gamma.uploaded && g_gamma.slot != kInvalidDescriptor &&
-                                     REXCVAR_GET(sa2_renut_gamma_ramp)
-                                 ? g_gamma.slot
-                                 : 0u;
-  push.param1 = std::bit_cast<float>(ramp_slot);
+  // kameo-nx (2026-11-03, banjo_renut_present_no_pow): the shader skips an exponent of exactly 1; a negative one is its size
+  // with the pow kept (the key off).
+  if (push.param0 == 1.0f && !banjo::renut_gpu::PresentNoPowOn())
+    push.param0 = -1.0f;
+  push.param1 = image.gamma > 0.0f ? 0.0f : g_gamma.param;  // banjo-nx: not on banjo_renut_diag_show_texture's views
+  // sasrt-nx (2026-11-08, sasrt_gpu_identity_ramp; the second GPU round): an identity ramp's lookup computed instead: 1 in
+  // param1's bits (slots 0-2 are the null textures, never the ramp's).
+  if (push.param1 != 0.0f && g_gamma.identity && sasrt::gpu_round::On(sasrt::gpu_round::kIdentityRamp)) {
+    push.param1 = std::bit_cast<float>(1u);
+    sasrt::gpu_round::Count(sasrt::gpu_round::kIdentityRamp);
+  }
+  // vivapinata-nx (2026-11-12, vivapinata_present_lut): the ramp texture's lookups (param1 its slot, not 0 or the identity's
+  // 1) of an 8-bit frame loaded at one to one with no pow: the table made from the same ramp version instead.
+  plume::RenderPipeline *pipeline = s.present_pipeline.get();
+  const uint32_t ramp_bits = std::bit_cast<uint32_t>(push.param1);
+  g_scanout_used_lut = false;
+  if (s.present_lut_pipeline && PresentLutOn() && !g_scanout_force_plain && image.unorm8 && push.sampler_index == UINT32_MAX &&
+      push.param0 == 1.0f && ramp_bits > 1u && ramp_bits == g_gamma.slot && g_gamma.lut_version != 0 &&
+      g_gamma.lut_version == g_gamma.uploaded && g_gamma.lut_slot != kInvalidDescriptor) {
+    pipeline = s.present_lut_pipeline.get();
+    push.param1 = std::bit_cast<float>(g_gamma.lut_slot);
+    g_scanout_used_lut = true;
+    static uint64_t lut_scans = 0, logged = 0;
+    if (++lut_scans >= logged * 2 + 1) {  // the 1st, 3rd, 7th ... 2^k - 1th
+      logged = lut_scans;
+      RGPU_INFO("[renut] scan-out through the gamma table (vivapinata_present_lut): {} frames", lut_scans);
+    }
+  }
+  cmd->setPipeline(pipeline);
+  cmd->setGraphicsDescriptorSet(s.texture_set.get(), 0);
+  cmd->setGraphicsDescriptorSet(s.sampler_set.get(), 1);
   cmd->setGraphicsPushConstants(0, &push, 0, sizeof(push));
   cmd->drawInstanced(3, 1, 0, 0);
 }
@@ -369,6 +507,43 @@ bool CaptureFrameLocked(VideoState &s, const PresentImage &image, rex::ui::RawIm
     }
   }
   c.readback->unmap();
+  // vivapinata-nx (2026-11-12, vivapinata_present_lut_check): the same frame through the plain scan-out (present_ps's
+  // three ramp fetches), compared with the table's drawing byte for byte.
+  if (!raw && g_scanout_used_lut && REXCVAR_GET(vivapinata_present_lut_check) && Video::EnsureCommandListLocked()) {
+    plume::RenderCommandList *check = s.command_list;
+    check->barriers(plume::RenderBarrierStage::GRAPHICS,
+                    plume::RenderTextureBarrier(c.target.get(), plume::RenderTextureLayout::COLOR_WRITE));
+    check->setFramebuffer(c.framebuffer.get());
+    g_scanout_force_plain = true;
+    RecordScanOut(s, image, w, h);
+    g_scanout_force_plain = false;
+    check->setFramebuffer(nullptr);
+    check->barriers(plume::RenderBarrierStage::COPY,
+                    plume::RenderTextureBarrier(c.target.get(), plume::RenderTextureLayout::COPY_SOURCE));
+    check->copyTextureRegion(
+        plume::RenderTextureCopyLocation::PlacedFootprint(c.readback.get(), kCaptureFormat, w, h, 1, c.row_texels),
+        plume::RenderTextureCopyLocation::Subresource(c.target.get()));
+    detail::SubmitAndWaitLocked(s);
+    if (const auto *plain = static_cast<const uint8_t *>(c.readback->map())) {
+      uint64_t differ = 0;
+      int largest = 0;
+      for (uint32_t y = 0; y < h; ++y) {
+        const uint8_t *row = plain + size_t(y) * c.row_texels * 4;
+        const uint8_t *lut = out.data.data() + size_t(y) * w * 4;
+        for (uint32_t x = 0; x < w; ++x) {
+          const int d[3] = {row[x * 4 + 2] - lut[x * 4 + 0], row[x * 4 + 1] - lut[x * 4 + 1], row[x * 4 + 0] - lut[x * 4 + 2]};
+          if (d[0] || d[1] || d[2]) {
+            ++differ;
+            for (int k : d)
+              largest = std::max(largest, std::abs(k));
+          }
+        }
+      }
+      c.readback->unmap();
+      RGPU_INFO("[renut] gamma table check (vivapinata_present_lut_check): {} of {} pixels differ from the plain "
+                "scan-out (largest {} levels)", differ, uint64_t(w) * h, largest);
+    }
+  }
   return true;
 }
 
@@ -421,7 +596,7 @@ void PresentLocked(VideoState &s, const PresentImage *image) {
   ApplyVsync(s);
   if (s.swap_chain->needsResize() || s.resize_requested.exchange(false, std::memory_order_acq_rel))
     RebuildSwapChain(s);
-  UpdateGammaRampLocked(s);  // sa2-nx (2026-10-20): before the capture and the scan-out, which both apply it
+  PrepareGameGammaLocked(s);     // banjo-nx (2026-10-20, banjo_renut_game_gamma)
   ServeCaptureLocked(s, image);  // banjo-nx: test captures (banjo_renut_capture.h)
   if (s.swap_framebuffers.empty()) {
     // Minimized or failed resize: keep the frame ring moving without a present.
@@ -531,25 +706,6 @@ PresentFence g_present_fences[kPresentFences];
 std::atomic<uint64_t> g_present_count{0};
 } // namespace
 
-void Video::SetGammaRamp(const uint8_t *big_endian_words) {
-  GammaRamp &g = g_gamma;
-  if (!big_endian_words || (g.seen_any && std::memcmp(g.seen, big_endian_words, sizeof(g.seen)) == 0))
-    return;
-  // A device that has no ramp yet (all zero) would black the picture out: the emulated display starts linear.
-  bool any = false;
-  for (uint32_t i = 0; i < sizeof(g.seen) && !any; ++i)
-    any = big_endian_words[i] != 0;
-  if (!any)
-    return;
-  std::memcpy(g.seen, big_endian_words, sizeof(g.seen));
-  g.seen_any = true;
-  {
-    std::lock_guard lock(g.mutex);
-    std::memcpy(g.words, big_endian_words, sizeof(g.words));
-  }
-  g.version.fetch_add(1, std::memory_order_acq_rel);
-}
-
 uint64_t Video::PresentCount() {
   return g_present_count.load(std::memory_order_acquire);
 }
@@ -572,6 +728,26 @@ int Video::PresentDone(uint64_t index) {
   (void)index;
   return -1;
 #endif
+}
+
+void Video::NoteGameGamma(const uint8_t *ramp, bool piecewise) {
+  if (!ramp || !REXCVAR_GET(banjo_renut_game_gamma))
+    return;
+  const auto word = [ramp](uint32_t i) { return (uint32_t(ramp[i * 2]) << 8 | ramp[i * 2 + 1]) >> 6 & 0x3FF; };
+  std::array<uint16_t, 3 * 1024> r;
+  for (uint32_t c = 0; c < 3; ++c) {
+    for (uint32_t i = 0; i < 1024; ++i) {
+      // halo3-nx (2026-11-03): D3DDevice_SetPWLGamma's form is 128 { base, delta } segments of a channel (Halo 3's):
+      // base + delta * the value's low 3 bits / 8. D3DDevice_SetGammaRamp's is 256 entries, by the 8-bit value.
+      r[c * 1024 + i] = piecewise ? uint16_t(std::min(word(c * 256 + (i >> 3) * 2) + word(c * 256 + (i >> 3) * 2 + 1) * (i & 7) / 8, 1023u))
+                                  : uint16_t(word(c * 256 + (i * 255 + 511) / 1023));
+    }
+  }
+  std::lock_guard lock(g_gamma.mutex);
+  if (r != g_gamma.ramp || !g_gamma.version) {
+    g_gamma.ramp = r;
+    ++g_gamma.version;
+  }
 }
 
 void Video::Present(const PresentImage *image) {
@@ -630,21 +806,6 @@ bool CaptureFrame(rex::ui::RawImage &out, int timeout_ms) {
   std::unique_lock lock(c.mutex);
   const uint64_t ticket = c.requested.fetch_add(1, std::memory_order_acq_rel) + 1;
   if (!c.cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return c.served >= ticket; }) || !c.ok)
-    return false;
-  out = c.image;
-  return true;
-}
-
-// sa2-nx (2026-10-20): the two halves (banjo_renut_capture.h).
-uint64_t RequestFrameCapture() {
-  return g_capture.requested.fetch_add(1, std::memory_order_acq_rel) + 1;
-}
-
-bool WaitFrameCapture(uint64_t ticket, rex::ui::RawImage &out, int timeout_ms) {
-  FrameCapture &c = g_capture;
-  std::unique_lock lock(c.mutex);
-  if (!c.cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return c.served >= ticket; }) || !c.ok ||
-      c.served != ticket)
     return false;
   out = c.image;
   return true;

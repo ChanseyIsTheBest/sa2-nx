@@ -1,48 +1,46 @@
 #!/usr/bin/env python3
-"""The post-codegen steps of the codegen flavour, in one place (docs/enhancements.md, "Build-time").
+"""banjo-nx: the post-codegen steps of the optimised codegen (from sa2-nx's tools/post_codegen.py; docs/enhancements.md,
+"Build-time"). Run after EVERY codegen: app/CMakeLists.txt appends this script to the generated renut_codegen command,
+because the PC build re-runs the generator by itself whenever an input changes (renut_config.toml, the xex, the
+generator) and that would otherwise drop the steps silently. Banjo ships only the optimised codegen (one NRO).
 
-Run after EVERY codegen, by tools/codegen.ps1 and by the build itself: app/CMakeLists.txt appends this script to the
-generated sa2_codegen command, because the PC build re-runs the generator on its own whenever an input changes (the
-manifest, a toml, the xex, the generator binary) and that would otherwise drop the steps silently.
+The sequence is sa2-nx's (its three CPU rounds of 2026-10-12, docs/enhancements.md "sa2-nx's CPU rounds"), on Banjo's one
+flat tree (app/generated), with its localized native copies as the last step (2026-10-13):
 
-  - the flavour is read from app/codegen_flavor.toml (written by tools/codegen.ps1 -Flavor): "optimised" when it sets
-    any codegen key, else "classic";
-  - optimised: tools/pch_no_volatile.py + tools/loop_barriers.py (required together) and tools/direct_calls.py on both
-    generated trees; then sasrt-nx's steps of 2026-10-12, each a rename of calls into macros the generated pch
-    defines: tools/guest_cas.py (compare-and-swap without the legacy builtin's trailing `dmb ish` on AArch64),
-    tools/flush_mode_flow.py (the flush-mode checks the control flow and the callees' summaries fix: nothing on the
-    Switch, still tested in the PC build), tools/vec_byteswap.py (the 16-byte reversal of guest vector loads and
-    stores without a table lookup on AArch64) and tools/pch_neon_shuffles.py (constant word shuffles as one
-    permutation on AArch64);
-  - optimised, the second CPU round of 2026-10-12 (each step has its own compile-time switch back, see the tool):
-      tools/indirect_calls.py   every `bctrl` tagged with its site (PC census), and the sites of
-                                app/indirect_promotions.txt as a guarded direct call. Before direct_calls.py.
-      tools/ro_constants.py     loads from the image's read-only data as constants. Before float_loads.py.
-      tools/float_loads.py      a single-precision load straight into a float register
-      tools/frame_traffic.py    the link register and the non-volatile saves of the function prologues
-      tools/leaf_locals.py      the ctx registers of leaf functions with loops as locals. Last: it renames registers.
-      tools/pch_cold_traps.py   the pch's trap helper (before every division) out of line and cold
-  - optimised, the third CPU round of 2026-10-12:
-      tools/loop_locals.py      the ctx registers a call-free loop uses as locals for the length of the loop (the
-                                barrier stays). After loop_barriers.py, before the localized copies and
-                                leaf_locals.py (which takes the leaf functions).
-    ro_constants.py and the entry modes of flush_mode_flow.py need the generator's image dump (out/default_image.bin,
-    written by tools/codegen.ps1 through REXGLUE_DUMP_IMAGE); the steps whose PC form calls into the app
-    (indirect_calls, ro_constants) run on the game's tree only, not on the stage module (a DLL of its own on the PC);
-  - optimised, banjo-nx's codegen round (ported 2026-10-19; docs/enhancements.md "banjo-nx's codegen round"), on the
-    game's tree, in banjo-nx's order after the loop and leaf locals:
-      tools/vperm_one_source.py, tools/fp_sign_ops.py, tools/leaf_dead_stores.py, tools/single_floats.py,
-      tools/inline_memcalls.py, tools/vec_unaligned_stores.py, tools/ro_constants_cfg.py, tools/dead_ctx_defs.py,
-      tools/flush_hoist.py; after the localized copies tools/lr_preserve.py --rewrite, tools/vsel_neon.py and
-      tools/inline_leaves.py (last). The late rewrites are taken back out first on a tree processed before, so every
-      analysis reads the text it was written for. ro_constants.py and ro_constants_cfg.py get --xex (import records).
-  - both: the localized native copies (tools/localize_native.py --list app/src/cpu/hot/localized.txt) and
-    app/generated/codegen_flavor.txt (the build's name in the first "[enh]" log line).
+  - tools/pch_no_volatile.py + tools/loop_barriers.py (required together: without barriers GCC turns guest polling
+    loops into infinite loops);
+  - tools/indirect_calls.py: every `bctrl` tagged with its site (PC census) and the sites of
+    app/indirect_promotions.txt as guarded direct calls. Before loop_barriers.py (a loop needs no barrier when every
+    way round it passes an indirect call, and a promoted call is no longer one) and before direct_calls.py;
+  - tools/pch_cold_traps.py: the pch's trap helper out of line and cold;
+  - tools/direct_calls.py --redo (calls between unhooked functions become direct, so GCC can inline them);
+  - sasrt-nx's steps: tools/guest_cas.py (compare-and-swap without the legacy builtin's trailing `dmb ish` on
+    AArch64), tools/flush_mode_flow.py (flush-mode checks the control flow and the callees fix: nothing on the Switch,
+    still tested in the PC build; after direct_calls.py, whose --redo can turn a direct call back into a hooked one),
+    tools/vec_byteswap.py (guest vector byte reversal without a table lookup on AArch64), tools/pch_neon_shuffles.py;
+  - tools/ro_constants.py (loads from the image's read-only data as constants, the XEX's import records excepted
+    with --xex; before float_loads.py),
+    tools/float_loads.py (a single-precision load straight into a float register), tools/frame_traffic.py (only marks
+    prologue statements: its elisions are opt-in and OFF, sa2-nx found them not exact);
+  - tools/loop_locals.py (the ctx registers of a call-free loop as locals for the length of the loop), then
+    tools/leaf_locals.py (the ctx registers of leaf functions with loops; it renames registers);
+  - from sasrt-nx's round of 2026-10-14: tools/fp_sign_ops.py, tools/leaf_dead_stores.py, tools/single_floats.py,
+    tools/vperm_one_source.py (a vperm of one vector as a one-register lookup;
+    simde_mm_perm1_epi8_ in sdk/include/rex/ppc/intrinsics.h, sdk/tests/vmx_helpers_neon_test.cpp),
+    tools/inline_memcalls.py (memcpy / memset of a constant size up to 64 bytes inline; sdk/include/rex/ppc/memcalls.h,
+    sdk/tests/memcalls_test.cpp), tools/vec_unaligned_stores.py (stvlx / stvrx as a few stores instead of byte
+    loops; sdk/include/rex/ppc/vec_unaligned.h, sdk/tests/vec_unaligned_test.cpp);
+  - tools/ro_constants_cfg.py (2026-10-16): the read-only constants over the control-flow graph (after a label);
+  - tools/localize_native.py --list: the localized native copies of the hot functions of
+    app/src/cpu/hot/localized.txt, into app/generated/hot (app/src/cpu/banjo_hot_guest.cpp includes them);
+  - tools/store_cards.py (2026-10-19): every guest store outside the stack also marks its 4 KB page's store card, last
+    of all (Renut proves its cached vertex and index copies by the cards; REX_STORE_CARDS_OFF compiles them out);
+  - app/generated/codegen_flavor.txt (the build's name in the "[enhancements]" log line).
 
-Every step is idempotent and the whole sequence is too: a second run of this script on a processed tree changes no
-file (checked on a copy: tools/scratch_ab.py copy, then this script twice with --gen out/gen_scratch and a hash of the
-tree after each run; the profile of a PGO build fits only the exact
-text it was made from).
+ro_constants.py and the entry modes of flush_mode_flow.py need the generator's image dump, out/renut_image.bin: the
+generator writes it when REXGLUE_DUMP_IMAGE names it (tools/pc_env.bat sets that for every PC build).
+
+Every step is idempotent, and so is the sequence (a second run on a processed tree changes no file).
 
   python tools/post_codegen.py [--gen <generated folder>]
 """
@@ -51,18 +49,33 @@ import re
 import subprocess
 import sys
 
+
+def gen_file(gen, suffix):
+    """renut-ultimate (2026-11-19, port 186; found by sasrt-nx's sync): the generator names its files after the project
+    (<project>_pch.h, <project>_init.cpp, <project>_recomp.N.cpp): renut_ in the base, a port's own name otherwise."""
+    for name in sorted(os.listdir(gen)):
+        m = re.fullmatch(r'(\w+)_recomp\.\d+\.cpp', name)
+        if m:
+            return os.path.join(gen, m.group(1) + '_' + suffix)
+    return os.path.join(gen, 'renut_' + suffix)
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, 'app')
 GEN = os.path.join(APP, 'generated')
-IMAGE = os.path.join(ROOT, 'out', 'default_image.bin')
-XEX = os.path.join(ROOT, 'assets', 'game_root', 'default.xex')
+IMAGE = os.path.join(ROOT, 'out', 'renut_image.bin')
 PROMOTIONS = os.path.join(APP, 'indirect_promotions.txt')
+# Where a function's address can be written down outside the generated code (a hook, a host call of the original, a
+# named function): the app's and the SDK's sources, and the tomls. NOT config/renut_funcs.toml: it lists every
+# function boundary of the game, which would make every function look hooked.
+HOOK_TOMLS = [APP, os.path.join(APP, 'config', 'renut_hooks.toml'), os.path.join(APP, 'config', 'renut_gpu_funcs.toml'),
+              os.path.join(APP, 'config', 'renut_crt.toml')]
 
 
 def run(*args):
     result = subprocess.run([sys.executable, *args], cwd=ROOT)
     if result.returncode != 0:
-        sys.exit(f'post_codegen: {" ".join(os.path.basename(a) for a in args[:1])} failed ({result.returncode})')
+        sys.exit(f'post_codegen: {os.path.basename(args[0])} failed ({result.returncode})')
 
 
 def tool(name):
@@ -71,125 +84,205 @@ def tool(name):
 
 def main():
     gen = sys.argv[sys.argv.index('--gen') + 1] if '--gen' in sys.argv else GEN
-    scratch = gen != GEN  # a copy for measurements (tools/scratch_ab.py): no localized copies, no flavour file
-    flavor_toml = open(os.path.join(APP, 'codegen_flavor.toml'), encoding='utf-8').read()
-    optimised = re.search(r'^\s*[a-z_]+\s*=\s*true', flavor_toml, re.M) is not None
-    flavor = 'optimised' if optimised else 'classic'
-    trees = [t for t in ('default', 'data_dll') if os.path.isdir(os.path.join(gen, t))]
-    if optimised:
-        if not os.path.isfile(IMAGE):
-            sys.exit('post_codegen: out/default_image.bin is missing (the image dump of the code generator): run '
-                     'tools\\codegen.ps1 -Flavor optimised once, it writes it (REXGLUE_DUMP_IMAGE)')
-        xex = os.path.join(ROOT, 'assets', 'game_root', 'default.xex')
-        if os.path.isfile(xex) and os.path.getmtime(xex) > os.path.getmtime(IMAGE):
-            sys.exit('post_codegen: out/default_image.bin is older than assets/game_root/default.xex: run '
-                     'tools\\codegen.ps1 -Flavor optimised (it writes the dump again)')
-        # banjo-nx's late rewrites out first (they change statements the analyses parse); nothing on a fresh codegen.
-        game = os.path.join(gen, 'default')
-        proofs = os.path.join(ROOT, 'out', 'codegen_proofs')
-        # sa2-nx (2026-10-20): the store cards were the last step: out first, on both trees and the localized copies.
-        for tree in trees:
-            run(tool('store_cards.py'), '--gen', os.path.join(gen, tree), '--hot', os.path.join(gen, 'hot'), '--restore')
-        run(tool('inline_leaves.py'), '--gen', game, '--restore')
-        run(tool('vsel_neon.py'), '--gen', game, '--restore')
-        run(tool('lr_preserve.py'), '--gen', game, '--out', proofs, '--restore')
-        run(tool('flush_hoist.py'), '--gen', game, '--restore')
-        # And the round's other rewrites (peggle2-nx's round_restore.py): the base steps decided differently on their
-        # forms on a second run (loop barriers, flush proofs, read-only constants), and a PGO profile fits only the
-        # exact text it was made from. Two runs now give identical files.
-        run(tool('round_restore.py'), '--gen', game)
-        run(tool('pch_no_volatile.py'), *[os.path.join(gen, t, 'sa2_pch.h') for t in trees])
-        os.environ.setdefault('REXSDK_DIR', os.path.join(ROOT, 'sdk'))
-        # Second round: the tagged and promoted indirect calls. Before direct_calls.py (a promoted call is a direct
-        # call like any other: __imp__ where its target has no hook) and BEFORE loop_barriers.py: a loop needs no
-        # barrier when every way round it passes an indirect call, and a promoted call is no longer one (the
-        # compiler can inline its target and see that it leaves the polled memory alone).
-        run(tool('indirect_calls.py'), '--gen', os.path.join(gen, 'default'), '--promote', PROMOTIONS)
-        # REQUIRED with pch_no_volatile.py: without barriers GCC turns guest polling loops into infinite loops.
-        run(tool('loop_barriers.py'), *[os.path.join(gen, t) for t in trees])
-        run(tool('pch_cold_traps.py'), *[os.path.join(gen, t, 'sa2_pch.h') for t in trees])
-        for tree in trees:
-            # Undo and redo in one pass: a function hooked since the last run (a new native) must be called through
-            # its hook again. --redo writes only the files that change, so the build does not recompile the others.
-            run(tool('direct_calls.py'), '--redo', '--gen', os.path.join(gen, tree))
-        for tree in trees:
-            # sasrt-nx's steps (2026-10-12). After direct_calls.py: the flush-mode proofs depend on which callees are
-            # called directly, and --redo drops proofs from before a function was hooked. They only rename calls to
-            # macros of the generated pch, so the localized copies below are made from the same statements.
-            run(tool('guest_cas.py'), '--gen', os.path.join(gen, tree))
-            # The entry modes (second round) need the image: the game's tree only.
-            run(tool('flush_mode_flow.py'), '--redo', '--gen', os.path.join(gen, tree),
-                *(['--image', IMAGE] if tree == 'default' else []))
-            run(tool('vec_byteswap.py'), '--gen', os.path.join(gen, tree))
-            run(tool('pch_neon_shuffles.py'), os.path.join(gen, tree, 'sa2_pch.h'))
-        # Second round, the rest. ro_constants before float_loads (it folds the integer form of a float load).
-        # --xex: loads of the XEX's import records (kernel variable addresses the loader writes) stay loads (from
-        # futari-nx / peggle2-nx via banjo-nx: 86 such loads were folded in SA2's tree).
-        run(tool('ro_constants.py'), '--gen', os.path.join(gen, 'default'), '--image', IMAGE, '--xex', XEX)
-        for tree in trees:
-            run(tool('float_loads.py'), '--gen', os.path.join(gen, tree))
-            run(tool('frame_traffic.py'), '--gen', os.path.join(gen, tree))
-    if optimised:
-        for tree in trees:
-            # Third round: the ctx registers of call-free loops as locals for the length of the loop. Before the
-            # localized copies, which are made from this text and rename its ctx registers once more.
-            run(tool('loop_locals.py'), '--gen', os.path.join(gen, tree))
-        for tree in trees:
-            # Before banjo-nx's analyses (they read its forms) and the localized copies (localize_native.py reads
-            # both forms).
-            run(tool('leaf_locals.py'), '--gen', os.path.join(gen, tree))
-        # banjo-nx's codegen round, on the game's tree (the stage module calls into it through pointers only, which
-        # the analyses take for address-taken functions).
-        game = os.path.join(gen, 'default')
-        run(tool('vperm_one_source.py'), '--gen', game)
-        # fp_sign_ops: exact while the game never selects round-up / round-down (the "[census] FPSCR rounding mode"
-        # line of sa2_diag_runtime_census counts the guest's choices).
-        run(tool('fp_sign_ops.py'), '--gen', game)
-        run(tool('leaf_dead_stores.py'), '--gen', game, '--image', IMAGE)
-        run(tool('single_floats.py'), '--gen', game)
-        run(tool('inline_memcalls.py'), '--gen', game)
-        run(tool('vec_unaligned_stores.py'), '--gen', game)
-        run(tool('ro_constants_cfg.py'), '--gen', game, '--image', IMAGE, '--xex', XEX)
-        if os.environ.get('SA2_DEAD_DEFS_OFF'):
-            run(tool('dead_ctx_defs.py'), '--gen', game, '--restore-only')
-        elif not os.environ.get('SA2_DEAD_DEFS_HOLD'):  # tools/dead_defs_bisect.py has set the files: leave them
-            run(tool('dead_ctx_defs.py'), '--gen', game, '--image', IMAGE, '--abi-indirect')
-        run(tool('flush_hoist.py'), '--gen', game)
+    scratch = os.path.abspath(gen) != os.path.abspath(GEN)  # a copy for measurements: no flavour file
+    pch = gen_file(gen, 'pch.h')
+    if not os.path.isfile(IMAGE):
+        sys.exit('post_codegen: out/renut_image.bin is missing (the image dump of the code generator): run the PC '
+                 'build through tools\\pc_env.bat, which sets REXGLUE_DUMP_IMAGE, or set it for one codegen run')
+    xex = os.path.join(APP, 'assets', 'default.xex')
+    # banjo-nx (2026-10-29): and the title update's patch next to it (the image is the patched one).
+    xexp = xex + 'p'
+    if os.path.isfile(xexp) and os.path.getmtime(xexp) > os.path.getmtime(IMAGE):
+        sys.exit('post_codegen: out/renut_image.bin is older than app/assets/default.xexp: run the code generator with '
+                 'REXGLUE_DUMP_IMAGE set (tools\\pc_env.bat does) so it writes the dump of the patched image again')
+    if os.path.isfile(xex) and os.path.getmtime(xex) > os.path.getmtime(IMAGE):
+        sys.exit('post_codegen: out/renut_image.bin is older than app/assets/default.xex: run the code generator with '
+                 'REXGLUE_DUMP_IMAGE set (tools\\pc_env.bat does) so it writes the dump again')
+    os.environ.setdefault('REXSDK_DIR', os.path.join(ROOT, 'sdk'))
+    # cpu_aggressive (2026-10-16): the late rewrites below change statements the analyses parse (r1l for ctx.r1,
+    # REX_LR_WRITE_SAME, computed gotos, hoisted checks): on a tree that was processed before they are taken back out
+    # first, so every analysis sees the text it was written for. On a fresh codegen these find nothing.
+    # blur-nx (2026-11-11, CPU batch 1): the DC ZVA pairs come out before the cards (store_cards.py finds a dcbz by its
+    # memset, and tools/localize_native.py knows the memset's store, not REX_DCBZ128).
+    run(tool('vec_dcbz_zva.py'), '--gen', gen, '--restore')
+    # banjo-nx (2026-10-19): the store cards were the last step: out first.
+    run(tool('store_cards.py'), '--gen', gen, '--restore')
+    run(tool('switch_goto.py'), '--gen', gen, '--restore')
+    run(tool('r1_local.py'), '--gen', gen, '--restore')
+    run(tool('lr_preserve.py'), '--gen', gen, '--out', os.path.join(ROOT, 'out', 'cpu_aggressive_proofs'), '--restore')
+    run(tool('flush_hoist.py'), '--gen', gen, '--restore')
+    # Package 27's codegen round: the inline copies of tiny leaves and the hot declarations come out first too (the
+    # analyses read calls by name and functions by their definition line).
+    run(tool('inline_leaves.py'), '--gen', gen, '--restore')
+    run(tool('vsel_neon.py'), '--gen', gen, '--restore')
+    run(tool('hot_layout.py'), '--gen', gen, '--restore')
+    # sasrt-nx (2026-11-12, its idea 2; port 121): the forwarded stack-slot vector loads out too (put back below).
+    run(tool('stack_forward.py'), '--gen', gen, '--restore')
+    # renut-ultimate (2026-11-16, port 144): the negated fused multiply-adds' macro out too (single_floats.py and
+    # fma_single.py read the forms it wraps; put back below).
+    run(tool('fnm_sign.py'), '--gen', gen, '--restore')
+    run(tool('pch_no_volatile.py'), pch)
+    run(tool('indirect_calls.py'), '--gen', gen, '--promote', PROMOTIONS)
+    # REQUIRED with pch_no_volatile.py: without barriers GCC turns guest polling loops into infinite loops.
+    run(tool('loop_barriers.py'), gen)
+    run(tool('pch_cold_traps.py'), pch)
+    # Undo and redo in one pass: a function hooked since the last run (a new native) must be called through its hook
+    # again. --redo writes only the files that change, so the build does not recompile the others.
+    run(tool('direct_calls.py'), '--redo', '--gen', gen)
+    run(tool('guest_cas.py'), '--gen', gen)
+    # blur-nx (2026-11-16, the 15 ms batch, #164 / #165): sync, lwsync and eieio with the PowerPC's orderings (lwsync
+    # `dmb ishld` + `dmb ishst`, eieio `dmb ishst` on AArch64; g_rex_guest_fence_full puts the full fence back).
+    run(tool('guest_fences.py'), '--gen', gen)
+    run(tool('flush_mode_flow.py'), '--redo', '--gen', gen, '--image', IMAGE, '--tomls', *HOOK_TOMLS)
+    run(tool('vec_byteswap.py'), '--gen', gen)
+    run(tool('pch_neon_shuffles.py'), pch)
+    # --xex: loads of the XEX's import records (kernel variable addresses the loader writes) stay loads (from
+    # peggle2-nx, 2026-10-15; found by futari-nx: 77 such loads were folded here).
+    xex = os.path.join(ROOT, 'app', 'assets', 'default.xex')
+    run(tool('ro_constants.py'), '--gen', gen, '--image', IMAGE, *(['--xex', xex] if os.path.isfile(xex) else []))
+    run(tool('float_loads.py'), '--gen', gen)
+    run(tool('frame_traffic.py'), '--gen', gen)
+    run(tool('loop_locals.py'), '--gen', gen)
+    run(tool('leaf_locals.py'), '--gen', gen)
+    # From sasrt-nx's codegen round of 2026-10-14 (each in its own tool, tested in sdk/tests), in its order.
+    run(tool('vperm_one_source.py'), '--gen', gen)
+    # fp_sign_ops: exact while the game never selects round-up / round-down (banjo_diag_runtime_census, 2026-10-14:
+    # 24 guest FPSCR writes to nearest, 10 toward zero, 0 up or down in 345 s to the level).
+    run(tool('fp_sign_ops.py'), '--gen', gen)
+    run(tool('leaf_dead_stores.py'), '--gen', gen, '--image', IMAGE)
+    run(tool('single_floats.py'), '--gen', gen)
+    run(tool('inline_memcalls.py'), '--gen', gen)
+    run(tool('vec_unaligned_stores.py'), '--gen', gen)
+    # blur-nx (2026-11-11): stvewx / stvehx lanes read from the register, not stored to the stack and loaded back (the
+    # A57 cannot forward the wider store; sdk/include/rex/ppc/vec_lane.h, checked on the device by the forms
+    # self-check). Before the localized copies, so they take the same form.
+    run(tool('vec_lane_index.py'), '--gen', gen)
+    # blur-nx (2026-11-11, CPU batch 1; the user: "do all the exact ones", "optimise the hell out of CPU ... in large
+    # batches"): docs/vector-store-ideas.md VS-27, VS-08, VS-25 and docs/vector-ideas-2.md VX-20, VX-21, each exact and
+    # checked by the app's forms self-check on the device. Before the localized copies, so they take the same forms.
+    run(tool('vec_cvt_fixed.py'), '--gen', gen)      # vcfsx / vcfux with a scale: one SCVTF / UCVTF #n
+    run(tool('vec_prefetch_line.py'), '--gen', gen)  # a guest dcbt prefetches the whole 128-byte line
+    run(tool('vec_lvlx_splat.py'), '--gen', gen)     # lvlx + vspltw 0: one 4-byte load (where the lvlx is dead after)
+    run(tool('vec_shift_whole.py'), '--gen', gen)    # vsrw / vsraw as one vector shift; vslw without the dead clamp
+    # banjo-nx (2026-10-16, CPU codegen agent): the read-only constants ro_constants.py could not see because a label
+    # stood between the base register's constant and the load (loop heads): followed over the control-flow graph.
+    run(tool('ro_constants_cfg.py'), '--gen', gen, '--image', IMAGE, *(['--xex', xex] if os.path.isfile(xex) else []))
+    # banjo-nx (2026-10-15): guest register writes no instruction can read, on leaf_dead_stores.py's analysis; before
+    # the localized copies, so each copy is made from the same statements as its function.
+    # On since 2026-10-15 (the eighteenth package), after its crash was found (the parser missed the mid-asm hooks'
+    # conditional gotos and register arguments) and the PC intro route ran clean with the poison build.
+    # BANJO_DEAD_DEFS_OFF=1 takes any earlier run's rewrites back out instead (--restore-only).
+    if os.environ.get('BANJO_DEAD_DEFS_HOLD'):  # tools/dead_defs_bisect.py has set the files: leave them
+        print('post_codegen: dead_ctx_defs.py held (BANJO_DEAD_DEFS_HOLD)')
+    elif os.environ.get('BANJO_DEAD_DEFS_OFF'):
+        run(tool('dead_ctx_defs.py'), '--gen', gen, '--restore-only')
+    else:
+        run(tool('dead_ctx_defs.py'), '--gen', gen, '--image', IMAGE,
+            *([] if os.environ.get('BANJO_DEAD_DEFS_NO_ABI') else ['--abi-indirect']))
+    # cpu_aggressive A: a loop header's flush-mode check in front of the loop (178 loops; the copies below get it too).
+    # Switch back: BANJO_GEN_FLUSH_HOIST=OFF (REX_FLUSH_HOIST_OFF: the original check in the loop again).
+    run(tool('flush_hoist.py'), '--gen', gen)
+    # sasrt-nx (2026-11-11, port 73; its machine-copy idea 43 B3): vupkd3d128 type 0 as one NEON table lookup (before
+    # the copies, so they get it too; REX_VUPKD3D_LANES: the four lane lines).
+    run(tool('vupkd3d_neon.py'), '--gen', gen)
+    # sasrt-nx (2026-11-11, port 72; its machine-copy idea 43 F1-F4): vrsqrtefp, vrefp, vlogefp, vmaddfp and vnmsubfp as
+    # macros (their default is the expression the generator writes; CMake SASRT_VMX_FAST_ESTIMATES / SASRT_VMX_FUSED_MADD,
+    # ON, give the faster AArch64 forms). Before the copies, so they get the macros too.
+    run(tool('vmx_float_macros.py'), '--gen', gen)
+    # blur-nx (2026-11-12, the user: "Please do the fmadds change"): fmadds / fmsubs / fnmadds / fnmsubs rounded once in
+    # single precision, as the Xenon does (sdk/include/rex/ppc/fma_single.h; not bit-exact to the double rounding the
+    # generator wrote; CMake BLUR_FMADDS_SINGLE=OFF gives it back). Before the copies, so they take the same form.
+    run(tool('fma_single.py'), '--gen', gen)
+    # renut-ultimate (2026-11-16, port 144; tw2de_nx's fnmadd / fnmsub fix): the negated fused multiply-adds as
+    # REX_FNEG_FUSED(...), the plain negation by default (the same code); CMake TW2DE_FNMADD_SIGN=ON (off by default)
+    # gives the PowerPC's sign of zero and NaN (sdk/include/rex/ppc/fpu_fma.h). After fma_single.py, before the copies.
+    run(tool('fnm_sign.py'), '--gen', gen)
+    # sasrt-nx (2026-11-12, its docs/cpu-moonshots-1112.md idea 2; port 121): a vector load of a stack slot that four
+    # 4-byte stores of the same block just wrote takes the stored values (the stores stay; REX_STACK_FWD4 checks the
+    # address, REX_STACK_FWD_VERIFY compares with the real load in the hooked builds). Before the copies, so they take
+    # the same form. REX_STACK_FWD_OFF (compile time): the original loads.
+    run(tool('stack_forward.py'), '--gen', gen)
+    # blur-nx (2026-11-13, M-23 of docs/cpu-moonshots-50-1113.md): float_loads.py again, now with the any-mode pairs
+    # (CG-13: the helpers are the plain conversions, so their loads and stores go through the vector unit too), and the
+    # plain single loads the steps above made after its first run (single_floats.py turns proven any-mode loads into
+    # plain ones: 10,239 sites were left in the integer form). After ro_constants_cfg.py and dead_ctx_defs.py, before
+    # the copies (so they take the same forms) and store_cards.py (which marks the new stores' cards). renut-ultimate
+    # (2026-11-13): after port 121's stack_forward.py, which then sees the stores as port 121 measured them.
+    run(tool('float_loads.py'), '--gen', gen, '--any-mode', '--doubles')  # #231: lfd too (2026-11-17)
+    # blur-nx (2026-11-13, docs/cpu-near-exact-50-1113.md, the user's choice of near-exact ideas): the forms a near-exact
+    # switch changes as helpers whose default is the generator's expression (#42: vmaxfp / vminfp as rex::ppc::VMaxFp /
+    # VMinFp, sdk/include/rex/ppc/diet_ops.h). Before the copies, so they take the same forms.
+    run(tool('near_exact.py'), '--gen', gen)
     if not scratch:
-        # sa2-nx (2026-10-28): and the bulk copies with their hook files (src/cpu/sa2_hot_bulk_<N>.cpp compile them).
-        bulk = os.path.join(APP, 'src', 'cpu', 'hot', 'localized_bulk.txt')
-        run(tool('localize_native.py'), '--list', os.path.join(APP, 'src', 'cpu', 'hot', 'localized.txt'),
-            *(['--bulk', bulk] if os.path.exists(bulk) else []))
-    if optimised:
-        game = os.path.join(gen, 'default')
-        proofs = os.path.join(ROOT, 'out', 'codegen_proofs')
-        # Link-register write-backs proven to store the value ctx.lr already holds compile to nothing on the Switch;
-        # the PC build checks every one (REX_LR_WRITE_SAME_CHECK). Strictly, without --assume-indirect: peggle2-nx's
-        # PC check found 1,473 wrong write-backs with it (functions that end through __restgprlr, reached through
-        # pointers or hooks).
-        run(tool('lr_preserve.py'), '--gen', game, '--out', proofs, '--rewrite')
-        run(tool('vsel_neon.py'), '--gen', game)
-        # Last of all: inline copies of the tiny leaves each file calls in another.
-        run(tool('inline_leaves.py'), '--gen', game)
-        # sa2-nx (2026-10-20, banjo-nx's CPU proposal 1): the store cards, after everything else (the inline copies and
-        # the localized copies included): every store outside the stack marks its page for Renut's cached copies
-        # (REX_STORE_CARDS_OFF compiles them out). The localized copies (app/generated/hot) once, with the game's tree.
-        for tree in trees:
-            run(tool('store_cards.py'), '--gen', os.path.join(gen, tree),
-                *(['--hot', os.path.join(gen, 'hot')] if tree == 'default' else ['--hot', '-']))
+        # sasrt-nx (2026-11-12, its calling-convention stages 1-1d; port 121): whole-program liveness with the vector
+        # registers, right before the copies are made from this same text (localize_native.py checks the stamp):
+        # what a real call need not hand over, the vector LiveOut, the scratch vectors dead after an indirect call.
+        run(tool('reg_liveness.py'), '--gen', gen, '--image', IMAGE)
+        # The localized native copies (app/generated/hot, from sa2-nx): made from the text as it stands after every
+        # step above, so each copy matches the function the build compiles. The list is app/src/cpu/hot/localized.txt;
+        # direct_calls.py (above) has already sent the callers of those functions through their hooks.
+        # 2026-10-22: and the bulk list (app/src/cpu/hot/localized_bulk.txt, from the console profiles: tools/switch_hot_bulk.py).
+        run(tool('localize_native.py'), '--list', '--bulk')
+        # cpu_aggressive B: the XAudio limiter's copy computes log10 only where the dB value is read (the recompiled
+        # original stays as it is: the hook's guard compares the two). Switch back: BANJO_HOT_LAZY_LOG10=OFF
+        # (-DBANJO_LAZY_LOG10_ON=0) or the key banjo_cpu_native_sub_82B6A678.
+        run(tool('limiter_lazy_log10.py'), '--hot', os.path.join(gen, 'hot'))
+    # cpu_aggressive C: the script interpreters' jump-table dispatch threaded into each handler (computed gotos, GCC
+    # cross-jumping off for these functions only). Switch back: REX_SWITCH_THREAD_OFF / REX_SWITCH_GOTO_OFF.
+    run(tool('switch_goto.py'), '--gen', gen, '--thread', '--only',
+        'sub_8299D480,sub_829A75E8,sub_8299E2E8,sub_82C3D4E8,sub_829AA068')
+    # cpu_aggressive D: proven link-register write-backs (the value ctx.lr already holds) compile to nothing on the
+    # Switch; REX_LR_WRITE_SAME_CHECK (PC verify) tests every one. Before r1_local.py (its patterns name ctx.r1).
+    proofs = os.path.join(ROOT, 'out', 'cpu_aggressive_proofs')
+    run(tool('lr_preserve.py'), '--gen', gen, '--out', proofs, '--assume-indirect', '--rewrite',
+        '--only-file', os.path.join(APP, 'config', 'lr_write_same_choice.json'))
+    # cpu_aggressive E: r1 as a local mirror in the functions where it compiles cheaper (app/config/r1_local_choice.json),
+    # on the whole-program proof that callees return with r1 unchanged. REX_R1_CHECK (PC verify) tests the assumed
+    # calls, REX_R1_STRICT reloads after them, REX_R1_LOCAL_OFF is the original code.
+    run(tool('r1_preserve.py'), '--gen', gen, '--out', os.path.join(proofs, 'strict'))
+    # blur-nx (2026-11-13, near-exact #9): with BLUR_NX_R1_ASSUME=1 in the environment, the assumed proof also takes a
+    # function as preserving unless its own body fails (r1_preserve.py --near-exact); the strict one stays a proof, so
+    # REX_R1_CHECK (PC) tests every call the assumption covers.
+    run(tool('r1_preserve.py'), '--gen', gen, '--out', os.path.join(proofs, 'assumed'), '--indirect-preserve',
+        *(['--near-exact'] if os.environ.get('BLUR_NX_R1_ASSUME') == '1' else []))
+    run(tool('r1_local.py'), '--gen', gen, '--proof-strict', os.path.join(proofs, 'strict', 'r1_preserve.json'),
+        '--proof-assumed', os.path.join(proofs, 'assumed', 'r1_preserve.json'),
+        '--only-file', os.path.join(APP, 'config', 'r1_local_choice.json'))
+    # Package 27's codegen round (docs/codegen-enhancements.md), last, on the final text: VMX vsel as one NEON bit select
+    # (REX_VSEL_OFF), the console profile's functions declared hot so the linker gathers them (REX_HOT_LAYOUT_OFF), and
+    # inline copies of the tiny leaf functions each file calls in another (REX_INLINE_LEAVES_OFF), the last of all.
+    run(tool('vsel_neon.py'), '--gen', gen)
+    run(tool('hot_layout.py'), '--gen', gen, '--list', os.path.join(APP, 'config', 'hot_functions.txt'))
+    run(tool('inline_leaves.py'), '--gen', gen, '--hot', os.path.join(APP, 'config', 'hot_edges.txt'))
+    # banjo-nx (2026-10-19, CPU proposal 1): the store cards, after everything else (the inline copies included): every
+    # store outside the stack marks its page for Renut's cached vertex and index copies (REX_STORE_CARDS_OFF).
+    run(tool('store_cards.py'), '--gen', gen)
+    # blur-nx (2026-11-11, CPU batch 2, docs/vector-store-ideas.md VS-14): in the copies, one card check per group of
+    # card stores to the same base in a straight stretch (two at its end: the lowest and highest offset's page).
+    run(tool('card_groups.py'), '--gen', gen)
+    # blur-nx (2026-11-11, CPU batch 2, docs/vector-ideas-2.md VX-15 / VX-14): in the copies' f_ bodies only (the o_
+    # bodies stay the guard's reference), two or four broadcast dot products merged by vmrghw / vmrglw as one
+    # pairwise-add tree (sdk/include/rex/ppc/vec_batch2.h).
+    run(tool('vec_dp_merge.py'), '--gen', gen)
+    # blur-nx (2026-11-11, CPU batch 2, docs/vector-ideas-2.md VX-29 / VX-02): in the copies' f_ bodies, vupkd3d128 of a
+    # zero register as 1.0 and vcuxwfp128 / vcsxwfp128 of a known splat as their constants.
+    run(tool('vec_const_fold.py'), '--gen', gen)
+    # blur-nx (2026-11-11, CPU batch 1, docs/vector-store-ideas.md VS-05): a 128-byte dcbzl as two DC ZVA (no read of
+    # the line it zeroes). After store_cards.py, which finds the dcbz by its memset to put the card in front.
+    run(tool('vec_dcbz_zva.py'), '--gen', gen)
+    # blur-nx (2026-11-16, the 15 ms batch, CG-26): the files that write the guest FPSCR keep -ftrapping-math when the
+    # rest gets -fno-trapping-math (a port's CMake option: Blur's BLUR_NO_TRAPPING_MATH); last, on the final text.
+    run(tool('fp_env_files.py'), '--gen', gen)
     if scratch:
-        print(f'post_codegen: {flavor} codegen steps done on {gen}')
+        print(f'post_codegen: optimised codegen steps done on {gen}')
         return
-    # Round 7: the options added since round 6 are named too, so a console log tells the builds apart.
-    extras = [name for key, name in (('non_volatile_as_local', 'non-volatile locals'), ('elide_lr_stores', 'no lr stores'),
-                                     ('fp_moves_modeless', 'modeless fp moves'),
-                                     ('non_argument_as_local', 'non-argument locals'),
-                                     ('fp_mode_lookahead', 'fp mode lookahead'),
-                                     ('fcti_inline', 'second round'))
-              if re.search(r'^\s*' + key + r'\s*=\s*true', flavor_toml, re.M)]
-    # Written only when it changes: the file is a CMake configure dependency (app/CMakeLists.txt), and rewriting it
-    # made every build re-run CMake, rebuild the generator and run the codegen again (2026-10-07).
-    text = f'{flavor} codegen' + (f' ({", ".join(extras)})' if extras else '')
+    config = open(os.path.join(APP, 'renut_config.toml'), encoding='utf-8').read()
+    extras = [name for key, name in (('non_volatile_as_local', 'non-volatile locals'), ('non_argument_as_local', 'non-argument locals'),
+                                     ('fp_mode_lookahead', 'fp mode lookahead'), ('div_inline', 'CPU rounds 1-3'))
+              if re.search(r'^\s*' + key + r'\s*=\s*true', config, re.M)]
+    # Written only when it changes (from sa2-nx): the file is a CMake configure dependency (app/CMakeLists.txt), and
+    # rewriting it made every build re-run CMake, rebuild the generator and run the codegen again.
+    text = 'optimised codegen' + (f' ({", ".join(extras)})' if extras else '')
     path = os.path.join(GEN, 'codegen_flavor.txt')
     try:
         old_text = open(path, encoding='utf-8').read()
@@ -199,14 +292,14 @@ def main():
         with open(path, 'w', encoding='utf-8', newline='\n') as f:
             f.write(text)
     keep_unchanged_times(GEN)
-    print(f'post_codegen: {flavor} codegen steps done')
+    print('post_codegen: optimised codegen steps done')
 
 
 def keep_unchanged_times(gen):
-    """From banjo-nx (2026-10-16): a CMake re-run runs the code generator again, which writes every generated file
-    anew; the steps above then give most of them exactly the text they had. A file whose text is the one of the last
-    run gets its old modification time back, so ninja does not compile it again. The times and hashes of the last
-    run: app/generated/codegen.times.json."""
+    """banjo-nx (2026-10-16): a CMake re-run (any new file under app/src) runs the code generator again, which writes
+    every generated file anew; the steps above then give most of them exactly the text they had. A file whose text is
+    the one of the last run gets its old modification time back, so ninja does not compile it again (a full rebuild of
+    the 213 files is about 20 minutes on the PC). The times and hashes of the last run: app/generated/codegen.times.json."""
     import hashlib
     import json
     record = os.path.join(gen, 'codegen.times.json')
@@ -216,33 +309,41 @@ def keep_unchanged_times(gen):
         old = {}
     new = {}
     kept = 0
-    # The inputs of the generator's build step besides the manifest: never give an output a time older than these
-    # (ninja would then run the step on every build).
-    inputs = [os.path.join(APP, n) for n in ('codegen_flavor.toml', 'overrides.toml', 'overrides_data_dll.toml')]
-    inputs += [XEX] + [os.path.join(ROOT, 'sdk', 'out', 'win-amd64', n) for n in ('rexglue.exe', 'rexgluerd.exe')]
+    # The inputs of the generator's build step besides the manifest (codegen.d, and the generator itself).
+    inputs = [os.path.join(os.path.dirname(gen), 'renut_config.toml'), os.path.join(os.path.dirname(gen), 'assets',
+              'default.xex'), os.path.join(os.path.dirname(gen), 'config', 'renut_funcs.toml'),
+              os.path.join(os.path.dirname(gen), 'config', 'renut_hooks.toml'),
+              os.path.join(os.environ.get('REXSDK_DIR', os.path.join(ROOT, 'sdk')), 'out', 'win-amd64', 'rexglue.exe')]
     floor = max([os.stat(p).st_mtime_ns for p in inputs if os.path.isfile(p)] or [0])
     paths = []
-    for folder in (os.path.join(gen, 'default'), os.path.join(gen, 'data_dll'), os.path.join(gen, 'hot')):
-        if os.path.isdir(folder):
-            paths += [os.path.join(folder, n) for n in sorted(os.listdir(folder)) if n.endswith(('.cpp', '.h', '.inc'))]
+    for folder in (gen, os.path.join(gen, 'hot')):
+        if not os.path.isdir(folder):
+            continue
+        for name in sorted(os.listdir(folder)):
+            if name.endswith(('.cpp', '.h', '.inc')):
+                paths.append(os.path.join(folder, name))
     for path in paths:
-        rel = os.path.relpath(path, gen).replace(os.sep, '/')
-        digest = hashlib.blake2b(open(path, 'rb').read(), digest_size=16).hexdigest()
-        entry = old.get(rel)
-        if entry and entry[0] == digest:
-            when = max(entry[1], floor)
-            os.utime(path, ns=(when, when))
-            kept += 1
-            new[rel] = [digest, when]
-        else:
-            new[rel] = [digest, os.stat(path).st_mtime_ns]
-    # The generator writes its manifest again on every run (the same text); a manifest newer than the outputs kept
-    # above would make every build run the generator again. It gets the time of the oldest output.
-    manifest = os.path.join(APP, 'sa2_manifest.toml')
+        if os.path.isfile(path):
+            rel = os.path.relpath(path, gen).replace(os.sep, '/')
+            digest = hashlib.blake2b(open(path, 'rb').read(), digest_size=16).hexdigest()
+            entry = old.get(rel)
+            if entry and entry[0] == digest:
+                # Never older than an input of the generator's step (a newer generator binary, say): ninja would
+                # then run the step again on every build.
+                when = max(entry[1], floor)
+                os.utime(path, ns=(when, when))
+                kept += 1
+                new[rel] = [digest, when]
+            else:
+                new[rel] = [digest, os.stat(path).st_mtime_ns]
+    # The generator also writes its manifest again on every run (the sdk_version stamp, the same text). It is an input
+    # of its own build step (codegen.d): a manifest newer than the outputs kept above made every build run the
+    # generator again. It gets a time a second before the oldest output (it was read before any of them was written).
+    manifest = os.path.join(os.path.dirname(gen), 'renut_manifest.toml')
     if new and os.path.isfile(manifest):
         oldest = min(os.stat(os.path.join(gen, rel)).st_mtime_ns for rel in new)
         if os.stat(manifest).st_mtime_ns > oldest:
-            os.utime(manifest, ns=(oldest, oldest))
+            os.utime(manifest, ns=(oldest, oldest))  # (an input as old as an output is not newer: ninja keeps it)
     with open(record, 'w', encoding='utf-8') as f:
         json.dump(new, f)
     print(f'post_codegen: {kept} of {len(new)} generated files unchanged since the last run (their old times kept)')

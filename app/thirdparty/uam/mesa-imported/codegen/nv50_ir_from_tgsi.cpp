@@ -2760,7 +2760,10 @@ Converter::handleLOAD(Value *dst0[4])
       // aw4 view of the address window, g_DkAddressWindow4) as one 128-bit load instead of four 32-bit ones, which
       // MemoryOpt does not merge under banjo flag 2 (GlobalOffsetFold). Aligned by construction: the renderer's binding
       // starts on 256 bytes (render/draw.cpp) and the load is element n of 16 bytes. The same words, the same registers.
-      if ((nv50_ir_get_banjo_flags() & 1024) && tgsi.getSrc(0).getFile() == TGSI_FILE_BUFFER && r == 15 && !ind &&
+      // 2026-10-20: and of storage buffer 13 (the fur's skin cache, tools/deko3d_glsl_opt.py pass skinonce: vec4
+      // elements, the renderer's region on 256 bytes).
+      if ((nv50_ir_get_banjo_flags() & 1024) && tgsi.getSrc(0).getFile() == TGSI_FILE_BUFFER && (r == 15 || r == 13) &&
+          !ind &&
           tgsi.getSrc(1).getFile() != TGSI_FILE_IMMEDIATE && !code->bufferAtomics[r] &&
           dst0[0] && dst0[1] && dst0[2] && dst0[3]) {
          bool identity = true;
@@ -2924,6 +2927,24 @@ Converter::handleSTORE()
    switch (tgsi.getDst(0).getFile()) {
    case TGSI_FILE_BUFFER:
    case TGSI_FILE_MEMORY:
+      // banjo-nx (2026-10-20, banjo flag 1024): a whole vec4 to storage buffer 13 (the fur's skin cache,
+      // tools/deko3d_glsl_opt.py pass skinonce) as one 128-bit store instead of four 32-bit ones (MemoryOpt does not
+      // merge global stores under banjo flag 2). Aligned by construction: the renderer's region starts on 256 bytes
+      // (render/draw.cpp) and the store is element n of 16 bytes. The same words in the same places.
+      if ((nv50_ir_get_banjo_flags() & 1024) && tgsi.getDst(0).getFile() == TGSI_FILE_BUFFER && r == 13 && !ind &&
+          tgsi.getSrc(0).getFile() != TGSI_FILE_IMMEDIATE && tgsi.getDst(0).getMask() == 0xF &&
+          !code->bufferAtomics[r]) {
+         // The address last: setIndirect puts it in the first free source, which the data's must not overwrite (as
+         // MemoryOpt::combineSt keeps it after them).
+         Symbol *sym = makeSym(TGSI_FILE_BUFFER, r, -1, 0, 0);
+         Value *addr = fetchSrc(0, 0);
+         Instruction *st = mkStore(OP_STORE, TYPE_B128, sym, NULL, fetchSrc(1, 0));
+         for (c = 1; c < 4; ++c)
+            st->setSrc(c + 1, fetchSrc(1, c));
+         st->setIndirect(0, 0, addr);
+         st->cache = tgsi.getCacheMode();
+         break;
+      }
       for (c = 0; c < 4; ++c) {
          if (!(tgsi.getDst(0).getMask() & (1 << c)))
             continue;

@@ -1,6 +1,6 @@
 /**
  * @file        ppc/diet_ops.h
- * @brief       Codegen "diet" helpers: cheaper but bit-identical lowerings of single PPC instructions.
+ * @brief       Mass Effect "diet" helpers: cheaper but bit-identical lowerings of single PPC instructions.
  *
  * Included from context.h. Each helper reproduces exactly the value the previous generated expression produced
  * (including the upper word of the 64-bit register image), so it can be switched on per option.
@@ -26,6 +26,79 @@ extern "C" volatile unsigned long long g_rex_diet_census[6];
 #else
 #define REX_DIET_CENSUS(k) ((void)0)
 #endif
+// blur-nx (2026-11-13, Blur's docs/cpu-near-exact-50-1113.md): the near-exact ideas' census (PC game code,
+// REX_DIET_CENSUS_ON): how often each rare case that an idea's switch would change happens. Plain lossy counters
+// (app/src/cpu/banjo_codegen_checks.cpp, the "[census] near-exact" line):
+//   0 #1 a signalling NaN at a float copy store (QuietSingleBits)    1 #2 a NaN into a float-to-integer conversion
+//   2 #17 a signed division by zero                                    3 #17 the signed overflow (INT_MIN / -1)
+//   4 #17 an unsigned division by zero                                 5 #41 a float compare with a NaN (unordered)
+//   6 #42 a vector max/min lane where the SSE form and Arm's fmax/fmin differ (a NaN, or +0 against -0)
+//   7 #3 FPSCR writes (mtfsf)   8 #3 ... that change the rounding mode   9 #3 ... that select a mode other than nearest
+//   10 #4 FPSCR reads (mffs)    11 #5 an integer compare that copies XER[SO] = 1    12 #5 an mtxer that sets SO
+//   13 #42 vector max/min executions
+//   16-24 Blur's audio node loop (tools/blur_mix_nx.py): 16 constant gains other than 0 and 1, 17 of them within 1e-7
+//   of 1 (#23), 18 unity gains, 19 ramps, 20 ramps under 1e-6 (#24), 21 constant gains under 2^-16, 22 zero gains,
+//   23 constant gains within 1e-5 of 1, 24 ramps under 2^-16
+//   25 #38 card marks of the generated tree (store_cards.py's REX_CARD), 26 the copies' run marks (banjo_hot_prelude.h)
+//   27 #49 resampling kernel calls (tools/blur_mix_nx.py), 28 of them consuming 256 samples at a ratio other than 1
+//   30 #21 ramps with both ends under 2^-16
+//   31 #43 exp memo hits, 32 its misses (cpu/hot/blur_hand_natives_batch2.h)
+//   33 #66 the copies' run marks on a page Renut reads, 34 of them writing the card (26: the run marks with a run)
+#if defined(REX_DIET_CENSUS_ON) && !defined(__SWITCH__)
+extern "C" volatile unsigned long long g_rex_nx_census[48];
+#define REX_NX_CENSUS(k) (g_rex_nx_census[k] = g_rex_nx_census[k] + 1)
+#define REX_NX_CENSUS_IF(c, k) ((c) ? (void)REX_NX_CENSUS(k) : (void)0)
+#define REX_NX_CENSUS_ON 1
+#else
+#define REX_NX_CENSUS(k) ((void)0)
+#define REX_NX_CENSUS_IF(c, k) ((void)0)
+#endif
+// The switches (Blur's CMake BLUR_NX_*, all OFF by default; OFF is exactly the code before):
+//   REX_NX_SNAN_PASS     #1  a float copy store keeps a signalling NaN's bits (as the Xenon's lfs/stfs pair does)
+//   REX_NX_FCTI_NO_NAN   #2  the float-to-integer conversions without the NaN select (AArch64: fcvtzs gives 0)
+//   REX_NX_DIV_NO_CHECK  #17 the signed divisions without the overflow select (AArch64: sdiv gives INT_MIN)
+//   REX_NX_FCMP_NO_UN    #41 a float compare leaves cr.un 0 (lt/gt/eq are already right for a NaN: all 0)
+//   REX_NX_VMINMAX_FAST  #42 vmaxfp / vminfp as Arm's fmax / fmin (VMaxFp / VMinFp below)
+//   REX_NX_XER_SO_ZERO   #5  integer compares and record forms copy SO = 0 (no overflow-recording form in the code)
+//   REX_NX_RN_ONLY       #3  FPSCR writes leave the rounding mode at round-to-nearest (context.h)
+//   REX_NX_NO_TRAPS      #19 the divide-by-zero traps and twi asserts compiled out (tools/near_exact.py writes their
+//                            test as `REX_NX_TRAPS_ON && (...)`); a hit only logged a warning (the pch's ppc_trap)
+#if defined(REX_NX_NO_TRAPS)
+#define REX_NX_TRAPS_ON 0
+#else
+#define REX_NX_TRAPS_ON 1
+#endif
+// blur-nx (2026-11-12, codegen-ideas-3 CG-13's census): each cold path below also counts the code address it was
+// called from (rex/sys_counters.h CensusDenormalSite): a cold path is exactly a result that one flush mode for all code
+// would change, and the addresses name the game functions (tools/census_sites.py --denormal).
+#if defined(REX_DIET_CENSUS_ON) && !defined(__SWITCH__) && (defined(__clang__) || defined(__GNUC__))
+#include <rex/sys_counters.h>
+#define REX_DIET_SLOW_SITE() ::rex::syscount::CensusDenormalSite(reinterpret_cast<uint64_t>(__builtin_return_address(0)))
+#else
+#define REX_DIET_SLOW_SITE() ((void)0)
+#endif
+
+// blur-nx (2026-11-12, codegen-ideas-3 CG-13, the user: "build CG 13 ... it probably should be off by default"): CMake
+// BLUR_FPCR_ONE_MODE (REX_FPCR_ONE_MODE) runs all guest float code with the flush mode on (rex/ppc/context.h), so the
+// any-mode forms below are the plain operations. NOT bit-exact: the Xenon's scalar FPU keeps denormals (|x| below
+// FLT_MIN / DBL_MIN) where this flushes them to zero; the census above counts how often that happens.
+#if defined(REX_FPCR_ONE_MODE)
+#define REX_ONE_MODE_PLAIN(...) return __VA_ARGS__
+#else
+#define REX_ONE_MODE_PLAIN(...) ((void)0)
+#endif
+
+// sasrt-nx (2026-11-11, port 71): the small helpers (one or a few host instructions) forced inline. Built with -Os, or
+// inside a big function past GCC's growth limits, the compiler kept them out of line: in SASRT's 2026-11-10 NRO the
+// localized copies called them about 33,000 times (CRRegister::compare 21,000, the flush-mode switches 3,800,
+// SingleToDoublePure, QuietSingleBits, fctid, divw), and an out-of-line compare writes the copy's condition-register
+// local through memory. The any-mode and slow helpers stay as they are. REX_NO_FORCED_HELPERS (CMake
+// SASRT_FORCE_INLINE_HELPERS=OFF) gives plain `inline` again.
+#ifndef REX_NO_FORCED_HELPERS
+#define REX_SMALL_HELPER [[gnu::always_inline]] inline
+#else
+#define REX_SMALL_HELPER inline
+#endif
 
 namespace rex::ppc {
 
@@ -34,10 +107,14 @@ namespace rex::ppc {
 /// The old expression was `isnan ? 0x80000000U : v >= INT_MAX ? INT_MAX : simde_mm_cvttsd_si32(v)`, where simde's
 /// portable version returns INT32_MIN for v <= INT32_MIN: that is exactly the saturating AArch64 fcvtzs (positive
 /// overflow -> INT32_MAX, negative overflow -> INT32_MIN); only NaN (fcvtzs gives 0) needs the select.
-inline int64_t fctiwz(double v) noexcept {
+REX_SMALL_HELPER int64_t fctiwz(double v) noexcept {
+  REX_NX_CENSUS_IF(__builtin_isnan(v), 1);
 #if defined(__aarch64__)
   int32_t r;
   asm("fcvtzs %w0, %d1" : "=r"(r) : "w"(v));
+#if defined(REX_NX_FCTI_NO_NAN)
+  return int64_t(r);  // blur-nx (#2): a NaN gives 0, not 0x80000000
+#endif
   return __builtin_isnan(v) ? int64_t(0x80000000U) : int64_t(r);
 #else
   if (__builtin_isnan(v))
@@ -57,9 +134,13 @@ inline int64_t fctiwz(double v) noexcept {
 /// INT64_MIN for exactly v == 2^63 (its test is `>`); the Xbox 360 and the AArch64 build give INT64_MAX there, and
 /// so does this helper: the one input where it differs from the old x86 code.
 inline int64_t fctidz(double v) noexcept {
+  REX_NX_CENSUS_IF(__builtin_isnan(v), 1);
 #if defined(__aarch64__)
   int64_t r;
   asm("fcvtzs %x0, %d1" : "=r"(r) : "w"(v));
+#if defined(REX_NX_FCTI_NO_NAN)
+  return r;  // blur-nx (#2)
+#endif
   return __builtin_isnan(v) ? INT64_MIN : r;
 #else
   if (__builtin_isnan(v))
@@ -77,9 +158,12 @@ inline int64_t fctidz(double v) noexcept {
 /// 360). On AArch64 simde's portable version is `(int64_t)round(v)`: halves AWAY from zero (0.5 -> 1, 2.5 -> 3) in
 /// every mode, where the 360 and x86 give 0 and 2. `frinti` (to an integral double in the current mode, no inexact
 /// flag) and the saturating `fcvtzs` round as the 360 does: the helper CORRECTS that build.
-inline int64_t fctid(double v) noexcept {
+REX_SMALL_HELPER int64_t fctid(double v) noexcept {
+  REX_NX_CENSUS_IF(__builtin_isnan(v), 1);
+#if !(defined(REX_NX_FCTI_NO_NAN) && defined(__aarch64__))  // blur-nx (#2): frinti / fcvtzs give 0 for a NaN
   if (__builtin_isnan(v)) [[unlikely]]
     return INT64_MIN;
+#endif
 #if defined(__aarch64__)
   double integral;
   asm("frinti %d0, %d1" : "=w"(integral) : "w"(v));
@@ -97,8 +181,11 @@ inline int64_t fctid(double v) noexcept {
 /// everything else sign extended). Old: `isnan ? 0x80000000U : v >= INT_MAX ? INT_MAX : simde_mm_cvtsd_si32(v)`;
 /// on x86 this is that expression, on AArch64 the halves are corrected as for fctid.
 inline int64_t fctiw(double v) noexcept {
+  REX_NX_CENSUS_IF(__builtin_isnan(v), 1);
+#if !(defined(REX_NX_FCTI_NO_NAN) && defined(__aarch64__))  // blur-nx (#2)
   if (__builtin_isnan(v)) [[unlikely]]
     return int64_t(0x80000000U);
+#endif
 #if defined(__aarch64__)
   double integral;
   asm("frinti %d0, %d1" : "=w"(integral) : "w"(v));
@@ -118,7 +205,8 @@ inline int64_t fctiw(double v) noexcept {
 /// are the instruction alone and the signed ones add a select for the overflow, which `sdiv` answers with INT_MIN.
 /// The C expression needs its guards (division by zero is undefined there) and the compiler keeps them as a branch.
 /// A divisor known at compile time keeps the C expression: the compiler makes a multiplication of it.
-inline uint32_t divwu(uint32_t n, uint32_t d) noexcept {
+REX_SMALL_HELPER uint32_t divwu(uint32_t n, uint32_t d) noexcept {
+  REX_NX_CENSUS_IF(d == 0, 4);
 #if defined(__aarch64__)
   if (!__builtin_constant_p(d)) {
     uint32_t q;
@@ -128,7 +216,8 @@ inline uint32_t divwu(uint32_t n, uint32_t d) noexcept {
 #endif
   return d ? n / d : 0;
 }
-inline uint64_t divdu(uint64_t n, uint64_t d) noexcept {
+REX_SMALL_HELPER uint64_t divdu(uint64_t n, uint64_t d) noexcept {
+  REX_NX_CENSUS_IF(d == 0, 4);
 #if defined(__aarch64__)
   if (!__builtin_constant_p(d)) {
     uint64_t q;
@@ -139,21 +228,31 @@ inline uint64_t divdu(uint64_t n, uint64_t d) noexcept {
   return d ? n / d : 0;
 }
 /// The result as the zero-extended word the old expression assigned to the 64-bit register.
-inline uint32_t divw(int32_t n, int32_t d) noexcept {
+REX_SMALL_HELPER uint32_t divw(int32_t n, int32_t d) noexcept {
+  REX_NX_CENSUS_IF(d == 0, 2);
+  REX_NX_CENSUS_IF(n == INT32_MIN && d == -1, 3);
 #if defined(__aarch64__)
   if (!__builtin_constant_p(d)) {
     int32_t q;
     asm("sdiv %w0, %w1, %w2" : "=r"(q) : "r"(n), "r"(d));
+#if defined(REX_NX_DIV_NO_CHECK)
+    return uint32_t(q);  // blur-nx (#17): INT_MIN / -1 gives INT_MIN, not 0
+#endif
     return uint32_t((n == INT32_MIN && d == -1) ? 0 : q);
   }
 #endif
   return uint32_t((d && !(n == INT32_MIN && d == -1)) ? n / d : 0);
 }
-inline int64_t divd(int64_t n, int64_t d) noexcept {
+REX_SMALL_HELPER int64_t divd(int64_t n, int64_t d) noexcept {
+  REX_NX_CENSUS_IF(d == 0, 2);
+  REX_NX_CENSUS_IF(n == INT64_MIN && d == -1, 3);
 #if defined(__aarch64__)
   if (!__builtin_constant_p(d)) {
     int64_t q;
     asm("sdiv %x0, %x1, %x2" : "=r"(q) : "r"(n), "r"(d));
+#if defined(REX_NX_DIV_NO_CHECK)
+    return q;  // blur-nx (#17)
+#endif
     return (n == INT64_MIN && d == -1) ? 0 : q;
   }
 #endif
@@ -166,7 +265,7 @@ inline int64_t divd(int64_t n, int64_t d) noexcept {
 /// the mode. Only a denormal single reads differently with the mode on; it is converted with integer arithmetic
 /// (normalise the fraction, rebuild the double), so the function is pure and the compiler removes it when the
 /// register is not read again.
-inline double SingleToDoublePure(uint32_t bits) noexcept {
+REX_SMALL_HELPER double SingleToDoublePure(uint32_t bits) noexcept {
   REX_DIET_CENSUS(4);
   const uint32_t fraction = bits & 0x007FFFFFu;
   if ((bits & 0x7F800000u) == 0 && fraction != 0) [[unlikely]] {
@@ -180,9 +279,62 @@ inline double SingleToDoublePure(uint32_t bits) noexcept {
 
 /// stfs of the value such an lfs loaded: `float(double(single))` with the mode off is the single again, except
 /// that the two conversions quiet a signalling NaN (they set the top fraction bit and keep the rest).
-inline uint32_t QuietSingleBits(uint32_t bits) noexcept {
+REX_SMALL_HELPER uint32_t QuietSingleBits(uint32_t bits) noexcept {
   REX_DIET_CENSUS(5);
+  REX_NX_CENSUS_IF((bits & 0x7FFFFFFFu) > 0x7F800000u && (bits & 0x00400000u) == 0, 0);
+#if defined(REX_NX_SNAN_PASS)
+  return bits;  // blur-nx (#1): the signalling NaN's bits kept, as the Xenon's lfs / stfs pair keeps them
+#endif
   return (bits & 0x7FFFFFFFu) > 0x7F800000u ? (bits | 0x00400000u) : bits;
+}
+
+/// blur-nx (2026-11-13, #42 of Blur's docs/cpu-near-exact-50-1113.md): vmaxfp / vminfp. The generator wrote SSE's
+/// max / min (`a > b ? a : b`, a compare and a select on Arm); tools/near_exact.py makes them these. REX_NX_VMINMAX_FAST:
+/// Arm's fmax / fmin (one instruction), which differ only for a NaN lane (a NaN where SSE gives b; the Xenon's VMX
+/// gives a NaN too) or +0 against -0 (the sign Arm and the Xenon give where SSE gives b's).
+#if defined(REX_NX_CENSUS_ON)
+inline void VMinMaxCensus(simde__m128 a, simde__m128 b, bool max) noexcept {
+  REX_NX_CENSUS(13);
+  float x[4], y[4];
+  simde_mm_storeu_ps(x, a);
+  simde_mm_storeu_ps(y, b);
+  for (int i = 0; i < 4; ++i) {
+    const bool nan = __builtin_isnan(x[i]) || __builtin_isnan(y[i]);
+    const float sse = max ? (x[i] > y[i] ? x[i] : y[i]) : (x[i] < y[i] ? x[i] : y[i]);
+    bool zeros = false;
+    if (x[i] == 0.0f && y[i] == 0.0f) {
+      const bool both_neg = __builtin_signbit(x[i]) && __builtin_signbit(y[i]);
+      const bool any_neg = __builtin_signbit(x[i]) || __builtin_signbit(y[i]);
+      zeros = bool(__builtin_signbit(sse)) != (max ? both_neg : any_neg);
+    }
+    if (nan || zeros) {
+      REX_NX_CENSUS(6);
+      return;
+    }
+  }
+}
+#endif
+
+REX_SMALL_HELPER simde__m128 VMaxFp(simde__m128 a, simde__m128 b) noexcept {
+#if defined(REX_NX_CENSUS_ON)
+  VMinMaxCensus(a, b, true);
+#endif
+#if defined(REX_NX_VMINMAX_FAST) && defined(__aarch64__)
+  return simde__m128_from_neon_f32(vmaxq_f32(simde__m128_to_neon_f32(a), simde__m128_to_neon_f32(b)));
+#else
+  return simde_mm_max_ps(a, b);
+#endif
+}
+
+REX_SMALL_HELPER simde__m128 VMinFp(simde__m128 a, simde__m128 b) noexcept {
+#if defined(REX_NX_CENSUS_ON)
+  VMinMaxCensus(a, b, false);
+#endif
+#if defined(REX_NX_VMINMAX_FAST) && defined(__aarch64__)
+  return simde__m128_from_neon_f32(vminq_f32(simde__m128_to_neon_f32(a), simde__m128_to_neon_f32(b)));
+#else
+  return simde_mm_min_ps(a, b);
+#endif
 }
 
 /// sa2-nx round 7 (codegen option fp_moves_modeless): the lfs/stfs conversions with the IEEE result, i.e. the one
@@ -203,6 +355,7 @@ namespace detail {
 #endif
 
 [[gnu::noinline, gnu::cold]] inline double SingleToDoubleSlow(uint32_t bits) noexcept {
+  REX_DIET_SLOW_SITE();
   using P = rex::platform::FPSCRPlatform;
   const auto saved = P::getcsr();
   P::setcsr(decltype(saved)(saved & ~decltype(saved)(P::FlushMask)));
@@ -215,6 +368,7 @@ namespace detail {
 }
 
 [[gnu::noinline, gnu::cold]] inline float DoubleToSingleSlow(double d) noexcept {
+  REX_DIET_SLOW_SITE();
   using P = rex::platform::FPSCRPlatform;
   const auto saved = P::getcsr();
   P::setcsr(decltype(saved)(saved & ~decltype(saved)(P::FlushMask)));
@@ -227,6 +381,7 @@ namespace detail {
 // The plain single-precision operations with the mode cleared (the cold paths of the *SingleAnyMode helpers).
 #define REX_DIET_SINGLE_SLOW(NAME, EXPR)                                        \
   [[gnu::noinline, gnu::cold]] inline double NAME(double a, double b) noexcept { \
+    REX_DIET_SLOW_SITE();                                                       \
     using P = rex::platform::FPSCRPlatform;                                     \
     const auto saved = P::getcsr();                                             \
     P::setcsr(decltype(saved)(saved & ~decltype(saved)(P::FlushMask)));         \
@@ -245,6 +400,7 @@ REX_DIET_SINGLE_SLOW(DivSingleSlow, a / b)
 
 template <typename CR>
 [[gnu::noinline, gnu::cold]] inline void CompareSlow(CR& cr, double a, double b) noexcept {
+  REX_DIET_SLOW_SITE();
   using P = rex::platform::FPSCRPlatform;
   const auto saved = P::getcsr();
   P::setcsr(decltype(saved)(saved & ~decltype(saved)(P::FlushMask)));
@@ -259,6 +415,7 @@ template <typename CR>
 /// lfs: the single's bits to the double register value. A denormal single (exponent 0, fraction not 0) takes the
 /// slow path; zero, normal, infinite and NaN inputs convert the same in either mode.
 inline double SingleToDoubleAnyMode(uint32_t bits) noexcept {
+  REX_ONE_MODE_PLAIN(double(std::bit_cast<float>(bits)));
   REX_DIET_CENSUS(0);
   if (uint32_t((bits & 0x7FFFFFFFu) - 1u) < 0x007FFFFFu) [[unlikely]] {
     REX_DIET_CENSUS(3);
@@ -271,6 +428,7 @@ inline double SingleToDoubleAnyMode(uint32_t bits) noexcept {
 /// double) takes the slow path: only there can the result be tiny. From FLT_MIN up, and for zero, infinity and NaN,
 /// neither an input flush nor an output flush can apply, on AArch64 (tininess before rounding) or x86 (after).
 inline float DoubleToSingleAnyMode(double d) noexcept {
+  REX_ONE_MODE_PLAIN(float(d));
   REX_DIET_CENSUS(0);
   const uint64_t a = std::bit_cast<uint64_t>(d) & 0x7FFFFFFFFFFFFFFFull;
   if (a - 1u < 0x3810000000000000ull - 1u) [[unlikely]] {
@@ -293,6 +451,10 @@ inline bool IsDenormalDouble(double d) noexcept {
 /// a denormal double the answer is the same in either mode. Those compare in the cold helper with the mode cleared.
 template <typename CR>
 inline void CompareAnyMode(CR& cr, double a, double b) noexcept {
+#if defined(REX_FPCR_ONE_MODE)
+  cr.compare(a, b);
+  return;
+#endif
   REX_DIET_CENSUS(1);
   if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] {
     REX_DIET_CENSUS(3);
@@ -303,7 +465,23 @@ inline void CompareAnyMode(CR& cr, double a, double b) noexcept {
 }
 
 /// frsp: the stfs conversion followed by the lfs one, each exact in either mode (above).
+/// blur-nx (2026-11-12, CPU batch 3; codegen-ideas-3 CG-16): one range test, not two. When the stfs half takes its fast
+/// path (|d| >= 2^-126 = FLT_MIN, or zero, infinity, NaN) the rounded single is never a denormal (rounding is monotone
+/// and FLT_MIN is a single), so the lfs half's denormal test could only pass on the slow path: only that path keeps it.
+/// The same bits as SingleToDoubleAnyMode(bit_cast(DoubleToSingleAnyMode(d))) for every d (the forms self-check).
 inline double RoundToSingleAnyMode(double d) noexcept {
+  REX_ONE_MODE_PLAIN(double(float(d)));
+  REX_DIET_CENSUS(0);
+  REX_DIET_CENSUS(0);
+  const uint64_t a = std::bit_cast<uint64_t>(d) & 0x7FFFFFFFFFFFFFFFull;
+  if (a - 1u < 0x3810000000000000ull - 1u) [[unlikely]] {
+    REX_DIET_CENSUS(3);
+    return SingleToDoubleAnyMode(std::bit_cast<uint32_t>(detail::DoubleToSingleSlow(d)));
+  }
+  return double(float(d));
+}
+/// The two-test form above it replaced (the forms self-check's reference).
+inline double RoundToSingleAnyModeRef(double d) noexcept {
   return SingleToDoubleAnyMode(std::bit_cast<uint32_t>(DoubleToSingleAnyMode(d)));
 }
 
@@ -319,6 +497,7 @@ inline double RoundToSingleAnyMode(double d) noexcept {
 ///     dividend) and recomputed otherwise;
 ///   - the rounding to single and the widening back: RoundToSingleAnyMode (above).
 inline double AddSingleAnyMode(double a, double b) noexcept {
+  REX_ONE_MODE_PLAIN(double(float(a + b)));
   REX_DIET_CENSUS(2);
   if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] return detail::AddSingleSlow(a, b);
   const double d = a + b;
@@ -326,6 +505,7 @@ inline double AddSingleAnyMode(double a, double b) noexcept {
   return RoundToSingleAnyMode(d);
 }
 inline double SubSingleAnyMode(double a, double b) noexcept {
+  REX_ONE_MODE_PLAIN(double(float(a - b)));
   REX_DIET_CENSUS(2);
   if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] return detail::SubSingleSlow(a, b);
   const double d = a - b;
@@ -333,6 +513,7 @@ inline double SubSingleAnyMode(double a, double b) noexcept {
   return RoundToSingleAnyMode(d);
 }
 inline double MulSingleAnyMode(double a, double b) noexcept {
+  REX_ONE_MODE_PLAIN(double(float(a * b)));
   REX_DIET_CENSUS(2);
   if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] return detail::MulSingleSlow(a, b);
   const double d = a * b;
@@ -340,12 +521,26 @@ inline double MulSingleAnyMode(double a, double b) noexcept {
   return RoundToSingleAnyMode(d);
 }
 inline double DivSingleAnyMode(double a, double b) noexcept {
+  REX_ONE_MODE_PLAIN(double(float(a / b)));
   REX_DIET_CENSUS(2);
   if (IsDenormalDouble(a) || IsDenormalDouble(b)) [[unlikely]] return detail::DivSingleSlow(a, b);
   const double d = a / b;
   if (d == 0.0 && a != 0.0) [[unlikely]] return detail::DivSingleSlow(a, b);
   return RoundToSingleAnyMode(d);
 }
+
+/// blur-nx (2026-11-12, CPU batch 3; codegen-ideas-3 CG-14): the same four operations when tools/single_floats.py has
+/// proven both operands single (each register last written by a single-precision instruction or a load single, on
+/// every path). A widened single is zero, infinite, NaN or at least 2^-149 in magnitude, so it is never a denormal
+/// double; and the double result of +, -, *, / of two of them is zero only when the exact result is zero (a sum or
+/// difference of multiples of 2^-149 is one; a product of two singles is exact in double; a quotient is at least
+/// 2^-277 unless the divisor is infinite, whose zero is exact too), and is never tiny in double. So the operand and the
+/// zero-result tests of the *SingleAnyMode forms can never send these to their cold path: what is left is the
+/// rounding to single (RoundToSingleAnyMode), with the same bits in either flush mode.
+inline double AddSingleKnown(double a, double b) noexcept { return RoundToSingleAnyMode(a + b); }
+inline double SubSingleKnown(double a, double b) noexcept { return RoundToSingleAnyMode(a - b); }
+inline double MulSingleKnown(double a, double b) noexcept { return RoundToSingleAnyMode(a * b); }
+inline double DivSingleKnown(double a, double b) noexcept { return RoundToSingleAnyMode(a / b); }
 
 /// fsel's test, FRA >= 0.0, on the bits: true for both zeros and every positive number and +infinity, false for every
 /// NaN and every negative number, denormals included (which the flush mode would read as -0: true). The same truth

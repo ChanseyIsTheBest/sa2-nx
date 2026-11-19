@@ -291,14 +291,16 @@ getDualIssueClass(const Instruction *insn)
 bool
 TargetGM107::canDualIssue(const Instruction *a, const Instruction *b) const
 {
-   if (!a->canCommuteDefDef(b) || !a->canCommuteDefSrc(b))
-      return false;
-
+   // Port 162 (from fnxf_xiii, its uam patch 10): the classes first (a table lookup), then the operand tests (loops
+   // over defs and sources): the same answer, without the operand work for the pairs the classes already rule out.
    DualIssueClass ac = getDualIssueClass(a);
    DualIssueClass bc = getDualIssueClass(b);
 
    // Dual issue is allowed if the first instruction is ALU, and the second is not
-   return ac == ALU && bc != ALU;
+   if (!(ac == ALU && bc != ALU))
+      return false;
+
+   return a->canCommuteDefDef(b) && a->canCommuteDefSrc(b);
 }
 
 // Return the number of stall counts needed to complete a single instruction.

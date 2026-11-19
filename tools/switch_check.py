@@ -117,6 +117,12 @@ def table_shape(img, bctr):
                 continue
             idx, at = unshift(img, s_reg, x.addr, 2)
             if idx is None:
+                # katamari-nx (2026-11-01): `rlwinm rS, rI, 2, mb, 29` masks the index as it scales it (sub_822DF3B0:
+                # 27, eight entries); the mask is the bound.
+                d = find_def(img, s_reg, x.addr)
+                if d and d.op == 'rlwinm' and d.sh == 2 and d.me == 29 and 0 < d.mb <= 29:
+                    return {'kind': 'absolute', 'table': table, 'index': d.rt, 'index_use': d.addr, 'load': x.addr,
+                            'width': 4, 'mask_bound': 1 << (d.me - d.mb + 1)}
                 return {'kind': 'absolute?', 'table': table, 'load': x.addr}
             return {'kind': 'absolute', 'table': table, 'index': idx, 'index_use': at, 'load': x.addr, 'width': 4}
         return None
@@ -303,10 +309,16 @@ def read_targets(img, shape, n):
 def generated_bctrs(gen):
     """{bctr address: [(function, kind, register, [case targets])]} from the generated code. kind is 'switch' or
     'indirect' (REX_CALL_INDIRECT_FUNC). Addresses come from the labels plus one per instruction comment."""
+    # katamari-nx (2026-11-01): the register diet writes most switches on locals (`switch (r11.u32)`, `l_r10`,
+    # `ll_r9`: 611 of 770), which the `ctx.rN` pattern alone never saw; and loop locals send a case that leaves or
+    # enters a loop through a synthetic label (`loc_F0000001:` REX_LOOP_OUT / REX_LOOP_IN ... `goto loc_X;` or falling into `loc_X:`),
+    # which is followed to its real target and is not an address.
+    switch_re = re.compile(r'\tswitch \((?:ctx\.|l_|ll_)?r(\d+)\.u32\) \{')
     out, starts = {}, set()
     for path in sorted(glob.glob(os.path.join(gen, '*_recomp.*.cpp'))):
         func = addr = None
         lines = open(path, errors='replace').read().split('\n')
+        exits = {}
         n = 0
         while n < len(lines):
             line = lines[n]
@@ -314,6 +326,19 @@ def generated_bctrs(gen):
             if m:
                 func = addr = int(m.group(1), 16)
                 starts.add(func)
+                # This function's synthetic loop exits, up to its closing brace.
+                exits = {}
+                k = n + 1
+                while k < len(lines) and not lines[k].startswith('}'):
+                    em = re.match(r'^loc_(F[0-9A-F]{7}):', lines[k])
+                    if em:
+                        j = k + 1
+                        while j < len(lines) and lines[j].startswith(('\tREX_LOOP_OUT', '\tREX_LOOP_IN')):
+                            j += 1
+                        tm = re.match(r'^\tgoto loc_([0-9A-F]+);', lines[j]) or re.match(r'^loc_([0-9A-F]+):', lines[j])
+                        if tm:
+                            exits[em.group(1)] = tm.group(1)
+                    k += 1
                 n += 1
                 continue
             if func is None:
@@ -325,7 +350,8 @@ def generated_bctrs(gen):
                 continue
             m = re.match(r'^loc_([0-9A-F]+):', line)
             if m:
-                addr = int(m.group(1), 16)
+                if not m.group(1).startswith('F'):
+                    addr = int(m.group(1), 16)
                 n += 1
                 continue
             m = re.match(r'^\t// (\S.*)$', line)
@@ -336,7 +362,7 @@ def generated_bctrs(gen):
                     n += 1
                     while n < len(lines) and lines[n].strip() == '':
                         n += 1
-                    sm = re.match(r'\tswitch \(ctx\.r(\d+)\.u32\) \{', lines[n])
+                    sm = switch_re.match(lines[n])
                     if sm:
                         reg, cases, cur = int(sm.group(1)), [], None
                         n += 1
@@ -350,12 +376,15 @@ def generated_bctrs(gen):
                                 t = re.search(r'goto loc_([0-9A-F]+);', lines[n]) or \
                                     re.search(r'\b(?:sub|__imp__sub)_([0-9A-F]+)\(ctx, base\);', lines[n])
                                 if t and cases[cur] is None:
-                                    cases[cur] = int(t.group(1), 16)
+                                    label = t.group(1)
+                                    for _ in range(4):
+                                        label = exits.get(label, label)
+                                    cases[cur] = int(label, 16)
                                 elif 'jump to null value' in lines[n] and cases[cur] is None:
                                     cases[cur] = 0
                             n += 1
                         out.setdefault(here, []).append((func, 'switch', reg, cases))
-                    elif 'REX_CALL_INDIRECT_FUNC' in '\n'.join(lines[n:n + 3]):
+                    elif 'REX_CALL_INDIRECT_FUNC' in '\n'.join(lines[n:n + 12]):  # after the saved registers
                         out.setdefault(here, []).append((func, 'indirect', None, []))
                     continue
             n += 1
@@ -367,7 +396,7 @@ def main():
     ap.add_argument('--image', default=os.path.join(ROOT, 'out', 'default_image.bin'))
     ap.add_argument('--base', default='0x82000000', help='image base (hex)')
     ap.add_argument('--gen', default=os.path.join(ROOT, 'app', 'generated', 'default'))
-    ap.add_argument('--code', default='82120000:82970600', help='code range lo:hi (hex)')
+    ap.add_argument('--code', default='82140000:828AF6A8', help='code range lo:hi (hex)')
     ap.add_argument('--toml', help='write [[switch_tables]] entries for the tables to fix here')
     ap.add_argument('-v', '--verbose', action='store_true', help='also list the tables with extra cases')
     a = ap.parse_args()
@@ -378,7 +407,7 @@ def main():
 
     stats = {}
     fixes, report = [], {'truncated': [], 'wrong targets': [], 'missed': [], 'extra': [], 'no bound': [],
-                         'not generated': [], 'odd shape': []}
+                         'not generated': [], 'odd shape': [], 'rewritten index': [], 'pointer tables': []}
     for bctr in range(lo, hi, 4):
         if img.word(bctr) != 0x4E800420:
             continue
@@ -393,10 +422,20 @@ def main():
         # The index register must still hold the index at the bctr (the switch reads it there).
         for k in range(shape['index_use'] + 4, bctr, 4):
             if shape['index'] in ins_at(img, k).writes:
-                report['odd shape'].append((bctr, dict(shape, why='index register rewritten'), gen.get(bctr)))
+                # katamari-nx (2026-11-01): a call through a table of function pointers, the index register reused
+                # for the loaded pointer (lwzx r11,r11,r10). A switch the generator wrote here tests some register
+                # that does not hold the index at the bctr: every call falls to its trap (sub_822AC470, the
+                # supermarket DLC level). Only an indirect call is right.
+                g = gen.get(bctr)
+                if g and any(e[1] == 'switch' for e in g):
+                    report['rewritten index'].append((bctr, shape, g))
+                else:
+                    report['odd shape'].append((bctr, dict(shape, why='index register rewritten'), g))
                 break
         else:
             n, where = bound_of(img, branches, bctr, shape, lo)
+            if n is None and shape.get('mask_bound'):
+                n, where = shape['mask_bound'], shape['index_use']
             if n is None:
                 n = inline_count(img, shape, lo, hi)
                 where = shape['table'] if n else None
@@ -414,6 +453,10 @@ def main():
             for func, kind, reg, cases in g:
                 entry = (bctr, func, shape, n, where, kind, reg, cases, truth)
                 if kind == 'indirect':
+                    if not lo <= shape['table'] < hi and all(t in starts for t in truth):
+                        # A call through a table of function starts in data (indirect_calls): right.
+                        report['pointer tables'].append(entry)
+                        continue
                     report['missed'].append(entry)
                     fixes.append(entry)
                 elif cases[:n] != truth[:len(cases)]:
@@ -439,6 +482,17 @@ def main():
                   f' bound {n} (0x{where:08X}); generated {kind} r{reg} with {len(cases)} cases'
                   + (f', first wrong case {diff[0]}: 0x{cases[diff[0]] or 0:08X} instead of 0x{truth[diff[0]]:08X}'
                      if diff else ''))
+    print(f'switches at a call through a function-pointer table (index register rewritten; every call traps): '
+          f'{len(report["rewritten index"])}')
+    for bctr, shape, g in report['rewritten index']:
+        for func, kind, reg, cases in g:
+            print(f'  sub_{func:08X} bctr 0x{bctr:08X} table 0x{shape["table"]:08X} index r{shape["index"]} (rewritten '
+                  f'at the load 0x{shape["load"]:08X}); generated switch on r{reg} with {len(cases)} cases: '
+                  + ', '.join(f'0x{c or 0:08X}' for c in cases))
+    print(f'calls through a table of function starts in data, generated as indirect calls (right): '
+          f'{len(report["pointer tables"])}')
+    for bctr, func, shape, n, where, kind, reg, cases, truth in report['pointer tables']:
+        print(f'  sub_{func:08X} bctr 0x{bctr:08X} table 0x{shape["table"]:08X}, {n} entries')
     print(f'extra cases (generated more than the bound, never taken): {len(report["extra"])}')
     if a.verbose:
         for bctr, func, shape, n, where, kind, reg, cases, truth in report['extra']:

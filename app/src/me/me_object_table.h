@@ -1,8 +1,8 @@
-// SA2 native renderer: shader object address -> library entry, readable without a lock.
+// Mass Effect native renderer: shader object address -> library entry, readable without a lock.
 //
 // The game thread learns which library entry a Direct3D shader object belongs to (NoteShaderObject) and the ring thread
 // needs it for every draw. The map that holds it (g_entry_of_object) is guarded by a mutex that both threads take; this
-// mirrors it in an open-addressing table of atomics for the ring (sa2_native_fast_pair).
+// mirrors it in an open-addressing table of atomics for the ring (masseffect_native_fast_pair).
 //  * One writer at a time (the caller holds the map's mutex); keys are never removed or moved, a value may be replaced.
 //  * A slot's value is stored before its key is published with release, so a reader that acquires the key sees the value.
 //  * Keys are guest addresses >= 0x40000000, so 0 marks an empty slot.

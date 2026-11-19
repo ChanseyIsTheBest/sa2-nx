@@ -11,10 +11,13 @@ add_library(rexcore OBJECT
     exception_handler.cpp
     filesystem.cpp
     filesystem_wildcard.cpp
+    frame_latency.cpp
     hash.cpp
     logging.cpp
     memory.cpp
     mutex.cpp
+    ppc_exact_log.cpp  # renut-ultimate (2026-11-16, port 144): exact_fp_log / fp_origin_log reports (tw2de_nx)
+    ppc_estimates.cpp  # renut-ultimate (2026-11-16, port 144): the 360's estimate tables (tw2de_nx, Xenia)
     ring_buffer.cpp
     string_buffer.cpp
     threading.cpp

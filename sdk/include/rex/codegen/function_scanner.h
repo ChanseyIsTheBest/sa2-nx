@@ -116,6 +116,11 @@ class FunctionScanner {
     known_switch_tables_ = addresses;
   }
 
+  // katamari-nx (2026-11-01): bctr addresses that are calls through a table of function pointers (indirect_calls
+  // of the config): never a jump table, whatever the code before them looks like. Both detectors read them: this
+  // class's detect_jump_table (late detection at emission) and the free detectJumpTable (block discovery).
+  static void setForcedIndirectCalls(const std::unordered_set<uint32_t>& addresses);
+
   // Set discontinuous function chunks (chunk_addr -> FunctionConfig with parent set)
   void setChunks(const std::unordered_map<uint32_t, FunctionConfig>& chunks) { chunks_ = chunks; }
 

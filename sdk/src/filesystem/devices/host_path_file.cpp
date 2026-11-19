@@ -39,12 +39,12 @@
  * exactly on those 64 KB. The RAM ceiling goes down, not up: 16 windows x 256 KB = 4 MB, against
  * 128 x 64 KB = 8 MB.
  */
-REXCVAR_DEFINE_INT32(sa2_io_window_kb, 256, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_window_kb, 256, "Filesystem",
                      "Read-ahead per file, in KB (0 = off). Read-only data only.");
 
 // How many windows can exist at once. A hard cap so that opening many files does not eat the RAM.
 // 128 was an arbitrary number; in a whole measured session there were never more than 10 live windows.
-REXCVAR_DEFINE_INT32(sa2_io_windows_max, 16, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_windows_max, 16, "Filesystem",
                      "Maximum number of files with read-ahead at the same time.");
 
 /*
@@ -69,11 +69,11 @@ REXCVAR_DEFINE_INT32(sa2_io_windows_max, 16, "Filesystem",
  * loading screens there is no correlation between slow reads and stutters. It is on because it
  * bounds the worst case and fixes short reads, not because a gain is expected.
  */
-REXCVAR_DEFINE_INT32(sa2_io_chunk_mb, 4, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_chunk_mb, 4, "Filesystem",
                      "Splits large direct reads into pieces of this many MB (0 = in a single call).");
 
 /*
- * RAM read cache by blocks (sa2_io_cache_mb, off). The game rereads the same data from the SD
+ * RAM read cache by blocks (masseffect_io_cache_mb, off). The game rereads the same data from the SD
  * every lap.
  *
  * Measured over 5 minutes of play (line `[io] ranges:`):
@@ -113,7 +113,7 @@ REXCVAR_DEFINE_INT32(sa2_io_chunk_mb, 4, "Filesystem",
  *  game crawled.)
  * ================================================================================================
  */
-REXCVAR_DEFINE_INT32(sa2_io_cache_mb, 0, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_cache_mb, 0, "Filesystem",
                      "RAM cache of what was already read from disk, in MB (0 = off). Read-only data "
                      "only. The game rereads the same data over and over.");
 
@@ -128,7 +128,7 @@ REXCVAR_DEFINE_INT32(sa2_io_cache_mb, 0, "Filesystem",
  * blocks for 132 to 140 ms. They are rereads of the zone pack: the game releases the pack on
  * leaving and asks for it again on entering, with the same offset and the same size.
  *
- * Why by range and not by blocks. The block cache above (sa2_io_cache_mb) failed on the console
+ * Why by range and not by blocks. The block cache above (masseffect_io_cache_mb) failed on the console
  * because of the blocks: only 1 % of the offsets the game asks for are aligned to 256 KB, so it
  * brought 365 KB from the SD for every 110 KB requested (x3.3 amplification) and ended up reading
  * more disk than it saved. Storing the exact range (file, offset, bytes) makes the amplification
@@ -172,21 +172,28 @@ REXCVAR_DEFINE_INT32(sa2_io_cache_mb, 0, "Filesystem",
  * Memory: it comes from the host heap (1,024 MB), not from the GPU heap. With ~506 MB for the guest
  * and the thread stacks, 64 MB leaves margin; 128 would not in the pessimistic case.
  */
-REXCVAR_DEFINE_INT32(sa2_io_ranges_mb, 64, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_ranges_mb, 64, "Filesystem",
                      "Cache of reads by exact range, total cap in MB (0 = off). 64 = the measured "
                      "footprint of a session (56.6 MB) without evictions; more buys nothing.");
 
 // Floor, in KB. At 4 MB it left out everything that is reread during a race (0.14-2.0 MB).
-REXCVAR_DEFINE_INT32(sa2_io_ranges_min_kb, 256, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_ranges_min_kb, 256, "Filesystem",
                      "Only reads of this many KB or more are cached. 256 = the point where the simulation "
                      "stops gaining (with 128 evictions go up and hits go down).");
 
 // Compatibility: the old cvar in MB. If a toml sets it to a value > 0, it overrides the KB one.
-REXCVAR_DEFINE_INT32(sa2_io_ranges_min_mb, 0, "Filesystem",
-                     "OBSOLETE (build 131): use sa2_io_ranges_min_kb. If it is > 0 it takes precedence over the KB one.");
+REXCVAR_DEFINE_INT32(masseffect_io_ranges_min_mb, 0, "Filesystem",
+                     "OBSOLETE (build 131): use masseffect_io_ranges_min_kb. If it is > 0 it takes precedence over the KB one.");
+
+// sasrt-nx (2026-11-09 night, the user: "15-20 more memory improvements"; SASRT's docked run mem12: 0 hits in 106
+// lookups over 15 minutes, 61 MB of heap held): with no hit once this many MB have gone in, the cache empties and stops
+// (the game reads from the SD as it would without it).
+REXCVAR_DEFINE_INT32(rex_io_ranges_auto_off_mb, 128, "Filesystem",
+                     "The range cache switches itself off (and frees its memory) when this many MB have gone in without "
+                     "a single hit; 0 never");
 
 // Per-entry ceiling: a single read cannot take more than this out of the total cap.
-REXCVAR_DEFINE_INT32(sa2_io_ranges_max_mb, 12, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_ranges_max_mb, 12, "Filesystem",
                      "No entry of the range cache exceeds this many MB.");
 
 namespace rex::filesystem {
@@ -201,7 +208,7 @@ std::atomic<int64_t> g_live_windows{0};
 // Above this it does not pay off: the request is already large and the window would only add an extra copy.
 constexpr size_t kSubmissionMaxFraction = 4;  // request <= window/4
 
-/* The read cache (see sa2_io_cache_mb). */
+/* The read cache (see masseffect_io_cache_mb). */
 constexpr size_t kBlockCache = 256 * 1024;
 
 struct BlockCache {
@@ -261,7 +268,7 @@ void PruneCache(size_t limit) {
  */
 bool ReadWithCache(FileHandle* fh, uint32_t id, std::span<uint8_t> buffer, size_t byte_offset,
                   size_t* out_bytes_read) {
-  const size_t limit = static_cast<size_t>(REXCVAR_GET(sa2_io_cache_mb)) * 1024u * 1024u;
+  const size_t limit = static_cast<size_t>(REXCVAR_GET(masseffect_io_cache_mb)) * 1024u * 1024u;
   const size_t request = buffer.size();
   if (!limit || !request || !id || g_cache_no_memory) {
     return false;
@@ -297,7 +304,7 @@ bool ReadWithCache(FileHandle* fh, uint32_t id, std::span<uint8_t> buffer, size_
          * truncates large ones). The loop only stops when a piece returns 0 bytes. Without this,
          * half-filled blocks would be cached and the game would get incomplete data.
          */
-        const int32_t chunk_mb = REXCVAR_GET(sa2_io_chunk_mb);
+        const int32_t chunk_mb = REXCVAR_GET(masseffect_io_chunk_mb);
         const size_t chunk = chunk_mb > 0 ? static_cast<size_t>(chunk_mb) * 1024u * 1024u : span;
         while (read < span) {
           size_t n = 0;
@@ -367,7 +374,7 @@ bool ReadWithCache(FileHandle* fh, uint32_t id, std::span<uint8_t> buffer, size_
     REXLOG_INFO("[io] RAM cache: {} blocks ({} MB of {}), {} served from RAM and {} from disk "
                 "({:.1f} % hits); {:.1f} MB delivered, {:.1f} read from the SD, {} blocks "
                 "evicted",
-                g_cache.size(), g_cache_bytes >> 20, REXCVAR_GET(sa2_io_cache_mb), g_cache_hits,
+                g_cache.size(), g_cache_bytes >> 20, REXCVAR_GET(masseffect_io_cache_mb), g_cache_hits,
                 g_cache_failures, laps ? 100.0 * double(g_cache_hits) / double(laps) : 0.0,
                 double(g_cache_bytes_served) / 1048576.0, double(g_cache_bytes_disk) / 1048576.0,
                 g_cache_evicted);
@@ -377,7 +384,7 @@ bool ReadWithCache(FileHandle* fh, uint32_t id, std::span<uint8_t> buffer, size_
 
 /*
  * ================================================================================================
- * The exact-range cache. See sa2_io_ranges_mb above.
+ * The exact-range cache. See masseffect_io_ranges_mb above.
  *
  * The table is a vector and is scanned in full. This is deliberate: it was sized for a 32 MB cap
  * and a 4 MB floor per entry, where at most eight entries fit and the linear search is eight
@@ -401,6 +408,7 @@ std::vector<RangeEntry> g_ranges;
 uint64_t g_ranges_usage = 0;
 uint64_t g_ranges_bytes = 0;
 bool g_ranges_no_memory = false;  // turned itself off for lack of RAM: not retried
+uint64_t g_ranges_stored = 0;     // sasrt-nx (2026-11-09 night): bytes that went in (rex_io_ranges_auto_off_mb)
 
 // Counters. Atomic so the periodic summary can read them without taking the lock.
 std::atomic<uint64_t> g_ranges_hits{0};
@@ -421,21 +429,21 @@ std::atomic<uint64_t> g_sequential_ranges_mb{0};
 std::unordered_map<uint32_t, uint64_t> g_last_ranges_end;
 
 int64_t FloorBytes() {
-  const int64_t old_mb = REXCVAR_GET(sa2_io_ranges_min_mb);
+  const int64_t old_mb = REXCVAR_GET(masseffect_io_ranges_min_mb);
   if (old_mb > 0) {
     return old_mb * 1024 * 1024;  // an old toml sets it: honor it
   }
-  return int64_t(REXCVAR_GET(sa2_io_ranges_min_kb)) * 1024;
+  return int64_t(REXCVAR_GET(masseffect_io_ranges_min_kb)) * 1024;
 }
 
 // Does this read go into the cache? Only the size decides; the constructor already took care of
 // the file being read-only when it gave (or did not give) it an id.
 bool EligibleRange(size_t request) {
-  const int64_t cap = int64_t(REXCVAR_GET(sa2_io_ranges_mb)) * 1024 * 1024;
+  const int64_t cap = int64_t(REXCVAR_GET(masseffect_io_ranges_mb)) * 1024 * 1024;
   if (cap <= 0) {
     return false;
   }
-  const int64_t ceiling = int64_t(REXCVAR_GET(sa2_io_ranges_max_mb)) * 1024 * 1024;
+  const int64_t ceiling = int64_t(REXCVAR_GET(masseffect_io_ranges_max_mb)) * 1024 * 1024;
   if (int64_t(request) < FloorBytes()) {
     g_low_ranges_floor.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -503,6 +511,19 @@ void SaveRange(uint32_t id, uint64_t displacement, uint32_t request, const uint8
     if (g_ranges_no_memory) {
       return;
     }
+    // sasrt-nx (2026-11-09 night, rex_io_ranges_auto_off_mb): useless here: emptied and off (as for lack of RAM)
+    static const uint64_t auto_off = uint64_t(std::max(0, int(REXCVAR_GET(rex_io_ranges_auto_off_mb)))) << 20;
+    if (auto_off && g_ranges_stored >= auto_off && g_ranges_hits.load(std::memory_order_relaxed) == 0) {
+      const uint64_t had = g_ranges_bytes >> 20;
+      g_ranges_no_memory = true;
+      g_ranges.clear();
+      g_ranges_bytes = 0;
+      g_ranges_inputs.store(0, std::memory_order_relaxed);
+      g_ranges_bytes_live.store(0, std::memory_order_relaxed);
+      REXLOG_INFO("[io] range cache: no hit in {} MB stored, switched off ({} MB freed; rex_io_ranges_auto_off_mb)",
+                  g_ranges_stored >> 20, had);
+      return;
+    }
     // The load sweep does not go in. Decided here, before copying the megabytes.
     if (IsSweepAndNote(id, displacement, request)) {
       g_sequential_ranges.fetch_add(1, std::memory_order_relaxed);
@@ -533,7 +554,7 @@ void SaveRange(uint32_t id, uint64_t displacement, uint32_t request, const uint8
     return;
   }
 
-  const size_t cap = size_t(REXCVAR_GET(sa2_io_ranges_mb)) * 1024u * 1024u;
+  const size_t cap = size_t(REXCVAR_GET(masseffect_io_ranges_mb)) * 1024u * 1024u;
   std::lock_guard lock(g_ranges_mutex);
   for (const auto& e : g_ranges) {
     if (e.id == id && e.displacement == displacement && e.request == request) {
@@ -547,6 +568,7 @@ void SaveRange(uint32_t id, uint64_t displacement, uint32_t request, const uint8
   new_entry.data = std::move(copy);
   new_entry.usage = ++g_ranges_usage;
   g_ranges_bytes += bytes;
+  g_ranges_stored += bytes;  // sasrt-nx (2026-11-09 night)
 
   // LRU: evict the oldest until it fits. The entry just added has the highest use count, so it is
   // never the one evicted.
@@ -566,6 +588,27 @@ void SaveRange(uint32_t id, uint64_t displacement, uint32_t request, const uint8
 }
 }  // namespace
 
+uint64_t TrimRangeCache(uint64_t keep_bytes) {  // sasrt-nx (2026-11-09): host_path_file.h
+  std::vector<std::shared_ptr<const std::vector<uint8_t>>> gone;  // freed outside the lock
+  uint64_t freed = 0;
+  {
+    std::lock_guard lock(g_ranges_mutex);
+    while (g_ranges_bytes > keep_bytes && !g_ranges.empty()) {
+      size_t old = 0;
+      for (size_t i = 1; i < g_ranges.size(); ++i)
+        if (g_ranges[i].usage < g_ranges[old].usage) old = i;
+      const uint64_t bytes = g_ranges[old].data ? g_ranges[old].data->size() : 0;
+      g_ranges_bytes -= std::min<uint64_t>(bytes, g_ranges_bytes);
+      freed += bytes;
+      gone.push_back(std::move(g_ranges[old].data));
+      g_ranges.erase(g_ranges.begin() + long(old));
+    }
+    g_ranges_inputs.store(g_ranges.size(), std::memory_order_relaxed);
+    g_ranges_bytes_live.store(g_ranges_bytes, std::memory_order_relaxed);
+  }
+  return freed;
+}
+
 StatsRanges ReadStatsRanges() {
   StatsRanges e;
   e.hits = g_ranges_hits.load(std::memory_order_relaxed);
@@ -580,7 +623,7 @@ StatsRanges ReadStatsRanges() {
   e.sequential = g_sequential_ranges.load(std::memory_order_relaxed);
   e.sequential_bytes = g_sequential_ranges_mb.load(std::memory_order_relaxed);
   e.floor_kb = uint64_t(FloorBytes() / 1024);
-  const int32_t cap = REXCVAR_GET(sa2_io_ranges_mb);
+  const int32_t cap = REXCVAR_GET(masseffect_io_ranges_mb);
   e.cap_mb = cap > 0 ? uint64_t(cap) : 0;
   {
     std::lock_guard lock(g_ranges_mutex);
@@ -605,7 +648,7 @@ HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
     : File(file_access, entry), file_handle_(std::move(file_handle)) {
   // The window is decided once, at open time. Conditions: there is a handle (it is not a directory),
   // the device is read-only, the file was not opened for writing and the cvar allows it.
-  const int32_t kb = REXCVAR_GET(sa2_io_window_kb);
+  const int32_t kb = REXCVAR_GET(masseffect_io_window_kb);
   const bool wants_write =
       (file_access & (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
                       FileAccess::kFileAppendData | FileAccess::kGenericAll)) != 0;
@@ -619,7 +662,7 @@ HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
    * serving a stale copy would mean a corrupt save.
    */
   if (file_handle_ && entry && entry->is_read_only() && !wants_write &&
-      (REXCVAR_GET(sa2_io_cache_mb) > 0 || REXCVAR_GET(sa2_io_ranges_mb) > 0)) {
+      (REXCVAR_GET(masseffect_io_cache_mb) > 0 || REXCVAR_GET(masseffect_io_ranges_mb) > 0)) {
     cache_id_ = IdOfPath(entry->path());
   }
   // Startup trace / preload (startup_trace.cpp): same read-only condition, so saves and profiles
@@ -628,7 +671,7 @@ HostPathFile::HostPathFile(uint32_t file_access, HostPathEntry* entry,
     trace_tag_ = startup_trace::OnOpen(static_cast<HostPathDevice*>(entry->device()), entry->path());
   }
   if (file_handle_ && kb > 0 && entry && entry->is_read_only() && !wants_write) {
-    const int64_t max = REXCVAR_GET(sa2_io_windows_max);
+    const int64_t max = REXCVAR_GET(masseffect_io_windows_max);
     if (g_live_windows.fetch_add(1, std::memory_order_relaxed) < max) {
       window_size_ = static_cast<size_t>(kb) * 1024u;
       active_window_ = true;
@@ -735,7 +778,7 @@ bool HostPathFile::FillWindow(size_t byte_offset, size_t request, std::span<uint
 }
 
 /*
- * The direct read, split into pieces. See sa2_io_chunk_mb above.
+ * The direct read, split into pieces. See masseffect_io_chunk_mb above.
  *
  * It must return exactly the same as a single pread in every case the game can see: success with
  * whatever count results, and X_STATUS_END_OF_FILE only if the first call really fails.
@@ -743,7 +786,7 @@ bool HostPathFile::FillWindow(size_t byte_offset, size_t request, std::span<uint
 X_STATUS HostPathFile::DirectRead(std::span<uint8_t> buffer, size_t byte_offset,
                                    size_t* out_bytes_read) {
   const size_t request = buffer.size();
-  const int32_t chunk_mb = REXCVAR_GET(sa2_io_chunk_mb);
+  const int32_t chunk_mb = REXCVAR_GET(masseffect_io_chunk_mb);
   const size_t chunk = chunk_mb > 0 ? static_cast<size_t>(chunk_mb) * 1024u * 1024u : 0;
 
   if (!chunk || request <= chunk) {
@@ -836,7 +879,7 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
   }
 
   /*
-   * The exact-range cache, before going to disk. See sa2_io_ranges_mb.
+   * The exact-range cache, before going to disk. See masseffect_io_ranges_mb.
    *
    * It is the only thing between the game and the SD for large reads: the zone pack that the game
    * releases on leaving and asks for again on entering, byte for byte, at the same place and with
@@ -856,7 +899,7 @@ X_STATUS HostPathFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
     }
   }
 
-  // The RAM cache, before going to disk. See sa2_io_cache_mb: the game rereads the same data every
+  // The RAM cache, before going to disk. See masseffect_io_cache_mb: the game rereads the same data every
   // lap, and those reads are what make a facade take a while to get its proper texture.
   if (cache_id_ && request) {
     size_t read = 0;

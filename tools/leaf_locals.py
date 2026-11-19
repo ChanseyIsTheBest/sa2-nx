@@ -32,21 +32,76 @@ import re
 import sys
 
 FUNC = re.compile(r'^DEFINE_REX_FUNC\((\w+)\) \{$')
+
+# banjo-nx (2026-10-16, marathon-nx proposal 3): functions whose A57 code is cheaper without these locals, measured on the
+# compiled code by tools/locals_choice.py (app/config/locals_optout.txt, "<loop|leaf> <name>" per line). They keep their
+# ctx registers; a change of the list needs a fresh codegen (the tools never undo a function they already converted).
+OPTOUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'app', 'config', 'locals_optout.txt')
+
+
+def read_optout(kind, path=OPTOUT):
+    names = set()
+    if os.path.isfile(path):
+        for line in open(path, encoding='utf-8'):
+            parts = line.split('#', 1)[0].split()
+            if len(parts) == 2 and parts[0] == kind:
+                names.add(parts[1])
+    return names
+
 REG = re.compile(r'\bctx\.(r\d+|f\d+|v\d+|cr\d|ctr|xer|reserved)\b')
 CALL = re.compile(r'\(ctx, base[,)]|REX_CALL_INDIRECT_|ppc_trap\(|\bctx\s*[,)]')
 RETURN = re.compile(r'\breturn;')
 MARKER = '// rexglue ports: registers as locals in leaf functions with loops (tools/leaf_locals.py)'
+END = '// (end of the macros of tools/leaf_locals.py)\n'
 MACROS = MARKER + '''
 #ifndef REX_LEAF_LOCAL
+#ifndef REX_LOCAL_OF_DEFINED
+#define REX_LOCAL_OF_DEFINED
+// A vector register is never copied into a local: it stays a reference to its register. Why: peggle2-nx first blamed
+// a by-value PPCVRegister local for a console fault on 2026-10-13 (the lvsl row of the XDK's streaming copy never
+// loaded; large textures garbage after their first megabytes) and withdrew that within the hour: the cause was
+// devkitA64 GCC's -mearly-ra, which miscompiled the reference form the same way. With -mearly-ra=none
+// (app/CMakeLists.txt, compile and link lines) both forms are right; the reference form stays because sasrt-nx
+// measured it slightly smaller (-1.0 % / -0.6 % instructions in two vector-heavy files). The other register types
+// are only ever accessed as union members and keep their locals. REX_VECTOR_LOCALS_BY_VALUE gives the by-value form.
+template <typename T> struct RexLocalOf {
+  using local_t = T;
+  static T fresh(T&) noexcept { return T{}; }
+};
+#if !defined(REX_VECTOR_LOCALS_BY_VALUE)
+template <> struct RexLocalOf<PPCVRegister> {
+  using local_t = PPCVRegister&;
+  static PPCVRegister& fresh(PPCVRegister& r) noexcept { return r; }
+};
+#endif  // REX_VECTOR_LOCALS_BY_VALUE
+#endif  // REX_LOCAL_OF_DEFINED
 #if defined(REX_LEAF_LOCALS_OFF)
-#define REX_LEAF_LOCAL(type, name, reg) type& name = ctx.reg
+#define REX_LEAF_LOCAL(T, name, reg) T& name = ctx.reg
 #define REX_LEAF_STORE(name, reg) ((void)0)
 #else
-#define REX_LEAF_LOCAL(type, name, reg) type name = ctx.reg
+#define REX_LEAF_LOCAL(T, name, reg) RexLocalOf<T>::local_t name = ctx.reg
 #define REX_LEAF_STORE(name, reg) ctx.reg = name
-#endif
-#endif
-'''
+#endif  // REX_LEAF_LOCALS_OFF
+#endif  // REX_LEAF_LOCAL
+''' + END
+
+
+def install_macros(text):
+    """The macro block in the pch text: inserted before REX_LOAD_U8, or put in place of an older form of it. None when
+    the pch has no anchor."""
+    if MACROS in text:
+        return text
+    if MARKER in text:
+        start = text.index(MARKER)
+        if END in text[start:]:
+            end = text.index(END, start) + len(END)
+        else:  # the first form of the block ended with its two #endif lines
+            end = text.index('#endif\n#endif\n', start) + len('#endif\n#endif\n')
+        return text[:start] + MACROS + text[end:]
+    anchor = '#define REX_LOAD_U8(x)'
+    if anchor not in text:
+        return None
+    return text.replace(anchor, MACROS + anchor, 1)
 
 
 def type_of(reg):
@@ -74,6 +129,8 @@ def main():
     if not files or len(pchs) != 1:
         sys.exit('ERROR (post-codegen patch): leaf_locals: no *_recomp.N.cpp or no single *_pch.h in %s' % a.gen)
     done = already = skipped = registers = read_only = changed = 0
+    optout = read_optout('leaf')
+    opted_out = 0
     for f in files:
         path = os.path.join(a.gen, f)
         lines = open(path, encoding='utf-8').read().split('\n')
@@ -83,7 +140,8 @@ def main():
         while i < len(lines):
             line = lines[i]
             out.append(line)
-            if not FUNC.match(line):
+            func = FUNC.match(line)
+            if not func:
                 i += 1
                 continue
             j = i + 1
@@ -95,6 +153,10 @@ def main():
             i = j
             if 'REX_LEAF_LOCAL(' in text:
                 already += 1
+                out.extend(body)
+                continue
+            if func.group(1) in optout:
+                opted_out += 1
                 out.extend(body)
                 continue
             regs = sorted({m.group(1) for m in REG.finditer(text)}, key=order)
@@ -142,16 +204,17 @@ def main():
                 open(path, 'w', encoding='utf-8', newline='\n').write('\n'.join(out))
     pch = os.path.join(a.gen, pchs[0])
     text = open(pch, encoding='utf-8').read()
-    if MARKER not in text:
-        anchor = '#define REX_LOAD_U8(x)'
-        if anchor not in text:
-            sys.exit('ERROR (post-codegen patch): leaf_locals: no REX_LOAD_U8 in %s: the generated pch changed' % pch)
+    installed = install_macros(text)
+    if installed is None:
+        sys.exit('ERROR (post-codegen patch): leaf_locals: no REX_LOAD_U8 in %s: the generated pch changed' % pch)
+    if installed != text:
         if not a.check:
-            open(pch, 'w', encoding='utf-8', newline='\n').write(text.replace(anchor, MACROS + anchor, 1))
+            open(pch, 'w', encoding='utf-8', newline='\n').write(installed)
+        print('leaf_locals: the macros in %s were replaced by the current ones' % os.path.basename(pch))
     print('leaf_locals%s: %d leaf functions%s with %d registers as locals (%d of them only read: not written back), '
-          '%d left alone, %d already done; %d files changed' %
+          '%d left alone, %d already done, %d on the opt-out list; %d files changed' %
           (' (check only)' if a.check else '', done, '' if a.all_leaves else ' with loops', registers, read_only,
-           skipped, already, changed))
+           skipped, already, opted_out, changed))
 
 
 if __name__ == '__main__':

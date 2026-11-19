@@ -1,0 +1,6 @@
+# banjo-nx (2026-10-20): pixel shaders the diagnostic banjo_renut_diag_null_ps (constant 912) empties: the fur family
+# (the heaviest blended shells and the HUD portrait), to measure their draws without the pixel work.
+2F36770769087F99
+C92BA80672FB9774
+B3C10F3D80EF61E2
+D40EBF0336F89333

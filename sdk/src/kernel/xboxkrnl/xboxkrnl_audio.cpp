@@ -25,6 +25,7 @@
 #include <rex/sys_counters.h>
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -41,6 +42,18 @@ REXCVAR_DEFINE_INT32(audio_volumemask_sleep_us, 0, "Audio",
                      "frame (not in a poll loop); on Horizon even a 1 us sleep gives the core to another thread for up "
                      "to a scheduler slice and was measured at ~11 % of the mixer thread's wall time. 0 = no sleep; "
                      "1 = the original behaviour");
+
+// blur-nx (2026-11-13, the user: "force the game to stereo"; M-13 of docs/cpu-moonshots-50-1113.md). The value
+// XAudioGetSpeakerConfig gives the title: Xenia's 0x00010001 (analog stereo plus the Dolby Digital bit: the title's
+// audio library then mixes for 5.1, which the port folds to stereo), or 1 (analog stereo alone).
+REXCVAR_DEFINE_INT32(audio_speaker_config, 0x00010001, "Audio",
+                     "The speaker configuration XAudioGetSpeakerConfig reports: 0x00010001 (65537) analog stereo and "
+                     "digital Dolby Digital (Xenia's value; the title mixes 5.1, folded to stereo by the port), 1 analog "
+                     "stereo only (a title that adapts mixes for two speakers); read at each call");
+// blur-nx (2026-11-13): which of the six channels the title's frames carry sound in (the stereo work's census).
+REXCVAR_DEFINE_BOOL(audio_channel_census, false, "Audio",
+                    "Diagnostic: per 10 s, how many submitted render-driver frames carry a non-zero sample in each of "
+                    "the six channels (the log's '[audio] channels' line)");
 
 REXCVAR_DEFINE_INT32(audio_dump_s, 0, "Audio",
                      "Diagnostic: seconds of the audio the game delivers (6 channels, before the "
@@ -185,7 +198,7 @@ namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
 
 u32 XAudioGetSpeakerConfig_entry(mapped_u32 config_ptr) {
-  *config_ptr = 0x00010001;
+  *config_ptr = uint32_t(REXCVAR_GET(audio_speaker_config));  // blur-nx (2026-11-13): was 0x00010001 always
   return X_ERROR_SUCCESS;
 }
 
@@ -264,6 +277,32 @@ u32 XAudioSubmitRenderDriverFrame_entry(mapped_void driver_ptr, mapped_void samp
   // Diagnostics (audio_dump_s): copy of the frame before the driver; nothing else changes.
   DumpFrame(driver_ptr.guest_address() & 0x0000FFFF,
               REX_KERNEL_MEMORY()->TranslateVirtual<const uint8_t*>(samples_ptr.guest_address()));
+  // blur-nx (2026-11-13, audio_channel_census): the frame is 6 channels x 256 big-endian floats, channel by channel.
+  if (static const bool census = REXCVAR_GET(audio_channel_census); census) {
+    static std::mutex census_mutex;
+    static uint64_t frames = 0, with_sound[6] = {};
+    static auto last = std::chrono::steady_clock::now();
+    const auto* words = REX_KERNEL_MEMORY()->TranslateVirtual<const uint32_t*>(samples_ptr.guest_address());
+    std::lock_guard<std::mutex> lock(census_mutex);
+    ++frames;
+    for (int c = 0; c < 6; ++c) {
+      for (int i = 0; i < 256; ++i) {
+        if (words[c * 256 + i] & 0xFFFFFF7Fu) {  // (big-endian: any bit but the sign of +-0)
+          ++with_sound[c];
+          break;
+        }
+      }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last >= std::chrono::seconds(10)) {
+      last = now;
+      REXLOG_INFO("[audio] channels with sound in {} frames (speaker config {:08X}): FL {} FR {} C {} LFE {} RL {} RR {}",
+                  frames, uint32_t(REXCVAR_GET(audio_speaker_config)), with_sound[0], with_sound[1], with_sound[2],
+                  with_sound[3], with_sound[4], with_sound[5]);
+      frames = 0;
+      std::fill(std::begin(with_sound), std::end(with_sound), 0);
+    }
+  }
 
   auto* audio_system =
       static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system());

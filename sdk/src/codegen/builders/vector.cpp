@@ -72,26 +72,118 @@ namespace rex::codegen {
 // Vector Floating Point Arithmetic
 //=============================================================================
 
+// renut-ultimate (2026-11-16, port 144; tw2de_nx's of 2026-11-01): exact_fp: the result through rex::ppc::vmx_exact_nan, the operands named a, b, c in the 360's
+// NaN order (expr uses them).
+static void emit_vec_exact(BuilderContext& ctx, const std::string& expr, const char* a, const char* b,
+                           const char* c) {
+  ctx.println("\t{{");
+  ctx.println("\t\tconst simde__m128 a = simde_mm_load_ps({}.f32);", a);
+  ctx.println("\t\tconst simde__m128 b = simde_mm_load_ps({}.f32);", b);
+  if (c)
+    ctx.println("\t\tconst simde__m128 c = simde_mm_load_ps({}.f32);", c);
+  ctx.println("\t\tsimde_mm_store_ps({}.f32, rex::ppc::vmx_exact_nan({}, a, b, {}, {}));", ctx.v(ctx.insn.operands[0]),
+              expr, c ? "c" : "b", c ? 3 : 2);
+  ctx.println("\t}}");
+}
+
+// exact_fp_log (tw2de_nx 2026-11-01, diagnostic): around the host's code, the operands kept in the 360's NaN order
+// (as emit_vec_exact takes them), then rex::ppc::vmx_check (rex/ppc/fpu_exact.h): a report where the 360's NaN differs.
+namespace {
+class VecExactCheck {
+ public:
+  // cross: the dot products, whose result comes from several lanes of the operands (this host-lane mask: 0xE for
+  // vmsum3fp128, 0xF for vmsum4fp128, rex/ppc/fpu_exact.h vmx_dot3_ps / vmx_dot4_ps): the origin test then wants those
+  // lanes of both operands finite, and there is no exact_fp NaN rule to check. 0: lane by lane.
+  VecExactCheck(BuilderContext& ctx, const char* op, const std::string& a, const std::string& b, const std::string& c,
+                int cross = 0)
+      : ctx_(ctx), op_(op), three_(!c.empty()), cross_(cross), exact_(!cross && ctx.exact_fp_log()),
+        origin_(ctx.fp_origin_log()), on_(exact_ || origin_) {
+    if (!on_)
+      return;
+    ctx_.println("\t{{");
+    ctx_.println("\t\tconst simde__m128 xva = simde_mm_load_ps({}.f32);", a);
+    ctx_.println("\t\tconst simde__m128 xvb = simde_mm_load_ps({}.f32);", b);
+    ctx_.println("\t\tconst simde__m128 xvc = simde_mm_load_ps({}.f32);", three_ ? c : b);
+  }
+  ~VecExactCheck() {
+    if (!on_)
+      return;
+    if (exact_)
+      ctx_.println("\t\trex::ppc::vmx_check(0x{:08X}u, 0x{:08X}u, \"{}\", simde_mm_load_ps({}.f32), xva, xvb, xvc, {});",
+                   ctx_.base, ctx_.fn.base(), op_, ctx_.v(ctx_.insn.operands[0]), three_ ? 3 : 2);
+    if (origin_)
+      ctx_.println("\t\trex::ppc::vmx_origin(0x{:08X}u, 0x{:08X}u, \"{}\", simde_mm_load_ps({}.f32), xva, xvb, xvc, {}, "
+                   "uint32_t(ctx.lr), ctx.r1.u32, base);",
+                   ctx_.base, ctx_.fn.base(), op_, ctx_.v(ctx_.insn.operands[0]), cross_);
+    ctx_.println("\t}}");
+  }
+
+ private:
+  BuilderContext& ctx_;
+  const char* op_;
+  bool three_;
+  int cross_;
+  bool exact_;
+  bool origin_;
+  bool on_;
+};
+}  // namespace
+
 bool build_vaddfp(BuilderContext& ctx) {
+  if (ctx.exact_fp()) {  // port 144 (tw2de_nx's exact_fp): the 360's NaN (rex/ppc/fpu_exact.h)
+    ctx.emit_set_flush_mode(true);
+    emit_vec_exact(ctx, "simde_mm_add_ps(a, b)", ctx.v(ctx.insn.operands[1]).c_str(), ctx.v(ctx.insn.operands[2]).c_str(), nullptr);
+    return true;
+  }
+  VecExactCheck check(ctx, "vaddfp", ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]), std::string());
   ctx.emit_set_flush_mode(true);
   ctx.emit_vec_fp_binary("add");
   return true;
 }
 
 bool build_vsubfp(BuilderContext& ctx) {
+  if (ctx.exact_fp()) {  // port 144 (tw2de_nx's exact_fp): the 360's NaN (rex/ppc/fpu_exact.h)
+    ctx.emit_set_flush_mode(true);
+    emit_vec_exact(ctx, "simde_mm_sub_ps(a, b)", ctx.v(ctx.insn.operands[1]).c_str(), ctx.v(ctx.insn.operands[2]).c_str(), nullptr);
+    return true;
+  }
+  VecExactCheck check(ctx, "vsubfp", ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]), std::string());
   ctx.emit_set_flush_mode(true);
   ctx.emit_vec_fp_binary("sub");
   return true;
 }
 
 bool build_vmulfp128(BuilderContext& ctx) {
+  if (ctx.exact_fp()) {  // port 144 (tw2de_nx's exact_fp): the 360's NaN (rex/ppc/fpu_exact.h)
+    ctx.emit_set_flush_mode(true);
+    emit_vec_exact(ctx, "simde_mm_mul_ps(a, b)", ctx.v(ctx.insn.operands[1]).c_str(), ctx.v(ctx.insn.operands[2]).c_str(), nullptr);
+    return true;
+  }
+  VecExactCheck check(ctx, "vmulfp128", ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]), std::string());
   ctx.emit_set_flush_mode(true);
   ctx.emit_vec_fp_binary("mul");
   return true;
 }
 
 bool build_vmaddfp(BuilderContext& ctx) {
+  if (ctx.exact_fp()) {  // port 144 (tw2de_nx's exact_fp): operands[1] * operands[2] + operands[3]; NaN order
+    // vA, the addend, the other factor (rex/ppc/fpu_exact.h)
+    ctx.emit_set_flush_mode(true);
+    emit_vec_exact(ctx, "rex::ppc::vmx_madd_ps(a, c, b)", ctx.v(ctx.insn.operands[1]).c_str(), ctx.v(ctx.insn.operands[3]).c_str(),
+                   ctx.v(ctx.insn.operands[2]).c_str());
+    return true;
+  }
+  VecExactCheck check(ctx, "vmaddfp", ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[3]), ctx.v(ctx.insn.operands[2]));
   ctx.emit_set_flush_mode(true);
+  if (ctx.config().vmxFusedMadd) {
+    // futari-nx (2026-10-26, vmx_fused_madd): one rounding, as AltiVec's multiply-add (rex/ppc/intrinsics.h).
+    ctx.println(
+        "\tsimde_mm_store_ps({}.f32, rex::ppc::vmx_madd_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32), "
+        "simde_mm_load_ps({}.f32)));",
+        ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]),
+        ctx.v(ctx.insn.operands[3]));
+    return true;
+  }
   ctx.println(
       "\tsimde_mm_store_ps({}.f32, simde_mm_add_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), "
       "simde_mm_load_ps({}.f32)), simde_mm_load_ps({}.f32)));",
@@ -101,8 +193,27 @@ bool build_vmaddfp(BuilderContext& ctx) {
 }
 
 bool build_vnmsubfp(BuilderContext& ctx) {
+  if (ctx.exact_fp()) {  // port 144 (tw2de_nx's exact_fp): operands[1] * operands[2] + operands[3]; NaN order
+    // vA, the addend, the other factor (rex/ppc/fpu_exact.h)
+    ctx.emit_set_flush_mode(true);
+    emit_vec_exact(ctx, "rex::ppc::vmx_nmsub_exact_ps(a, c, b)", ctx.v(ctx.insn.operands[1]).c_str(), ctx.v(ctx.insn.operands[3]).c_str(),
+                   ctx.v(ctx.insn.operands[2]).c_str());
+    return true;
+  }
+  VecExactCheck check(ctx, "vnmsubfp", ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[3]), ctx.v(ctx.insn.operands[2]));
   // vnmsubfp: vD = -(vA * vB - vC) - negation done by XOR with sign bit (0x80000000)
   ctx.emit_set_flush_mode(true);
+  if (ctx.config().vmxFusedMadd) {
+    // futari-nx (2026-10-26, vmx_fused_madd): vA * vB - vC with one rounding, then the same negation.
+    ctx.println(
+        "\tsimde_mm_store_ps({}.f32, simde_mm_xor_ps(rex::ppc::vmx_madd_ps(simde_mm_load_ps({}.f32), "
+        "simde_mm_load_ps({}.f32), simde_mm_xor_ps(simde_mm_load_ps({}.f32), "
+        "simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000))))), "
+        "simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))));",
+        ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]),
+        ctx.v(ctx.insn.operands[3]));
+    return true;
+  }
   ctx.println(
       "\tsimde_mm_store_ps({}.f32, "
       "simde_mm_xor_ps(simde_mm_sub_ps(simde_mm_mul_ps(simde_mm_load_ps({}.f32), "
@@ -113,14 +224,41 @@ bool build_vnmsubfp(BuilderContext& ctx) {
   return true;
 }
 
+// futari-nx (2026-10-26, vmx_exact_minmax): vmaxfp / vminfp with AltiVec's NaN and signed-zero results
+// (rex/ppc/intrinsics.h) instead of x86's maxps / minps.
+static void emit_vmx_minmax(BuilderContext& ctx, const char* helper) {
+  ctx.println("\tsimde_mm_store_ps({}.f32, rex::ppc::{}(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32)));",
+              ctx.v(ctx.insn.operands[0]), helper, ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]));
+}
+
 bool build_vmaxfp(BuilderContext& ctx) {
+  if (ctx.exact_fp()) {  // port 144 (tw2de_nx's exact_fp): the 360's NaN (rex/ppc/fpu_exact.h)
+    ctx.emit_set_flush_mode(true);
+    emit_vec_exact(ctx, "rex::ppc::vmx_max_ps(a, b)", ctx.v(ctx.insn.operands[1]).c_str(), ctx.v(ctx.insn.operands[2]).c_str(), nullptr);
+    return true;
+  }
+  VecExactCheck check(ctx, "vmaxfp", ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]), std::string());
   ctx.emit_set_flush_mode(true);
+  if (ctx.config().vmxExactMinMax) {
+    emit_vmx_minmax(ctx, "vmx_max_ps");
+    return true;
+  }
   ctx.emit_vec_fp_binary("max");
   return true;
 }
 
 bool build_vminfp(BuilderContext& ctx) {
+  if (ctx.exact_fp()) {  // port 144 (tw2de_nx's exact_fp): the 360's NaN (rex/ppc/fpu_exact.h)
+    ctx.emit_set_flush_mode(true);
+    emit_vec_exact(ctx, "rex::ppc::vmx_min_ps(a, b)", ctx.v(ctx.insn.operands[1]).c_str(), ctx.v(ctx.insn.operands[2]).c_str(), nullptr);
+    return true;
+  }
+  VecExactCheck check(ctx, "vminfp", ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]), std::string());
   ctx.emit_set_flush_mode(true);
+  if (ctx.config().vmxExactMinMax) {
+    emit_vmx_minmax(ctx, "vmx_min_ps");
+    return true;
+  }
   ctx.emit_vec_fp_binary("min");
   return true;
 }
@@ -128,6 +266,12 @@ bool build_vminfp(BuilderContext& ctx) {
 bool build_vrefp(BuilderContext& ctx) {
   // TODO: see if we can use rcp safely
   ctx.emit_set_flush_mode(true);
+  // renut-ultimate (2026-11-16, port 144; tw2de_nx's; codegen key vmx_360_estimates, off by default): the 360's own
+  // estimates, bit for bit (rex/ppc/vmx_est360.h: Xenia's console tables; xenia-edge's for vrsqrtefp).
+  if (ctx.config().vmx360Estimates) {
+    ctx.emit_vec_fp_unary_expr("rex::ppc::vmx_re360_ps(simde_mm_load_ps({vA}.f32))");
+    return true;
+  }
   ctx.emit_vec_fp_unary_expr("simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_load_ps({vA}.f32))");
   return true;
 }
@@ -135,12 +279,21 @@ bool build_vrefp(BuilderContext& ctx) {
 bool build_vrsqrtefp(BuilderContext& ctx) {
   // TODO: see if we can use rsqrt safely
   ctx.emit_set_flush_mode(true);
+  if (ctx.config().vmx360Estimates) {  // port 144 (vmx_360_estimates)
+    ctx.emit_vec_fp_unary_expr("rex::ppc::vmx_rsqrte360_ps(simde_mm_load_ps({vA}.f32))");
+    return true;
+  }
   ctx.emit_vec_fp_unary_expr(
       "simde_mm_div_ps(simde_mm_set1_ps(1), simde_mm_sqrt_ps(simde_mm_load_ps({vA}.f32)))");
   return true;
 }
 
 bool build_vexptefp(BuilderContext& ctx) {
+  if (ctx.config().vmx360Estimates) {  // port 144 (vmx_360_estimates)
+    ctx.emit_set_flush_mode(true);
+    ctx.emit_vec_fp_unary_expr("rex::ppc::vmx_expte360_ps(simde_mm_load_ps({vA}.f32))");
+    return true;
+  }
   // SIMD exp2 estimate (~12-bit precision, matching PPC vexptefp spec)
   // Algorithm: exp2(x) = 2^n * poly(f), where n = floor(x), f = x - n
   auto vD = ctx.v(ctx.insn.operands[0]);
@@ -162,10 +315,19 @@ bool build_vexptefp(BuilderContext& ctx) {
   // Construct 2^n by adding n to the IEEE 754 exponent bias and shifting into place
   ctx.println("\t\tsimde__m128i exp_bits = simde_mm_slli_epi32(");
   ctx.println("\t\t\tsimde_mm_add_epi32(simde_mm_cvttps_epi32(n), simde_mm_set1_epi32(127)), 23);");
-  ctx.println(
-      "\t\tsimde_mm_store_ps({}.f32, "
-      "simde_mm_mul_ps(p, simde_mm_castsi128_ps(exp_bits)));",
-      vD);
+  if (ctx.config().vmxExpteRange) {
+    // futari-nx (2026-10-26, vmx_expte_range): the exponent arithmetic above is only right in [-126, 128);
+    // outside it the 360's 0, +inf and quieted NaN (rex/ppc/intrinsics.h).
+    ctx.println(
+        "\t\tsimde_mm_store_ps({}.f32, "
+        "rex::ppc::vmx_expte_range_ps(x, simde_mm_mul_ps(p, simde_mm_castsi128_ps(exp_bits))));",
+        vD);
+  } else {
+    ctx.println(
+        "\t\tsimde_mm_store_ps({}.f32, "
+        "simde_mm_mul_ps(p, simde_mm_castsi128_ps(exp_bits)));",
+        vD);
+  }
   ctx.println("\t}}");
   return true;
 }
@@ -173,6 +335,10 @@ bool build_vexptefp(BuilderContext& ctx) {
 bool build_vlogefp(BuilderContext& ctx) {
   // TODO: vectorize
   ctx.emit_set_flush_mode(true);
+  if (ctx.config().vmx360Estimates) {  // port 144 (vmx_360_estimates)
+    ctx.emit_vec_fp_unary_expr("rex::ppc::vmx_loge360_ps(simde_mm_load_ps({vA}.f32))");
+    return true;
+  }
   for (size_t i = 0; i < 4; i++)
     ctx.println("\t{}.f32[{}] = log2f({}.f32[{}]);", ctx.v(ctx.insn.operands[0]), i,
                 ctx.v(ctx.insn.operands[1]), i);
@@ -183,9 +349,60 @@ bool build_vlogefp(BuilderContext& ctx) {
 // Vector Dot Products
 //=============================================================================
 
+// rexglue-sdk PR #492 (taken 2026-10-26, vmx_dot_overflow_qnan): Xenon's dot products return QNaN where the sum of
+// finite inputs overflows; dpps gives an infinity there (or NaN, when products overflow both ways). The dpps result is
+// kept when it is finite, which is one well-predicted branch on its exponent. Otherwise the sum is redone as Xenia's
+// x64 backend does (DOT_PRODUCT_3/4): float64 products and sums in its order, (x + z) + y or (x + z) + (y + w),
+// rounded to float32; a float32 overflow of that finite sum is QNaN 0x7FC00000, and an infinity or NaN that came from
+// the inputs is kept. Host lanes 3..0 hold the guest's x, y, z, w.
+static void emit_dot_product(BuilderContext& ctx, const char* mask, bool four) {
+  auto vD = ctx.v(ctx.insn.operands[0]);
+  auto vA = ctx.v(ctx.insn.operands[1]);
+  auto vB = ctx.v(ctx.insn.operands[2]);
+  ctx.emit_set_flush_mode(true);
+  ctx.println("\t{{");
+  ctx.println(
+      "\t\tsimde__m128 d = simde_mm_dp_ps(simde_mm_load_ps({}.f32), simde_mm_load_ps({}.f32), "
+      "{});",
+      vA, vB, mask);
+  ctx.println(
+      "\t\tif ((uint32_t(simde_mm_cvtsi128_si32(simde_mm_castps_si128(d))) << 1) >= "
+      "0xFF000000u) [[unlikely]] {{");
+  ctx.println("\t\t\tdouble s = double({0}.f32[3]) * {1}.f32[3] + double({0}.f32[1]) * {1}.f32[1];",
+              vA, vB);
+  if (four) {
+    ctx.println("\t\t\ts += double({0}.f32[2]) * {1}.f32[2] + double({0}.f32[0]) * {1}.f32[0];", vA,
+                vB);
+  } else {
+    ctx.println("\t\t\ts += double({0}.f32[2]) * {1}.f32[2];", vA, vB);
+  }
+  ctx.println("\t\t\tfloat f = float(s);");
+  ctx.println(
+      "\t\t\td = std::isinf(f) && std::isfinite(s) ? "
+      "simde_mm_castsi128_ps(simde_mm_set1_epi32(0x7FC00000)) : simde_mm_set1_ps(f);");
+  ctx.println("\t\t}}");
+  ctx.println("\t\tsimde_mm_store_ps({}.f32, d);", vD);
+  ctx.println("\t}}");
+}
+
 bool build_vmsum3fp128(BuilderContext& ctx) {
+  // port 144 (fp_origin_log): the lanes the dot product reads (host lanes, the mask).
+  VecExactCheck check(ctx, "vmsum3fp128", ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]), std::string(), 0xE);
   // 3-element dot product accounting for guest->host vector element reversal
   // 0xEF = dot(yzw) with result broadcast to all elements (see constants doc)
+  // renut-ultimate (2026-11-16, port 144; tw2de_nx's, from xenia-canary pull request #1342; codegen key vmx_dot_360,
+  // off by default): the console's rounding (float64 sums truncated to single; rex/ppc/vmx_est360.h).
+  if (ctx.config().vmxDot360) {
+    ctx.emit_set_flush_mode(true);
+    ctx.println("\tsimde_mm_store_ps({}.f32, rex::ppc::vmx_dot3_360_ps(simde_mm_load_ps({}.f32), "
+                "simde_mm_load_ps({}.f32)));",
+                ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]));
+    return true;
+  }
+  if (ctx.config().vmxDotOverflowQnan) {
+    emit_dot_product(ctx, "0xEF", false);
+    return true;
+  }
   ctx.emit_set_flush_mode(true);
   ctx.println(
       "\tsimde_mm_store_ps({}.f32, simde_mm_dp_ps(simde_mm_load_ps({}.f32), "
@@ -195,7 +412,22 @@ bool build_vmsum3fp128(BuilderContext& ctx) {
 }
 
 bool build_vmsum4fp128(BuilderContext& ctx) {
+  // port 144 (fp_origin_log): the lanes the dot product reads (host lanes, the mask).
+  VecExactCheck check(ctx, "vmsum4fp128", ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]), std::string(), 0xF);
   // 4-element dot product: 0xFF = all 4 elements, result to all (see constants doc)
+  // renut-ultimate (2026-11-16, port 144; tw2de_nx's, from xenia-canary pull request #1342; codegen key vmx_dot_360,
+  // off by default): the console's rounding (float64 sums truncated to single; rex/ppc/vmx_est360.h).
+  if (ctx.config().vmxDot360) {
+    ctx.emit_set_flush_mode(true);
+    ctx.println("\tsimde_mm_store_ps({}.f32, rex::ppc::vmx_dot4_360_ps(simde_mm_load_ps({}.f32), "
+                "simde_mm_load_ps({}.f32)));",
+                ctx.v(ctx.insn.operands[0]), ctx.v(ctx.insn.operands[1]), ctx.v(ctx.insn.operands[2]));
+    return true;
+  }
+  if (ctx.config().vmxDotOverflowQnan) {
+    emit_dot_product(ctx, "0xFF", true);
+    return true;
+  }
   ctx.emit_set_flush_mode(true);
   ctx.println(
       "\tsimde_mm_store_ps({}.f32, simde_mm_dp_ps(simde_mm_load_ps({}.f32), "
@@ -217,7 +449,10 @@ bool build_vrfim(BuilderContext& ctx) {
 }
 
 bool build_vrfin(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(true);
+  // blur-nx (2026-11-11, docs/vector-ideas-2.md VX-01; the user: "do all the exact ones"): no flush mode. Its result is
+  // the same in both: int -> float gives 0 or a normal number (a scale 2^-n, n <= 31, of a nonzero integer is at least
+  // 2^-31); float -> int truncates a denormal (or its product with 2^n, below 2^-95) to 0 either way; round to nearest
+  // / to zero turns a denormal into the signed zero FZ would have made. (vrfim / vrfip keep it: floor(-denormal) is -1.)
   ctx.emit_vec_fp_unary_expr(
       "simde_mm_round_ps(simde_mm_load_ps({vA}.f32), "
       "SIMDE_MM_FROUND_TO_NEAREST_INT | SIMDE_MM_FROUND_NO_EXC)");
@@ -233,7 +468,10 @@ bool build_vrfip(BuilderContext& ctx) {
 }
 
 bool build_vrfiz(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(true);
+  // blur-nx (2026-11-11, docs/vector-ideas-2.md VX-01; the user: "do all the exact ones"): no flush mode. Its result is
+  // the same in both: int -> float gives 0 or a normal number (a scale 2^-n, n <= 31, of a nonzero integer is at least
+  // 2^-31); float -> int truncates a denormal (or its product with 2^n, below 2^-95) to 0 either way; round to nearest
+  // / to zero turns a denormal into the signed zero FZ would have made. (vrfim / vrfip keep it: floor(-denormal) is -1.)
   ctx.emit_vec_fp_unary_expr(
       "simde_mm_round_ps(simde_mm_load_ps({vA}.f32), "
       "SIMDE_MM_FROUND_TO_ZERO | SIMDE_MM_FROUND_NO_EXC)");
@@ -563,19 +801,23 @@ bool build_vcmpbfp(BuilderContext& ctx) {
   auto vB = ctx.v(ctx.insn.operands[2]);
   auto vD = ctx.v(ctx.insn.operands[0]);
 
+  // futari-nx (2026-10-26, vmx_cmpb_nan): AltiVec defines the bits as NOT(vA <= vB) and NOT(vA >= -vB), so a NaN
+  // operand sets both (out of bounds); cmpgt / cmplt are false for a NaN and set neither. The same for every other
+  // input. cmpnle / cmpnge are those negations (true when unordered), on x86 and through simde on AArch64.
+  const bool nan_bits = ctx.config().vmxCmpbNan;
   // Use v_temp as intermediate storage
   // gt_mask = (vA > vB) & 0x80000000
   ctx.println(
-      "\tsimde_mm_store_ps({}.f32, simde_mm_and_ps(simde_mm_cmpgt_ps(simde_mm_load_ps({}.f32), "
+      "\tsimde_mm_store_ps({}.f32, simde_mm_and_ps(simde_mm_{}_ps(simde_mm_load_ps({}.f32), "
       "simde_mm_load_ps({}.f32)), simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000)))));",
-      ctx.v_temp(), vA, vB);
+      ctx.v_temp(), nan_bits ? "cmpnle" : "cmpgt", vA, vB);
   // lt_neg_mask = (vA < -vB) & 0x40000000
   ctx.println(
-      "\tsimde_mm_store_ps({}.f32, simde_mm_and_ps(simde_mm_cmplt_ps(simde_mm_load_ps({}.f32), "
+      "\tsimde_mm_store_ps({}.f32, simde_mm_and_ps(simde_mm_{}_ps(simde_mm_load_ps({}.f32), "
       "simde_mm_xor_ps(simde_mm_load_ps({}.f32), "
       "simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x80000000))))), "
       "simde_mm_castsi128_ps(simde_mm_set1_epi32(int(0x40000000)))));",
-      vD, vA, vB);
+      vD, nan_bits ? "cmpnge" : "cmplt", vA, vB);
   // result = gt_mask | lt_neg_mask
   ctx.println(
       "\tsimde_mm_store_ps({}.f32, simde_mm_or_ps(simde_mm_load_ps({}.f32), "
@@ -585,6 +827,16 @@ bool build_vcmpbfp(BuilderContext& ctx) {
   // CR6 from vD: movemask_ps only checks bit 31, but lower-bound violations only
   // set bit 30. Shift left by 1 to move bit 30 into bit 31, then OR with original
   // so movemask detects both upper and lower bound violations.
+  // renut-ultimate (2026-11-16, port 144; tw2de_nx's, codegen option vcmpbfp_cr6_exact, off by default): CR6 is only
+  // its eq bit, "every element within its bounds" (vD all zero); lt, gt and so are 0. The mask form below also sets
+  // lt when every element is out of bounds (Xenia's hardware-recorded tests: CR6 = 8 where the hardware gives 0).
+  if (isRecordForm(ctx.insn) && ctx.config().vcmpbfpCr6Exact) {
+    ctx.println(
+        "\t{{ const simde__m128i b = simde_mm_load_si128((simde__m128i*){}.f32); "
+        "{}.set_raw(simde_mm_testz_si128(b, b) ? 2 : 0); }}",
+        vD, ctx.cr(6));
+    return true;
+  }
   if (isRecordForm(ctx.insn))
     ctx.println(
         "\t{}.setFromMask(simde_mm_castsi128_ps(simde_mm_or_si128("
@@ -595,7 +847,9 @@ bool build_vcmpbfp(BuilderContext& ctx) {
 }
 
 bool build_vcmpeqfp(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(true);
+  // blur-nx (2026-11-11, docs/vector-ideas-2.md VX-03): vcmpeqfp v, v, v is the NaN test (a value equals itself
+  // unless it is a NaN; a denormal equals itself whether or not FZ flushed it): no flush mode for it.
+  if (ctx.insn.operands[1] != ctx.insn.operands[2]) ctx.emit_set_flush_mode(true);
   ctx.emit_vec_fp_binary("cmpeq");
   if (isRecordForm(ctx.insn))
     ctx.println("\t{}.setFromMask(simde_mm_load_ps({}.f32), 0xF);", ctx.cr(6),
@@ -727,7 +981,10 @@ bool build_vcmpgtsw(BuilderContext& ctx) {
 //=============================================================================
 
 bool build_vctsxs(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(true);
+  // blur-nx (2026-11-11, docs/vector-ideas-2.md VX-01; the user: "do all the exact ones"): no flush mode. Its result is
+  // the same in both: int -> float gives 0 or a normal number (a scale 2^-n, n <= 31, of a nonzero integer is at least
+  // 2^-31); float -> int truncates a denormal (or its product with 2^n, below 2^-95) to 0 either way; round to nearest
+  // / to zero turns a denormal into the signed zero FZ would have made. (vrfim / vrfip keep it: floor(-denormal) is -1.)
   ctx.print("\tsimde_mm_store_si128((simde__m128i*){}.s32, rex::ppc::simde_mm_vctsxs(",
             ctx.v(ctx.insn.operands[0]));
   if (ctx.insn.operands[2] != 0)
@@ -739,7 +996,10 @@ bool build_vctsxs(BuilderContext& ctx) {
 }
 
 bool build_vcfsx(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(true);
+  // blur-nx (2026-11-11, docs/vector-ideas-2.md VX-01; the user: "do all the exact ones"): no flush mode. Its result is
+  // the same in both: int -> float gives 0 or a normal number (a scale 2^-n, n <= 31, of a nonzero integer is at least
+  // 2^-31); float -> int truncates a denormal (or its product with 2^n, below 2^-95) to 0 either way; round to nearest
+  // / to zero turns a denormal into the signed zero FZ would have made. (vrfim / vrfip keep it: floor(-denormal) is -1.)
   ctx.print("\tsimde_mm_store_ps({}.f32, ", ctx.v(ctx.insn.operands[0]));
   if (ctx.insn.operands[2] != 0) {
     const float value = std::ldexp(1.0f, -static_cast<int32_t>(ctx.insn.operands[2]));
@@ -755,7 +1015,10 @@ bool build_vcfsx(BuilderContext& ctx) {
 }
 
 bool build_vcfux(BuilderContext& ctx) {
-  ctx.emit_set_flush_mode(true);
+  // blur-nx (2026-11-11, docs/vector-ideas-2.md VX-01; the user: "do all the exact ones"): no flush mode. Its result is
+  // the same in both: int -> float gives 0 or a normal number (a scale 2^-n, n <= 31, of a nonzero integer is at least
+  // 2^-31); float -> int truncates a denormal (or its product with 2^n, below 2^-95) to 0 either way; round to nearest
+  // / to zero turns a denormal into the signed zero FZ would have made. (vrfim / vrfip keep it: floor(-denormal) is -1.)
   ctx.print("\tsimde_mm_store_ps({}.f32, ", ctx.v(ctx.insn.operands[0]));
   if (ctx.insn.operands[2] != 0) {
     const float value = std::ldexp(1.0f, -static_cast<int32_t>(ctx.insn.operands[2]));
@@ -773,7 +1036,10 @@ bool build_vcfux(BuilderContext& ctx) {
 
 bool build_vctuxs(BuilderContext& ctx) {
   // Vector Convert To Unsigned Fixed-Point Word Saturate
-  ctx.emit_set_flush_mode(true);
+  // blur-nx (2026-11-11, docs/vector-ideas-2.md VX-01; the user: "do all the exact ones"): no flush mode. Its result is
+  // the same in both: int -> float gives 0 or a normal number (a scale 2^-n, n <= 31, of a nonzero integer is at least
+  // 2^-31); float -> int truncates a denormal (or its product with 2^n, below 2^-95) to 0 either way; round to nearest
+  // / to zero turns a denormal into the signed zero FZ would have made. (vrfim / vrfip keep it: floor(-denormal) is -1.)
   ctx.print("\tsimde_mm_store_si128((simde__m128i*){}.u32, rex::ppc::simde_mm_vctuxs(",
             ctx.v(ctx.insn.operands[0]));
   if (ctx.insn.operands[2] != 0)
@@ -1098,14 +1364,16 @@ bool build_vpkuhus(BuilderContext& ctx) {
   // NOTE(tomc): _mm_packus_epi16 treats inputs as signed, so we need custom saturation for
   // unsigned. Unsigned halfwords >= 0x8000 would be interpreted as negative and clamped to 0
   // instead of 0xFF.
+  // rr6-nx (2026-11-02, from the Pac-Man port's report): built in v_temp and copied at the end. The destination may also be a
+  // source (vpkuwus128 v63,v63,v62), and writing it piece by piece overwrote source values before they were read.
   for (size_t i = 0; i < 8; i++) {
-    ctx.println("\t{}.u8[{}] = {}.u16[{}] > 0xFF ? 0xFF : (uint8_t){}.u16[{}];",
-                ctx.v(ctx.insn.operands[0]), 15 - i, ctx.v(ctx.insn.operands[1]), 7 - i,
-                ctx.v(ctx.insn.operands[1]), 7 - i);
-    ctx.println("\t{}.u8[{}] = {}.u16[{}] > 0xFF ? 0xFF : (uint8_t){}.u16[{}];",
-                ctx.v(ctx.insn.operands[0]), 7 - i, ctx.v(ctx.insn.operands[2]), 7 - i,
-                ctx.v(ctx.insn.operands[2]), 7 - i);
+    ctx.println("\t{}.u8[{}] = {}.u16[{}] > 0xFF ? 0xFF : (uint8_t){}.u16[{}];", ctx.v_temp(), 15 - i,
+                ctx.v(ctx.insn.operands[1]), 7 - i, ctx.v(ctx.insn.operands[1]), 7 - i);
+    ctx.println("\t{}.u8[{}] = {}.u16[{}] > 0xFF ? 0xFF : (uint8_t){}.u16[{}];", ctx.v_temp(), 7 - i,
+                ctx.v(ctx.insn.operands[2]), 7 - i, ctx.v(ctx.insn.operands[2]), 7 - i);
   }
+  ctx.println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_load_si128((simde__m128i*){}.u8));",
+              ctx.v(ctx.insn.operands[0]), ctx.v_temp());
   return true;
 }
 
@@ -1126,14 +1394,15 @@ bool build_vpkuwus(BuilderContext& ctx) {
 
   // NOTE(tomc): _mm_packus_epi32 treats inputs as signed, so we need custom saturation for unsigned
   // Saturate each u32 to [0, 0xFFFF], then pack to u16
+  // rr6-nx (2026-11-02): through v_temp, as in build_vpkuhus: the destination may also be a source.
   for (size_t i = 0; i < 4; i++) {
-    ctx.println("\t{}.u16[{}] = {}.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t){}.u32[{}];",
-                ctx.v(ctx.insn.operands[0]), 7 - i, ctx.v(ctx.insn.operands[1]), 3 - i,
-                ctx.v(ctx.insn.operands[1]), 3 - i);
-    ctx.println("\t{}.u16[{}] = {}.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t){}.u32[{}];",
-                ctx.v(ctx.insn.operands[0]), 3 - i, ctx.v(ctx.insn.operands[2]), 3 - i,
-                ctx.v(ctx.insn.operands[2]), 3 - i);
+    ctx.println("\t{}.u16[{}] = {}.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t){}.u32[{}];", ctx.v_temp(), 7 - i,
+                ctx.v(ctx.insn.operands[1]), 3 - i, ctx.v(ctx.insn.operands[1]), 3 - i);
+    ctx.println("\t{}.u16[{}] = {}.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t){}.u32[{}];", ctx.v_temp(), 3 - i,
+                ctx.v(ctx.insn.operands[2]), 3 - i, ctx.v(ctx.insn.operands[2]), 3 - i);
   }
+  ctx.println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_load_si128((simde__m128i*){}.u16));",
+              ctx.v(ctx.insn.operands[0]), ctx.v_temp());
   return true;
 }
 
@@ -1401,7 +1670,15 @@ bool build_vupkd3d128(BuilderContext& ctx) {
       for (size_t i = 0; i < 2; i++) {
         ctx.println("\t{}.f32 = 3.0f;", ctx.temp());
         ctx.println("\t{}.s32 += {}.s16[{}];", ctx.temp(), ctx.v(ctx.insn.operands[1]), 1 - i);
-        ctx.println("\t{}.f32[{}] = {}.f32;", ctx.v_temp(), 3 - i, ctx.temp());
+        if (ctx.config().vupkd3dExact) {
+          // renut-ultimate (2026-11-16, port 144; tw2de_nx's, from nx-mod/rexglue-sdk-nx, as Xenia's x64 EmitSHORT_2;
+          // codegen option vupkd3d_exact): the most negative short biases to exactly 3.0 + -32768 (0x403F8000), a
+          // quiet NaN (Xenia compares with XMMUnpackSHORT_Overflow and blends in XMMQNaN). z / w are constants.
+          ctx.println("\t{}.s32[{}] = {}.s32 == 0x403F8000 ? 0x7FC00000 : {}.s32;", ctx.v_temp(), 3 - i, ctx.temp(),
+                      ctx.temp());
+        } else {
+          ctx.println("\t{}.f32[{}] = {}.f32;", ctx.v_temp(), 3 - i, ctx.temp());
+        }
       }
       ctx.println("\t{}.f32[1] = 0.0f;", ctx.v_temp());
       ctx.println("\t{}.f32[0] = 1.0f;", ctx.v_temp());
@@ -1422,12 +1699,24 @@ bool build_vupkd3d128(BuilderContext& ctx) {
                   ctx.v_temp(), ctx.temp(), ctx.temp());
       ctx.println("\t{}.u32[3] = {}.u32[0];", vDst, ctx.v_temp());
       // y (bits 10-19) - sign extend from 10 bits --> Guest element 1 (host u32[2])
+      // renut-ultimate (2026-11-16, port 144; tw2de_nx's, from nx-mod/rexglue-sdk-nx; vupkd3d_exact): the most
+      // negative field (-512) is a quiet NaN for y and z too, not only x (Xenia's EmitUINT_2101010 compares every
+      // lane with XMMUnpackUINT_2101010_Overflow).
+      const bool nan_yz = ctx.config().vupkd3dExact;
       ctx.println("\t{}.s32 = ({}.s32[0] << 12) >> 22;", ctx.temp(), vSrc);
-      ctx.println("\t{}.s32[0] = {}.s32 + 0x40400000;", ctx.v_temp(), ctx.temp());
+      if (nan_yz)
+        ctx.println("\t{}.s32[0] = {}.s32 == -512 ? 0x7FC00000 : ({}.s32 + 0x40400000);", ctx.v_temp(), ctx.temp(),
+                    ctx.temp());
+      else
+        ctx.println("\t{}.s32[0] = {}.s32 + 0x40400000;", ctx.v_temp(), ctx.temp());
       ctx.println("\t{}.u32[2] = {}.u32[0];", vDst, ctx.v_temp());
       // z (bits 20-29) - sign extend from 10 bits --> Guest element 2 (host u32[1])
       ctx.println("\t{}.s32 = ({}.s32[0] << 2) >> 22;", ctx.temp(), vSrc);
-      ctx.println("\t{}.s32[0] = {}.s32 + 0x40400000;", ctx.v_temp(), ctx.temp());
+      if (nan_yz)
+        ctx.println("\t{}.s32[0] = {}.s32 == -512 ? 0x7FC00000 : ({}.s32 + 0x40400000);", ctx.v_temp(), ctx.temp(),
+                    ctx.temp());
+      else
+        ctx.println("\t{}.s32[0] = {}.s32 + 0x40400000;", ctx.v_temp(), ctx.temp());
       ctx.println("\t{}.u32[1] = {}.u32[0];", vDst, ctx.v_temp());
       // w (bits 30-31) - 2 bits, convert to 1.0+w form --> Guest element 3 (host u32[0])
       ctx.println("\t{}.u32[0] = ({}.u32[0] >> 30) | 0x3F800000;", ctx.v_temp(), vSrc);
@@ -1469,7 +1758,14 @@ bool build_vupkd3d128(BuilderContext& ctx) {
         size_t dstIdx = 3 - i;  // Write to f32 indices 3, 2, 1, 0 (Guest elements 0, 1, 2, 3)
         ctx.println("\t{}.f32 = 3.0f;", ctx.temp());
         ctx.println("\t{}.s32 += {}.s16[{}];", ctx.temp(), ctx.v(ctx.insn.operands[1]), srcIdx);
-        ctx.println("\t{}.f32[{}] = {}.f32;", ctx.v(ctx.insn.operands[0]), dstIdx, ctx.temp());
+        if (ctx.config().vupkd3dExact) {
+          // renut-ultimate (port 144; tw2de_nx's, from nx-mod/rexglue-sdk-nx; vupkd3d_exact): -32768 -> quiet NaN,
+          // as in NORMSHORT2 (Xenia's EmitSHORT_4).
+          ctx.println("\t{}.s32[{}] = {}.s32 == 0x403F8000 ? 0x7FC00000 : {}.s32;", ctx.v(ctx.insn.operands[0]),
+                      dstIdx, ctx.temp(), ctx.temp());
+        } else {
+          ctx.println("\t{}.f32[{}] = {}.f32;", ctx.v(ctx.insn.operands[0]), dstIdx, ctx.temp());
+        }
       }
       break;
     }
@@ -1501,6 +1797,23 @@ bool build_vupkd3d128(BuilderContext& ctx) {
     {
       auto vSrc = ctx.v(ctx.insn.operands[1]);
       auto vDst = ctx.v(ctx.insn.operands[0]);
+      if (ctx.config().vupkd3dExact) {
+        // renut-ultimate (2026-11-16, port 144; tw2de_nx's, from nx-mod/rexglue-sdk-nx, as Xenia's x64
+        // EmitULONG_4202020; codegen option vupkd3d_exact): w(4):z(20):y(20):x(20) in the guest's low doubleword
+        // (guest words 2:3, host u64[0]; the form below read u64[1], the high one). x, y, z are signed 20-bit fields
+        // in 3.0+X form, -524288 a quiet NaN (XMMUnpackULONG_4202020_Overflow); w unsigned in 1.0+w form; the biases
+        // are added to the bit patterns, as in the other types (the form below converted to float, dropped the bias
+        // and shifted an int32 by more than 31). Copied out first: vD may be vB.
+        ctx.println("\t{}.u64[0] = {}.u64[0];", ctx.v_temp(), vSrc);
+        const int shifts[3] = {44, 24, 4};  // x, y, z
+        for (int k = 0; k < 3; ++k) {
+          ctx.println("\t{}.s64 = int64_t({}.u64[0] << {}) >> 44;", ctx.temp(), ctx.v_temp(), shifts[k]);
+          ctx.println("\t{}.s32[{}] = {}.s64 == -524288 ? 0x7FC00000 : (int32_t({}.s64) + 0x40400000);", vDst, 3 - k,
+                      ctx.temp(), ctx.temp());
+        }
+        ctx.println("\t{}.s32[0] = int32_t({}.u64[0] >> 60) + 0x3F800000;", vDst, ctx.v_temp());
+        break;
+      }
       // Format: w(4 bits):z(20 bits):y(20 bits):x(20 bits) in 64 bits
       // x, y, z --> floats, w --> float
       ctx.println("\t{}.u64[0] = {}.u64[1];", ctx.v_temp(), vSrc);

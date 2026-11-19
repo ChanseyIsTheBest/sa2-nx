@@ -654,6 +654,71 @@ bool DispatchInstruction(int id, BuilderContext& ctx) {
     return it->second(ctx);
   }
 
+  // renut-ultimate (2026-11-16, port 144; tw2de_nx's table of 2026-11-01): the instructions Xenia's instruction tests
+  // use that had no table entry. Only with the codegen option extra_instructions (off by default: they stay
+  // REX_UNIMPLEMENTED traps, as before); the FPSCR moves also with fpscr_moves_exact.
+  if (ctx.config().extraInstructions || ctx.config().fpscrMovesExact) {
+    static const std::unordered_map<int, bool (*)(BuilderContext&)> fpscr_moves = {
+        {PPC_INST_MTFSFI, extra_insn::build_mtfsfi},
+        {PPC_INST_MTFSB0, extra_insn::build_mtfsb0},
+        {PPC_INST_MTFSB1, extra_insn::build_mtfsb1},
+        {PPC_INST_MCRFS, extra_insn::build_mcrfs},
+    };
+    auto f = fpscr_moves.find(id);
+    if (f != fpscr_moves.end())
+      return f->second(ctx);
+  }
+  if (ctx.config().extraInstructions) {
+    static const std::unordered_map<int, bool (*)(BuilderContext&)> extra = {
+        {PPC_INST_VADDCUW, extra_insn::build_vaddcuw},
+        {PPC_INST_VSUBCUW, extra_insn::build_vsubcuw},
+        {PPC_INST_VAVGUW, extra_insn::build_vavguw},
+        {PPC_INST_VMAXUW, extra_insn::build_vmaxuw},
+        {PPC_INST_VRLB, extra_insn::build_vrlb},
+        {PPC_INST_VPKPX, extra_insn::build_vpkpx},
+        {PPC_INST_LMW, extra_insn::build_lmw},
+        {PPC_INST_LDBRX, extra_insn::build_ldbrx},
+        {PPC_INST_STDBRX, extra_insn::build_stdbrx},
+        {PPC_INST_ROTLD, extra_insn::build_rotld},
+        {PPC_INST_MCRXR, extra_insn::build_mcrxr},
+        {PPC_INST_MFVSCR, extra_insn::build_mfvscr},
+        {PPC_INST_MTVSCR, extra_insn::build_mtvscr},
+        {PPC_INST_ISYNC, build_nop},  // context synchronisation: nothing to do here
+        {PPC_INST_ICBI, build_nop},   // instruction cache: none
+        {PPC_INST_MTMSR, build_mtmsrd},
+        {PPC_INST_LVSL128, build_lvsl},
+        {PPC_INST_LVSR128, build_lvsr},
+        {PPC_INST_LVLXL, build_lvlx},
+        {PPC_INST_LVLXL128, build_lvlx},
+        {PPC_INST_LVRXL, build_lvrx},
+        {PPC_INST_LVRXL128, build_lvrx},
+        {PPC_INST_STVLXL, build_stvlx},
+        {PPC_INST_STVRXL, build_stvrx},
+        {PPC_INST_STVRXL128, build_stvrx},
+        {PPC_INST_STVXL128, build_stvx},
+        {PPC_INST_ADDO, extra_insn::build_addo},
+        {PPC_INST_ADDCO, extra_insn::build_addco},
+        {PPC_INST_ADDEO, extra_insn::build_addeo},
+        {PPC_INST_ADDMEO, extra_insn::build_addmeo},
+        {PPC_INST_ADDZEO, extra_insn::build_addzeo},
+        {PPC_INST_SUBFO, extra_insn::build_subfo},
+        {PPC_INST_SUBFCO, extra_insn::build_subfco},
+        {PPC_INST_SUBFEO, extra_insn::build_subfeo},
+        {PPC_INST_SUBFMEO, extra_insn::build_subfmeo},
+        {PPC_INST_SUBFZEO, extra_insn::build_subfzeo},
+        {PPC_INST_NEGO, extra_insn::build_nego},
+        {PPC_INST_MULLWO, extra_insn::build_mullwo},
+        {PPC_INST_MULLDO, extra_insn::build_mulldo},
+        {PPC_INST_DIVWO, extra_insn::build_divwo},
+        {PPC_INST_DIVWUO, extra_insn::build_divwuo},
+        {PPC_INST_DIVDO, extra_insn::build_divdo},
+        {PPC_INST_DIVDUO, extra_insn::build_divduo},
+    };
+    auto e = extra.find(id);
+    if (e != extra.end())
+      return e->second(ctx);
+  }
+
   // Emit trap code for unimplemented instruction - allows tests to be generated
   // and fail at runtime rather than skipping the entire function
   REXCODEGEN_WARN("Unimplemented: {} at 0x{:08X}", ctx.insn.opcode->name, ctx.base);

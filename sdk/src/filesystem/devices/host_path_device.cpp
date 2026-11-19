@@ -19,6 +19,7 @@
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
+#include <rex/filesystem/lz4_blocks.h>  // rr6-nx (2026-11-10)
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/string/utf8.h>
@@ -186,8 +187,15 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
       const auto exact_path = current_entry->host_path() / rex::to_path(part);
       rex::filesystem::FileInfo exact_info;
       g_stats_in_sd.fetch_add(1, std::memory_order_relaxed);
-      if (rex::filesystem::GetInfo(exact_path, &exact_info)) {
-        auto* exact_child = HostPathEntry::Create(this, current_entry, exact_path, exact_info);
+      // rr6-nx (2026-11-10): or the game's file packed as NAME.lz4b (rex/filesystem/lz4_blocks.h)
+      auto found_path = exact_path;
+      bool found = rex::filesystem::GetInfo(exact_path, &exact_info);
+      if (!found) {
+        found_path += std::string(rex::filesystem::kLz4BlocksSuffix);
+        found = rex::filesystem::GetInfo(found_path, &exact_info);
+      }
+      if (found) {
+        auto* exact_child = HostPathEntry::Create(this, current_entry, found_path, exact_info);
         if (!exact_child) {
           return nullptr;
         }
@@ -205,7 +213,11 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
       g_swept_in_sd.fetch_add(1, std::memory_order_relaxed);
       auto child_infos = rex::filesystem::ListFiles(current_entry->host_path());
       auto match = std::find_if(child_infos.begin(), child_infos.end(), [&](const auto& info) {
-        return rex::string::utf8_equal_case(rex::path_to_utf8(info.name), part);
+        std::string name = rex::path_to_utf8(info.name);
+        if (rex::filesystem::HasLz4BlocksSuffix(name)) {  // rr6-nx: NAME.lz4b answers for NAME
+          name.resize(name.size() - rex::filesystem::kLz4BlocksSuffix.size());
+        }
+        return rex::string::utf8_equal_case(name, part);
       });
       if (match == child_infos.end()) {
         return nullptr;

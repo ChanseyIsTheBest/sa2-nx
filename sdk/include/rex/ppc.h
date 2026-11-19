@@ -18,6 +18,8 @@
 #include <rex/ppc/function.h>
 #include <rex/ppc/intrinsics.h>
 #include <rex/ppc/stack.h>
+#include <rex/ppc/vmx_est360.h>  // renut-ultimate (2026-11-16, port 144): vmx_360_estimates, vmx_dot_360
+#include <rex/ppc/fpu_exact.h>  // port 144: exact_fp, exact_fp_log, fp_origin_log
 
 // Consumer-facing using declarations
 using rex::ppc::FindPPCFuncByName;

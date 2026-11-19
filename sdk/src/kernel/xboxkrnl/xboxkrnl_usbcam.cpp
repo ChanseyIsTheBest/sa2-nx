@@ -28,6 +28,10 @@ u32 XUsbcamCreate_entry(u32 buffer,
   // function. If value is different than 0 instead of loading
   // rest of the game it returns from initalization function and tries
   // to run game normally which causes crash, due to uninitialized data.
+  // renut-ultimate (port 55): built since then (peggle1-nx's change); the arguments are not used.
+  (void)buffer;
+  (void)buffer_size;
+  (void)unk3_ptr;
   return X_STATUS_SUCCESS;
 }
 

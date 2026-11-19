@@ -28,10 +28,18 @@ struct PSInput
     float2 uv : TEXCOORD0;
 };
 
+// sasrt-nx (2026-11-08, sasrt_gpu_depth_resolve_float_ps): 1 = the float only (depth_resolve_float_ps.hlsl), for the
+// resolves whose words nothing reads (banjo_renut_depth_words_lazy): no stencil load, no encode, one output.
+#ifndef DEPTH_RESOLVE_FLOAT_ONLY
+#define DEPTH_RESOLVE_FLOAT_ONLY 0
+#endif
+
 struct PSOutput
 {
     float depth : SV_Target0;
+#if !DEPTH_RESOLVE_FLOAT_ONLY
     float4 words : SV_Target1;
+#endif
 };
 
 uint EncodeUnorm24(float depth)
@@ -56,6 +64,15 @@ PSOutput main(PSInput input)
 {
     const int2 texel = int2(input.position.xy) + int2(g_Push.translate);
     const uint index = NonUniformResourceIndex(g_Push.textureIndex);
+#if DEPTH_RESOLVE_FLOAT_ONLY
+    PSOutput floatOnly;
+#if DEPTH_RESOLVE_MS
+    floatOnly.depth = g_Depth[index].Load(texel, 0);
+#else
+    floatOnly.depth = g_Depth[index].Load(int3(texel, 0));
+#endif
+    return floatOnly;
+#else
     uint stencil = 0;
 #if DEPTH_RESOLVE_MS
     const float depth = g_Depth[index].Load(texel, 0);
@@ -72,4 +89,5 @@ PSOutput main(PSInput input)
     output.depth = depth;
     output.words = float4(word & 0xFF, (word >> 8) & 0xFF, (word >> 16) & 0xFF, word >> 24) / 255.0;
     return output;
+#endif
 }

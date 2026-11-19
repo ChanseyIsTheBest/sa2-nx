@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """Bisect tools/dead_ctx_defs.py's rewrites over the generated files (banjo-nx, 2026-10-15): which file's (and which
 function's) left-out writes break a run. Keeps both versions of every file under out/dead_bisect and writes into
 app/generated only the files whose text changes, so the build recompiles only those. Build with

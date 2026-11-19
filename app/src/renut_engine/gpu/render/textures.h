@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>  // blur-nx (2026-11-17): ResolveRemakeReport
 #include <vector>
 
 #include <plume_render_interface.h>
@@ -31,7 +32,12 @@ struct HostSurface;
 
 struct HostTexture {
   u32 guest_va = 0;
+  u32 base_page = 0;  // banjo-nx (2026-10-27): its fetch constant's base page as made (BumpTextureBindings)
   u32 desc[6] = {};  // the header fetch constant bits that define the data
+  // blur-nx (2026-11-17, audit #4, blur_renut_texture_pool): how Create made 'texture' (a render target only), and the
+  // image it made, so Retire gives back to the pool only that image under that description.
+  plume::RenderTextureDesc pool_desc{};
+  const plume::RenderTexture *pool_texture = nullptr;
 
   TextureDimension dimension = TextureDimension::Tex2D;
   GpuTextureFormat guest_format = GpuTextureFormat::Fmt8_8_8_8;
@@ -50,6 +56,11 @@ struct HostTexture {
   // downsamples to quarter size and below) average what the guest texels
   // cover, as one guest bilinear tap does. Sampled up to LOD log2(scale).
   uint32_t extra_levels = 0;
+  // banjo-nx (2026-10-28, banjo_renut_lazy_resolve_mips; from sa2-nx's sa2_renut_lazy_resolve_mips): the region of the
+  // host levels still to be made from level 0. The resolves since they were last made widen it; the first read of the
+  // levels (a bind) or other write of level 0 (an upload, a words copy) makes them (FlushResolveMipsLocked).
+  bool mips_pending = false;
+  plume::RenderRect mips_rect;
   // Level 0 without the fetch swizzle, which the levels are made from.
   std::unique_ptr<plume::RenderTextureView> level0_view;
   uint32_t level0_slot = UINT32_MAX;
@@ -105,6 +116,13 @@ struct HostTexture {
   bool sample_known = false;
   uint32_t sample_pages[2] = {};
   uint32_t sample_sizes[2] = {};
+  // dishonored-nx (2026-10-31, dishonored_renut_zero_level_recheck; port 104): a tiled texture with a level whose guest
+  // data was all zeros at the upload. Its whole guest extent is hashed (zero_hash) every 8 frames (zero_check_frame)
+  // until it changes, then uploaded again: SampleHash reads the ends and eight 64-byte probes, and a game's streaming
+  // writes the small levels (the packed tail) between them after the texture was first bound.
+  bool zero_levels = false;
+  uint64_t zero_hash = 0;
+  uint64_t zero_check_frame = 0;
 
   // Depth resolve destinations: the guest words the resolve wrote (see
   // shaders/host/depth_resolve.hlsli) and the framebuffer over both targets.
@@ -128,6 +146,11 @@ struct HostTexture {
   uint64_t last_source_writes = 0;
   int32_t last_src[4] = {};
   int32_t last_dest_x = 0, last_dest_y = 0;
+  // vivapinata-nx (2026-11-12, vivapinata_depth_resolve_skip_unread; render/draw.cpp DepthResolveReadLocked): read,
+  // something has sampled this depth resolve destination (its float or its words), or a destination at its address
+  // before; skipped, its last resolve was left out (the last_* fields above say from where and what).
+  bool depth_read = false;
+  bool depth_skipped = false;
   // A texture over a depth resolve's memory: the resolve its words were
   // copied from last.
   uint64_t copied_resolve = 0;
@@ -148,27 +171,8 @@ struct HostTexture {
   uint64_t handed_writes = 0;
   std::shared_ptr<DepthImage> held;
   bool held_current = false;
-  // sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips; render/draw.cpp FlushResolveMipsLocked): the region of the host
-  // levels (extra_levels) still to be made from level 0: the resolves since they were last made leave it, the first
-  // read of the levels (a bind) or other write of level 0 (an upload, a words copy) makes it.
-  bool mips_pending = false;
-  plume::RenderRect mips_rect;
-  // sa2-nx (2026-10-28, sa2_renut_direct_resolve_mips; textures.cpp UpdateResolveMipsLocked): the host levels drawn in
-  // place on deko3d: per level k >= 1 a view of it as a target and the framebuffer over that, and per level k >= 1
-  // that a deeper one is made from, a view to sample it (made on first use; [k - 1]).
-  std::vector<std::unique_ptr<plume::RenderTextureView>> level_target_views;
-  std::vector<std::unique_ptr<plume::RenderFramebuffer>> level_framebuffers;
-  std::vector<std::unique_ptr<plume::RenderTextureView>> level_sample_views;
-  std::vector<uint32_t> level_sample_slots;
-  // sa2-nx (2026-10-28, sa2_renut_colour_handover; render/draw.cpp, "Colour hand-over"): a colour resolve
-  // destination whose content is the image of the target it was resolved from (colour_from, with that target's
-  // generation and writes then), or colour_held (that image, taken at the target's next whole clear and shared with
-  // every destination that took it there; colour_current). colour_held stays as an image to swap in at a later take.
-  HostSurface *colour_from = nullptr;
-  uint64_t colour_generation = 0;
-  uint64_t colour_writes = 0;
-  std::shared_ptr<DepthImage> colour_held;
-  bool colour_current = false;
+  // kameo-nx (2026-11-03, banjo_deko3d_color_handover): the resolve left in that image is a colour resolve.
+  bool handed_color = false;
 };
 
 struct TextureBinding {
@@ -224,10 +228,48 @@ struct BindEffects {
   // banjo-nx (2026-10-19, render-thread proposal 3): the bind went through a depth resolve's words (a view of them, or
   // a copy; EnsureDepthWordsLocked), which every depth resolve can change: such a memo entry also holds g_depth_epoch.
   bool depth_source = false;
+  // banjo-nx (2026-10-27, render thread night): transition[0] is the fetch's own texture (TextureSlot), not a resolve's
+  // alias or depth words: the one the frame's content check is for (RefreshBindingLocked).
+  bool slot_texture = false;
 };
+// banjo-nx (2026-10-27, render thread night): BindTextureLocked's work for a binding a memo kept from an earlier frame of
+// the same texture epoch, with the same header and fetch words: its texture used this frame and, filled from guest
+// memory, the frame's content check (an upload if it changed). False for bindings it does not cover (the caller binds).
+bool RefreshBindingLocked(u32 texture_va, const TextureFetch &device_fetch, const BindEffects &fx);
+// banjo-nx (2026-10-27, render thread night, A/B 35): what g_texture_epoch counts, by the fetch's base page and by the
+// header's address (hashed into 4,096 buckets each): a texture made or retired, a resolve destination or depth words
+// entry of a page, a depth hand-over's state. A memo entry of a binding that went through no depth words and no
+// hand-over is valid while its page's and address's counts are (TextureBindingEpoch), not only while nothing changed
+// anywhere: a hand-over or a new resolve destination each frame made every binding of the next frame bind again.
+constexpr u32 kTextureEpochBuckets = 4096;
+extern uint32_t g_texture_page_epochs[kTextureEpochBuckets];
+extern uint32_t g_texture_va_epochs[kTextureEpochBuckets];
+inline u32 TextureEpochBucket(u32 key) { return (key * 0x9E3779B1u) >> 20; }
+// banjo-nx (2026-10-27, Phase A: texture objects): raised with every bucket either count raises, so an answer whose
+// epoch was checked at this generation still holds without reading the buckets (render/draw.cpp TextureObject).
+extern uint64_t g_texture_bind_gen;
+inline void BumpTexturePage(u32 page) {
+  ++g_texture_page_epochs[TextureEpochBucket(page)];
+  ++g_texture_bind_gen;
+}
+inline void BumpTextureVa(u32 va) {
+  ++g_texture_va_epochs[TextureEpochBucket(va)];
+  ++g_texture_bind_gen;
+}
+inline void BumpTextureBindings(const HostTexture &t) {
+  BumpTexturePage(t.base_page);
+  BumpTextureVa(t.guest_va);
+}
+inline uint64_t TextureBindingEpoch(u32 page, u32 va) {
+  return uint64_t(g_texture_page_epochs[TextureEpochBucket(page)]) << 32 | g_texture_va_epochs[TextureEpochBucket(va)];
+}
 // Bumped by everything BindTextureLocked reads besides its arguments and the guest header: a texture created, retired
 // or uploaded, a resolve destination set (every resolve), depth words copied or a view of them made.
 extern uint64_t g_texture_epoch;
+// banjo-nx (2026-10-26, the record-time draw path's round 4): raised by every layout change TransitionTextureLocked,
+// TransitionSurfaceLocked and TransitionDepthImageLocked make (render/textures.cpp, render/surfaces.cpp): while it, the
+// texture frame and epochs and the surface epoch stay the same, a bound texture's or target's layout is the one it was.
+extern uint64_t g_layout_epoch;
 // banjo-nx (2026-10-19, render-thread proposal 3): bumped by every depth resolve (GetDepthResolveTextureLocked).
 // g_texture_epoch is now bumped only by what changes a binding: a texture made or retired, a view or slot made, a
 // resolve destination or depth words entry that changes, depth words copied, a depth hand-over's state; no longer by
@@ -240,21 +282,13 @@ TextureBinding BindTextureLocked(u32 texture_va, const TextureFetch &device_fetc
 // (its own texture); and a destination that goes stops holding anything.
 uint32_t DepthHandOverSlotLocked(HostTexture &dest, const plume::RenderComponentMapping &mapping, BindEffects *fx);
 void DepthHandOverForgetLocked(HostTexture &dest);
-// sa2-nx (2026-10-28, sa2_renut_lazy_resolve_mips; render/draw.cpp): makes a resolve destination's pending host
-// levels (before a read of them or another write of its level 0; outside a draw's framebuffer).
-void FlushResolveMipsLocked(HostTexture &t);
-// sa2-nx (2026-10-28, sa2_renut_colour_handover; render/draw.cpp): before a bind samples 'dest' (its content drawn
-// into its own texture first where the image cannot be sampled for it); the slot it is then sampled through while its
-// content is a target's image ('mapping' as for DepthHandOverSlotLocked), or UINT32_MAX (its own texture); its
-// content overwritten (an upload) or the texture going.
-void ColourHandOverBeforeReadLocked(HostTexture &dest);
-uint32_t ColourHandOverSlotLocked(HostTexture &dest, const plume::RenderComponentMapping &mapping, BindEffects *fx);
-void ColourHandOverForgetLocked(HostTexture &dest);
 
 // The guest memory a texture's data spans: pages[0]/sizes[0] its base level,
 // pages[1]/sizes[1] its mip chain (a page is 4 KiB of physical memory; a zero
 // page or size is absent).
 void TextureGuestExtent(const TextureFetch &fetch, uint32_t pages[2], uint32_t sizes[2]);
+// banjo-nx (2026-10-23, render-thread round): the memo line TextureGuestExtent will read for this fetch constant.
+void PrefetchTextureGuestExtent(const TextureFetch &fetch);
 
 // Host texture for a resolve into the guest texture, created as a color
 // target in 'format' when there is none yet (or the existing one does not
@@ -262,8 +296,12 @@ void TextureGuestExtent(const TextureFetch &fetch, uint32_t pages[2], uint32_t s
 // GPU-written. 'header_format', when given, is the header's fetch constant as
 // it was when the resolve was recorded (the header may be a temporary the
 // game has since overwritten).
+// blur-nx (2026-11-10, port 76; its key 212: blur_renut_resolve_keep_dest): 'cover_pixels', when not 0, is how many
+// pixels a single-sampled resolve writes: one that covers less than an existing destination of another format keeps it
+// (the caller then writes its part with a converting draw: dest->host_format != format).
 HostTexture *GetResolveTextureLocked(u32 texture_va, plume::RenderFormat format, RenderScale scale,
-                                     const d3d::TextureFetchConstant *header_format = nullptr);
+                                     const d3d::TextureFetchConstant *header_format = nullptr,
+                                     uint32_t cover_pixels = 0);
 
 // The same for a depth resolve: a kDepthResolveFormat target plus the guest
 // words (kDepthResolveWordsFormat), which a texture of a 32-bit 8_8_8_8
@@ -274,32 +312,48 @@ HostTexture *GetDepthResolveTextureLocked(u32 texture_va, RenderScale scale,
 
 // Existing host texture for a guest texture VA, or nullptr.
 HostTexture *FindHostTextureLocked(u32 texture_va);
+// vivapinata-nx (2026-11-11): 't''s texels as stored (no swizzle, no red-blue swap), or kInvalidDescriptor.
+uint32_t RawViewSlotLocked(HostTexture &t);
 
 void ReleaseHostTextureLocked(u32 texture_va);
 
 // The game freed the guest memory at physical address 'physical' ('size'
 // bytes): the host textures whose data was there go. N&B's level textures are
-// headers it sets up itself (XGSetTextureHeader, sub_823191B8 and the
-// streaming's sub_8230B360) over data in its section pools; D3D never destroys
+// headers it sets up itself (XGSetTextureHeader, sub_822E8660 and the
+// streaming's sub_822DAB48) over data in its section pools; D3D never destroys
 // them, and the game drops them by destroying the pool at a section change
 // (game/level_pools.cpp).
+// blur-nx (2026-11-17, the Renut audit's #4 and #5): why resolve destinations are made, and the texture pool; the
+// 10 s line (banjo_renut_tuning.cpp), atomics only.
+std::string ResolveRemakeReport();
 void ReleaseHostTexturesInMemoryLocked(u32 physical, u32 size);
 
 void TransitionTextureLocked(HostTexture *texture, plume::RenderTextureLayout layout);
 // banjo-nx (2026-10-19): a layout a texture is only read in (banjo_deko3d_barrier_lean).
 bool ReadOnlyLayout(plume::RenderTextureLayout layout);
+// Port 161 (banjo_deko3d_vertex_texture_barrier): every layout move notes a GPU write; a draw whose vertex shader
+// samples textures calls the barrier first.
+void NoteGpuWriteLayoutLocked(plume::RenderTextureLayout layout);
+void VertexTextureBarrierLocked();
 
 // Rebuilds the host levels of a resolve destination (HostTexture::extra_levels)
 // over 'rect' of level 0, in host texels, after a resolve wrote it. Leaves the
 // texture in SHADER_READ and the command list's framebuffer, pipeline and
 // viewport changed.
 void UpdateResolveMipsLocked(HostTexture *texture, const plume::RenderRect &rect);
+// banjo-nx (2026-10-28, banjo_renut_lazy_resolve_mips; from sa2-nx; render/draw.cpp): makes a resolve destination's
+// pending host levels (before a read of them or another write of its level 0; outside a draw's framebuffer).
+void FlushResolveMipsLocked(HostTexture &t);
 
 // A single-level color target of a resolve destination's format and host
 // size, which a multisampled resolve into one with host levels goes through
 // (plume's Vulkan resolve writes every level of its destination, from levels
 // the source does not have). Its texture and layout only; kept for reuse.
 HostTexture *ResolveStagingLocked(const HostTexture *dest);
+// blur-nx (2026-11-10, port 76; its key 219: blur_renut_resolve_exp_bias): a single-sampled target of this format and
+// host size (a scratch target) to resolve a whole multisampled target into, and its bindless slot, to draw from it.
+HostTexture *ResolveSourceStagingLocked(plume::RenderFormat format, uint32_t width, uint32_t height);
+uint32_t ResolveSourceStagingSlotLocked(plume::RenderFormat format, uint32_t width, uint32_t height);
 
 // Bindless sampler slot matching the device fetch constant's sampler state.
 // 'lod_scale' (TextureBinding::lod_scale): a texture with host levels, which

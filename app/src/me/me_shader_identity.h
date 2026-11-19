@@ -39,7 +39,7 @@ inline bool VertexFetchSwizzleRepresentable(uint32_t original, uint32_t patched)
   return true;
 }
 
-// Experimental tolerance (cvar sa2_native_vs_identity_tolerance, default 0 = exact, as before): how many
+// Experimental tolerance (cvar masseffect_native_vs_identity_tolerance, default 0 = exact, as before): how many
 // words OUTSIDE the declared fetch triples (ALU/CF words) a loaded vertex shader may differ from the library
 // candidate of the same size and still be accepted. Without it such a draw is dropped (no VS identified).
 inline std::atomic<uint32_t> g_vs_identity_alu_tolerance{0};

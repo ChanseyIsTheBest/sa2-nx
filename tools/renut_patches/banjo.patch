@@ -1,0 +1,2478 @@
+diff --git a/backend/memory_report.cpp b/backend/memory_report.cpp
+--- a/backend/memory_report.cpp
++++ b/backend/memory_report.cpp
+@@ -12,6 +12,11 @@
+ #if defined(_WIN32)
+ #include <windows.h>
+ #include <psapi.h>
++#endif
++#if defined(__SWITCH__)
++#include <malloc.h>
++#include <switch.h>
++extern "C" size_t __nx_heap_size;  // libnx; the SDK's runtime_switch.cpp sets it
+ #endif
+ 
+ #include <rex/cvar.h>
+@@ -114,6 +119,17 @@
+             "MB, shared {:.0f}/{:.0f} MB)",
+             Mb(process.private_bytes), Mb(process.resident_bytes), gpu.valid ? "used/budget" : "n/a",
+             Mb(gpu.local_used), Mb(gpu.local_budget), Mb(gpu.shared_used), Mb(gpu.shared_budget));
++#if defined(__SWITCH__)
++  // banjo-nx (2026-10-17): the Switch's malloc heap is fixed (__nx_heap_size, or the loader's), the guest's memory in
++  // it: what the process line above cannot show there. GPU memory is not in it.
++  {
++    const struct mallinfo mi = mallinfo();
++    const size_t heap = envHasHeapOverride() ? size_t(envGetHeapOverrideSize()) : __nx_heap_size;
++    RGPU_INFO("Memory: heap {:.0f} MB in use of {:.0f} MB ({:.0f} MB taken from it so far, {:.0f} MB of that free in "
++              "{} pieces)",
++              Mb(mi.uordblks), Mb(heap), Mb(mi.arena), Mb(mi.fordblks), size_t(mi.ordblks));
++  }
++#endif
+   RGPU_INFO("Memory: GPU: {} render targets {:.0f} MB (x{:.3g} scale), {} textures {:.0f} MB (of "
+             "which {} resolve targets {:.0f} MB), memexport {:.0f} MB",
+             targets, Mb(target_bytes), ResolutionScale().Factor(), textures.textures, Mb(textures.bytes),
+diff --git a/backend/native_window.cpp b/backend/native_window.cpp
+--- a/backend/native_window.cpp
++++ b/backend/native_window.cpp
+@@ -7,6 +7,8 @@
+ 
+ #if defined(_WIN32)
+ #include <windows.h>
++#elif defined(__SWITCH__)
++#include <switch.h>
+ #else
+ #include <cstdlib>
+ 
+@@ -63,6 +65,28 @@
+     return false;
+   width = uint32_t(rect.right - rect.left);
+   height = uint32_t(rect.bottom - rect.top);
++  return true;
++}
++
++#elif defined(__SWITCH__)
++
++// banjo-nx: the Switch has one window, libnx's default NWindow, which plume's VK_NN_vi_surface takes.
++bool GetNativeRenderWindow(plume::RenderWindow &out) {
++  out = nwindowGetDefault();
++  if (!out) {
++    RGPU_ERROR("No default NWindow");
++    return false;
++  }
++  return true;
++}
++
++bool GetRenderWindowPixelSize(uint32_t &width, uint32_t &height) {
++  NWindow *window = nwindowGetDefault();
++  u32 w = 0, h = 0;
++  if (!window || R_FAILED(nwindowGetDimensions(window, &w, &h)) || !w || !h)
++    return false;
++  width = w;
++  height = h;
+   return true;
+ }
+ 
+diff --git a/backend/present.cpp b/backend/present.cpp
+--- a/backend/present.cpp
++++ b/backend/present.cpp
+@@ -4,7 +4,9 @@
+  *          submit and present.
+  */
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
++#include <condition_variable>
+ #include <mutex>
+ 
+ #include <plume_render_interface.h>
+@@ -19,6 +21,7 @@
+ #include "renut_engine/gpu/backend/render_thread.h"
+ #include "renut_engine/gpu/backend/video.h"
+ #include "renut_engine/gpu/backend/video_internal.h"
++#include "renut_engine/gpu/banjo_renut_capture.h"
+ 
+ REXCVAR_DEFINE_BOOL(renut_vsync, true, "Nuts&Bolts/Graphics",
+                     "Show each frame at the display's refresh: no tearing, and the game runs at "
+@@ -124,6 +127,108 @@
+   cmd->drawInstanced(3, 1, 0, 0);
+ }
+ 
++// banjo-nx: the test captures (banjo_renut_capture.h). CaptureFrame asks; the next Present, minimized or not, scans
++// the guest image out once more into an offscreen target of the frame's size and reads it back.
++struct FrameCapture {
++  std::mutex mutex;
++  std::condition_variable cv;
++  std::atomic<uint64_t> requested{0};
++  uint64_t served = 0;  // under mutex
++  bool ok = false;
++  rex::ui::RawImage image;
++  // Render thread only. Kept between captures of one size (the recording takes one per frame); never in flight
++  // between them, as each capture waits for the GPU.
++  std::unique_ptr<plume::RenderTexture> target;
++  std::unique_ptr<plume::RenderFramebuffer> framebuffer;
++  std::unique_ptr<plume::RenderBuffer> readback;
++  uint32_t width = 0, height = 0, row_texels = 0;
++  uint64_t served_render = 0;
++};
++FrameCapture g_capture;
++
++// The present pipeline's format (kSwapChainFormat in video.cpp).
++constexpr plume::RenderFormat kCaptureFormat = plume::RenderFormat::B8G8R8A8_UNORM;
++
++bool CaptureFrameLocked(VideoState &s, const PresentImage &image, rex::ui::RawImage &out) {
++  const uint32_t w = image.source_width ? image.source_width : image.width;
++  const uint32_t h = image.source_height ? image.source_height : image.height;
++  if (!w || !h || !Video::EnsureCommandListLocked())
++    return false;
++  FrameCapture &c = g_capture;
++  if (!c.target || c.width != w || c.height != h) {
++    c.framebuffer.reset();
++    c.target.reset();
++    c.readback.reset();
++    plume::RenderTextureDesc desc = plume::RenderTextureDesc::Texture2D(w, h, 1, kCaptureFormat);
++    desc.flags |= plume::RenderTextureFlag::RENDER_TARGET;
++    c.target = s.device->createTexture(desc);
++    if (!c.target)
++      return false;
++    const plume::RenderTexture *attachment = c.target.get();
++    c.framebuffer = s.device->createFramebuffer(plume::RenderFramebufferDesc(&attachment, 1));
++    c.row_texels = (w + 63) & ~63u;  // D3D12 copies rows of 256-byte multiples
++    c.readback = s.device->createBuffer(plume::RenderBufferDesc::ReadbackBuffer(uint64_t(c.row_texels) * h * 4));
++    if (!c.framebuffer || !c.readback) {
++      c.framebuffer.reset();
++      c.target.reset();
++      c.readback.reset();
++      return false;
++    }
++    c.width = w;
++    c.height = h;
++  }
++  plume::RenderCommandList *cmd = s.command_list;
++  cmd->barriers(plume::RenderBarrierStage::GRAPHICS,
++                plume::RenderTextureBarrier(c.target.get(), plume::RenderTextureLayout::COLOR_WRITE));
++  cmd->setFramebuffer(c.framebuffer.get());
++  RecordScanOut(s, image, w, h);
++  cmd->setFramebuffer(nullptr);
++  cmd->barriers(plume::RenderBarrierStage::COPY,
++                plume::RenderTextureBarrier(c.target.get(), plume::RenderTextureLayout::COPY_SOURCE));
++  cmd->copyTextureRegion(
++      plume::RenderTextureCopyLocation::PlacedFootprint(c.readback.get(), kCaptureFormat, w, h, 1, c.row_texels),
++      plume::RenderTextureCopyLocation::Subresource(c.target.get()));
++  // Submits the frame's work with the capture and waits; the next list starts with nothing bound.
++  detail::SubmitAndWaitLocked(s);
++  const auto *data = static_cast<const uint8_t *>(c.readback->map());
++  if (!data)
++    return false;
++  out.width = w;
++  out.height = h;
++  out.stride = size_t(w) * 4;
++  out.data.resize(size_t(w) * h * 4);
++  for (uint32_t y = 0; y < h; ++y) {
++    const uint8_t *row = data + size_t(y) * c.row_texels * 4;
++    uint8_t *dest = out.data.data() + size_t(y) * w * 4;
++    for (uint32_t x = 0; x < w; ++x) {  // B G R A -> R G B X
++      dest[x * 4 + 0] = row[x * 4 + 2];
++      dest[x * 4 + 1] = row[x * 4 + 1];
++      dest[x * 4 + 2] = row[x * 4 + 0];
++      dest[x * 4 + 3] = 0xFF;
++    }
++  }
++  c.readback->unmap();
++  return true;
++}
++
++// From PresentLocked: one relaxed load when nobody asked.
++void ServeCaptureLocked(VideoState &s, const PresentImage *image) {
++  FrameCapture &c = g_capture;
++  const uint64_t requested = c.requested.load(std::memory_order_acquire);
++  if (requested == c.served_render || !image || !image->texture || image->descriptor == kInvalidDescriptor)
++    return;
++  rex::ui::RawImage out;
++  const bool ok = CaptureFrameLocked(s, *image, out);
++  c.served_render = requested;
++  {
++    std::lock_guard lock(c.mutex);
++    c.image = std::move(out);
++    c.ok = ok;
++    c.served = requested;
++  }
++  c.cv.notify_all();
++}
++
+ // Records the back-buffer pass and presents. Caller holds s.mutex.
+ void PresentLocked(VideoState &s, const PresentImage *image) {
+   // Logs, once, why the GPU stopped if an earlier submission faulted.
+@@ -131,6 +236,7 @@
+   ApplyVsync(s);
+   if (s.swap_chain->needsResize() || s.resize_requested.exchange(false, std::memory_order_acq_rel))
+     RebuildSwapChain(s);
++  ServeCaptureLocked(s, image);  // banjo-nx: test captures (banjo_renut_capture.h)
+   if (s.swap_framebuffers.empty()) {
+     // Minimized or failed resize: keep the frame ring moving without a present.
+     if (s.list_open)
+@@ -243,4 +349,14 @@
+   PresentLocked(s, image.texture ? &image : nullptr);
+ }
+ 
++bool CaptureFrame(rex::ui::RawImage &out, int timeout_ms) {
++  FrameCapture &c = g_capture;
++  std::unique_lock lock(c.mutex);
++  const uint64_t ticket = c.requested.fetch_add(1, std::memory_order_acq_rel) + 1;
++  if (!c.cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return c.served >= ticket; }) || !c.ok)
++    return false;
++  out = c.image;
++  return true;
++}
++
+ } // namespace renut::gpu
+diff --git a/backend/queued.cpp b/backend/queued.cpp
+--- a/backend/queued.cpp
++++ b/backend/queued.cpp
+@@ -14,6 +14,7 @@
+ #include "renut_engine/gpu/d3d/d3d.h"
+ #include "renut_engine/gpu/guest/guest_memory.h"
+ #include "renut_engine/gpu/backend/render_thread.h"
++#include "renut_engine/gpu/banjo_renut_tuning.h"
+ 
+ namespace renut::gpu {
+ 
+@@ -26,9 +27,49 @@
+   DrawCall call;
+ };
+ 
++// banjo-nx (banjo_renut_capture_pool): a draw's capture comes from a pool and goes back to it once the render thread
++// has drawn it. Each draw made three heap allocations on the game thread (the capture, its 12.7 KB device snapshot,
++// the queued closure) and freed them on the render thread: about 2,000 a frame through the Switch's one malloc lock.
++// A pooled capture keeps its snapshot's storage, and the closure holds a plain pointer, which std::function stores
++// without allocating. Off: every capture is deleted after use, as before (a new one per draw).
++class CapturePool {
++public:
++  DrawCapture *Take() {
++    {
++      std::lock_guard lock(mutex_);
++      if (!free_.empty()) {
++        DrawCapture *capture = free_.back();
++        free_.pop_back();
++        return capture;
++      }
++    }
++    return new DrawCapture();
++  }
++  void Give(DrawCapture *capture) {
++    if (!capture)
++      return;
++    if (banjo::renut_gpu::CapturePoolOn()) {
++      capture->vertices.clear();
++      capture->indices.clear();
++      std::lock_guard lock(mutex_);
++      if (free_.size() < kMaxFree) {
++        free_.push_back(capture);
++        return;
++      }
++    }
++    delete capture;
++  }
++
++private:
++  static constexpr size_t kMaxFree = 2048;  // more than a frame's draws in flight
++  std::mutex mutex_;
++  std::vector<DrawCapture *> free_;
++};
++CapturePool g_capture_pool;
++
+ // A Begin*Vertices draw waiting for its vertices, per device.
+ struct DeferredDraw {
+-  std::shared_ptr<DrawCapture> capture;
++  DrawCapture *capture = nullptr;  // owned (g_capture_pool)
+   const u8 *scratch = nullptr;
+   u32 bytes = 0;
+ };
+@@ -47,24 +88,27 @@
+   return std::vector<u8>(device, device + d3d::kDeviceSnapshotSize);
+ }
+ 
+-void QueueCapture(std::shared_ptr<DrawCapture> capture) {
+-  render_thread::Queue([capture = std::move(capture)] {
++void QueueCapture(DrawCapture *capture) {
++  render_thread::Queue([capture] {
+     DrawCall call = capture->call;
+     if (!capture->vertices.empty())
+       call.up_vertices = capture->vertices.data();
+     if (!capture->indices.empty())
+       call.up_indices = capture->indices.data();
+     DrawStateLocked(capture->state.data(), call);
++    g_capture_pool.Give(capture);
+   });
+ }
+ 
+-std::shared_ptr<DrawCapture> Capture(u32 device_va, const DrawCall &call) {
++DrawCapture *Capture(u32 device_va, const DrawCall &call) {
+   auto *device = GuestPtr<d3d::Device>(device_va);
+   if (!device)
+     return nullptr;
+   ClearPending(device);
+-  auto capture = std::make_shared<DrawCapture>();
+-  capture->state = Snapshot(reinterpret_cast<const u8 *>(device));
++  DrawCapture *capture = g_capture_pool.Take();
++  // assign() keeps a pooled capture's storage (Snapshot() made a new vector each time).
++  const auto *bytes = reinterpret_cast<const u8 *>(device);
++  capture->state.assign(bytes, bytes + d3d::kDeviceSnapshotSize);
+   capture->call = call;
+   capture->call.up_vertices = nullptr;
+   capture->call.up_indices = nullptr;
+@@ -76,24 +120,30 @@
+ void QueueDraw(u32 device_va, const DrawCall &call, u32 up_vertex_bytes, u32 up_index_bytes) {
+   FlushDeferredVertices(device_va);
+   RunReadyCallbacks();
+-  auto capture = Capture(device_va, call);
++  DrawCapture *capture = Capture(device_va, call);
+   if (!capture)
+     return;
+   if (call.up_vertices)
+     capture->vertices.assign(call.up_vertices, call.up_vertices + up_vertex_bytes);
+   if (call.up_indices)
+     capture->indices.assign(call.up_indices, call.up_indices + up_index_bytes);
+-  QueueCapture(std::move(capture));
++  QueueCapture(capture);
+ }
+ 
+ void QueueDeferredDraw(u32 device_va, const DrawCall &call, const u8 *scratch, u32 bytes) {
+   FlushDeferredVertices(device_va);
+   RunReadyCallbacks();
+-  auto capture = Capture(device_va, call);
+-  if (!capture || !scratch)
+-    return;
++  DrawCapture *capture = Capture(device_va, call);
++  if (!capture)
++    return;
++  if (!scratch) {
++    g_capture_pool.Give(capture);
++    return;
++  }
+   std::lock_guard lock(g_deferred_mutex);
+-  g_deferred[device_va] = {std::move(capture), scratch, bytes};
++  DeferredDraw &slot = g_deferred[device_va];
++  g_capture_pool.Give(slot.capture);  // one not flushed (the original replaced it the same way)
++  slot = {capture, scratch, bytes};
+ }
+ 
+ void FlushDeferredVertices(u32 device_va) {
+@@ -108,7 +158,7 @@
+     g_deferred.erase(it);
+   }
+   deferred.capture->vertices.assign(deferred.scratch, deferred.scratch + deferred.bytes);
+-  QueueCapture(std::move(deferred.capture));
++  QueueCapture(deferred.capture);
+ }
+ 
+ void QueueClear(u32 device_va, u32 flags, const ClearRect *rect, const float color[4], float depth,
+diff --git a/backend/render_thread.cpp b/backend/render_thread.cpp
+--- a/backend/render_thread.cpp
++++ b/backend/render_thread.cpp
+@@ -15,6 +15,7 @@
+ #include "renut_engine/gpu/guest/guest_memory.h"
+ #include "renut_engine/gpu/log.h"
+ #include "renut_engine/gpu/backend/video.h"
++#include "renut_engine/gpu/banjo_renut_tuning.h"
+ 
+ #if defined(_WIN32)
+ #ifndef NOMINMAX
+@@ -39,6 +40,11 @@
+ 
+ std::mutex g_mutex;
+ std::condition_variable g_work_cv;  // work queued, or stopping
++// banjo-nx (banjo_renut_queue_notify_idle): the render thread is in g_work_cv.wait (under g_mutex). A push notifies only
++// then: on the Switch every notify is a kernel call, about 1,500 a frame from the game threads, most of them while the
++// render thread is busy and not waiting. The render thread reads the queue under g_mutex before it sleeps, so a push
++// it has not seen is never missed.
++bool g_render_waiting = false;
+ std::condition_variable g_done_cv;  // work done: frames, fences, drains; or stopped
+ std::vector<Item> g_queue;
+ std::once_flag g_start_once;
+@@ -84,15 +90,23 @@
+ }
+ 
+ void Run() {
++  {
++    // banjo-nx: the thread may be a plain pthread on the Switch (Start), so it records its own id.
++    std::lock_guard lock(g_mutex);
++    g_thread_id = std::this_thread::get_id();
++  }
+ #if defined(_WIN32)
+   SetThreadDescription(GetCurrentThread(), L"renut render");
+ #endif
++  banjo::renut_gpu::OnRenderThreadStart();  // banjo-nx: its core and priority on the Switch
+   t_render_thread = true;
+   std::vector<Item> batch;
+   for (;;) {
+     {
+       std::unique_lock lock(g_mutex);
++      g_render_waiting = true;
+       g_work_cv.wait(lock, [] { return !g_queue.empty() || g_stopping; });
++      g_render_waiting = false;
+       if (g_queue.empty())
+         break;
+       batch.swap(g_queue);
+@@ -123,8 +137,9 @@
+     // Never joined or destroyed: the renderer's objects are left at exit too
+     // (Video::BeginShutdown), and a joinable std::thread destroyed at exit
+     // would terminate the process.
+-    auto *thread = new std::thread(Run);
+-    g_thread_id = thread->get_id();
++    // banjo-nx: a 1 MB stack on the Switch (the conversions and the driver run deep on this thread), never joined
++    // (banjo_renut_tuning.h); Run records its id.
++    banjo::renut_gpu::StartLongLivedThread(Run, 1024 * 1024);
+     RGPU_INFO("Render thread started");
+   });
+ }
+@@ -137,8 +152,10 @@
+     if (g_running && !g_stopping) {
+       g_queue.push_back({std::move(work), locked});
+       ++g_items_queued;
++      const bool wake = g_render_waiting || !banjo::renut_gpu::QueueNotifyIdleOn();
+       lock.unlock();
+-      g_work_cv.notify_one();
++      if (wake)
++        g_work_cv.notify_one();
+       return;
+     }
+   }
+diff --git a/backend/video.cpp b/backend/video.cpp
+--- a/backend/video.cpp
++++ b/backend/video.cpp
+@@ -27,6 +27,7 @@
+ #include "renut_engine/gpu/render/pipeline.h"
+ #include "renut_engine/gpu/backend/render_thread.h"
+ #include "renut_engine/gpu/backend/video_internal.h"
++#include "renut_engine/gpu/banjo_renut_tuning.h"
+ 
+ #include "host_shaders/depth_resolve_ms_ps.spirv.h"
+ #include "host_shaders/depth_resolve_ps.spirv.h"
+@@ -160,6 +161,17 @@
+                             s.null_texture_cube_view.get());
+   s.texture_slot_used[kNullTexture3DSlot] = true;
+   s.texture_slot_used[kNullTextureCubeSlot] = true;
++  // banjo-nx (2026-10-17): banjo_renut_diag_poison_slots, a test of the eviction rules.
++  if (banjo::renut_gpu::PoisonSlotsOn()) {
++    s.poison_texture = s.device->createTexture(plume::RenderTextureDesc::Texture2D(1, 1, 1, kFormat));
++    if (s.poison_texture) {
++      s.poison_texture->setName("banjo-nx poison texture");
++      s.poison_texture_view =
++          s.poison_texture->createTextureView(plume::RenderTextureViewDesc::Texture2D(kFormat));
++    }
++    if (!s.poison_texture_view)
++      s.poison_texture.reset();
++  }
+   return true;
+ }
+ 
+@@ -184,6 +196,23 @@
+     }
+     cmd->barriers(plume::RenderBarrierStage::GRAPHICS,
+                   plume::RenderTextureBarrier(textures[t], plume::RenderTextureLayout::SHADER_READ));
++  }
++  // banjo-nx: the poison texture's one texel, magenta and opaque.
++  if (s.poison_texture) {
++    UploadAllocation magenta = s.uploads[s.frame].Allocate(256, 512);
++    if (!magenta)
++      return false;
++    const uint8_t texel[4] = {0xFF, 0x00, 0xFF, 0xFF};
++    std::memset(magenta.cpu, 0, 256);
++    std::memcpy(magenta.cpu, texel, sizeof(texel));
++    cmd->barriers(plume::RenderBarrierStage::COPY,
++                  plume::RenderTextureBarrier(s.poison_texture.get(), plume::RenderTextureLayout::COPY_DEST));
++    cmd->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(s.poison_texture.get(), 0, 0),
++                           plume::RenderTextureCopyLocation::PlacedFootprint(
++                               magenta.ref.ref, plume::RenderFormat::R8G8B8A8_UNORM, 1, 1, 1, 64,
++                               magenta.ref.offset));
++    cmd->barriers(plume::RenderBarrierStage::GRAPHICS,
++                  plume::RenderTextureBarrier(s.poison_texture.get(), plume::RenderTextureLayout::SHADER_READ));
+   }
+   return true;
+ }
+@@ -375,8 +404,11 @@
+   s.memexport_scratch_used[slot] = 0;
+   for (uint32_t index : s.retired_texture_slots[slot]) {
+     if (index >= kFirstDynamicTextureSlot && index < kTextureDescriptorCount) {
+-      s.texture_set->setTexture(index, s.null_texture.get(), plume::RenderTextureLayout::SHADER_READ,
+-                                s.null_texture_view.get());
++      // banjo-nx: banjo_renut_diag_poison_slots points it at magenta instead.
++      const bool poison = s.poison_texture != nullptr;
++      s.texture_set->setTexture(index, poison ? s.poison_texture.get() : s.null_texture.get(),
++                                plume::RenderTextureLayout::SHADER_READ,
++                                poison ? s.poison_texture_view.get() : s.null_texture_view.get());
+       if (s.texture_slot_used[index] && s.texture_slots_in_use)
+         --s.texture_slots_in_use;
+       s.texture_slot_used[index] = false;
+@@ -471,6 +503,7 @@
+   FinishRecordingLocked(s);
+   EndListTiming(s, false);
+   s.command_lists[cur]->end();
++  s.uploads[cur].Publish();  // banjo-nx: banjo_renut_upload_cached
+   const plume::RenderCommandList *lists[] = {s.command_lists[cur].get()};
+   s.queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, s.fences[cur].get());
+   {
+@@ -494,6 +527,7 @@
+     s.command_lists[cur]->end();
+     s.list_open = false;
+     s.command_list = nullptr;
++    s.uploads[cur].Publish();  // banjo-nx: banjo_renut_upload_cached
+     const plume::RenderCommandList *lists[] = {s.command_lists[cur].get()};
+     plume::RenderCommandSemaphore *waits[] = {wait};
+     plume::RenderCommandSemaphore *signals[] = {signal};
+@@ -542,6 +576,7 @@
+   }
+ #endif
+ 
++  banjo::renut_gpu::BeforeDeviceCreated();  // banjo-nx: plume's pipeline cache and barriers (banjo_renut_tuning.h)
+   s.render_interface = CreateRenderInterface();
+   if (!s.render_interface) {
+     RGPU_ERROR("{} render interface creation failed", BackendName(ActiveBackend()));
+@@ -552,6 +587,7 @@
+     RGPU_ERROR("{} device creation failed", BackendName(ActiveBackend()));
+     return false;
+   }
++  banjo::renut_gpu::OnDeviceCreated(s.device.get());
+   s.backend_description =
+       std::string(BackendName(ActiveBackend())) + " on " + s.device->getDescription().name;
+   RGPU_INFO("Renderer: {}", s.backend_description);
+@@ -569,7 +605,9 @@
+       RGPU_ERROR("Frame {} command objects creation failed", i);
+       return false;
+     }
+-    if (!s.uploads[i].Init(s.device.get(), i == 0 ? "upload ring 0" : "upload ring 1"))
++    // banjo-nx: on Vulkan each chunk carries the draws' uniform buffer descriptor sets (upload_ring.h).
++    if (!s.uploads[i].Init(s.device.get(), i == 0 ? "upload ring 0" : "upload ring 1", IsVulkan(),
++                           banjo::renut_gpu::UploadCached()))
+       return false;
+     if (s.device->getCapabilities().queryPools)
+       s.timestamps[i] = s.device->createQueryPool(2 * VideoState::kTimedLists);
+@@ -582,12 +620,20 @@
+   // plume's Vulkan swapchain is created lazily by resize().
+   if (s.swap_chain && IsVulkan())
+     s.swap_chain->resize();
+-  if (!s.swap_chain || s.swap_chain->isEmpty()) {
++  if (!s.swap_chain) {
+     RGPU_ERROR("Swapchain creation failed");
+     return false;
+   }
+-  if (!detail::BuildSwapChainTargets(s))
+-    return false;
++  // banjo-nx: a window that starts minimized (window_start_minimized, the automated tests) has no
++  // surface extent yet: PresentLocked builds the swapchain's targets once it has one (needsResize),
++  // presenting nothing until then, as it does while minimized.
++  if (s.swap_chain->isEmpty() || !detail::BuildSwapChainTargets(s)) {
++    if (s.swap_chain->getWidth() && s.swap_chain->getHeight()) {
++      RGPU_ERROR("Swapchain creation failed");
++      return false;
++    }
++    RGPU_INFO("Swapchain: the window has no size yet (minimized); presenting starts when it has one");
++  }
+ 
+   if (!BuildUtilityLayout(s) || !BuildSamplers(s) || !BuildNullTexture(s) ||
+       !BuildPresentPipeline(s) || !BuildDepthResolvePipelines(s) || !BuildDrawLayout(s)) {
+@@ -619,6 +665,7 @@
+   std::lock_guard lock(s.mutex);
+   if (s.queue)
+     detail::WaitAllSubmitted(s);
++  banjo::renut_gpu::BeforeDeviceDestroyed();  // banjo-nx: the pipeline cache's last save
+ }
+ 
+ plume::RenderDevice *Video::Device() {
+diff --git a/backend/video.h b/backend/video.h
+--- a/backend/video.h
++++ b/backend/video.h
+@@ -143,6 +143,9 @@
+   std::unique_ptr<plume::RenderTextureView> null_texture_3d_view;
+   std::unique_ptr<plume::RenderTexture> null_texture_cube;
+   std::unique_ptr<plume::RenderTextureView> null_texture_cube_view;
++  // banjo-nx: banjo_renut_diag_poison_slots' magenta texture, which slots given back point at (null without the key).
++  std::unique_ptr<plume::RenderTexture> poison_texture;
++  std::unique_ptr<plume::RenderTextureView> poison_texture_view;
+   bool null_texture_initialized = false;
+   std::unique_ptr<plume::RenderSampler> linear_clamp_sampler;
+   std::unique_ptr<plume::RenderSampler> point_clamp_sampler;
+diff --git a/d3d/hooks/device.cpp b/d3d/hooks/device.cpp
+--- a/d3d/hooks/device.cpp
++++ b/d3d/hooks/device.cpp
+@@ -28,6 +28,8 @@
+ 
+ #include <rex/hook.h>
+ 
++#include "renut_engine/gpu/banjo_renut_tuning.h"  // banjo-nx: CountFenceQuery
++#include "renut_engine/gpu/banjo_renut_checks.h"  // banjo-nx (package 27c): QueueKickFlush
+ #include "renut_engine/gpu/banjo_renut_select.h"
+ #include <rex/kernel/xboxkrnl/video.h>
+ #include <rex/ppc.h>
+@@ -476,7 +478,9 @@
+ // wait for them (DrawStateLocked).
+ void KickDevice(d3d::Device *device, u32 device_va) {
+   FlushDeferredVertices(device_va);
+-  render_thread::Queue([] { FlushVertexFillsLocked(); });
++  // banjo-nx (package 27c): the texture fills too (they were read at the submit, after this fence had let the game
++  // rewrite them), numbered for banjo_renut_check_worker.
++  banjo::renut_gpu::checks::QueueKickFlush();
+   KickFence(reinterpret_cast<u8 *>(device));
+ }
+ 
+@@ -564,6 +568,7 @@
+ // The original polls through CBlocker::Check, which after 5 s without
+ // progress dumps the GPU's registers and traps.
+ u32 BlockOnFence_hook(u32 device_va, u32 fence, u32 /*type*/, u32 /*no_kick*/) {
++  banjo::renut_gpu::CountFenceQuery();  // banjo-nx (package 27c): the stream checks' design
+   auto *bytes = GuestPtr<u8>(device_va);
+   if (!bytes || !FencePending(bytes, fence))
+     return 0;
+@@ -598,6 +603,7 @@
+ // poll it, and the fence may be waiting for callbacks only a guest thread can
+ // run.
+ u32 IsFencePending_hook(u32 fence) {
++  banjo::renut_gpu::CountFenceQuery();  // banjo-nx (package 27c): the stream checks' design
+   RunReadyCallbacks();
+   if (!fence)
+     return 0;
+@@ -857,8 +863,13 @@
+     word(d3d::kDeviceOffsetSwapFenceTag) = fence_tag;
+     word(d3d::kDeviceOffsetPresentFenceTag) = fence_tag;
+     device[d3d::kDeviceOffsetSwapFlags] &= u8(~d3d::kSwapFlagPending);
++    // banjo-nx (package 27c): the frame's last vertex and texture fills are read here, before the Swap's fence
++    // completes. They were read at the present, after it: the game, told the frame was done, could rewrite a dynamic
++    // buffer for the next frame first, and the frame's last draws (the composite, the HUD) took the new bytes.
++    banjo::renut_gpu::checks::QueueKickFlush();
+     KickFence(device);
+   }
++  banjo::renut_gpu::checks::FrameIssued();
+ 
+   render_thread::QueueFrame([front_buffer] {
+     PresentImage image;
+diff --git a/gpu.cmake b/gpu.cmake
+--- a/gpu.cmake
++++ b/gpu.cmake
+@@ -16,9 +16,10 @@
+     "Directory of dumped Xenos shader containers (tools/dump_shaders.py output)")
+ set(RENUT_ASSETS_DIR "${CMAKE_SOURCE_DIR}/assets" CACHE PATH
+     "Game assets the shaders are dumped from (default.xex and Bundle/)")
++# banjo-nx: one docstring argument. With two, set() is not a cache entry but a list
++# ("<dir>;CACHE;PATH;..."), and the captures were never globbed or collected.
+ set(RENUT_SHADER_CAPTURE_DIR "${CMAKE_BINARY_DIR}/shader_capture" CACHE PATH
+-    "Where reNut, run from the build directory, captures shaders its cache lacks "
+-    "(renut_shader_capture_dir); the build adds them to RENUT_SHADER_DUMP_DIR")
++    "Where reNut, run from the build directory, captures shaders its cache lacks (renut_shader_capture_dir); the build adds them to RENUT_SHADER_DUMP_DIR")
+ 
+ # tools/dump_shaders.py, which runs when there are no dumped shaders yet
+ # (renut_xenos_shader_cache), needs Python 3 with the xxhash module.
+@@ -120,10 +121,10 @@
+ #     there into shader_cache.cpp (DXIL and SPIR-V, zstd-compressed).
+ #  3. shader_cache.cpp is compiled into the executable.
+ # ---------------------------------------------------------------------------
+-function(renut_xenos_shader_cache TARGET)
+-    if(COMMAND banjo_renut_shader_cache_override)
+-        banjo_renut_shader_cache_override(${TARGET})
+-        return()
++function(renut_xenos_shader_cache TARGET)
++    if(COMMAND banjo_renut_shader_cache_override)
++        banjo_renut_shader_cache_override(${TARGET})
++        return()
+     endif()
+     set(recomp_prefix "${CMAKE_BINARY_DIR}/xenos_recomp")
+     set(recomp_exe "${recomp_prefix}/build/XenosRecomp/XenosRecomp${CMAKE_EXECUTABLE_SUFFIX}")
+@@ -175,17 +176,40 @@
+     set(cache_cpp "${RENUT_GPU_GEN_DIR}/shader_cache.cpp")
+     file(GLOB shader_inputs CONFIGURE_DEPENDS "${RENUT_SHADER_DUMP_DIR}/*.bin")
+     file(GLOB captured_inputs CONFIGURE_DEPENDS "${RENUT_SHADER_CAPTURE_DIR}/*.bin")
++    # banjo-nx (banjo_gpu_early_alpha, package 27): tools/renut_early_alpha.py between two runs of the translator: the
++    # first dumps the pixel shaders' HLSL (BANJO_HLSL_DUMP_ONLY), the pass gives the alpha-tested ones their early alpha
++    # copy (self-checked against the original), the second compiles them (BANJO_HLSL_OVERRIDE). The dumps are game
++    # data (build tree only). OFF: one run, as before.
++    option(BANJO_RENUT_EARLY_ALPHA "Early alpha copies in Renut's pixel shaders (tools/renut_early_alpha.py)" ON)
++    set(early_alpha_dir "${RENUT_GPU_GEN_DIR}/early_alpha_hlsl")
++    if(BANJO_RENUT_EARLY_ALPHA)
++        set(early_alpha_commands
++            COMMAND ${CMAKE_COMMAND} -E rm -rf "${early_alpha_dir}"
++            COMMAND ${CMAKE_COMMAND} -E make_directory "${early_alpha_dir}"
++            COMMAND ${CMAKE_COMMAND} -E env BANJO_HLSL_DUMP_ONLY=1 "${recomp_exe}" "${RENUT_SHADER_DUMP_DIR}"
++                    "${RENUT_GPU_GEN_DIR}/early_alpha_pass1.cpp" "${RENUT_SHADER_COMMON_DIR}/shader_common.h"
++                    "${early_alpha_dir}"
++            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/../tools/renut_early_alpha.py" "${early_alpha_dir}")
++        set(early_alpha_env ${CMAKE_COMMAND} -E env "BANJO_HLSL_OVERRIDE=${early_alpha_dir}")
++        set(early_alpha_depends "${CMAKE_SOURCE_DIR}/../tools/renut_early_alpha.py"
++                                "${CMAKE_SOURCE_DIR}/../tools/early_alpha.py")
++    else()
++        set(early_alpha_commands)
++        set(early_alpha_env)
++        set(early_alpha_depends)
++    endif()
+     add_custom_command(
+         OUTPUT "${cache_cpp}"
+         COMMAND "${CMAKE_COMMAND}" "-DCAPTURE_DIR=${RENUT_SHADER_CAPTURE_DIR}"
+                 "-DDUMP_DIR=${RENUT_SHADER_DUMP_DIR}"
+                 -P "${CMAKE_SOURCE_DIR}/cmake/collect_captured_shaders.cmake"
+         COMMAND ${CMAKE_COMMAND} -E make_directory "${RENUT_GPU_GEN_DIR}"
+-        COMMAND "${recomp_exe}" "${RENUT_SHADER_DUMP_DIR}" "${cache_cpp}"
++        ${early_alpha_commands}
++        COMMAND ${early_alpha_env} "${recomp_exe}" "${RENUT_SHADER_DUMP_DIR}" "${cache_cpp}"
+                 "${RENUT_SHADER_COMMON_DIR}/shader_common.h"
+         DEPENDS renut_xenos_recomp "${recomp_exe}" "${RENUT_SHADER_COMMON_DIR}/shader_common.h"
+                 "${CMAKE_SOURCE_DIR}/cmake/collect_captured_shaders.cmake"
+-                ${dump_outputs} ${shader_inputs} ${captured_inputs}
++                ${dump_outputs} ${shader_inputs} ${captured_inputs} ${early_alpha_depends}
+         COMMENT "Recompiling Xenos shaders (RENUT_RECOMP) from ${RENUT_SHADER_DUMP_DIR}"
+         USES_TERMINAL VERBATIM)
+ 
+@@ -273,8 +297,12 @@
+         "${RENUT_IMGUI_DIR}/imgui_draw.cpp"
+         "${RENUT_IMGUI_DIR}/imgui_tables.cpp"
+         "${RENUT_IMGUI_DIR}/imgui_widgets.cpp")
+-    target_sources(${TARGET} PRIVATE ${renut_imgui_sources})
+-    set_source_files_properties(${renut_imgui_sources} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
++    # banjo-nx: not on the Switch, where everything links statically: a second copy there is a second definition of
++    # every ImGui symbol. The console uses the SDK's copy, and Renut's overlay is not started there (app_integration).
++    if(NOT REXGLUE_PLATFORM_SWITCH)
++        target_sources(${TARGET} PRIVATE ${renut_imgui_sources})
++        set_source_files_properties(${renut_imgui_sources} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
++    endif()
+     target_include_directories(${TARGET} BEFORE PRIVATE "${RENUT_IMGUI_DIR}")
+     target_compile_definitions(${TARGET} PRIVATE RENUT_RECOMP)
+     target_link_libraries(${TARGET} PRIVATE plume renut_zstd renut_smolv renut_xxhash rex::o1heap)
+diff --git a/guest/callbacks.cpp b/guest/callbacks.cpp
+--- a/guest/callbacks.cpp
++++ b/guest/callbacks.cpp
+@@ -13,6 +13,7 @@
+ #include "renut_engine/gpu/log.h"
+ #include "renut_engine/gpu/backend/render_thread.h"
+ #include "renut_engine/gpu/render/textures.h"
++#include "renut_engine/gpu/banjo_renut_checks.h"  // banjo-nx (package 27c)
+ 
+ namespace renut::gpu {
+ 
+@@ -42,7 +43,9 @@
+   // The linear textures of the work before it are read now, not when the
+   // command list is submitted: after the callback the game may rewrite them
+   // (the XMV player's frames).
+-  render_thread::Queue([] { FlushTextureFillsLocked(); });
++  // banjo-nx (package 27c): the vertex fills too, for the same reason, numbered as an interval's end for
++  // banjo_renut_check_worker.
++  banjo::renut_gpu::checks::QueueKickFlush();
+   render_thread::QueueCallbackMarker(seq);
+ }
+ 
+diff --git a/guest/resources.h b/guest/resources.h
+--- a/guest/resources.h
++++ b/guest/resources.h
+@@ -59,6 +59,11 @@
+   std::mutex host_mutex;
+   std::unique_ptr<plume::RenderShader> host;
+ 
++  // banjo-nx (banjo_gpu_bool_spec): the bools the shader's SPIR-V specialises (ShaderBoolSpecMask), read on the
++  // render thread at the first draw.
++  mutable u32 bool_spec_mask[8] = {};
++  mutable bool bool_spec_read = false;
++
+   bool pixel() const { return kind == RecordKind::PixelShader; }
+ };
+ 
+diff --git a/overlay/app_integration.cpp b/overlay/app_integration.cpp
+--- a/overlay/app_integration.cpp
++++ b/overlay/app_integration.cpp
+@@ -98,10 +98,15 @@
+     return false;
+   }
+   // reNut's own overlay (overlay_ui.h), built on the UI thread with the SDK's.
++#if !defined(__SWITCH__)
+   if (!overlay::Start([&app_context](std::function<void()> build) {
+         app_context.CallInUIThreadDeferred(std::move(build));
+       }))
+     RGPU_WARN("Overlay input unavailable: no game window");
++#else
++  // banjo-nx: not on the Switch. Its Dear ImGui there is the SDK's one copy (gpu.cmake), whose current context the
++  // SDK switches from any thread: the reason Renut builds its own copy elsewhere.
++#endif
+ 
+   // The SDK's own menus: recorded on the UI thread by the pump, drawn here
+   // from the latest recording, so Present never waits for the UI thread.
+diff --git a/render/draw.cpp b/render/draw.cpp
+--- a/render/draw.cpp
++++ b/render/draw.cpp
+@@ -9,6 +9,7 @@
+ #include <cmath>
+ #include <condition_variable>
+ #include <cstring>
++#include <limits>
+ #include <map>
+ #include <mutex>
+ #include <string>
+@@ -31,10 +32,13 @@
+ #include "renut_engine/gpu/log.h"
+ #include "renut_engine/gpu/render/pipeline.h"
+ #include "renut_engine/gpu/guest/resources.h"
++#include "renut_engine/gpu/render/shader_library.h"  // banjo-nx: ShaderBoolSpecMask
+ #include "renut_engine/gpu/render/surfaces.h"
+ #include "renut_engine/gpu/render/textures.h"
+ #include "renut_engine/gpu/render/vertex_format.h"
+ #include "renut_engine/gpu/backend/video_internal.h"
++#include "renut_engine/gpu/banjo_renut_tuning.h"
++#include "renut_engine/gpu/banjo_renut_checks.h"  // banjo-nx (package 27c): banjo_renut_check_worker
+ 
+ namespace renut::gpu {
+ 
+@@ -80,7 +84,9 @@
+   // transform off) and it maps them to clip space itself; 0 when the host
+   // viewport does it.
+   u32 screen_space;
+-  u32 pad_972;
++  // 972, banjo-nx (package 27; was padding): the byte size of the fetch data from vertex_fetch_data, the bound of
++  // vfetchMemoryClamped (shader_common.h): the predicated-block pass runs bone fetches unconditionally in that form.
++  u32 vertex_fetch_bytes;
+   // 976: memexport windows: guest byte address, size, byte offset in the
+   // export buffer. None yet, so memExport stores nothing.
+   u32 memexport_streams[4][4];
+@@ -100,7 +106,8 @@
+   // viewport, which is 'resolution_scale' times that), and padding.
+   float viewport_size[2];
+   float resolution_scale;  // 1336: of the render targets (ResolutionScale)
+-  float pad_1340;
++  // 1340, banjo-nx: FLT_MAX, the Xenos clamps' bound the SPIR-V shaders read here (shader_common.h; was padding).
++  float flt_max;
+ };
+ static_assert(offsetof(SharedConstants, sampler_indices) == 384);
+ static_assert(offsetof(SharedConstants, booleans) == 512);
+@@ -118,6 +125,7 @@
+ static_assert(offsetof(SharedConstants, viewport_size) == 1328);
+ static_assert(offsetof(SharedConstants, resolution_scale) == 1336);
+ static_assert(sizeof(SharedConstants) == 1344);
++static_assert(sizeof(SharedConstants) == kSharedConstantsUboBytes);
+ 
+ // The guest D3DDevice a draw reads its state from: the live device, or a
+ // recorded copy of its first kDeviceSnapshotSize bytes.
+@@ -154,6 +162,8 @@
+   // its constants, since when that replay's dirty groups are the only ones
+   // that can differ; 0 for none.
+   uint64_t replay = 0;
++  // banjo-nx (banjo_gpu_literals_cbuf): the shader whose literal registers alloc holds (UploadFloatConstants).
++  const ShaderCacheEntry *literals = nullptr;
+ };
+ 
+ // State bound on the current command list, reset whenever a new one begins.
+@@ -186,8 +196,29 @@
+   Stream streams[kZeroStreamSlot + 1];
+   bool index_set = false;
+   plume::RenderIndexBufferView index;
++  // banjo-nx (banjo_renut_shared_dedupe): the last SharedConstants upload and its bytes, which a draw with the same
++  // bytes reuses (no upload, and set 7 stays bound).
++  UploadAllocation shared_alloc;
++  bool shared_valid = false;
++  SharedConstants shared_bytes;
++  // banjo-nx: the uniform buffer sets 5-7 last bound (Vulkan), and their offsets.
++  const plume::RenderDescriptorSet *constant_sets[3] = {};
++  uint32_t constant_offsets[3] = {};
+ };
+ Bound g_bound;
++
++// banjo-nx: binds a constant upload's uniform buffer set at its offset (Vulkan), unless it is bound there already:
++// most draws in a row reuse the vertex shader's constants, and many the pixel shader's.
++void BindConstantSet(plume::RenderCommandList *cmd, uint32_t set_index, plume::RenderDescriptorSet *set,
++                     uint64_t offset) {
++  const uint32_t slot = set_index - kVertexConstantsSet;
++  const uint32_t offset32 = uint32_t(offset);
++  if (g_bound.constant_sets[slot] == set && g_bound.constant_offsets[slot] == offset32)
++    return;
++  cmd->setGraphicsDescriptorSetDynamic(set, set_index, &offset32, 1);
++  g_bound.constant_sets[slot] = set;
++  g_bound.constant_offsets[slot] = offset32;
++}
+ 
+ // The last declaration a draw looked up by VA (otherwise a registry lookup
+ // under its lock per draw): draws in a row mostly use the same one. Cleared
+@@ -385,6 +416,12 @@
+ constexpr uint64_t kStreamCacheMaxBytes = 768ull << 20;
+ uint64_t g_stream_cache_bytes = 0;
+ uint64_t g_stream_cache_frame = 0;
++// banjo-nx (2026-10-17): FlushVertexFillsLocked's calls (every kick, and the end of every command list): the points
++// after which the game may learn the GPU is done with what the draws before read, and write those buffers again.
++// banjo_renut_exact_streams proves a cached copy once per interval between two of them.
++uint64_t g_flush_serial = 0;
++// banjo-nx (package 28, banjo_renut_diag_resolve_trace): draws since the last change of targets.
++uint32_t g_trace_draws = 0;
+ 
+ // A cached copy's memory: part of one of the pool's buffers.
+ struct PoolSpan {
+@@ -579,6 +616,8 @@
+   u32 bytes = 0;
+   uint64_t last_used = 0;               // g_stream_cache_frame
+   uint64_t checked_frame = UINT64_MAX;  // g_stream_cache_frame the copy was last checked in
++  uint64_t proven_flush = UINT64_MAX;   // banjo-nx: g_flush_serial the copy was last hashed equal in
++  uint64_t exact_frame = UINT64_MAX;    // banjo-nx: g_stream_cache_frame of its last exact check (repeat count)
+ };
+ using StreamCache = std::unordered_map<StreamKey, CachedStream, StreamKeyHash>;
+ StreamCache g_stream_cache;
+@@ -589,8 +628,36 @@
+   return checked_frame == UINT64_MAX || g_stream_cache_frame - checked_frame >= kCacheVerifyFrames;
+ }
+ 
++// banjo-nx (package 27c): banjo_renut_exact_streams' checks, through a memo of the ranges hashed in this interval
++// (between two kicks): a buffer cached under several stream keys (layouts, stream slots) or index keys is read once.
++// Exact as the checks themselves: they hash at the first use in the interval, and so does the memo's first.
++struct IntervalHash {
++  const void *data = nullptr;
++  size_t size = 0;
++  uint64_t serial = UINT64_MAX;
++  uint64_t hash = 0;
++};
++IntervalHash g_interval_hashes[4096];
++
++uint64_t ExactHash(const void *data, size_t size) {
++  const uintptr_t k = (reinterpret_cast<uintptr_t>(data) >> 4) ^ (uintptr_t(size) * 0x9E3779B1u);
++  IntervalHash &e = g_interval_hashes[(k ^ (k >> 12)) & 4095];
++  if (e.serial == g_flush_serial && e.data == data && e.size == size) {
++    banjo::renut_gpu::CountExactMemoHit(size);
++    return e.hash;
++  }
++  // The check worker's hash of it at this interval's kick (package 27c), or the render thread's own.
++  banjo::renut_gpu::checks::Record(data, size);
++  uint64_t hash;
++  if (!banjo::renut_gpu::checks::Lookup(data, size, hash))
++    hash = banjo::renut_gpu::ContentHash64(data, size);
++  e = {data, size, g_flush_serial, hash};
++  return e.hash;
++}
++
+ uint64_t HashGuestStream(const StreamKey &key) {
+-  return XXH3_64bits(key.guest, size_t(key.count) * key.stride);
++  // banjo-nx: banjo_renut_pmull_hash (the PMULL CRC-64 on ARM).
++  return banjo::renut_gpu::ContentHash64(key.guest, size_t(key.count) * key.stride);
+ }
+ 
+ // The cached copies' checks, hashed off the render thread: every copy's guest
+@@ -643,6 +710,8 @@
+ 
+ private:
+   void Run() {
++    // banjo-nx: the background core and priority on the Switch (banjo_renut_tuning.h).
++    banjo::renut_gpu::OnBackgroundThreadStart("content verifier");
+     std::vector<Check> batch;
+     std::unique_lock lock(mutex_);
+     for (;;) {
+@@ -691,7 +760,8 @@
+   c.stable = hash == c.hash ? c.stable + 1 : 0;
+   c.hash = hash;
+   const u32 bytes = f.count * f.stream.host_stride;
+-  if (c.stable + 1 < kStableFlushes || g_stream_cache_bytes + bytes > kStreamCacheMaxBytes)
++  if (c.stable + 1 < kStableFlushes ||
++      g_stream_cache_bytes + bytes > banjo::renut_gpu::StreamCacheMaxBytes(kStreamCacheMaxBytes))  // banjo-nx
+     return;
+   const PoolSpan copy = g_copy_pool.Allocate(bytes);
+   if (!copy)
+@@ -702,6 +772,7 @@
+   c.copy = copy;
+   c.bytes = bytes;
+   c.checked_frame = g_stream_cache_frame;
++  c.proven_flush = UINT64_MAX;  // banjo-nx: made at a flush; proven again at its first use after it
+   g_stream_cache_bytes += bytes;
+ }
+ 
+@@ -822,6 +893,16 @@
+   plume::RenderFramebuffer *framebuffer = GetFramebufferLocked(t.colors, t.color_count, t.depth);
+   if (!framebuffer)
+     return false;
++  if (banjo::renut_gpu::ResolveTraceOn() && g_bound.framebuffer != framebuffer) {
++    RGPU_INFO("[trace] targets: {} draws before; now {} colour {:08X} {:08X} ({}x{} fmt {} samples {}), depth {:08X} "
++              "({}x{} samples {})",
++              g_trace_draws, t.color_count, t.color_count ? t.colors[0]->guest_va : 0,
++              t.color_count > 1 ? t.colors[1]->guest_va : 0, t.color_count ? t.colors[0]->width : 0,
++              t.color_count ? t.colors[0]->height : 0, t.color_count ? u32(t.colors[0]->format) : 0,
++              t.color_count ? u32(t.colors[0]->samples) : 0, t.depth ? t.depth->guest_va : 0,
++              t.depth ? t.depth->width : 0, t.depth ? t.depth->height : 0, t.depth ? u32(t.depth->samples) : 0);
++    g_trace_draws = 0;
++  }
+   if (g_bound.framebuffer != framebuffer) {
+     State().command_list->setFramebuffer(framebuffer);
+     g_bound.framebuffer = framebuffer;
+@@ -1038,8 +1119,12 @@
+ // the shader reads are written, whole: fixed-size copies the compiler keeps
+ // inline, where a run of registers at a time cost a branch per register.
+ UploadAllocation UploadFloatConstants(const FloatConstants &constants, const u32 used[8],
+-                                      ConstantUpload &last) {
+-  bool reuse = bool(last.alloc);
++                                      ConstantUpload &last, const ShaderCacheEntry *entry) {
++  // banjo-nx (banjo_gpu_literals_cbuf): the shader's literal registers it reads from the constant buffer hold its
++  // literal values, as the console's Direct3D loads them at SetShader. An upload holding another shader's (or none) is
++  // not reused for it.
++  const ShaderCacheEntry *literals = entry && entry->literalCount ? entry : nullptr;
++  bool reuse = bool(last.alloc) && (!literals || last.literals == literals);
+   for (u32 word = 0; reuse && word < 8; ++word)
+     reuse = !(used[word] & ~last.valid[word]);
+   // Within the replay that last matched 'last', only groups written since can
+@@ -1102,6 +1187,18 @@
+     }
+     last.valid[word] = valid;
+   }
++  // banjo-nx (banjo_gpu_literals_cbuf): the literal registers, after the groups (a group may hold one). They are not
++  // the device's values: out of 'valid', so a shader reading them as registers takes a new upload.
++  last.literals = literals;
++  if (literals) {
++    for (u32 i = 0; i < literals->literalCount; ++i) {
++      const ShaderLiteral &l = g_shaderLiterals[literals->literalOffset + i];
++      if (l.reg >= 256)
++        continue;
++      std::memcpy(out + l.reg * 16, l.value, 16);
++      last.valid[l.reg / 32] &= ~(1u << (l.reg % 32));
++    }
++  }
+   last.alloc = alloc;
+   last.replay = constants.replay;
+   if (constants.replay)
+@@ -1232,13 +1329,15 @@
+   bool wide = false;
+   uint64_t last_used = 0;               // g_stream_cache_frame
+   uint64_t checked_frame = UINT64_MAX;  // frame the range was last hashed or checked in
++  uint64_t proven_flush = UINT64_MAX;   // banjo-nx: g_flush_serial the copy was last hashed equal in
++  uint64_t exact_frame = UINT64_MAX;    // banjo-nx: g_stream_cache_frame of its last exact check (repeat count)
+ };
+ using IndexCache = std::unordered_map<IndexKey, CachedIndices, IndexKeyHash>;
+ IndexCache g_index_cache;
+ EntryMemo<IndexCache, IndexKeyHash, 12> g_index_memo;
+ 
+ uint64_t HashIndices(const IndexKey &key) {
+-  return XXH3_64bits(key.src, size_t(key.count) * (key.is32 ? 4 : 2));
++  return banjo::renut_gpu::ContentHash64(key.src, size_t(key.count) * (key.is32 ? 4 : 2));  // banjo-nx
+ }
+ 
+ ContentVerifier<IndexKey, HashIndices> g_index_verifier;
+@@ -1259,7 +1358,24 @@
+     return false;
+   CachedIndices &c = entry->second;
+   c.last_used = g_stream_cache_frame;
+-  if (CacheCheckDue(c.checked_frame)) {
++  if (banjo::renut_gpu::ExactStreamsOn()) {
++    // banjo-nx (2026-10-17): banjo_renut_exact_streams, as for streams. A changed range is dropped and the draw reads
++    // it itself (TrackIndices hashes it again).
++    if (c.proven_flush != g_flush_serial) {
++      const bool same = ExactHash(key.src, size_t(key.count) * (key.is32 ? 4 : 2)) == c.hash;
++      banjo::renut_gpu::CountExactCheck(uint64_t(key.count) * (key.is32 ? 4 : 2), !same,
++                                        c.exact_frame == g_stream_cache_frame);
++      c.exact_frame = g_stream_cache_frame;
++      if (!same) {
++        DropCachedIndices(c);
++        c.stable = 0;
++        c.checked_frame = UINT64_MAX;
++        c.dynamic = ++c.drops >= kMaxCacheDrops;
++        return false;
++      }
++      c.proven_flush = g_flush_serial;
++    }
++  } else if (CacheCheckDue(c.checked_frame)) {
+     c.checked_frame = g_stream_cache_frame;
+     g_index_verifier.Submit(key, c.hash);
+   }
+@@ -1286,7 +1402,8 @@
+   c.hash = hash;
+   const bool wide = max_index > 0xFFFE;
+   const u32 bytes = u32(g_indices.size()) * (wide ? 4 : 2);
+-  if (c.stable + 1 < kStableFlushes || g_stream_cache_bytes + bytes > kStreamCacheMaxBytes)
++  if (c.stable + 1 < kStableFlushes ||
++      g_stream_cache_bytes + bytes > banjo::renut_gpu::StreamCacheMaxBytes(kStreamCacheMaxBytes))  // banjo-nx
+     return;
+   const PoolSpan copy = g_copy_pool.Allocate(bytes);
+   if (!copy)
+@@ -1409,6 +1526,68 @@
+   return true;
+ }
+ 
++// banjo-nx (banjo_gpu_tess_grid, package 27): the index list of a tessellation grid, made once per kind and level: the
++// triangles renutVertexRegisters' kinds 1 and 2 place, in their order, with their corners, each corner as its grid
++// vertex's number (kinds 3 and 4 there). Render thread; the buffers live as long as the device.
++struct TessellationGrid {
++  std::unique_ptr<plume::RenderBuffer> buffer;
++  u32 index_count = 0;
++  bool wide = false;
++};
++std::map<u32, TessellationGrid> g_tess_grids;  // key: triangles << 8 | level
++
++const TessellationGrid *TessellationGridFor(bool triangles, u32 level) {
++  TessellationGrid &grid = g_tess_grids[(triangles ? 1u : 0u) << 8 | level];
++  if (grid.buffer)
++    return &grid;
++  std::vector<u32> indices;
++  if (triangles) {
++    auto number = [](u32 a, u32 b) { return a * (a + 1) / 2 + b; };
++    for (u32 t = 0; t < level * level; ++t) {
++      u32 row = u32(std::sqrt(double(t)));
++      while (row * row > t)
++        --row;
++      while ((row + 1) * (row + 1) <= t)
++        ++row;
++      const u32 k = t - row * row, b = k / 2;
++      if ((k & 1) == 0) {
++        indices.insert(indices.end(), {number(row, b), number(row + 1, b), number(row + 1, b + 1)});
++      } else {
++        indices.insert(indices.end(), {number(row, b), number(row + 1, b + 1), number(row, b + 1)});
++      }
++    }
++  } else {
++    auto number = [level](u32 u, u32 v) { return v * (level + 1) + u; };
++    for (u32 t = 0; t < 2 * level * level; ++t) {
++      const u32 cell = t / 2, u = cell % level, v = cell / level;
++      if ((t & 1) == 0)
++        indices.insert(indices.end(), {number(u, v), number(u + 1, v), number(u + 1, v + 1)});
++      else
++        indices.insert(indices.end(), {number(u, v), number(u + 1, v + 1), number(u, v + 1)});
++    }
++  }
++  const u32 points = triangles ? (level + 1) * (level + 2) / 2 : (level + 1) * (level + 1);
++  grid.wide = points > 0xFFFF;
++  const size_t bytes = indices.size() * (grid.wide ? 4 : 2);
++  auto buffer = State().device->createBuffer(
++      plume::RenderBufferDesc::UploadBuffer(bytes, plume::RenderBufferFlag::INDEX));
++  void *mapped = buffer ? buffer->map() : nullptr;
++  if (!mapped)
++    return nullptr;
++  if (grid.wide) {
++    std::memcpy(mapped, indices.data(), bytes);
++  } else {
++    auto *out = static_cast<uint16_t *>(mapped);
++    for (size_t i = 0; i < indices.size(); ++i)
++      out[i] = uint16_t(indices[i]);
++  }
++  buffer->unmap();
++  buffer->setName(fmt::format("banjo-nx tessellation grid {} {}", triangles ? "triangles" : "quads", level));
++  grid.buffer = std::move(buffer);
++  grid.index_count = u32(indices.size());
++  return &grid;
++}
++
+ // Tessellated draws (DrawCall::tessellation): the patches become instances of a
+ // grid the vertex shader places (renutVertexRegisters in shader_common.h), at
+ // one level for the whole draw, the highest any patch edge asks for.
+@@ -1468,6 +1647,21 @@
+   tessellation[0] = triangles ? 1 : 2;
+   tessellation[1] = segments;
+   tessellation[2] = u32(call.base_vertex);
++  // banjo-nx (banjo_gpu_tess_grid): the same triangles, indexed by grid vertex.
++  if (banjo::renut_gpu::TessGridOn()) {
++    if (const TessellationGrid *grid = TessellationGridFor(triangles, segments)) {
++      g.indexed = true;
++      g.index_count = grid->index_count;
++      g.index_view = plume::RenderIndexBufferView(plume::RenderBufferReference(grid->buffer.get()),
++                                                  grid->index_count * (grid->wide ? 4 : 2),
++                                                  grid->wide ? plume::RenderFormat::R32_UINT
++                                                             : plume::RenderFormat::R16_UINT);
++      tessellation[0] = triangles ? 3 : 4;
++      banjo::renut_gpu::CountTessGrid(uint64_t(patches) * g.vertex_count,
++                                      uint64_t(patches) * (triangles ? (segments + 1) * (segments + 2) / 2
++                                                                     : (segments + 1) * (segments + 1)));
++    }
++  }
+   return true;
+ }
+ 
+@@ -1569,7 +1763,24 @@
+     if (queued && src.stride) {
+       cached = &g_stream_memo.Get(g_stream_cache, key, true)->second;
+       cached->last_used = g_stream_cache_frame;
+-      if (cached->copy && CacheCheckDue(cached->checked_frame)) {
++      if (cached->copy && banjo::renut_gpu::ExactStreamsOn()) {
++        // banjo-nx (2026-10-17): banjo_renut_exact_streams. The copy's guest bytes hashed whole on its first use
++        // after each kick; changed, it is dropped and the stream converted below, as an uncached one.
++        if (cached->proven_flush != g_flush_serial) {
++          const bool same = ExactHash(key.guest, size_t(key.count) * key.stride) == cached->hash;
++          banjo::renut_gpu::CountExactCheck(uint64_t(key.count) * key.stride, !same,
++                                            cached->exact_frame == g_stream_cache_frame);
++          cached->exact_frame = g_stream_cache_frame;
++          if (same) {
++            cached->proven_flush = g_flush_serial;
++          } else {
++            DropCachedCopy(*cached);
++            cached->stable = 0;
++            cached->checked_frame = UINT64_MAX;
++            cached->dynamic = ++cached->drops >= kMaxCacheDrops;
++          }
++        }
++      } else if (cached->copy && CacheCheckDue(cached->checked_frame)) {
+         cached->checked_frame = g_stream_cache_frame;
+         g_stream_verifier.Submit(key, cached->hash);
+       }
+@@ -1751,9 +1962,14 @@
+     alloc.ref.offset = 0;
+     alloc.gpu_address = alloc.gpu_address ? alloc.gpu_address - chunk_offset : 0;
+     sc.vertex_fetch_data = alloc.gpu_address;
++    // banjo-nx: the whole chunk from its start (the base), all of it allocated memory: the same for every draw of the
++    // chunk, so draws keep the same SharedConstants (banjo_renut_shared_dedupe). 0 for a draw with no copies (its
++    // shaders fetch nothing from memory).
++    sc.vertex_fetch_bytes = copy_count ? u32(std::min<uint64_t>(alloc.chunk_size, 0xFFFFFFF0ull)) : 0u;
+     return alloc;
+   }
+   sc.vertex_fetch_data = alloc.gpu_address;
++  sc.vertex_fetch_bytes = copy_count ? total : 0u;  // banjo-nx: the region below, from its start
+ 
+   // The guest buffers' copies from the upload, the exported ones from their
+   // windows (raw bytes, as guest memory would hold them), each into its own
+@@ -1815,11 +2031,35 @@
+ 
+ // ---------------------------------------------------------------------------
+ 
++// banjo-nx (banjo_gpu_bool_spec): the bools a shader's SPIR-V specialises, read once.
++const u32 *BoolSpecMask(const ShaderRecord *r) {
++  if (!r->bool_spec_read) {
++    r->bool_spec_read = true;
++    if (r->entry)
++      ShaderBoolSpecMask(*r->entry, r->bool_spec_mask);
++  }
++  return r->bool_spec_mask;
++}
++
+ PipelineKey MakeKey(const GuestDevice &device, const ShaderRecord *vs, const ShaderRecord *ps,
+                     const VertexDeclarationRecord *declaration, const Targets &t, u32 primitive,
+-                    bool per_instance) {
++                    bool per_instance, const u32 *booleans) {
+   PipelineKey key;
+   std::memset(&key, 0, sizeof(key));
++  // banjo-nx (banjo_gpu_bool_spec): the draw's values of the bools its shaders specialise (the same words the shaders
++  // read at run time, SharedConstants.booleans).
++  if (banjo::renut_gpu::BoolSpecOn()) {
++    const u32 *vm = BoolSpecMask(vs);
++    const u32 *pm = ps ? BoolSpecMask(ps) : nullptr;
++    bool any = false;
++    for (u32 w = 0; w < 8; ++w) {
++      key.bool_mask[w] = vm[w] | (pm ? pm[w] : 0u);
++      key.bool_values[w] = booleans[w] & key.bool_mask[w];
++      any |= key.bool_mask[w] != 0;
++    }
++    if (any)
++      banjo::renut_gpu::CountBoolSpec(banjo::renut_gpu::BoolSpecEvent::kDraw);
++  }
+   const d3d::Device &dev = device.dev();
+   key.vertex_shader = vs->entry;
+   key.pixel_shader = ps ? ps->entry : nullptr;
+@@ -1861,6 +2101,12 @@
+     // the control points, so it is not culled.
+     key.mode_control &= ~3u;
+   }
++  // banjo-nx (banjo_gpu_blend_skip): from the fields above.
++  if (banjo::renut_gpu::BlendSkipOn())
++    key.blend_skip = BlendSkipMode(key);
++  // banjo-nx (banjo_gpu_output_trim, package 28): from the fields above too (the same pipelines: they differ by them).
++  if (banjo::renut_gpu::OutputTrimOn())
++    key.output_trim = OutputTrimMask(key);
+   return key;
+ }
+ 
+@@ -2649,6 +2895,8 @@
+ } // namespace detail
+ 
+ void FlushVertexFillsLocked() {
++  ++g_flush_serial;  // banjo-nx: banjo_renut_exact_streams' intervals
++  banjo::renut_gpu::CountKick();
+   for (const PendingStreamFill &f : g_stream_fills) {
+     ConvertVertices(f.stream, f.guest, f.stride, f.count, f.endian, f.host);
+     if (f.cacheable)
+@@ -2672,7 +2920,34 @@
+   return previous;
+ }
+ 
++// banjo-nx (banjo_gpu_depth_only, package 28; Unleashed / Marathon's depth-only pipelines): a draw that writes no
++// colour, into a depth target, without the alpha test or alpha to coverage, keeps nothing of its pixel shader unless the
++// shader kills pixels, writes depth or exports to memory (ShaderCacheEntry::shaderFlags, which the translator checks
++// against the shader's own text, and memExportConstants): it is drawn without it. Depth and stencil come from the
++// rasterizer either way (no SV_Depth), so the targets get the same values; the shader's constants and textures are not
++// set up, and its draws share one pipeline per vertex shader and state, whose vertex outputs NVK drops (linked stages).
++bool DrawsWithoutPixelShader(const GuestDevice &device, const Targets &t, const ShaderRecord &ps) {
++  if (!t.depth || !ps.entry || !banjo::renut_gpu::DepthOnlyOn())
++    return false;
++  const ShaderCacheEntry &e = *ps.entry;
++  if (e.shaderFlags & (kShaderFlagPixelKill | kShaderFlagPixelDepth))
++    return false;
++  for (const u32 m : e.memExportConstants) {
++    if (m)
++      return false;
++  }
++  const d3d::Device &dev = device.dev();
++  const u32 color_mask = u32(dev.m_ValuesPacket.ColorMask) & 0xFFFF;  // MakeKey's; 4 bits per target
++  if (t.color_count && (color_mask & ((1u << (4 * t.color_count)) - 1u)))
++    return false;
++  const u32 color_control = dev.m_ControlPacket.ColorControl;
++  if ((color_control & 8) && (color_control & 7) != 7)  // the alpha test, as sc.alpha_test_func
++    return false;
++  return ((color_control >> 4) & 1) == 0;  // alpha to coverage, as MakeKey's
++}
++
+ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayConstants *replay) {
++  ++g_trace_draws;
+   auto &s = State();
+   const GuestDevice device(device_state);
+   if (!device.valid())
+@@ -2748,10 +3023,17 @@
+   Targets targets;
+   if (!GatherTargets(device, targets))
+     return false;
++  // banjo-nx (banjo_gpu_depth_only): before anything of the pixel shader is set up.
++  if (ps && DrawsWithoutPixelShader(device, targets, *ps)) {
++    ps = nullptr;
++    host_ps = nullptr;
++    banjo::renut_gpu::CountDepthOnly();
++  }
+ 
+   // Everything that records copies or barriers comes before the framebuffer.
+   SharedConstants sc;
+   std::memset(&sc, 0, sizeof(sc));
++  sc.flt_max = std::numeric_limits<float>::max();  // banjo-nx: 0x7F7FFFFF, the clamps' bound (shader_common.h)
+   const u32 texture_mask =
+       (vs->entry ? vs->entry->textureFetchMask : 0) | (ps && ps->entry ? ps->entry->textureFetchMask : 0);
+   FillTextures(device, texture_mask, sc);
+@@ -2804,8 +3086,8 @@
+   static constexpr u32 kNoRegisters[8] = {};
+   const u32 *vs_used = vs->entry ? vs->entry->floatConstants : kAllRegisters;
+   const u32 *ps_used = !ps ? kNoRegisters : ps->entry ? ps->entry->floatConstants : kAllRegisters;
+-  UploadAllocation vs_alloc = UploadFloatConstants(vs_constants, vs_used, g_bound.vs_constants);
+-  UploadAllocation ps_alloc = UploadFloatConstants(ps_constants, ps_used, g_bound.ps_constants);
++  UploadAllocation vs_alloc = UploadFloatConstants(vs_constants, vs_used, g_bound.vs_constants, vs->entry);
++  UploadAllocation ps_alloc = UploadFloatConstants(ps_constants, ps_used, g_bound.ps_constants, ps ? ps->entry : nullptr);
+   MemExportStream exports[kMaxMemExportStreams];
+   u32 export_count = 0;
+   u32 export_offsets[kMaxMemExportStreams] = {};
+@@ -2819,12 +3101,45 @@
+   plume::RenderBuffer *memexport = MemExportBufferLocked(s);
+   if (memexport && IsVulkan())
+     sc.memexport_address = memexport->getDeviceAddress();
+-  UploadAllocation sc_alloc = Video::UploadsLocked().Upload(&sc, sizeof(sc), 256);
++  UploadAllocation sc_alloc;
++  if (g_bound.shared_valid && banjo::renut_gpu::SharedDedupeOn() &&
++      std::memcmp(&g_bound.shared_bytes, &sc, sizeof(sc)) == 0) {
++    sc_alloc = g_bound.shared_alloc;  // banjo-nx: the same bytes are in this list's last upload
++    banjo::renut_gpu::CountSharedConstants(true);
++  } else {
++    sc_alloc = Video::UploadsLocked().Upload(&sc, sizeof(sc), 256);
++    if (sc_alloc) {
++      g_bound.shared_alloc = sc_alloc;
++      std::memcpy(&g_bound.shared_bytes, &sc, sizeof(sc));
++      g_bound.shared_valid = true;
++    }
++    banjo::renut_gpu::CountSharedConstants(false);
++  }
+   if (!fetch_alloc || !vs_alloc || !ps_alloc || !sc_alloc || !memexport)
+     return false;
+ 
+   const PipelineKey key =
+-      MakeKey(device, vs, ps, declaration, targets, call.primitive, geometry.per_instance);
++      MakeKey(device, vs, ps, declaration, targets, call.primitive, geometry.per_instance, sc.booleans);
++  {
++    // banjo-nx (package 28, a census): draws that write no colour, nothing at all, or part of a target's channels.
++    const u32 used_mask = key.color_count ? key.color_mask & ((1u << (4 * key.color_count)) - 1u) : 0u;
++    const bool no_colour = used_mask == 0;
++    const u32 dc = key.depth_control;
++    const bool depth = key.depth_format != plume::RenderFormat::UNKNOWN;
++    const bool depth_writes = depth && (dc & 2) && (dc & 4);
++    const u32 stencil_write_mask = (key.stencil_ref_mask >> 16) & 0xFF;
++    const bool stencil_ops = ((dc >> 11) & 0x1FF) != 0 || ((dc >> 20) & 0x1FF) != 0;
++    const bool stencil_writes = depth && (dc & 1) && stencil_write_mask && stencil_ops;
++    bool partial = false;
++    for (u32 i = 0; i < key.color_count; ++i) {
++      const u32 m = (key.color_mask >> (4 * i)) & 0xF;
++      partial |= m != 0 && m != 0xF;
++    }
++    const bool exports = (vs->entry && vs->entry->memExportConstants[0]) || (ps && ps->entry && ps->entry->memExportConstants[0]);
++    banjo::renut_gpu::CountDrawKind(no_colour && depth, no_colour && depth && sc.alpha_test_func == 7 &&
++                                    !key.alpha_to_coverage && ps != nullptr,
++                                    no_colour && !depth_writes && !stencil_writes && !exports, partial);
++  }
+   plume::RenderPipeline *pipeline =
+       GetPipelineLocked(key, {host_vs, host_ps, &declaration->layout});
+   if (!pipeline || !BindTargets(targets))
+@@ -2842,8 +3157,10 @@
+     g_bound.layout = true;
+     g_bound.pipeline = nullptr;
+     std::fill(std::begin(g_bound.root_set), std::end(g_bound.root_set), false);
++    std::fill(std::begin(g_bound.constant_sets), std::end(g_bound.constant_sets), nullptr);
+   }
+   if (g_bound.pipeline != pipeline) {
++    banjo::renut_gpu::BeforePipelineBind(pipeline);  // banjo-nx: NVK's prefetch hint (the Switch)
+     cmd->setPipeline(pipeline);
+     g_bound.pipeline = pipeline;
+     // Vulkan: a pipeline without the constant as dynamic state overwrites it.
+@@ -2866,8 +3183,16 @@
+     }
+   }
+   if (IsVulkan()) {
+-    const DrawPushConstants push{vs_alloc.gpu_address, ps_alloc.gpu_address, sc_alloc.gpu_address};
+-    cmd->setGraphicsPushConstants(0, &push, 0, sizeof(push));
++    // banjo-nx (banjo_renut_push_point_only): with the constants in uniform buffers only point_sprite_gs reads the
++    // push constant, so the other draws do not push it (NVK: a root-table upload a draw less).
++    if (key.point_sprite || !banjo::renut_gpu::PushPointOnly()) {
++      const DrawPushConstants push{vs_alloc.gpu_address, ps_alloc.gpu_address, sc_alloc.gpu_address};
++      cmd->setGraphicsPushConstants(0, &push, 0, sizeof(push));
++    }
++    // banjo-nx: what the guest shaders read.
++    BindConstantSet(cmd, kVertexConstantsSet, vs_alloc.float_constants_set, vs_alloc.ref.offset);
++    BindConstantSet(cmd, kPixelConstantsSet, ps_alloc.float_constants_set, ps_alloc.ref.offset);
++    BindConstantSet(cmd, kSharedConstantsSet, sc_alloc.shared_constants_set, sc_alloc.ref.offset);
+   } else {
+     SetRootDescriptor(cmd, vs_alloc.ref, kDrawRootVertexConstants);
+     SetRootDescriptor(cmd, ps_alloc.ref, kDrawRootPixelConstants);
+@@ -2882,7 +3207,8 @@
+   }
+   if (geometry.indexed) {
+     SetIndexBuffer(cmd, geometry.index_view);
+-    cmd->drawIndexedInstanced(geometry.index_count, 1, 0, 0, 0);
++    // banjo-nx: instanced for a tessellation grid (banjo_gpu_tess_grid); 1 for every other indexed draw.
++    cmd->drawIndexedInstanced(geometry.index_count, geometry.instance_count, 0, 0, 0);
+   } else {
+     cmd->drawInstanced(geometry.vertex_count, geometry.instance_count, 0, 0);
+   }
+@@ -2906,15 +3232,20 @@
+   auto &s = State();
+   plume::RenderBuffer *readback = s.memexport_readback[slot].get();
+   if (const auto *data = readback ? static_cast<const u8 *>(readback->map()) : nullptr) {
++    banjo::renut_gpu::checks::MemoryWriteBegin();  // banjo-nx: the check worker's hashes in flight are void
+     for (const PendingExport &p : exports.pending) {
+       if (u8 *guest = GuestPhysicalPtr<u8>(p.base))
+         std::memcpy(guest, data + p.offset, p.size);
+     }
++    banjo::renut_gpu::checks::MemoryWriteEnd();
+     readback->unmap();
+   }
+   exports.pending.clear();
+   exports.used = 0;
+   RebuildExportGranules();
++  // banjo-nx (2026-10-17): guest memory changed under the draws: cached copies are proven again
++  // (banjo_renut_exact_streams), as after a kick.
++  ++g_flush_serial;
+ }
+ 
+ } // namespace detail
+@@ -2927,6 +3258,8 @@
+ }
+ 
+ void AdvanceStreamCacheFrameLocked() {
++  banjo::renut_gpu::ResolveTraceFrameStart();
++  g_trace_draws = 0;
+   // Copies whose guest bytes changed (ContentVerifier), unless made again
+   // since they were checked.
+   static std::vector<decltype(g_stream_verifier)::Check> stale;
+@@ -2943,6 +3276,7 @@
+     c.stable = 0;
+     c.checked_frame = UINT64_MAX;
+     c.dynamic = ++c.drops >= kMaxCacheDrops;
++    banjo::renut_gpu::CountLateStale(1);  // banjo-nx: drawn from its old copy until now
+   }
+   stale.clear();
+ 
+@@ -2960,6 +3294,7 @@
+     c.stable = 0;
+     c.checked_frame = UINT64_MAX;  // hashed again by TrackIndices
+     c.dynamic = ++c.drops >= kMaxCacheDrops;
++    banjo::renut_gpu::CountLateStale(1);  // banjo-nx: drawn from its old copy until now
+   }
+   stale_indices.clear();
+ 
+@@ -2968,14 +3303,16 @@
+   // The memos may hold entries about to go.
+   g_stream_memo.Clear();
+   g_index_memo.Clear();
+-  std::erase_if(g_stream_cache, [](auto &entry) {
+-    if (g_stream_cache_frame - entry.second.last_used < kStreamCacheIdleFrames)
++  // banjo-nx: banjo_renut_memory_policy's idle time (Renut's kStreamCacheIdleFrames without it).
++  const uint64_t idle_frames = banjo::renut_gpu::StreamCacheIdleFrames(kStreamCacheIdleFrames);
++  std::erase_if(g_stream_cache, [idle_frames](auto &entry) {
++    if (g_stream_cache_frame - entry.second.last_used < idle_frames)
+       return false;
+     DropCachedCopy(entry.second);
+     return true;
+   });
+-  std::erase_if(g_index_cache, [](auto &entry) {
+-    if (g_stream_cache_frame - entry.second.last_used < kStreamCacheIdleFrames)
++  std::erase_if(g_index_cache, [idle_frames](auto &entry) {
++    if (g_stream_cache_frame - entry.second.last_used < idle_frames)
+       return false;
+     DropCachedIndices(entry.second);
+     return true;
+@@ -3002,6 +3339,10 @@
+ // piled up into drips.
+ void ClearTargets(const Targets &t, u32 flags, const plume::RenderRect &rect, const float color[4],
+                   float depth, u32 stencil) {
++  if (banjo::renut_gpu::ResolveTraceOn()) {
++    RGPU_INFO("[trace] clear {:X} rect ({},{})-({},{}) of {}x{}", flags, rect.left, rect.top, rect.right, rect.bottom,
++              t.width, t.height);
++  }
+   if (rect.right <= rect.left || rect.bottom <= rect.top || !BindTargets(t))
+     return;
+   plume::RenderCommandList *cmd = State().command_list;
+@@ -3161,6 +3502,14 @@
+   const u32 source_va = source == 4 ? device.U32(d3d::kDeviceOffsetDepthStencil)
+                                     : device.U32(d3d::kDeviceOffsetRenderTargets + source * 4);
+   HostSurface *surface = GetHostSurfaceLocked(source_va);
++  if (banjo::renut_gpu::ResolveTraceOn() && surface) {
++    const ClearRect r = source_rect ? *source_rect : ClearRect{0, 0, -1, -1};
++    RGPU_INFO("[trace] resolve {} {:08X} ({}x{} fmt {} samples {}) -> texture {:08X} at ({},{}) level {} slice {}, "
++              "rect ({},{})-({},{}), flags {:X} ({}{})",
++              surface->depth ? "depth" : "colour", source_va, surface->width, surface->height, u32(surface->format),
++              u32(surface->samples), dest_texture_va, dest_x, dest_y, dest_level, dest_slice, r.x1, r.y1, r.x2, r.y2,
++              flags, (flags & 0x100) ? "clear colour after " : "", (flags & 0x200) ? "clear depth after" : "");
++  }
+   plume::RenderCommandList *cmd = s.command_list;
+   static uint32_t depth_logged = 0;
+ 
+diff --git a/render/pipeline.cpp b/render/pipeline.cpp
+--- a/render/pipeline.cpp
++++ b/render/pipeline.cpp
+@@ -4,6 +4,7 @@
+ #include "renut_engine/gpu/render/pipeline.h"
+ 
+ #include <algorithm>
++#include <bit>
+ #include <condition_variable>
+ #include <cstring>
+ #include <deque>
+@@ -13,6 +14,7 @@
+ #include <memory>
+ #include <mutex>
+ #include <string>
++#include <chrono>
+ #include <thread>
+ #include <unordered_map>
+ #include <unordered_set>
+@@ -38,6 +40,7 @@
+ #include "renut_engine/gpu/log.h"
+ #include "renut_engine/gpu/guest/resources.h"
+ #include "renut_engine/gpu/render/shader_library.h"
++#include "renut_engine/gpu/banjo_renut_tuning.h"
+ 
+ REXCVAR_DEFINE_STRING(renut_pipeline_list, "pipeline_list.bin", "Nuts&Bolts/Graphics",
+                       "The pipelines the renderer has built, which it builds ahead of use at the "
+@@ -103,8 +106,126 @@
+   return desc;
+ }
+ 
++} // namespace
++
++// banjo-nx (banjo_gpu_blend_skip). Vulkan clamps a UNORM target's source and factors to [0, 1] before the blend, so a
++// source alpha of 0 or less is 0 there, and a whole source of 0 or less is 0. The target keeps its value where the
++// source term is 0 and the destination factor is 1 at that source, on every channel written, with ADD.
++uint32_t BlendSkipMode(const PipelineKey &key) {
++  if (!key.pixel_shader || key.color_count != 1 || key.alpha_to_coverage)
++    return 0;
++  // Depth or stencil writes would differ (the discard writes neither).
++  if (key.depth_format != plume::RenderFormat::UNKNOWN && (key.depth_control & (1u | 4u)))
++    return 0;
++  switch (key.color_formats[0]) {
++  case plume::RenderFormat::R8G8B8A8_UNORM:
++  case plume::RenderFormat::B8G8R8A8_UNORM:
++  case plume::RenderFormat::R16G16B16A16_UNORM:
++  case plume::RenderFormat::R8G8_UNORM:
++  case plume::RenderFormat::R8_UNORM:
++  case plume::RenderFormat::R16G16_UNORM:
++  case plume::RenderFormat::R16_UNORM:
++    break;
++  default:
++    return 0;  // float targets do not clamp; sRGB ones convert
++  }
++  const plume::RenderBlendDesc b = BlendDesc(key.blend_control[0], key.color_mask);
++  if (!b.blendEnabled || (b.renderTargetWriteMask & 0xF) == 0)
++    return 0;
++  using B = plume::RenderBlend;
++  using Op = plume::RenderBlendOperation;
++  const bool rgb = (b.renderTargetWriteMask & 7) != 0, alpha = (b.renderTargetWriteMask & 8) != 0;
++  // Alpha: the source alpha is 0 in both modes, so its term is 0 whatever its factor; the destination's must be 1.
++  if (alpha && !(b.blendOpAlpha == Op::ADD && (b.dstBlendAlpha == B::ONE || b.dstBlendAlpha == B::INV_SRC_ALPHA)))
++    return 0;
++  if (!rgb)
++    return 1;
++  if (b.blendOp != Op::ADD)
++    return 0;
++  // Mode 1: only the alpha is 0 or less: the colour's source factor must be 0 at alpha 0.
++  const bool src_zero_at_alpha_zero =
++      b.srcBlend == B::ZERO || b.srcBlend == B::SRC_ALPHA || b.srcBlend == B::SRC_ALPHA_SAT;
++  const bool dst_one_at_alpha_zero = b.dstBlend == B::ONE || b.dstBlend == B::INV_SRC_ALPHA;
++  if (src_zero_at_alpha_zero && dst_one_at_alpha_zero)
++    return 1;
++  // Mode 2: the whole source is 0: its term is 0 for any factor; the destination's must be 1 at a zero source.
++  if (dst_one_at_alpha_zero || b.dstBlend == B::INV_SRC_COLOR)
++    return 2;
++  return 0;
++}
++
++namespace {
++
++// The channels a render target format has (RGBA bits, as the colour write mask). Vulkan drops a component the format
++// lacks. Formats not listed: all four (nothing trimmed).
++uint32_t FormatChannels(plume::RenderFormat format) {
++  using F = plume::RenderFormat;
++  switch (format) {
++  case F::R8_UNORM:
++  case F::R16_UNORM:
++  case F::R16_FLOAT:
++  case F::R32_FLOAT:
++    return 0x1;
++  case F::R8G8_UNORM:
++  case F::R16G16_UNORM:
++  case F::R16G16_FLOAT:
++  case F::R32G32_FLOAT:
++    return 0x3;
++  default:
++    return 0xF;
++  }
++}
++
++bool BlendReadsSourceAlpha(plume::RenderBlend b) {
++  using B = plume::RenderBlend;
++  return b == B::SRC_ALPHA || b == B::INV_SRC_ALPHA || b == B::SRC_ALPHA_SAT;
++}
++
++bool BlendReadsSecondSource(plume::RenderBlend b) {
++  using B = plume::RenderBlend;
++  return b == B::SRC1_COLOR || b == B::INV_SRC1_COLOR || b == B::SRC1_ALPHA || b == B::INV_SRC1_ALPHA;
++}
++
++} // namespace
++
++// banjo-nx (banjo_gpu_output_trim). Vulkan writes a channel only where the write mask has it and the format has it;
++// blending reads the source per channel (its own value, SRC_COLOR) and the source alpha (the alpha factors), never
++// another colour channel; the alpha factors of the alpha channel read only alphas.
++uint32_t OutputTrimMask(const PipelineKey &key) {
++  if (!key.pixel_shader)
++    return 0;
++  uint32_t trim = 0;
++  for (uint32_t i = 0; i < d3d::kMaxRenderTargets; ++i) {
++    if (i >= key.color_count) {
++      trim |= 0xFu << (4 * i);  // no target: an output nothing receives
++      continue;
++    }
++    const uint32_t write = (key.color_mask >> (4 * i)) & 0xF & FormatChannels(key.color_formats[i]);
++    uint32_t t = ~write & 0xF;
++    const plume::RenderBlendDesc b = BlendDesc(key.blend_control[i], key.color_mask >> (4 * i));
++    if (b.blendEnabled) {
++      if (BlendReadsSecondSource(b.srcBlend) || BlendReadsSecondSource(b.dstBlend) ||
++          BlendReadsSecondSource(b.srcBlendAlpha) || BlendReadsSecondSource(b.dstBlendAlpha))
++        t = 0;
++      // A written colour channel whose factors read the source alpha.
++      if ((write & 7) && (BlendReadsSourceAlpha(b.srcBlend) || BlendReadsSourceAlpha(b.dstBlend)))
++        t &= 7;
++    }
++    if (i == 0 && key.alpha_to_coverage)
++      t &= 7;
++    trim |= t << (4 * i);
++  }
++  return trim;
++}
++
++namespace {
++
+ // Any thread: reads only what device creation set up.
+ std::unique_ptr<plume::RenderPipeline> Build(const PipelineKey &key, const PipelineInputs &inputs) {
++  // banjo-nx (a test, banjo_renut_diag_build_delay_ms): console-slow compiles on the PC.
++  if (const int delay = banjo::renut_gpu::DiagBuildDelayMs())
++    std::this_thread::sleep_for(std::chrono::milliseconds(delay));
++  banjo::renut_gpu::NotePipelineBuilt();  // banjo-nx (banjo_renut_cache_save_quiet)
+   auto &s = State();
+   const HostVertexLayout &layout = *inputs.layout;
+ 
+@@ -162,6 +283,28 @@
+   desc.multisampling = plume::RenderMultisampling(plume::RenderSampleCounts(key.samples));
+   desc.alphaToCoverageEnabled = key.alpha_to_coverage != 0;
+ 
++  // banjo-nx (banjo_gpu_bool_spec): the key's bools as the shaders' specialization constants (banjo_bool_spec.h). One
++  // list for every stage: a stage takes the ids it declares (vertex and pixel shader bools have distinct ones).
++  plume::RenderSpecConstant spec[257];
++  uint32_t spec_count = 0;
++  for (uint32_t w = 0; w < 8; ++w) {
++    for (uint32_t m = key.bool_mask[w]; m; m &= m - 1) {
++      const uint32_t b = uint32_t(std::countr_zero(m));
++      spec[spec_count++] = plume::RenderSpecConstant(1000 + w * 32 + b, (key.bool_values[w] >> b) & 1u);
++    }
++  }
++  // banjo-nx (banjo_gpu_blend_skip): the pixel shader's discard of pixels the blend would not change.
++  if (key.blend_skip)
++    spec[spec_count++] = plume::RenderSpecConstant(900, key.blend_skip);
++  // banjo-nx (banjo_gpu_output_trim): the colour channels the pixel shader leaves 0.
++  if (key.output_trim) {
++    spec[spec_count++] = plume::RenderSpecConstant(901, key.output_trim);
++    if (banjo::renut_gpu::DiagTrimPoison())
++      spec[spec_count++] = plume::RenderSpecConstant(902, 1);  // the test: trimmed channels 60000
++  }
++  desc.specConstants = spec_count ? spec : nullptr;
++  desc.specConstantsCount = spec_count;
++
+   plume::RenderInputSlot slots[kMaxVertexStreams + 1];
+   uint32_t slot_count = 0;
+   for (uint32_t stream = 0; stream < kMaxVertexStreams; ++stream) {
+@@ -202,7 +345,7 @@
+ // bumps kListVersion; a file of another version is started over.
+ 
+ constexpr char kListMagic[4] = {'R', 'N', 'P', 'L'};
+-constexpr u32 kListVersion = 1;
++constexpr u32 kListVersion = 3;  // banjo-nx: 2, the key's bool words (banjo_gpu_bool_spec); 3, output_trim
+ 
+ struct ListHeader {
+   char magic[4];
+@@ -354,7 +497,7 @@
+     if (failed || !listed.insert(hash).second)
+       return;
+     if (!out.is_open()) {
+-      const std::filesystem::path path(REXCVAR_GET(renut_pipeline_list));
++      const std::filesystem::path path = banjo::renut_gpu::NextToExecutable(REXCVAR_GET(renut_pipeline_list));
+       std::error_code ec;
+       const bool fresh = !std::filesystem::exists(path, ec) || std::filesystem::file_size(path, ec) == 0;
+       out.open(path, std::ios::binary | std::ios::app);
+@@ -386,7 +529,7 @@
+ // is missing or from another version.
+ std::vector<std::unique_ptr<Job>> LoadList() {
+   std::vector<std::unique_ptr<Job>> jobs;
+-  const std::filesystem::path path(REXCVAR_GET(renut_pipeline_list));
++  const std::filesystem::path path = banjo::renut_gpu::NextToExecutable(REXCVAR_GET(renut_pipeline_list));
+   std::ifstream in(path, std::ios::binary);
+   if (!in)
+     return jobs;
+@@ -444,6 +587,7 @@
+   u32 workers = 0;               // still running
+   u32 building = 0;              // workers between taking a job and finishing it
+   bool stop = false;
++  bool started = false;          // banjo-nx: the workers were started (StartWorkersLocked)
+   // Host shaders for the queued jobs, shared by the workers; freed whenever the
+   // queue runs dry (the pipelines keep their own compiled copies).
+   std::unordered_map<const ShaderCacheEntry *, std::unique_ptr<plume::RenderShader>> shaders;
+@@ -464,6 +608,7 @@
+   SetThreadDescription(GetCurrentThread(), L"renut pipeline prebuild");
+   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+ #endif
++  banjo::renut_gpu::OnPrebuildWorkerStart();  // banjo-nx: its core and priority on the Switch
+   std::unique_lock lock(g_prebuild.mutex);
+   for (;;) {
+     g_prebuild.work.wait(lock, [] { return g_prebuild.stop || !g_prebuild.queue.empty(); });
+@@ -508,6 +653,66 @@
+     g_prebuild.queue.push_back(&job);
+ }
+ 
++// banjo-nx: the prebuild workers, started once (by the list at the start, or by the first specialised pipeline).
++// Requires g_prebuild.mutex.
++void StartWorkersLocked() {
++  if (g_prebuild.workers != 0 || g_prebuild.stop || g_prebuild.started)
++    return;
++  g_prebuild.started = true;
++  // Leave the render and game threads their cores.
++  const u32 cores = std::max(1u, std::thread::hardware_concurrency());
++  const u32 workers = banjo::renut_gpu::PrebuildWorkers(std::clamp(cores / 2, 1u, 4u));  // banjo-nx
++  g_prebuild.workers = workers;
++  // banjo-nx: not std::thread::detach, which throws on the Switch (package 24's crash); a thread that is never
++  // joined, with a stack of its own size there (banjo_renut_tuning.h). StopPipelinePrebuild waits for the workers.
++  for (u32 i = 0; i < workers; ++i)
++    banjo::renut_gpu::StartLongLivedThread(PrebuildWorker, 512 * 1024);
++}
++
++// banjo-nx (banjo_gpu_bool_spec): a specialised pipeline, without waiting. Ready: built (moved to 'out'); Pending:
++// queued or building (a job made now if there was none); Failed: its build failed. Render thread.
++enum class SpecState { Ready, Pending, Failed };
++SpecState SpecialisedPipeline(const PipelineKey &key, uint64_t hash, const HostVertexLayout &layout,
++                              std::unique_ptr<plume::RenderPipeline> &out) {
++  std::lock_guard lock(g_prebuild.mutex);
++  if (g_prebuild.stop)
++    return SpecState::Failed;
++  auto &jobs = g_prebuild.by_hash[hash];
++  for (Job *j : jobs) {
++    if (std::memcmp(&j->key, &key, sizeof(key)) != 0)
++      continue;
++    if (j->stage != Job::Stage::Done)
++      return SpecState::Pending;
++    if (!j->pipeline)
++      return SpecState::Failed;
++    out = std::move(j->pipeline);
++    return SpecState::Ready;
++  }
++  // A job of its own, self-contained (the record form copies the layout's names), as the list's are.
++  auto job = std::make_unique<Job>();
++  const std::vector<char> record = EncodeRecord(key, layout);
++  if (!DecodeRecord(record.data(), record.size(), *job))
++    return SpecState::Failed;
++  Job *j = job.get();
++  g_prebuild.jobs.push_back(std::move(job));
++  jobs.push_back(j);
++  QueueOrWait(*j);
++  StartWorkersLocked();
++  g_prebuild.work.notify_one();
++  return SpecState::Pending;
++}
++
++bool Specialised(const PipelineKey &key) {
++  for (const uint32_t w : key.bool_mask) {
++    if (w)
++      return true;
++  }
++  return false;
++}
++
++// Render thread: specialised keys whose build failed (they draw with the generic pipeline).
++std::unordered_set<uint64_t> g_spec_failed;
++
+ // The listed pipeline for the key, when the list has it: built by a worker
+ // (waited for when one is building it), or nullptr with 'claimed' set when no
+ // worker has started it, which the caller then builds itself. Render thread.
+@@ -555,7 +760,15 @@
+   layout.addDescriptorSet(textures);  // space2 TextureCube[]
+   layout.addDescriptorSet(samplers);  // space3 SamplerState[]
+   layout.addDescriptorSet(textures);  // space4 Texture2DArray[] (stacked textures)
++  plume::RenderDescriptorSetBuilder constants;
++  constants.begin();
++  constants.addConstantBufferDynamic(0);
++  constants.end();
+   if (IsVulkan()) {
++    // banjo-nx: the guest shaders' constants (sets 5-7, kVertexConstantsSet...).
++    layout.addDescriptorSet(constants);
++    layout.addDescriptorSet(constants);
++    layout.addDescriptorSet(constants);
+     // Geometry too: point_sprite_gs reads SharedConstants.
+     layout.addPushConstant(0, 4, sizeof(DrawPushConstants),
+                            plume::RenderShaderStageFlag::VERTEX | plume::RenderShaderStageFlag::GEOMETRY |
+@@ -589,6 +802,28 @@
+       }
+       return cached.pipeline.get();
+     }
++  }
++  // banjo-nx (banjo_gpu_bool_spec): a specialised pipeline not built yet is built by a prebuild worker while the draws
++  // take the generic one (every bool read at run time: the same result), from the first draw after it is done.
++  if (Specialised(key)) {
++    std::unique_ptr<plume::RenderPipeline> ready;
++    const SpecState state = g_spec_failed.contains(hash) ? SpecState::Failed
++                                                         : SpecialisedPipeline(key, hash, *inputs.layout, ready);
++    if (state == SpecState::Ready && ready) {
++      g_list.Append(key, hash, *inputs.layout);
++      bucket.push_back({key, std::move(ready)});
++      g_last_key = key;
++      g_last_pipeline = bucket.back().pipeline.get();
++      banjo::renut_gpu::CountBoolSpec(banjo::renut_gpu::BoolSpecEvent::kBuilt);
++      return g_last_pipeline;
++    }
++    if (state == SpecState::Failed)
++      g_spec_failed.insert(hash);
++    banjo::renut_gpu::CountBoolSpec(banjo::renut_gpu::BoolSpecEvent::kGeneric);
++    PipelineKey generic = key;
++    std::memset(generic.bool_mask, 0, sizeof(generic.bool_mask));
++    std::memset(generic.bool_values, 0, sizeof(generic.bool_values));
++    return GetPipelineLocked(generic, inputs);
+   }
+   std::unique_ptr<plume::RenderPipeline> pipeline;
+   bool claimed = false;
+@@ -631,12 +866,7 @@
+     g_prebuild.by_hash[job->hash].push_back(job.get());
+     QueueOrWait(*job);
+   }
+-  // Leave the render and game threads their cores.
+-  const u32 cores = std::max(1u, std::thread::hardware_concurrency());
+-  const u32 workers = std::clamp(cores / 2, 1u, 4u);
+-  g_prebuild.workers = workers;
+-  for (u32 i = 0; i < workers; ++i)
+-    std::thread(PrebuildWorker).detach();
++  StartWorkersLocked();  // banjo-nx: shared with the specialised pipelines'
+ }
+ 
+ void StopPipelinePrebuild() {
+diff --git a/render/pipeline.h b/render/pipeline.h
+--- a/render/pipeline.h
++++ b/render/pipeline.h
+@@ -39,6 +39,12 @@
+   uint64_t shared_constants;
+ };
+ 
++// banjo-nx: sets 5-7 of the draw layout on Vulkan, one dynamic uniform buffer each (render/upload_ring.h): the
++// vertex shader's float constants, the pixel shader's, SharedConstants.
++constexpr uint32_t kVertexConstantsSet = 5;
++constexpr uint32_t kPixelConstantsSet = 6;
++constexpr uint32_t kSharedConstantsSet = 7;
++
+ bool BuildDrawLayout(VideoState &s);
+ 
+ // Everything a pipeline is built from. Compared and hashed as raw bytes, so
+@@ -62,7 +68,26 @@
+   uint32_t per_instance_streams;  // tessellated draws: vertex streams are per instance
+   uint32_t rectangle_list;        // triangle list expanded by rectangle_list_gs
+   uint32_t point_sprite;          // point list expanded by point_sprite_gs
++  // banjo-nx (banjo_gpu_bool_spec, package 27): the bool constants the two shaders test, as their specialization
++  // constants 1000 + N (N the unified index: vertex shader bools 0-127, pixel shader bools 128-255; banjo_bool_spec.h in
++  // the translator), and the draw's values of them. All zero: the generic pipeline, whose shaders read every bool at run
++  // time (as before). A specialised key not built yet draws with the generic one while a prebuild worker builds it.
++  uint32_t bool_mask[8];
++  uint32_t bool_values[8];
++  // banjo-nx (banjo_gpu_blend_skip, package 27): the pixel shader's specialization constant 900 (BlendSkipMode).
++  uint32_t blend_skip;
++  // banjo-nx (banjo_gpu_output_trim, package 28): the pixel shader's specialization constant 901 (OutputTrimMask).
++  uint32_t output_trim;
+ };
++
++// banjo-nx (banjo_gpu_blend_skip): for the key's other fields, 1 when its one target keeps its value for a source alpha
++// of 0 or less, 2 when it does for a whole source of 0 or less, 0 otherwise (shader_common.h, banjoBlendSkip).
++uint32_t BlendSkipMode(const PipelineKey &key);
++
++// banjo-nx (banjo_gpu_output_trim): for the key's other fields, the colour channels (4 bits a target, RGBA) the
++// pixel shader may leave 0: unwritten (write mask, a target's format, no target), and the alpha only when no written
++// colour channel blends with it and alpha to coverage is off (shader_common.h, banjoTrim).
++uint32_t OutputTrimMask(const PipelineKey &key);
+ 
+ struct HostVertexLayout;
+ 
+diff --git a/render/shader_library.cpp b/render/shader_library.cpp
+--- a/render/shader_library.cpp
++++ b/render/shader_library.cpp
+@@ -20,6 +20,7 @@
+ #include "renut_engine/gpu/backend/backend.h"
+ #include "renut_engine/gpu/d3d/d3d.h"
+ #include "renut_engine/gpu/log.h"
++#include "renut_engine/gpu/banjo_renut_tuning.h"
+ 
+ REXCVAR_DEFINE_STRING(renut_shader_capture_dir, "shader_capture", "Nuts&Bolts/Graphics",
+                       "Where shaders missing from the shader cache are written; the next build "
+@@ -84,6 +85,35 @@
+   return (it != end && it->hash == hash) ? it : nullptr;
+ }
+ 
++void ShaderBoolSpecMask(const ShaderCacheEntry &entry, uint32_t mask[8]) {
++  std::fill(mask, mask + 8, 0u);
++  if (!IsVulkan() || entry.spirvSize == 0)
++    return;
++  const uint8_t *cache = Decompress(g_spirv, g_compressedSpirvCache, g_spirvCacheCompressedSize,
++                                    g_spirvCacheDecompressedSize, "SPIR-V");
++  if (!cache)
++    return;
++  const uint8_t *smol = cache + entry.spirvOffset;
++  std::vector<uint8_t> spirv(smolv::GetDecodedBufferSize(smol, entry.spirvSize));
++  if (spirv.size() < 20 || !smolv::Decode(smol, entry.spirvSize, spirv.data(), spirv.size()))
++    return;
++  // After the five header words, each instruction's first word is (word count << 16) | opcode. OpDecorate (71):
++  // target, decoration, literals; SpecId is decoration 1.
++  const auto *words = reinterpret_cast<const uint32_t *>(spirv.data());
++  const size_t count = spirv.size() / 4;
++  for (size_t i = 5; i < count;) {
++    const uint32_t length = words[i] >> 16, opcode = words[i] & 0xFFFF;
++    if (length == 0)
++      break;
++    if (opcode == 71 && length >= 4 && i + 3 < count && words[i + 2] == 1) {
++      const uint32_t id = words[i + 3];
++      if (id >= 1000 && id < 1256)
++        mask[(id - 1000) / 32] |= 1u << ((id - 1000) % 32);
++    }
++    i += length;
++  }
++}
++
+ std::unique_ptr<plume::RenderShader> CreateCachedShader(plume::RenderDevice *device,
+                                                         const ShaderCacheEntry &entry) {
+   if (!device)
+@@ -127,7 +157,8 @@
+ 
+   const auto *header = reinterpret_cast<const d3d::ShaderContainer *>(container);
+   const size_t size = size_t(u32(header->virtualSize)) + u32(header->physicalSize);
+-  const std::filesystem::path dir(REXCVAR_GET(renut_shader_capture_dir));
++  // banjo-nx: next to the executable (on the Switch, the NRO's folder), not the working directory.
++  const std::filesystem::path dir = banjo::renut_gpu::NextToExecutable(REXCVAR_GET(renut_shader_capture_dir));
+   const std::filesystem::path path =
+       dir / fmt::format("{}_{:016x}.bin", pixel_shader ? "ps" : "vs", hash);
+ 
+diff --git a/render/shader_library.h b/render/shader_library.h
+--- a/render/shader_library.h
++++ b/render/shader_library.h
+@@ -34,4 +34,8 @@
+ // For the memory report: the decompressed shader cache kept in memory.
+ uint64_t ShaderCacheHostBytes();
+ 
++// banjo-nx (banjo_gpu_bool_spec): the bools whose specialization constants (SpecId 1000 + N) the shader's SPIR-V
++// declares, bit N of mask (8 words). All zero on D3D12, for a shader without, or one not in the cache.
++void ShaderBoolSpecMask(const ShaderCacheEntry &entry, uint32_t mask[8]);
++
+ } // namespace renut::gpu
+diff --git a/render/textures.cpp b/render/textures.cpp
+--- a/render/textures.cpp
++++ b/render/textures.cpp
+@@ -12,6 +12,8 @@
+ #include <vector>
+ 
+ #include <xxhash.h>
++
++#include "renut_engine/gpu/banjo_renut_tuning.h"
+ 
+ #include "renut_engine/gpu/backend/backend.h"
+ #include "renut_engine/gpu/backend/gpu_profile.h"
+@@ -263,7 +265,7 @@
+       }
+     }
+   }
+-  return at ? XXH3_64bits(gathered, at) : 0;
++  return at ? banjo::renut_gpu::ContentHash64(gathered, at) : 0;  // banjo-nx: banjo_renut_pmull_hash
+ }
+ 
+ // Fingerprint of every guest byte of a texture, for the CPU-written linear
+@@ -276,7 +278,7 @@
+   for (u32 i = 0; i < 2; ++i) {
+     const uint32_t page = t.sample_pages[i], size = t.sample_sizes[i];
+     if (page && size)
+-      hash = XXH3_64bits_withSeed(GuestPhysicalPtr<const uint8_t>(page << 12), size, hash);
++      hash = banjo::renut_gpu::ContentHash64(GuestPhysicalPtr<const uint8_t>(page << 12), size, hash);  // banjo-nx
+   }
+   return hash;
+ }
+@@ -567,6 +569,12 @@
+   Video::RetireLocked(std::move(t.view));
+   Video::RetireLocked(std::move(t.texture));
+   if (t.words) {
++    for (HostTexture::WordsView &v : t.words_views) {  // banjo-nx (banjo_gpu_depth_words_view)
++      if (v.slot != UINT32_MAX && v.slot != kInvalidDescriptor)
++        Video::FreeTextureSlotLocked(v.slot);
++      Video::RetireLocked(std::move(v.view));
++    }
++    t.words_views.clear();
+     Video::RetireLocked(std::move(t.depth_framebuffer));
+     Retire(*t.words);
+     t.words.reset();
+@@ -612,6 +620,38 @@
+   if (!source->words || source->width != width || source->height != height)
+     return nullptr;
+   return source;
++}
++
++// banjo-nx (banjo_gpu_depth_words_view, package 28): the slot of a view of the depth resolve's words that 't' (a
++// texture over its memory) samples instead of its own copy, or UINT32_MAX (then the copy). The copy is of the whole
++// words texture into a texture of the same format, size and one level, made at the first bind after each resolve, and
++// every draw binds its textures again: the draws after a resolve read its words either way. So only a texture of that
++// format, size and one level, sampled through its own view's description with the fetch's swizzle.
++uint32_t WordsViewSlot(HostTexture &t, HostTexture &source, u32 swizzle) {
++  if (!banjo::renut_gpu::DepthWordsViewOn() || !source.words || !source.words->texture ||
++      t.host_format != kDepthResolveWordsFormat || t.dimension != TextureDimension::Tex2D || t.stacked ||
++      t.mip_levels != 1 || t.alloc_width != source.words->alloc_width || t.alloc_height != source.words->alloc_height)
++    return UINT32_MAX;
++  for (const HostTexture::WordsView &v : source.words_views) {
++    if (v.swizzle == swizzle)
++      return v.slot;
++  }
++  plume::RenderTextureViewDesc desc = t.view_desc;
++  desc.mipLevels = 1;
++  desc.componentMapping = SwizzleMapping(swizzle, t.view_swap_red_blue, t.host_format);
++  HostTexture::WordsView v;
++  v.swizzle = swizzle;
++  v.view = source.words->texture->createTextureView(desc);
++  if (!v.view)
++    return UINT32_MAX;
++  v.slot = Video::AllocateTextureSlotLocked();
++  if (v.slot == kInvalidDescriptor) {
++    Video::RetireLocked(std::move(v.view));
++    return UINT32_MAX;
++  }
++  Video::SetTextureSlotLocked(v.slot, source.words->texture.get(), v.view.get());
++  source.words_views.push_back(std::move(v));
++  return source.words_views.back().slot;
+ }
+ 
+ // Copies the depth resolve's words into 't' (of the source's scale) when it
+@@ -779,7 +819,10 @@
+     }
+   }
+   std::vector<u32> idle;
++  const bool keep_gpu_written = banjo::renut_gpu::KeepGpuWritten();  // banjo-nx
+   for (const auto &[va, t] : g_textures) {
++    if (t && t->gpu_written && keep_gpu_written)
++      continue;  // banjo-nx: only the GPU has its content (banjo_renut_keep_gpu_written)
+     const uint64_t limit = t && t->gpu_written ? kEvictIdleGpuFrames : kEvictIdleFrames;
+     if (!t || g_frame - t->used_frame >= limit)
+       idle.push_back(va);
+@@ -797,6 +840,60 @@
+   }
+ }
+ 
++// banjo-nx (2026-10-17): banjo_renut_memory_policy (banjo_renut_tuning.h). Every kColdCheckFrames frames, with less
++// than banjo_renut_textures_reserve_mb left of the GPU memory budget (the driver's, VK_EXT_memory_budget: real
++// footprints) or the bindless table three quarters full, the cold host textures go: not bound for kColdFrames frames
++// (sa2-nx's kFramesNoUsageForDrop), so no command list still to run reads them (2 frames in flight; a slot given back
++// is reused only once its frame has finished, DrainSlot) and a texture in use is never re-uploaded over and over. A
++// released texture is made again from guest memory when bound, as it was made the first time. Never one the GPU wrote
++// (banjo_renut_keep_gpu_written). If every texture is warm nothing goes: better a larger cache than thrash. Renut's
++// backstop above stays (85 % of the budget, 600 frames), sized for a PC's video memory.
++constexpr uint64_t kColdCheckFrames = 32;
++constexpr uint64_t kColdFrames = 120;
++
++void EvictColdTexturesLocked(uint64_t reserve) {
++  const bool slots = Video::TextureSlotsInUseLocked() >= kEvictPressureSlots;
++  uint64_t left = 0, used = 0, budget = 0;
++  if (!slots) {
++    const GpuMemoryUsage memory = QueryGpuMemory(State().device.get());
++    if (!memory.valid)
++      return;
++    // The device-local heaps where there are any (a PC's video memory); otherwise the shared ones.
++    const bool local = memory.local_budget != 0;
++    budget = local ? memory.local_budget : memory.shared_budget;
++    used = local ? memory.local_used : memory.shared_used;
++    if (!budget)
++      return;
++    left = budget > used ? budget - used : 0;
++    if (left >= reserve)
++      return;
++  }
++  const bool keep_gpu_written = banjo::renut_gpu::KeepGpuWritten();
++  std::vector<u32> cold;
++  for (const auto &[va, t] : g_textures) {
++    if (t && t->gpu_written && keep_gpu_written)
++      continue;
++    const uint64_t limit = t && t->gpu_written ? kEvictIdleGpuFrames : kColdFrames;
++    if (!t || g_frame - t->used_frame >= limit)
++      cold.push_back(va);
++  }
++  for (u32 va : cold)
++    ReleaseHostTextureLocked(va);
++  banjo::renut_gpu::CountReserveEviction(cold.size());
++  static uint32_t logged = 0;
++  if (!cold.empty() && logged++ < 32) {
++    if (slots) {
++      RGPU_WARN("Textures: bindless table three quarters full (banjo_renut_memory_policy); {} cold host textures "
++                "released ({} of {} slots in use)",
++                cold.size(), Video::TextureSlotsInUseLocked(), kTextureDescriptorCount);
++    } else {
++      RGPU_WARN("Textures: {} MB of the GPU memory budget left ({} of {} MB used), under the {} MB reserve "
++                "(banjo_renut_memory_policy); {} cold host textures released",
++                left >> 20, used >> 20, budget >> 20, reserve >> 20, cold.size());
++    }
++  }
++}
++
+ } // namespace
+ 
+ void AdvanceTextureFrameLocked() {
+@@ -804,6 +901,9 @@
+   ApplyUnlocksLocked();
+   if (g_frame % kEvictCheckFrames == 0)
+     EvictIdleTexturesLocked();
++  // banjo-nx: banjo_renut_memory_policy.
++  if (const uint64_t reserve = banjo::renut_gpu::TextureReserveBytes(); reserve && g_frame % kColdCheckFrames == 0)
++    EvictColdTexturesLocked(reserve);
+ }
+ 
+ void ReleaseHostTexturesInMemoryLocked(u32 physical, u32 size) {
+@@ -930,6 +1030,11 @@
+     }
+   }
+   HostTexture &t = *slot;
++  if (banjo::renut_gpu::ResolveTraceOn() && t.gpu_written && t.trace_frame != g_frame) {
++    t.trace_frame = g_frame;  // banjo-nx (package 28): banjo_renut_diag_resolve_trace
++    RGPU_INFO("[trace] sample resolved {:08X} ({}x{} levels {} fmt {})", texture_va, t.width, t.height,
++              t.extra_levels ? 1 + t.extra_levels : 1, u32(t.host_format));
++  }
+   // One that could not be made is not marked used: it goes once idle, and the
+   // next bind tries again (the bindless table may have room by then).
+   if (!t.texture)
+@@ -937,6 +1042,19 @@
+   t.used_frame = g_frame;
+ 
+   if (depth_source && !t.gpu_written) {
++    // banjo-nx (banjo_gpu_depth_words_view, package 28): the resolve's words themselves, not a copy.
++    if (const uint32_t words_slot = WordsViewSlot(t, *depth_source, fetch.Swizzle()); words_slot != UINT32_MAX) {
++      t.copied_resolve = 0;  // its own texture has not got them: copied in full if the view is not used later
++      TransitionTextureLocked(depth_source->words.get(), plume::RenderTextureLayout::SHADER_READ);
++      banjo::renut_gpu::CountDepthWords(true);
++      binding.dimension = t.dimension;
++      binding.slot = words_slot;
++      binding.stacked = false;
++      binding.scale = t.scale;
++      binding.lod_scale = RenderScale{};
++      return binding;
++    }
++    banjo::renut_gpu::CountDepthWords(false);
+     CopyDepthWords(t, *depth_source);
+   } else if (!t.gpu_written && t.checked_frame != g_frame) {
+     t.checked_frame = g_frame;
+diff --git a/render/textures.h b/render/textures.h
+--- a/render/textures.h
++++ b/render/textures.h
+@@ -77,6 +77,7 @@
+   std::vector<SwizzleView> swizzle_views;
+ 
+   bool gpu_written = false;     // content comes from a Resolve, not guest memory
++  uint64_t trace_frame = UINT64_MAX;  // banjo-nx: banjo_renut_diag_resolve_trace's frame
+   bool uploaded = false;
+   uint64_t content_hash = 0;
+   uint64_t checked_frame = 0;
+@@ -104,6 +105,14 @@
+   // A texture over a depth resolve's memory: the resolve its words were
+   // copied from last.
+   uint64_t copied_resolve = 0;
++  // banjo-nx (banjo_gpu_depth_words_view, package 28): views of 'words' that the textures over the resolve's memory
++  // sample instead of a copy (one per fetch swizzle), with their bindless slots; they go with 'words'.
++  struct WordsView {
++    u32 swizzle = 0;
++    std::unique_ptr<plume::RenderTextureView> view;
++    uint32_t slot = UINT32_MAX;
++  };
++  std::vector<WordsView> words_views;
+ };
+ 
+ struct TextureBinding {
+diff --git a/render/upload_ring.cpp b/render/upload_ring.cpp
+--- a/render/upload_ring.cpp
++++ b/render/upload_ring.cpp
+@@ -7,13 +7,17 @@
+ #include <cstring>
+ #include <string>
+ 
++#include "renut_engine/gpu/banjo_renut_tuning.h"  // banjo-nx: banjo_renut_memory_policy
++#include "renut_engine/gpu/backend/video.h"
+ #include "renut_engine/gpu/log.h"
+ 
+ namespace renut::gpu {
+ 
+-bool UploadRing::Init(plume::RenderDevice *device, const char *name) {
++bool UploadRing::Init(plume::RenderDevice *device, const char *name, bool constant_sets, bool host_cached) {
+   device_ = device;
+   name_ = name;
++  constant_sets_ = constant_sets;
++  host_cached_ = host_cached;
+   chunks_.clear();
+   current_ = 0;
+   offset_ = 0;
+@@ -27,7 +31,8 @@
+   // address (see AddressableBufferFlags).
+   auto buffer = device_->createBuffer(plume::RenderBufferDesc::UploadBuffer(
+       size, plume::RenderBufferFlag::CONSTANT | plume::RenderBufferFlag::VERTEX |
+-                plume::RenderBufferFlag::INDEX | plume::RenderBufferFlag::DEVICE_ADDRESSABLE));
++                plume::RenderBufferFlag::INDEX | plume::RenderBufferFlag::DEVICE_ADDRESSABLE |
++                (host_cached_ ? plume::RenderBufferFlag::HOST_CACHED : plume::RenderBufferFlag::NONE)));
+   if (!buffer) {
+     RGPU_ERROR("Upload ring '{}': createBuffer({} bytes) failed", name_, size);
+     return false;
+@@ -42,6 +47,25 @@
+   chunk.address = buffer->getDeviceAddress();
+   chunk.mapped = static_cast<uint8_t *>(mapped);
+   chunk.size = size;
++  if (constant_sets_) {
++    // One dynamic uniform buffer each, the layout of sets 5-7 of the draw layout (render/pipeline.cpp).
++    auto make_set = [&](uint32_t range) {
++      plume::RenderDescriptorSetBuilder builder;
++      builder.begin();
++      builder.addConstantBufferDynamic(0);
++      builder.end();
++      std::unique_ptr<plume::RenderDescriptorSet> set = builder.create(device_);
++      if (set)
++        set->setBuffer(0, buffer.get(), range);
++      return set;
++    };
++    chunk.float_constants_set = make_set(kFloatConstantsUboBytes);
++    chunk.shared_constants_set = make_set(kSharedConstantsUboBytes);
++    if (!chunk.float_constants_set || !chunk.shared_constants_set) {
++      RGPU_ERROR("Upload ring '{}': constant descriptor sets failed", name_);
++      return false;
++    }
++  }
+   chunk.buffer = std::move(buffer);
+   chunks_.push_back(std::move(chunk));
+   return true;
+@@ -49,7 +73,8 @@
+ 
+ void UploadRing::Reset() {
+   window_chunks_ = std::max(window_chunks_, current_ + 1);
+-  if (++window_resets_ >= kTrimResets) {
++  // banjo-nx: banjo_renut_memory_policy's trim interval (kTrimResets without it).
++  if (++window_resets_ >= banjo::renut_gpu::UploadTrimResets(kTrimResets, kFramesInFlight)) {
+     // A large chunk made for one big allocation goes too; the first one stays.
+     if (chunks_.size() > window_chunks_)
+       chunks_.resize(std::max<size_t>(window_chunks_, 1));
+@@ -58,6 +83,21 @@
+   }
+   current_ = 0;
+   offset_ = 0;
++  for (Chunk &chunk : chunks_)
++    chunk.written = chunk.published = 0;
++}
++
++void UploadRing::Publish() {
++  if (!host_cached_)
++    return;
++  for (size_t i = 0; i <= current_ && i < chunks_.size(); ++i) {
++    Chunk &chunk = chunks_[i];
++    if (chunk.written > chunk.published) {
++      const plume::RenderRange range(chunk.published, chunk.written);
++      chunk.buffer->unmap(0, &range);  // plume: flushes the range of a persistently mapped buffer
++      chunk.published = chunk.written;
++    }
++  }
+ }
+ 
+ uint64_t UploadRing::Bytes() const {
+@@ -80,7 +120,11 @@
+       out.cpu = chunk.mapped + aligned;
+       out.gpu_address = chunk.address ? chunk.address + aligned : 0;
+       out.size = static_cast<uint32_t>(size);
++      out.chunk_size = chunk.size;  // banjo-nx
++      out.float_constants_set = chunk.float_constants_set.get();
++      out.shared_constants_set = chunk.shared_constants_set.get();
+       offset_ = aligned + size;
++      chunk.written = offset_;
+       return out;
+     }
+     // Next chunk, growing the ring if this frame outgrew every existing one.
+diff --git a/render/upload_ring.h b/render/upload_ring.h
+--- a/render/upload_ring.h
++++ b/render/upload_ring.h
+@@ -18,11 +18,22 @@
+ 
+ namespace renut::gpu {
+ 
++// banjo-nx (2026-10-17): on Vulkan the guest shaders read their constants from dynamic uniform buffers (sets 5-7 of
++// the draw layout, render/pipeline.cpp), which NVK keeps in Maxwell's constant banks, instead of through 64-bit
++// pointers (global memory loads on NAK). Each chunk has two descriptor sets over its buffer, bound at the
++// allocation's offset: the float constants' (all 256 registers) and SharedConstants'.
++constexpr uint32_t kFloatConstantsUboBytes = 256 * 16;
++constexpr uint32_t kSharedConstantsUboBytes = 1344;  // sizeof(SharedConstants), render/draw.cpp
++
+ struct UploadAllocation {
+   plume::RenderBufferReference ref;  // buffer + offset, for copies / views
+   void *cpu = nullptr;               // mapped write pointer
+   uint64_t gpu_address = 0;          // device address (Vulkan raw loads)
+   uint32_t size = 0;
++  uint64_t chunk_size = 0;  // banjo-nx: the size of the chunk the allocation is in (the bound of a clamped fetch)
++  // Vulkan (UploadRing::Init with constant_sets): the chunk's uniform buffer descriptor sets.
++  plume::RenderDescriptorSet *float_constants_set = nullptr;
++  plume::RenderDescriptorSet *shared_constants_set = nullptr;
+   explicit operator bool() const { return cpu != nullptr; }
+ };
+ 
+@@ -33,7 +44,13 @@
+   // used are released.
+   static constexpr uint32_t kTrimResets = 300;
+ 
+-  bool Init(plume::RenderDevice *device, const char *name);
++  // constant_sets: each chunk gets the uniform buffer descriptor sets (Vulkan draws).
++  // host_cached (banjo-nx, banjo_renut_upload_cached): the chunks in CPU-cached memory, which Publish() hands to the
++  // GPU before each submission.
++  bool Init(plume::RenderDevice *device, const char *name, bool constant_sets = false, bool host_cached = false);
++  // banjo-nx: publishes what was written since the last call (host_cached; nothing otherwise). Before every submission
++  // of the slot's command list.
++  void Publish();
+   // The slot's fence has been waited: nothing uses the ring's memory.
+   void Reset();
+   UploadAllocation Allocate(uint64_t size, uint64_t alignment = 256);
+@@ -46,12 +63,16 @@
+     uint8_t *mapped = nullptr;
+     uint64_t size = 0;
+     uint64_t address = 0;
++    std::unique_ptr<plume::RenderDescriptorSet> float_constants_set, shared_constants_set;
++    uint64_t written = 0, published = 0;  // host_cached: the allocated extent, and how much of it Publish() flushed
+   };
+ 
+   bool AddChunk(uint64_t min_size);
+ 
+   plume::RenderDevice *device_ = nullptr;
+   const char *name_ = "upload";
++  bool constant_sets_ = false;
++  bool host_cached_ = false;
+   std::vector<Chunk> chunks_;
+   size_t current_ = 0;
+   uint64_t offset_ = 0;
+diff --git a/render/vertex_format.cpp b/render/vertex_format.cpp
+--- a/render/vertex_format.cpp
++++ b/render/vertex_format.cpp
+@@ -8,7 +8,12 @@
+ #include <cstring>
+ 
+ #include "renut_engine/gpu/log.h"
++#include "renut_engine/gpu/banjo_renut_tuning.h"
+ #include "shader_common.h"
++
++#if defined(__aarch64__)
++#include <arm_neon.h>
++#endif
+ 
+ namespace renut::gpu {
+ 
+@@ -498,9 +503,47 @@
+   }
+ }
+ 
++#if defined(__aarch64__)
++// banjo-nx (banjo_renut_neon_swap): 16 bytes per NEON byte reverse, the same bytes SwapDword gives each word:
++// 8in16 = rev16 of bytes, 8in32 = rev32 of bytes, 16in32 = rev32 of halfwords.
++template <u32 kEndian>
++inline uint8x16_t SwapVector(uint8x16_t v) {
++  if constexpr (kEndian == 1)
++    return vrev16q_u8(v);
++  else if constexpr (kEndian == 2)
++    return vrev32q_u8(v);
++  else
++    return vreinterpretq_u8_u16(vrev32q_u16(vreinterpretq_u16_u8(v)));
++}
++
++// The words a vector loop did not take are left to the caller.
++template <u32 kEndian>
++size_t SwapWordsNeon(const u8 *src, u8 *dst, size_t words) {
++  size_t i = 0;
++  for (; i + 8 <= words; i += 8) {
++    const uint8x16_t a = vld1q_u8(src + i * 4), b = vld1q_u8(src + i * 4 + 16);
++    vst1q_u8(dst + i * 4, SwapVector<kEndian>(a));
++    vst1q_u8(dst + i * 4 + 16, SwapVector<kEndian>(b));
++  }
++  for (; i + 4 <= words; i += 4)
++    vst1q_u8(dst + i * 4, SwapVector<kEndian>(vld1q_u8(src + i * 4)));
++  return i;
++}
++#endif
++
+ // LoadGuestWord over 'words' consecutive words, with the endian mode hoisted
+ // out of the loop.
+ void SwapWords(const u8 *src, u8 *dst, size_t words, u32 endian) {
++#if defined(__aarch64__)
++  if (endian && banjo::renut_gpu::NeonSwapOn()) {
++    const size_t done = endian == 1   ? SwapWordsNeon<1>(src, dst, words)
++                        : endian == 2 ? SwapWordsNeon<2>(src, dst, words)
++                                      : SwapWordsNeon<3>(src, dst, words);
++    src += done * 4;
++    dst += done * 4;
++    words -= done;
++  }
++#endif
+   switch (endian) {
+   case 1:
+     SwapWordsAs<1>(src, dst, words);
+@@ -519,6 +562,16 @@
+ 
+ template <u32 kEndian, u32 kWords>
+ void CopyWordsLoop(const u8 *src, u32 src_stride, u8 *dst, u32 dst_stride, u32 count) {
++#if defined(__aarch64__)
++  // banjo-nx (banjo_renut_neon_swap): a four-word element (positions, normals as float4) is one vector.
++  if constexpr (kWords == 4 && kEndian != 0) {
++    if (banjo::renut_gpu::NeonSwapOn()) {
++      for (u32 v = 0; v < count; ++v, src += src_stride, dst += dst_stride)
++        vst1q_u8(dst, SwapVector<kEndian>(vld1q_u8(src)));
++      return;
++    }
++  }
++#endif
+   for (u32 v = 0; v < count; ++v, src += src_stride, dst += dst_stride)
+     SwapWordsAs<kEndian>(src, dst, kWords);
+ }
+diff --git a/shaders/shader_cache.h b/shaders/shader_cache.h
+--- a/shaders/shader_cache.h
++++ b/shaders/shader_cache.h
+@@ -34,7 +34,24 @@
+   // + vertexInputCount).
+   uint32_t vertexInputOffset;
+   uint32_t vertexInputCount;
++  // banjo-nx (banjo_gpu_literals_cbuf, package 27): g_shaderLiterals[literalOffset .. + literalCount), the literal
++  // registers the shader reads (some components of) from its constant buffer, which every draw's constants must hold.
++  uint32_t literalOffset;
++  uint32_t literalCount;
++  // banjo-nx (banjo_gpu_depth_only, package 28): kShaderFlagPixelKill, kShaderFlagPixelDepth.
++  uint32_t shaderFlags;
+ };
++
++// ShaderCacheEntry::shaderFlags: the pixel shader kills pixels (a kill instruction, not the alpha test) / writes depth.
++constexpr uint32_t kShaderFlagPixelKill = 1;
++constexpr uint32_t kShaderFlagPixelDepth = 2;
++
++// banjo-nx: a literal register's value as the shader defines it (host-order words).
++struct ShaderLiteral {
++  uint32_t reg;
++  uint32_t value[4];
++};
++extern ShaderLiteral g_shaderLiterals[];
+ 
+ // A vertex element as the shader's vfetch describes it: what a vertex
+ // declaration bound to the shader would say.
+@@ -60,8 +77,8 @@
+ 
+ // Entry layout the generator wrote. A cache from an older XenosRecomp lacks
+ // the symbol and fails to link rather than zero-filling the newer fields.
+-// 6: the viewport epilogue (g_ScreenSpace) and the memexport rewrite.
+-constexpr uint32_t kShaderCacheLayout = 6;
++// 6: the viewport epilogue (g_ScreenSpace) and the memexport rewrite. 7 (banjo-nx, package 28): shaderFlags.
++constexpr uint32_t kShaderCacheLayout = 7;
+ extern const uint32_t g_shaderCacheLayout;
+ 
+ // zstd-compressed concatenations of every entry's DXIL / smol-v SPIR-V.

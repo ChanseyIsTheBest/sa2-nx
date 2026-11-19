@@ -16,6 +16,7 @@
 #include <optional>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <CLI/CLI.hpp>
 
@@ -583,7 +584,22 @@ std::vector<std::string> Init(int argc, char** argv) {
   CLI::App app{"", ""};
   app.allow_extras();
 
+  // pacman-nx (2026-11-03, 72c28ced): only the cvars the command line names. CLI11 checks each new option against every
+  // one before it, and each machine-made hot copy has a cvar: with 5,649 copies this loop held the console's main thread
+  // for about 90 s at every start, and a homebrew launch names none of them.
+  std::unordered_set<std::string_view> named;
+  for (int i = 1; i < argc; ++i) {
+    if (!argv || !argv[i]) continue;
+    std::string_view arg(argv[i]);
+    if (!arg.starts_with("--")) continue;
+    arg.remove_prefix(2);
+    arg = arg.substr(0, arg.find('='));
+    named.insert(arg);
+    if (arg.starts_with("no-")) named.insert(arg.substr(3));
+  }
+
   for (auto& entry : GetRegistryStorage()) {
+    if (!named.contains(std::string_view(entry.name))) continue;
     if (entry.type == FlagType::Boolean) {
       app.add_flag_function(
           "--" + entry.name + ",!--no-" + entry.name,
@@ -642,6 +658,16 @@ std::vector<std::string> Init(int argc, char** argv) {
   return positional;
 }
 
+void LoadConfigString(std::string_view toml_text, std::string_view origin) {
+  try {
+    auto config = toml::parse(toml_text, origin);
+    ApplyTomlTable(config, "");
+    REXLOG_DEBUG("Loaded config from {}", origin);
+  } catch (const toml::parse_error& err) {
+    REXLOG_ERROR("Failed to parse config {}: {}", origin, err.what());
+  }
+}
+
 void LoadConfig(const std::filesystem::path& config_path) {
   if (!std::filesystem::exists(config_path)) {
     REXLOG_DEBUG("Config file not found: {}", config_path.string());
@@ -654,16 +680,6 @@ void LoadConfig(const std::filesystem::path& config_path) {
     REXLOG_DEBUG("Loaded config from {}", config_path.string());
   } catch (const toml::parse_error& err) {
     REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
-  }
-}
-
-void LoadConfigString(std::string_view toml_text, std::string_view origin) {
-  try {
-    auto config = toml::parse(toml_text, origin);
-    ApplyTomlTable(config, "");
-    REXLOG_DEBUG("Loaded config from {}", origin);
-  } catch (const toml::parse_error& err) {
-    REXLOG_ERROR("Failed to parse config {}: {}", origin, err.what());
   }
 }
 

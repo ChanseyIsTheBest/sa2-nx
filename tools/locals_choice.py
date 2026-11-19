@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """Which guest functions are better off WITHOUT the loop / leaf locals, judged from the compiled A57 code
 (marathon-nx's proposal 3; docs/codegen-enhancements.md, "proposal 3").
 

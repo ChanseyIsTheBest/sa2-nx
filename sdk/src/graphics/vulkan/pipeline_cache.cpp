@@ -63,6 +63,12 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_log_interpolator_sampling, false, "GPU/Vulkan",
+                    "Diagnostic (katamari-nx): log each pixel shader's MSAA, SQ_CONTEXT_MISC and SQ_INTERPOLATOR_CNTL "
+                    "the first time a combination is drawn (which interpolators the game samples at centroids)");
+
+#include <mutex>
+
 #include <rex/platform.h>
 #if REX_PLATFORM_SWITCH
 // Counters for the Switch profiler (switch_perf.cpp).
@@ -995,6 +1001,24 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentPixelShaderMo
                               regs.Get<reg::RB_SURFACE_INFO>().msaa_samples,
                               regs.Get<reg::SQ_CONTEXT_MISC>().sc_sample_cntl,
                               regs.Get<reg::SQ_INTERPOLATOR_CNTL>().sampling_pattern);
+  // katamari-nx (2026-11-01): which interpolators the game has sampled at centroids (the presents menu's seam line
+  // on Renut, which interpolates every one at the centre). Each pixel shader's first combination, once.
+  if (REXCVAR_GET(gpu_log_interpolator_sampling)) {
+    static std::mutex m;
+    static std::set<std::pair<uint64_t, uint32_t>> seen;
+    const uint32_t misc = regs.Get<reg::SQ_CONTEXT_MISC>().value;
+    const uint32_t key = (uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples) << 30) ^ misc ^
+                         (regs.Get<reg::SQ_INTERPOLATOR_CNTL>().value << 1);
+    std::lock_guard<std::mutex> lock(m);
+    if (seen.insert({shader.ucode_data_hash(), key}).second)
+      REXLOG_INFO("[interp] ps {:016X}: msaa {} SQ_CONTEXT_MISC {:08X} (sc_sample_cntl {}) SQ_INTERPOLATOR_CNTL {:08X} "
+                  "(sampling_pattern {:04X}), interpolators {:04X}, centroid {:04X}",
+                  shader.ucode_data_hash(), uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples), misc,
+                  uint32_t(regs.Get<reg::SQ_CONTEXT_MISC>().sc_sample_cntl),
+                  regs.Get<reg::SQ_INTERPOLATOR_CNTL>().value,
+                  uint32_t(regs.Get<reg::SQ_INTERPOLATOR_CNTL>().sampling_pattern), interpolator_mask,
+                  uint32_t(modification.pixel.interpolators_centroid));
+  }
 
   if (param_gen_pos < xenos::kMaxInterpolators) {
     modification.pixel.param_gen_enable = 1;

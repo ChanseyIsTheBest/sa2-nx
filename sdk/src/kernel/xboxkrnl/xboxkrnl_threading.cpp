@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <array>  // port 59: the multiple waits' objects
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -868,12 +869,24 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
   return result;
 }
 
+// port 59 (2026-11-10): the objects a multiple wait keeps on the stack (the 360's MAXIMUM_WAIT_OBJECTS).
+static constexpr uint32_t kInlineWaitObjects = 64;
+
 u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_type,
                                    u32 wait_reason, u32 processor_mode, u32 alertable,
                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
   assert_true(wait_type <= 1);
 
-  std::vector<object_ref<XObject>> objects;
+  // port 59 (2026-11-10, from LostOdysseyRecomp 299ac550): no heap allocation per call: up to 64 objects
+  // (the 360's MAXIMUM_WAIT_OBJECTS) on the stack, more on the heap as before (newlib's malloc has one lock
+  // for every thread).
+  std::array<object_ref<XObject>, kInlineWaitObjects> inline_objects;
+  std::vector<object_ref<XObject>> heap_objects;
+  object_ref<XObject>* objects = inline_objects.data();
+  if (count > kInlineWaitObjects) {
+    heap_objects.resize(count);
+    objects = heap_objects.data();
+  }
   for (uint32_t n = 0; n < count; n++) {
     auto object_ptr = REX_KERNEL_MEMORY()->TranslateVirtual(objects_ptr[n]);
     auto object_ref = XObject::GetNativeObject<XObject>(REX_KERNEL_STATE(), object_ptr);
@@ -881,12 +894,12 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
       return X_STATUS_INVALID_PARAMETER;
     }
 
-    objects.push_back(std::move(object_ref));
+    objects[n] = std::move(object_ref);
   }
 
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
   X_STATUS result = XObject::WaitMultiple(
-      uint32_t(objects.size()), reinterpret_cast<XObject**>(objects.data()), wait_type, wait_reason,
+      count, reinterpret_cast<XObject**>(objects), wait_type, wait_reason,
       processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();
@@ -899,17 +912,26 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
                                       uint64_t* timeout_ptr) {
   assert_true(wait_type <= 1);
 
-  std::vector<object_ref<XObject>> objects;
+  // port 59 (2026-11-10, from LostOdysseyRecomp 299ac550): no heap allocation per call: up to 64 objects
+  // (the 360's MAXIMUM_WAIT_OBJECTS) on the stack, more on the heap as before (newlib's malloc has one lock
+  // for every thread).
+  std::array<object_ref<XObject>, kInlineWaitObjects> inline_objects;
+  std::vector<object_ref<XObject>> heap_objects;
+  object_ref<XObject>* objects = inline_objects.data();
+  if (count > kInlineWaitObjects) {
+    heap_objects.resize(count);
+    objects = heap_objects.data();
+  }
   for (uint32_t n = 0; n < count; n++) {
     uint32_t object_handle = handles[n];
     auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
     if (!object) {
       return X_STATUS_INVALID_PARAMETER;
     }
-    objects.push_back(std::move(object));
+    objects[n] = std::move(object);
   }
 
-  auto result = XObject::WaitMultiple(count, reinterpret_cast<XObject**>(objects.data()), wait_type,
+  auto result = XObject::WaitMultiple(count, reinterpret_cast<XObject**>(objects), wait_type,
                                       6, wait_mode, alertable, timeout_ptr);
   if (alertable && result == X_STATUS_USER_APC) {
     XThread::GetCurrentThread()->DeliverAPCs();
@@ -1096,6 +1118,49 @@ void KfLowerIrql_entry(u32 old_value) {
 u32 KfRaiseIrql_entry(u32 new_irql) {
   return xeKfRaiseIrql(current_ppc_context(),
                        static_cast<unsigned char>(static_cast<uint32_t>(new_irql)));
+}
+
+// banjo-nx (2026-10-23, batch 6): raw bodies of the IRQL and spinlock exports (XAudio's router makes four of these calls
+// for every voice and frame on the audio thread): the caller's context as it comes, not current_ppc_context() (a
+// thread-pointer read and a call into the thread state) and no argument shim; the PCR at the caller's r13 and the lock at
+// its r3 by the base, as the shims translate them. The same reads and writes, the same results in r3.
+void KfLowerIrql_raw(PPCContext& ctx, uint8_t* base) {
+  auto* pcr = rex::memory::GuestPtr<X_KPCR*>(base, static_cast<uint32_t>(ctx.r13.u64));
+  pcr->current_irql = static_cast<uint8_t>(ctx.r3.u32);
+}
+
+void KeRaiseIrqlToDpcLevel_raw(PPCContext& ctx, uint8_t* base) {
+  auto* pcr = rex::memory::GuestPtr<X_KPCR*>(base, static_cast<uint32_t>(ctx.r13.u64));
+  const uint8_t old_irql = pcr->current_irql;
+  pcr->current_irql = IRQL_DISPATCH;
+  ctx.r3.u64 = static_cast<uint32_t>(old_irql);
+}
+
+void KfRaiseIrql_raw(PPCContext& ctx, uint8_t* base) {
+  auto* pcr = rex::memory::GuestPtr<X_KPCR*>(base, static_cast<uint32_t>(ctx.r13.u64));
+  const uint8_t old_irql = pcr->current_irql;
+  pcr->current_irql = static_cast<uint8_t>(ctx.r3.u32);
+  ctx.r3.u64 = static_cast<uint32_t>(old_irql);
+}
+
+void KfAcquireSpinLock_raw(PPCContext& ctx, uint8_t* base) {
+  auto* lock = rex::memory::GuestPtr<X_KSPINLOCK*>(base, ctx.r3.u32);
+  ctx.r3.u64 = xeKeKfAcquireSpinLock(&ctx, lock);
+}
+
+void KfReleaseSpinLock_raw(PPCContext& ctx, uint8_t* base) {
+  auto* lock = rex::memory::GuestPtr<X_KSPINLOCK*>(base, ctx.r3.u32);
+  xeKeKfReleaseSpinLock(&ctx, lock, ctx.r4.u32);
+}
+
+void KeAcquireSpinLockAtRaisedIrql_raw(PPCContext& ctx, uint8_t* base) {
+  auto* lock = rex::memory::GuestPtr<X_KSPINLOCK*>(base, ctx.r3.u32);
+  xeKeKfAcquireSpinLock(&ctx, lock, false);
+}
+
+void KeReleaseSpinLockFromRaisedIrql_raw(PPCContext& ctx, uint8_t* base) {
+  auto* lock = rex::memory::GuestPtr<X_KSPINLOCK*>(base, ctx.r3.u32);
+  xeKeKfReleaseSpinLock(&ctx, lock, 0, false);
 }
 
 void NtQueueApcThread_entry(u32 thread_handle, mapped_void apc_routine,
@@ -1479,18 +1544,40 @@ REX_EXPORT(__imp__NtWaitForMultipleObjectsEx,
            rex::kernel::xboxkrnl::NtWaitForMultipleObjectsEx_entry)
 REX_EXPORT(__imp__NtSignalAndWaitForSingleObjectEx,
            rex::kernel::xboxkrnl::NtSignalAndWaitForSingleObjectEx_entry)
-REX_EXPORT(__imp__KfAcquireSpinLock, rex::kernel::xboxkrnl::KfAcquireSpinLock_entry)
-REX_EXPORT(__imp__KfReleaseSpinLock, rex::kernel::xboxkrnl::KfReleaseSpinLock_entry)
-REX_EXPORT(__imp__KeAcquireSpinLockAtRaisedIrql,
-           rex::kernel::xboxkrnl::KeAcquireSpinLockAtRaisedIrql_entry)
+// banjo-nx (2026-10-23, batch 6): raw (KfAcquireSpinLock_raw).
+REX_HOOK_RAW(__imp__KfAcquireSpinLock) {
+  rex::kernel::xboxkrnl::KfAcquireSpinLock_raw(ctx, base);
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__KfAcquireSpinLock("__imp__KfAcquireSpinLock", &__imp__KfAcquireSpinLock);
+// banjo-nx (2026-10-23, batch 6): raw (KfReleaseSpinLock_raw).
+REX_HOOK_RAW(__imp__KfReleaseSpinLock) {
+  rex::kernel::xboxkrnl::KfReleaseSpinLock_raw(ctx, base);
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__KfReleaseSpinLock("__imp__KfReleaseSpinLock", &__imp__KfReleaseSpinLock);
+// banjo-nx (2026-10-23, batch 6): raw (KeAcquireSpinLockAtRaisedIrql_raw).
+REX_HOOK_RAW(__imp__KeAcquireSpinLockAtRaisedIrql) {
+  rex::kernel::xboxkrnl::KeAcquireSpinLockAtRaisedIrql_raw(ctx, base);
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__KeAcquireSpinLockAtRaisedIrql("__imp__KeAcquireSpinLockAtRaisedIrql", &__imp__KeAcquireSpinLockAtRaisedIrql);
 REX_EXPORT(__imp__KeTryToAcquireSpinLockAtRaisedIrql,
            rex::kernel::xboxkrnl::KeTryToAcquireSpinLockAtRaisedIrql_entry)
-REX_EXPORT(__imp__KeReleaseSpinLockFromRaisedIrql,
-           rex::kernel::xboxkrnl::KeReleaseSpinLockFromRaisedIrql_entry)
+// banjo-nx (2026-10-23, batch 6): raw (KeReleaseSpinLockFromRaisedIrql_raw).
+REX_HOOK_RAW(__imp__KeReleaseSpinLockFromRaisedIrql) {
+  rex::kernel::xboxkrnl::KeReleaseSpinLockFromRaisedIrql_raw(ctx, base);
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__KeReleaseSpinLockFromRaisedIrql("__imp__KeReleaseSpinLockFromRaisedIrql", &__imp__KeReleaseSpinLockFromRaisedIrql);
 REX_EXPORT(__imp__KeEnterCriticalRegion, rex::kernel::xboxkrnl::KeEnterCriticalRegion_entry)
 REX_EXPORT(__imp__KeLeaveCriticalRegion, rex::kernel::xboxkrnl::KeLeaveCriticalRegion_entry)
-REX_EXPORT(__imp__KeRaiseIrqlToDpcLevel, rex::kernel::xboxkrnl::KeRaiseIrqlToDpcLevel_entry)
-REX_EXPORT(__imp__KfLowerIrql, rex::kernel::xboxkrnl::KfLowerIrql_entry)
+// banjo-nx (2026-10-23, batch 6): raw (KeRaiseIrqlToDpcLevel_raw).
+REX_HOOK_RAW(__imp__KeRaiseIrqlToDpcLevel) {
+  rex::kernel::xboxkrnl::KeRaiseIrqlToDpcLevel_raw(ctx, base);
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__KeRaiseIrqlToDpcLevel("__imp__KeRaiseIrqlToDpcLevel", &__imp__KeRaiseIrqlToDpcLevel);
+// banjo-nx (2026-10-23, batch 6): raw (KfLowerIrql_raw).
+REX_HOOK_RAW(__imp__KfLowerIrql) {
+  rex::kernel::xboxkrnl::KfLowerIrql_raw(ctx, base);
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__KfLowerIrql("__imp__KfLowerIrql", &__imp__KfLowerIrql);
 REX_EXPORT(__imp__NtQueueApcThread, rex::kernel::xboxkrnl::NtQueueApcThread_entry)
 REX_EXPORT(__imp__KeInitializeApc, rex::kernel::xboxkrnl::KeInitializeApc_entry)
 REX_EXPORT(__imp__KeInsertQueueApc, rex::kernel::xboxkrnl::KeInsertQueueApc_entry)
@@ -1536,11 +1623,9 @@ REX_EXPORT_STUB(__imp__KeIpiGenericCall);
 REX_EXPORT_STUB(__imp__KeQueryBackgroundProcessors);
 REX_EXPORT_STUB(__imp__KeQueryInterruptTime);
 REX_EXPORT_STUB(__imp__KeRegisterDriverNotification);
-REX_EXPORT_STUB(__imp__KeRestoreFloatingPointState);
 REX_EXPORT_STUB(__imp__KeRestoreVectorUnitState);
 REX_EXPORT_STUB(__imp__KeRetireDpcList);
 REX_EXPORT_STUB(__imp__KeRundownQueue);
-REX_EXPORT_STUB(__imp__KeSaveFloatingPointState);
 REX_EXPORT_STUB(__imp__KeSaveVectorUnitState);
 REX_EXPORT_STUB(__imp__KeSetBackgroundProcessors);
 REX_EXPORT_STUB(__imp__KeSetPriorityClassThread);
@@ -1551,4 +1636,25 @@ REX_EXPORT_STUB(__imp__KeStallExecutionProcessor);
 REX_EXPORT_STUB(__imp__KeSweepDcacheRange);
 REX_EXPORT_STUB(__imp__KeSweepIcacheRange);
 REX_EXPORT_STUB(__imp__KeTestAlertThread);
-REX_EXPORT(__imp__KfRaiseIrql, rex::kernel::xboxkrnl::KfRaiseIrql_entry)
+// banjo-nx (2026-10-23, batch 6): raw (KfRaiseIrql_raw).
+REX_HOOK_RAW(__imp__KfRaiseIrql) {
+  rex::kernel::xboxkrnl::KfRaiseIrql_raw(ctx, base);
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__KfRaiseIrql("__imp__KfRaiseIrql", &__imp__KfRaiseIrql);
+
+// mk9-nx (2026-10-20; port 56): Mortal Kombat calls these ~40 times a second each (one game thread around its
+// floating-point work). The recompiled code keeps each guest thread's floating-point state in its own host context, so
+// there is nothing to save or restore: both succeed (STATUS_SUCCESS in r3; the logging stub left the caller's buffer
+// pointer there) without a log line per call.
+REX_HOOK_RAW(__imp__KeSaveFloatingPointState) {
+  (void)base;
+  ctx.r3.u64 = 0;
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__KeSaveFloatingPointState("__imp__KeSaveFloatingPointState",
+                                                                                    &__imp__KeSaveFloatingPointState);
+REX_HOOK_RAW(__imp__KeRestoreFloatingPointState) {
+  (void)base;
+  ctx.r3.u64 = 0;
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__KeRestoreFloatingPointState(
+    "__imp__KeRestoreFloatingPointState", &__imp__KeRestoreFloatingPointState);

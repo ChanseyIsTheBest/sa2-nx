@@ -5,6 +5,8 @@
 // in the source register (the old form reads `rS.u32 | (rS.u64 << 32)`, which drops them) and, for rlwimi, in the
 // destination (whose upper half must be kept). The wrapping masks (mb > me) keep the old form in the generator; the
 // test also shows that they need it (the narrow form differs there).
+// banjo-nx (2026-10-16): also rotate_word_shifts, the shift / extract forms of builders/logical.cpp
+// RotateWordShiftForm (the same rules, evaluated here), against the same old forms.
 //
 //   clang++ -O2 -std=c++20 sdk/tests/rotate_word_test.cpp -o out/tools/rotate_word_test.exe
 #include <cstdint>
@@ -46,6 +48,24 @@ uint64_t NewRlwimi(uint64_t ra, uint64_t rs, unsigned sh, uint64_t mask) {
   return (Rotl32(uint32_t(rs), sh) & uint32_t(mask)) | (ra & ~mask);
 }
 
+// rotate_word_shifts: RotateWordShiftForm's expression for (sh, mask), as C++ evaluates it (uint32_t arithmetic).
+uint32_t ShiftForm(uint32_t x, unsigned sh, uint32_t mask) {
+  if (sh == 0) return x & mask;
+  if ((mask & ((1u << sh) - 1u)) == 0) {
+    if (mask == (0xFFFFFFFFu << sh)) return (uint32_t)(x << sh);
+    return (uint32_t)(x << sh) & mask;
+  }
+  if (mask < (1u << sh)) {
+    if (mask == (1u << sh) - 1u) return x >> (32 - sh);
+    return (x >> (32 - sh)) & mask;
+  }
+  return Rotl32(x, sh) & mask;
+}
+uint64_t ShiftsRlwinm(uint64_t rs, unsigned sh, uint64_t mask) { return ShiftForm(uint32_t(rs), sh, uint32_t(mask)); }
+uint64_t ShiftsRlwimi(uint64_t ra, uint64_t rs, unsigned sh, uint64_t mask) {
+  return ShiftForm(uint32_t(rs), sh, uint32_t(mask)) | (ra & ~mask);
+}
+
 }  // namespace
 
 int main() {
@@ -64,7 +84,9 @@ int main() {
             if ((mask >> 32) != 0) ++failures;  // the premise: a mask that does not wrap lies in the low word
             failures += OldRlwinm(rs, sh, mask) != NewRlwinm(rs, sh, mask);
             failures += OldRlwimi(ra, rs, sh, mask) != NewRlwimi(ra, rs, sh, mask);
-            checked += 2;
+            failures += OldRlwinm(rs, sh, mask) != ShiftsRlwinm(rs, sh, mask);
+            failures += OldRlwimi(ra, rs, sh, mask) != ShiftsRlwimi(ra, rs, sh, mask);
+            checked += 4;
           } else {
             ++wrapping;
             wrapping_differ += OldRlwinm(rs, sh, mask) != NewRlwinm(rs, sh, mask);
@@ -73,7 +95,7 @@ int main() {
       }
     }
   }
-  std::printf("%llu comparisons of the narrow forms with the 64-bit forms (every shift, every mask mb <= me)\n",
+  std::printf("%llu comparisons of the narrow and shift forms with the 64-bit forms (every shift, every mask mb <= me)\n",
               static_cast<unsigned long long>(checked));
   std::printf("wrapping masks (kept in the 64-bit form by the generator): the narrow form would differ in %llu of "
               "%llu cases\n",

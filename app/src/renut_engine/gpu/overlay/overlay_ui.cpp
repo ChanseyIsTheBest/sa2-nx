@@ -478,6 +478,13 @@ bool Start(UIThreadRunner run_on_ui_thread) {
     io.BackendRendererName = "renut";
     io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset | ImGuiBackendFlags_RendererHasTextures;
     ImGui::StyleColorsDark();
+    // renut-ultimate (port 66, 2026-11-10): one empty frame now, before the pumps start. A context sets its font in
+    // its first NewFrame; the app's dialogs, drawn by the SDK's ImGuiDrawer with this context, crashed in Begin
+    // (g.Font null) when the SDK menus' first UI-thread task ran before the first BuildFrame. No dialog draws here.
+    io.DisplaySize = ImVec2(1.0f, 1.0f);
+    io.DeltaTime = 1.0f / 60.0f;
+    ImGui::NewFrame();
+    ImGui::EndFrame();
   }
   g_last_build = std::chrono::steady_clock::now();
 

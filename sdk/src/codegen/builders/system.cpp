@@ -54,13 +54,18 @@ bool build_eieio(BuilderContext& ctx) {
 
 bool build_db16cyc(BuilderContext& ctx) {
   // Xenon-specific 16-cycle delay hint, no effect in recompiled code
-  (void)ctx;
+  // renut-ultimate (2026-11-16, port 144; tw2de_nx's of 2026-10-22; codegen option spin_hint_yield, off by default):
+  // a spin-wait: rex_spin_hint (rex/ppc/context.h) yields the core.
+  if (ctx.config().spinHintYield)
+    ctx.println("\trex_spin_hint();");
   return true;
 }
 
 bool build_cctpl(BuilderContext& ctx) {
   // Xenon-specific cache control thread priority low, no effect in recompiled code
-  (void)ctx;
+  // Port 144 (spin_hint_yield): or r1,r1,r1 (thread priority low), a spin-wait, as db16cyc.
+  if (ctx.config().spinHintYield)
+    ctx.println("\trex_spin_hint();");
   return true;
 }
 
@@ -146,8 +151,9 @@ void emit_prefetch(BuilderContext& ctx, int write) {
     return;
   }
   // dcbt / dcbtst decode as {CT, RA, RB} (thirdparty/disasm/ppc-dis.c), unlike dcbz's {RA, RB}: the address is
-  // (RA|0) + RB. banjo-nx found (2026-10-16) that this read operands 0 and 1, so every prefetch went to RA alone (or
-  // r0) instead of RA + RB. A prefetch changes no value either way.
+  // (RA|0) + RB. banjo-nx (2026-10-16): this read operands 0 and 1, so every prefetch went to RA alone (or r0) instead
+  // of RA + RB: "dcbt r31,r6" prefetched r31, "dcbt r0,r8" r0 (often a small number: the null page). A prefetch
+  // changes no value either way; 1.85 % of the console's game-thread samples sat on the wrong ones.
   ctx.print("\tREX_PREFETCH(");
   if (ctx.insn.operands[1] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
@@ -279,6 +285,12 @@ bool build_mfmsr(BuilderContext& ctx) {
 }
 
 bool build_mffs(BuilderContext& ctx) {
+  // renut-ultimate (2026-11-16, port 144; tw2de_nx's, codegen option fpscr_moves_exact): the upper word is
+  // 0xFFF80000 on the 360 (Xenia's instruction tests, xenia-canary pull request #1342); it was 0.
+  if (ctx.config().fpscrMovesExact) {
+    ctx.println("\t{}.u64 = 0xFFF8000000000000ull | ctx.fpscr.loadFromHost();", ctx.f(ctx.insn.operands[0]));
+    return true;
+  }
   ctx.println("\t{}.u64 = ctx.fpscr.loadFromHost();", ctx.f(ctx.insn.operands[0]));
   return true;
 }
@@ -359,8 +371,12 @@ bool build_mtfsf(BuilderContext& ctx) {
   uint32_t fm = ctx.insn.operands[0];
   uint32_t mask = 0;
   for (int j = 0; j < 8; j++) {
-    if (fm & (1 << (7 - j)))
-      mask |= 0xF << (4 * j);
+    if (fm & (1 << (7 - j))) {
+      // renut-ultimate (2026-11-16, port 144; tw2de_nx's, codegen option fpscr_moves_exact): FM bit 0x80 is FPSCR
+      // field 0, bits 0..3 in the PowerPC's numbering (0xF0000000); the default order took 0x0000000F, so a partial
+      // mask wrote the wrong fields (`mtfsf 1, f` left the rounding mode alone). A full mask (255) is the same both ways.
+      mask |= ctx.config().fpscrMovesExact ? (0xFu << (4 * (7 - j))) : (0xFu << (4 * j));
+    }
   }
   if (mask == 0xFFFFFFFF) {
     ctx.println("\tctx.fpscr.storeFromGuest({}.u32);", ctx.f(ctx.insn.operands[1]));
@@ -371,6 +387,44 @@ bool build_mtfsf(BuilderContext& ctx) {
   }
   return true;
 }
+
+// renut-ultimate (2026-11-16, port 144; tw2de_nx's): the FPSCR moves that had no builder (REX_UNIMPLEMENTED traps), in
+// the table with fpscr_moves_exact or extra_instructions (instruction_dispatch.cpp). This SDK's FPSCR is the host's
+// rounding mode (loadFromHost / storeFromGuest): the exception bits are not kept, so they read 0 here and writes of them
+// go nowhere, as with mtfsf.
+// renut-ultimate (2026-11-19, port 187; found by sasrt-nx's sync): port 144's builders are in their own namespace,
+// so a port that has its own build_ldbrx (or any other of these) in rex::codegen still links; the dispatch table
+// names them as extra_insn::build_*.
+namespace extra_insn {
+
+bool build_mtfsfi(BuilderContext& ctx) {
+  const uint32_t field = ctx.insn.operands[0] & 7;
+  const uint32_t shift = 28 - 4 * field;
+  ctx.println("\tctx.fpscr.storeFromGuest((ctx.fpscr.loadFromHost() & 0x{:08X}) | 0x{:08X});", ~(0xFu << shift),
+              (ctx.insn.operands[1] & 0xF) << shift);
+  return true;
+}
+
+bool build_mtfsb0(BuilderContext& ctx) {
+  ctx.println("\tctx.fpscr.storeFromGuest(ctx.fpscr.loadFromHost() & 0x{:08X});",
+              ~(0x80000000u >> (ctx.insn.operands[0] & 31)));
+  return true;
+}
+
+bool build_mtfsb1(BuilderContext& ctx) {
+  ctx.println("\tctx.fpscr.storeFromGuest(ctx.fpscr.loadFromHost() | 0x{:08X});",
+              0x80000000u >> (ctx.insn.operands[0] & 31));
+  return true;
+}
+
+// mcrfs crfD, crfS: FPSCR field crfS (0 = bits 0..3) to a CR field.
+bool build_mcrfs(BuilderContext& ctx) {
+  ctx.println("\t{}.set_raw((ctx.fpscr.loadFromHost() >> {}) & 0xF);", ctx.cr(ctx.insn.operands[0]),
+              28 - 4 * (ctx.insn.operands[1] & 7));
+  return true;
+}
+
+}  // namespace extra_insn
 
 bool build_mtxer(BuilderContext& ctx) {
   ctx.println("\t{}.so = ({}.u64 & 0x80000000) != 0;", ctx.xer(), ctx.r(ctx.insn.operands[0]));

@@ -115,6 +115,11 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
       result = patch_module->xex_module()->ApplyPatch(xex_module());
       if (result) {
         REXSYS_ERROR("Failed to apply XEX patch, code: {}", result);
+      } else if (auto* dispatcher = kernel_state_->function_dispatcher()) {
+        // banjo-nx (2026-10-29): the base image (larger than the patched one) was loaded over the start of the
+        // function table that follows the patched image, and the patch zeroed it.
+        const size_t rewritten = dispatcher->RewriteFunctionTable();
+        REXSYS_INFO("XEX patch: {} function table entries written again (the base image covered them)", rewritten);
       }
     } else {
       REXSYS_ERROR("Failed to load XEX patch, code: {}", result);

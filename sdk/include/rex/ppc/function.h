@@ -100,7 +100,40 @@ struct arg_count_t {
 // Argument Translator
 //=============================================================================
 
+// renut-ultimate (2026-11-16, port 143; tw2de_nx's): kernel_u64_args_whole (sdk/src/system/kernel_state.cpp, off by
+// default): a 64-bit integer argument of an export is read whole. Without it GetIntegerArgumentValue keeps the low
+// word, which the 32-bit arguments want (their registers may carry a sign extension), so a u64 lost its high word:
+// XamFormatDateString / XamFormatTimeString's FILETIME, XamNotifyCreateListener's mask (tw2de_nx: an XUID of
+// XamContentAggregateCreateEnumerator came as 00000000BABEBABE and listed no content). Set once at the kernel's start.
+extern bool g_u64_args_whole;
+
 struct ArgTranslator {
+  // The 64-bit form (g_u64_args_whole): the register whole, or the stack slot's 8 bytes at r1 + 0x50 + 8 * (arg - 8)
+  // (GetIntegerArgumentValue reads the slot's low word at + 0x54).
+  static uint64_t GetInteger64ArgumentValue(const PPCContext& ctx, uint8_t* base, size_t arg) noexcept {
+    switch (arg) {
+      case 0:
+        return ctx.r3.u64;
+      case 1:
+        return ctx.r4.u64;
+      case 2:
+        return ctx.r5.u64;
+      case 3:
+        return ctx.r6.u64;
+      case 4:
+        return ctx.r7.u64;
+      case 5:
+        return ctx.r8.u64;
+      case 6:
+        return ctx.r9.u64;
+      case 7:
+        return ctx.r10.u64;
+      default:
+        break;
+    }
+    return __builtin_bswap64(*rex::memory::GuestPtr<uint64_t*>(base, ctx.r1.u32 + 0x50 + ((arg - 8) * 8)));
+  }
+
   // Get integer argument value from register or stack
   static constexpr uint64_t GetIntegerArgumentValue(const PPCContext& ctx, uint8_t* base,
                                                     size_t arg) noexcept {
@@ -279,6 +312,10 @@ struct ArgTranslator {
   static constexpr T GetValue(PPCContext& ctx, uint8_t* base, size_t idx) noexcept {
     if constexpr (is_precise_v<T>) {
       return static_cast<T>(GetPrecisionArgumentValue(ctx, base, idx));
+    } else if constexpr (std::is_integral_v<T> && sizeof(T) == 8) {
+      // Port 143 (kernel_u64_args_whole).
+      return static_cast<T>(g_u64_args_whole ? GetInteger64ArgumentValue(ctx, base, idx)
+                                             : GetIntegerArgumentValue(ctx, base, idx));
     } else {
       return static_cast<T>(GetIntegerArgumentValue(ctx, base, idx));
     }

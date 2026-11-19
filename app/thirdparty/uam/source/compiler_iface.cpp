@@ -306,6 +306,14 @@ DekoCompiler::DekoCompiler(pipeline_stage stage, int optLevel) :
 
 DekoCompiler::~DekoCompiler()
 {
+	// Port 162 (from fnxf_xiii, its uam patch 11): what nv50_ir_generate_code allocated for the result (nouveau frees
+	// these in nvc0_program_destroy): the code, its relocations and fixups, the symbol table. Leaked by every compile
+	// before (fnxf_xiii: ~22 KB for a pixel shader's four back-end runs); each compiler object runs the back end once
+	// (Compile or CompileTgsiOf), and RetrieveAndPadCode copies the code into m_code.
+	free(m_info.bin.code);
+	free(m_info.bin.relocData);
+	free(m_info.bin.fixupData);
+	free(m_info.bin.syms);
 	if (m_glsl)
 		glsl_program_free(m_glsl);
 
@@ -687,7 +695,7 @@ std::unique_ptr<DekoCompiler> DekoCompiler::CompileBest(pipeline_stage stage, co
 		return nullptr;
 	const unsigned flags = nv50_ir_get_banjo_flags();
 	if (stage != pipeline_stage_fragment || !(flags & 16))
-		return best;
+		return TryRescue(std::move(best), stage, optLevel, flags, glsl);  // port 163 (nothing without flag 2048)
 	static const unsigned drops[] = { 8, 32, 40, 512 };
 	for (unsigned drop : drops)
 	{
@@ -702,6 +710,43 @@ std::unique_ptr<DekoCompiler> DekoCompiler::CompileBest(pipeline_stage stage, co
 		const uint32_t bb = (best->m_dkph.num_gprs + 7) / 8, ba = (alt->m_dkph.num_gprs + 7) / 8;
 		// without the clustering only for a step of registers fewer (its few moves more or less are not the point)
 		if (ba < bb || (drop != 512 && ba == bb && alt->m_codeSize < best->m_codeSize))
+		{
+			alt->TakeGlslProgram(*best);
+			best = std::move(alt);
+		}
+	}
+	return TryRescue(std::move(best), stage, optLevel, flags, glsl);  // port 163 (nothing without flag 2048)
+}
+
+// Port 163 (from fnxf_xiii, its note of 2026-10-22): a shader above 56 registers (Maxwell gives a warp registers in
+// steps of 8: 64 registers hold 32 warps on an SM, 56 hold 36) is compiled again with the register-saving passes that
+// cost instructions (rematerialisation, 262144 and 524288; texture fetches sunk to their use, 4096 and 131072; the
+// global sink, 65536), then with the hoist in place of the neutral sinks (16384 and 32768 without 8192); the one with
+// the fewest registers in steps of 8 is kept (then the smaller code). fnxf_xiii measured: the 34 pixel shaders above
+// 64 all at 64 or fewer (69.0 registers on average to 57.8); of the 560 at 57-64, 470 at 56 or fewer (code +4%). Only
+// with the pressure passes on (2048), not for a variant capped at 32 registers (constant 910).
+std::unique_ptr<DekoCompiler> DekoCompiler::TryRescue(std::unique_ptr<DekoCompiler> best, pipeline_stage stage,
+	int optLevel, unsigned flags, const char* glsl)
+{
+	if (!best || !(flags & 2048) || best->m_dkph.num_gprs <= 56 || strstr(glsl, "SPIRV_CROSS_CONSTANT_ID_910 1u"))
+		return best;
+	static const unsigned add = 2048u | 4096u | 65536u | 131072u | 262144u | 524288u;
+	const unsigned sets[2] = {
+		(flags | add) & ~16u,
+		(flags | add | 16384u | 32768u) & ~(16u | 8192u),
+	};
+	for (unsigned set : sets)
+	{
+		if (best->m_dkph.num_gprs <= 56)
+			break;
+		nv50_ir_set_banjo_flags(set);
+		std::unique_ptr<DekoCompiler> alt(new DekoCompiler(stage, optLevel));
+		const bool ok = alt->CompileTgsiOf(*best);
+		nv50_ir_set_banjo_flags(flags);
+		if (!ok)
+			continue;
+		const uint32_t bb = (best->m_dkph.num_gprs + 7) / 8, ba = (alt->m_dkph.num_gprs + 7) / 8;
+		if (ba < bb || (ba == bb && alt->m_codeSize < best->m_codeSize))
 		{
 			alt->TakeGlslProgram(*best);
 			best = std::move(alt);

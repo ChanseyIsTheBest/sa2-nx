@@ -25,6 +25,27 @@
     X(TexCoord,  2,  9) \
     X(Color,     0, 10)
 
+// renut-ultimate (2026-11-07): locations 23-27 hold one of two sets. The hardware takes 32 vertex inputs and the host binds
+// every row of the table below, and halo3-nx's set, vivapinata-nx's and rr6-nx's TANGENT1 together would be 34. halo3-nx's
+// by default; vivapinata-nx's morph inputs with RENUT_VERTEX_INPUTS_MORPH defined, for the translator and the host alike.
+#if defined(RENUT_VERTEX_INPUTS_MORPH)
+#define RENUT_VERTEX_INPUTS_23_27(X) \
+    /* vivapinata-nx (tools/viva_vertex_inputs.py): morph targets. */ \
+    X(Position,  5, 23) \
+    X(Position,  6, 24) \
+    X(Position,  7, 25) \
+    X(Position,  8, 26) \
+    X(Position,  9, 27)
+#else
+#define RENUT_VERTEX_INPUTS_23_27(X) \
+    /* halo3-nx (tools/halo3_shader_usages.py): Halo 3's vertex elements beyond N&B's. */ \
+    X(BlendWeight,  1, 23) \
+    X(BlendWeight,  2, 24) \
+    X(BlendWeight,  3, 25) \
+    X(Color,     2, 26) \
+    X(Normal,    1, 27)
+#endif
+
 // SPIR-V vertex input locations for reNut, shared with its host input-layout
 // builder. Covers every vertex element N&B's shaders declare. Like reblue's
 // above, only a define: the recompiler reads it under RENUT_RECOMP.
@@ -51,7 +72,9 @@
     X(TexCoord,  7, 19) \
     X(TexCoord,  8, 20) \
     X(TexCoord,  9, 21) \
-    X(TexCoord, 10, 22)
+    X(TexCoord, 10, 22) \
+    RENUT_VERTEX_INPUTS_23_27(X) \
+    X(Tangent,   1, 28)  /* rr6-nx (23 there) */
 
 // SPEC_CONSTANTS_ONLY keeps the HLSL below out of host C++ TUs, which IntelliSense would otherwise parse.
 #if (!defined(__cplusplus) || defined(__INTELLISENSE__)) && !defined(SHADER_COMMON_SPEC_CONSTANTS_ONLY)
@@ -62,7 +85,7 @@
 #ifdef __spirv__
 
 // banjo-nx: 16-byte vectors of SharedConstants (render/draw.h, kSharedConstantsUboBytes / 16).
-#define RENUT_SHARED_VECTORS 85  // banjo-nx (2026-10-19): 1360 bytes, with g_PixelOrigin
+#define RENUT_SHARED_VECTORS 97  // banjo-nx (2026-10-19): 1360 bytes, with g_PixelOrigin; halo3-nx: 1488, the loop constants; renut-ultimate: 1552, the user clip planes
 
 #ifndef BANJO_DEKO3D  // banjo-nx: the deko3d build has no push constants and no 64-bit addresses
 struct PushConstants
@@ -119,6 +142,13 @@ struct RenutUboShared { uint4 v[RENUT_SHARED_VECTORS]; };
 #define g_ScreenScale              RENUT_SHARED_FLOAT2(568)
 #define g_ScreenSpace              RENUT_SHARED_UINT(968)
 #define g_ViewportSize             RENUT_SHARED_FLOAT2(1328)
+// 1312 (from rr6-nx, vivapinata_user_clip_plane): the draw's user clip plane, where a draw of points has its sprite state.
+// 1488 (renut-ultimate, from rr6-nx and vivapinata-nx, which put it at 1312 for the vertex shaders they listed): user clip plane
+// 0, all zero when the draw has none (a distance of 0 clips nothing); 1504-1551 hold planes 1-3, unused yet.
+#define g_UserClipPlane            float4(RENUT_SHARED_FLOAT(1488), RENUT_SHARED_FLOAT(1492), RENUT_SHARED_FLOAT(1496), RENUT_SHARED_FLOAT(1500))
+// 1504 (sasrt-nx, 2026-10-20; 1352 there): a viewport whose depth range runs backwards (MinZ 1, MaxZ 0), which D3D12 cannot
+// take: the host viewport then spans 0-1 and the position's z becomes z * x + w * y, the guest's depth itself (x = 0: off).
+#define g_DepthRemap               RENUT_SHARED_FLOAT2(1504)
 // 1336: host pixels per guest pixel on each axis (the render targets are that multiple of their
 // guest size; g_ViewportSize and the screen-space values are in guest pixels).
 #define g_ResolutionScale          RENUT_SHARED_FLOAT(1336)
@@ -126,6 +156,9 @@ struct RenutUboShared { uint4 v[RENUT_SHARED_VECTORS]; };
 // a draw predicated to one tile renders to; the pixel position is relative to it, as the GPU's is to the EDRAM a tile
 // renders in.
 #define g_PixelOrigin              RENUT_SHARED_FLOAT2(1344)
+// 1360..1487 (halo3-nx, 2026-11-02): the device's 32 loop constants (i0-i15 the vertex shaders', i16-i31 the pixel shaders'), for the
+// loops a shader does not define itself: Halo 3's material shaders loop on counts the game sets per draw.
+#define g_LoopConstantWord(i)      RENUT_SHARED_UINT(1360 + (i)*4)
 #define g_AlphaThreshold           RENUT_SHARED_FLOAT(552)
 #define g_AlphaTestFunc            RENUT_SHARED_UINT(556)
 #define g_VertexFetchDataAddress   RENUT_SHARED_UINT64(560)
@@ -191,9 +224,13 @@ struct RenutUboShared { uint4 v[RENUT_SHARED_VECTORS]; };
     uint4 g_BoundFetchArr[16] : packoffset(c66); \
     float2 g_ViewportSize : packoffset(c83.x); \
     float g_ResolutionScale : packoffset(c83.z); \
-    float2 g_PixelOrigin : packoffset(c84.x);
+    float2 g_PixelOrigin : packoffset(c84.x); \
+    uint4 g_LoopConstantsArr[8] : packoffset(c85); \
+    float4 g_UserClipPlane : packoffset(c93); \
+    float2 g_DepthRemap : packoffset(c94.x);
 
 #define g_Booleans(i) (g_BooleansArr[(i) / 4][(i) % 4])
+#define g_LoopConstantWord(i) (g_LoopConstantsArr[(i) / 4][(i) % 4])
 #define g_VertexFetchSlot(i) (g_VertexFetchSlotsArr[(i) / 4][(i) % 4])
 #define g_MemExportStream(i) (g_MemExportStreamsArr[i])
 #define g_BoundFetch(i) (g_BoundFetchArr[i])
@@ -221,6 +258,12 @@ uint g_SpecConstants();
 #define BOOL_BIT(n) ((g_Booleans((n) / 32u) & (1u << ((n) & 31u))) != 0)
 #endif
 
+#ifdef RENUT_RECOMP
+// halo3-nx (2026-11-02): loop constant N from the device, unpacked as a shader's own definition is: count, start, step, each a signed byte.
+#define g_LoopConstant(n) int4(int(g_LoopConstantWord(n) << 24) >> 24, int(g_LoopConstantWord(n) << 16) >> 24, \
+                               int(g_LoopConstantWord(n) << 8) >> 24, int(g_LoopConstantWord(n)) >> 24)
+#endif
+
 Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
 Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
 TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
@@ -239,12 +282,64 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
 // host renders at a ratio of the guest resolution, and the textures resolved from its render
 // targets are that ratio of their guest size (rounded); texel offsets and texel coordinates are in
 // guest texels, so the sizes the fetches use are the guest's.
+// sasrt-nx (2026-10-20, renut-ultimate port 25): bits 20-25 the fetch's exponent (signed), and on the PC bits 16-19 the result
+// components read through Xenos' gamma, 13-15 the X-Z ones unsigned biased (renutSigns; on deko3d those are in the sampler word).
+// The PC's slot is below bit 13 (kTextureDescriptorCount, 8192). deko3d: the mask must fold into dkh's (t & 0xFFFFF), the handle
+// form Ryujinx follows back to the constant buffer (sasrt-nx: 0x1FFF there broke every texture in Ryujinx); bits 13-19 of this
+// word are zero on deko3d and bits 20-25 fall outside the handle.
+#ifdef BANJO_DEKO3D
 #define RENUT_DESCRIPTOR_INDEX_MASK 0x03FFFFFFu
+#else
+#define RENUT_DESCRIPTOR_INDEX_MASK 0x00001FFFu
+#endif
 #define RENUT_RESOLUTION_SCALE_SHIFT 26u
 
 uint renutDescriptor(uint resourceDescriptorIndex)
 {
     return resourceDescriptorIndex & RENUT_DESCRIPTOR_INDEX_MASK;
+}
+
+// sasrt-nx (2026-10-20): Xenos' piecewise-linear gamma to linear (the emulated GPU's PWLGammaToLinear): 8-bit steps 0-64,
+// 64-96, 96-192 and 192-255 to 10-bit linear with slopes 1, 2, 4 and 8.
+float renutPWLGammaToLinear(float gamma)
+{
+    gamma = saturate(gamma);
+    const bool high = gamma >= 96.0 / 255.0;
+    const float scale = select(high, select(gamma >= 192.0 / 255.0, 8.0 / 1024.0, 4.0 / 1024.0),
+                               select(gamma >= 64.0 / 255.0, 2.0 / 1024.0, 1.0 / 1024.0));
+    const float offset = select(high, select(gamma >= 192.0 / 255.0, -1024.0, -256.0),
+                                select(gamma >= 64.0 / 255.0, -64.0, 0.0));
+    float value = gamma * (255.0 * 1024.0) * scale + offset;  // not "linear": an HLSL keyword
+    value += trunc(value * scale);
+    return value * (1.0 / 1023.0);
+}
+
+// sasrt-nx (2026-10-20), renut-ultimate port 25: what the fetch constant asks beyond the host format, after filtering, as the
+// emulated GPU applies it: gamma (TextureSign 3, bits 16-19) and unsigned biased (TextureSign 2, 2x - 1, bits 13-15 for X-Z)
+// per result component, then the exponent (bits 20-25 of the texture word: times 2^e; the exponent adjust, and an integer
+// number format's range). The signs are in the texture word on the PC, in the sampler word on deko3d. The words are the draw's,
+// so the branch is uniform. Called by the tfetch helpers below with the words as the shader passed them.
+float4 renutSigns(float4 value, uint resourceDescriptorIndex, uint samplerDescriptorIndex)
+{
+#ifdef BANJO_DEKO3D
+    const uint flags = samplerDescriptorIndex;
+#else
+    const uint flags = resourceDescriptorIndex;
+#endif
+    const uint gamma = (flags >> 16) & 15u;
+    const uint biased = (flags >> 13) & 7u;
+    const int exponent = int(resourceDescriptorIndex << 6) >> 26;
+    [branch] if ((gamma | biased) != 0u || exponent != 0)
+    {
+        [unroll] for (uint i = 0u; i < 4u; ++i)
+        {
+            const float v = value[i];
+            value[i] = select(((gamma >> i) & 1u) != 0u, renutPWLGammaToLinear(v),
+                              select(((biased >> i) & 1u) != 0u, v * 2.0 - 1.0, v));
+        }
+        value *= exp2(float(exponent));
+    }
+    return value;
 }
 
 // Host texels per guest texel, by the host's RenderScale code (render_scale.h): 1x, 2/3 (480p),
@@ -281,8 +376,8 @@ uint2 getTexture2DSize(uint resourceDescriptorIndex)
 
 float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
 {
-    return getTexture2D(resourceDescriptorIndex).Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex],
-        texCoord + offset / getTexture2DSize(resourceDescriptorIndex));
+    return renutSigns(getTexture2D(resourceDescriptorIndex).Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+        texCoord + offset / getTexture2DSize(resourceDescriptorIndex)), resourceDescriptorIndex, samplerDescriptorIndex);
 }
 
 float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
@@ -365,6 +460,9 @@ float h1(float a)
 
 float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
 {
+#ifdef RENUT_RECOMP
+    resourceDescriptorIndex = renutDescriptor(resourceDescriptorIndex);  // renut-ultimate: the word carries flags above the slot
+#endif
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
     SamplerState samplerState = g_SamplerDescriptorHeap[samplerDescriptorIndex];
     uint2 dimensions = getTexture2DDimensions(texture);
@@ -407,6 +505,9 @@ struct CubeMapData
     // bd_glass_cs_ps); overflowing this array drops the stored directions and
     // every tfetchCube reads OOB -> point-light shadows vanish.
     float3 cubeMapDirections[9];
+    #elif defined(RENUT_RECOMP)
+    // halo3-nx (2026-11-02): Halo 3's reflection shaders run up to 11 cube ops; past the array the fetches read undefined directions.
+    float3 cubeMapDirections[16];
     #else
     float3 cubeMapDirections[2];
     #endif
@@ -416,9 +517,11 @@ struct CubeMapData
 float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
 {
 #ifdef RENUT_RECOMP
-    resourceDescriptorIndex = renutDescriptor(resourceDescriptorIndex);
-#endif
+    return renutSigns(g_TextureCubeDescriptorHeap[renutDescriptor(resourceDescriptorIndex)].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+        cubeMapData.cubeMapDirections[texCoord.z]), resourceDescriptorIndex, samplerDescriptorIndex);
+#else
     return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
+#endif
 }
 
 #ifdef RENUT_RECOMP
@@ -426,8 +529,15 @@ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, flo
 // fetches in pixel shaders sample the register LOD.
 float4 tfetch2DLevel(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lod)
 {
-    return getTexture2D(resourceDescriptorIndex).SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
-        texCoord + offset / getTexture2DSize(resourceDescriptorIndex), lod);
+    return renutSigns(getTexture2D(resourceDescriptorIndex).SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+        texCoord + offset / getTexture2DSize(resourceDescriptorIndex), lod), resourceDescriptorIndex, samplerDescriptorIndex);
+}
+
+// vivapinata-nx (2026-11-03): a fetch's own LOD bias, added to the computed LOD (and to the sampler's).
+float4 tfetch2DBias(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float bias)
+{
+    return renutSigns(getTexture2D(resourceDescriptorIndex).SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+        texCoord + offset / getTexture2DSize(resourceDescriptorIndex), bias), resourceDescriptorIndex, samplerDescriptorIndex);
 }
 
 uint3 getTexture3DDimensions(Texture3D<float4> texture)
@@ -535,17 +645,19 @@ float4 tfetchStackedLevel(uint resourceDescriptorIndex, uint samplerDescriptorIn
 float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset)
 {
     if (isStackedTexture(resourceDescriptorIndex))
-        return tfetchStacked(resourceDescriptorIndex, samplerDescriptorIndex, texCoord, offset);
-    return getTexture3D(resourceDescriptorIndex).Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex],
-        texCoord + offset / getTexture3DSize(resourceDescriptorIndex));
+        return renutSigns(tfetchStacked(resourceDescriptorIndex, samplerDescriptorIndex, texCoord, offset), resourceDescriptorIndex,
+            samplerDescriptorIndex);
+    return renutSigns(getTexture3D(resourceDescriptorIndex).Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+        texCoord + offset / getTexture3DSize(resourceDescriptorIndex)), resourceDescriptorIndex, samplerDescriptorIndex);
 }
 
 float4 tfetch3DLevel(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float3 offset, float lod)
 {
     if (isStackedTexture(resourceDescriptorIndex))
-        return tfetchStackedLevel(resourceDescriptorIndex, samplerDescriptorIndex, texCoord, offset, lod);
-    return getTexture3D(resourceDescriptorIndex).SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
-        texCoord + offset / getTexture3DSize(resourceDescriptorIndex), lod);
+        return renutSigns(tfetchStackedLevel(resourceDescriptorIndex, samplerDescriptorIndex, texCoord, offset, lod),
+            resourceDescriptorIndex, samplerDescriptorIndex);
+    return renutSigns(getTexture3D(resourceDescriptorIndex).SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+        texCoord + offset / getTexture3DSize(resourceDescriptorIndex), lod), resourceDescriptorIndex, samplerDescriptorIndex);
 }
 
 // Fetches with denormalized coordinates (texCoordDenorm) address texels; sample with UVs instead.
@@ -594,7 +706,8 @@ float4 getCompTexLodCube(uint resourceDescriptorIndex, uint samplerDescriptorInd
 
 float4 tfetchCubeLevel(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData, float lod)
 {
-    return g_TextureCubeDescriptorHeap[renutDescriptor(resourceDescriptorIndex)].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z], lod);
+    return renutSigns(g_TextureCubeDescriptorHeap[renutDescriptor(resourceDescriptorIndex)].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex],
+        cubeMapData.cubeMapDirections[texCoord.z], lod), resourceDescriptorIndex, samplerDescriptorIndex);
 }
 
 // Xenos rcpf / rsqf: infinities become 0 rather than clamping to FLT_MAX.
@@ -679,10 +792,41 @@ void banjoBlendSkip(float4 c)
 [[vk::constant_id(901)]] const uint g_banjoOutputTrim = 0;
 // The test (banjo_renut_diag_trim_poison): the trimmed channels are 60000 instead of 0, so one trimmed wrongly shows.
 [[vk::constant_id(902)]] const uint g_banjoTrimPoison = 0;
+// halo3-nx (2026-11-03; 920 there): a bit for each target of the guest format k_8_8_8_8_GAMMA, whose writes the GPU encodes.
+[[vk::constant_id(924)]] const uint g_banjoTargetGamma = 0;
+// halo3-nx (2026-11-03; 921 there): each target's colour exponent bias (RB_COLOR_INFO bits 20-25, 6 bits a target). The GPU
+// multiplies what the shader exports by 2^bias. Here only the alpha is, as it is what blending reads: Halo 3 draws its UI to a
+// target of bias 5 with an alpha scale of 1/32. The colour stays as exported in the host's float target: its blends come out
+// the same but for that scale, and what reads the target knows it.
+[[vk::constant_id(925)]] const uint g_banjoTargetBias = 0;
+// blur-nx (2026-11-17, blur_renut_target_bias_rgb; the menu backdrop): 1 scales the colour channels by the bias as well, as
+// the GPU scales everything the shader exports. Blur blurs its menu backdrop through 320x180 16_16_16_16_FLOAT targets of
+// bias 5, each pass resolved with exponent bias 11 and read by a shader that multiplies by 2^-16: on the console the three
+// cancel, here each pass came out 32 times too dark and the backdrop black. What reads a target then gets the scaled
+// colour, as on the console (the resolve applies its own exponent bias on top: blur_renut_resolve_exp_bias).
+[[vk::constant_id(927)]] const uint g_banjoTargetBiasRgb = 0;
 #endif
+// halo3-nx (2026-11-03): linear to Xenos' piecewise-linear gamma (slopes 1/4, 1/2, 1 and 2 in gamma against linear, the breaks
+// at 64, 96 and 192 of 255): the encode of a gamma target's writes, the inverse of renutPWLGammaToLinear (port 25).
+float3 renutLinearToGamma(float3 l)
+{
+    const float3 v = saturate(l) * 1024.0;
+    return select(v >= 512.0, (v + 1024.0) / 8.0, select(v >= 128.0, (v + 256.0) / 4.0, select(v >= 64.0, (v + 64.0) / 2.0, v))) / 255.0;
+}
 float4 banjoTrim(float4 c, uint target)
 {
 #ifdef __spirv__
+    const uint bias = (g_banjoTargetBias >> (target * 6u)) & 0x3Fu;
+    const float biasScale = bias != 0u ? pow(2.0, float(int(bias << 26u) >> 26)) : 1.0;
+    // blur-nx (2026-11-17): the colour scaled first, as the GPU does before the format's encode (constant 927 above).
+    if (bias != 0u && g_banjoTargetBiasRgb != 0u)
+        c.xyz *= biasScale;
+    if (((g_banjoTargetGamma >> target) & 1u) != 0u)
+        c.xyz = renutLinearToGamma(c.xyz);
+    // Saturated: the alpha of the formats that use a bias is unorm on the console (2 bits in 2_10_10_10_FLOAT), and a blend
+    // reads what the target can hold. A shader that does not divide its alpha by the bias would blend past 1 here.
+    if (bias != 0u)
+        c.w = saturate(c.w * biasScale);
     const uint m = (g_banjoOutputTrim >> (target * 4u)) & 0xFu;
     const float v = g_banjoTrimPoison != 0u ? 60000.0 : 0.0;
     return select(bool4((m & 1u) != 0u, (m & 2u) != 0u, (m & 4u) != 0u, (m & 8u) != 0u), float4(v, v, v, v), c);
@@ -748,6 +892,10 @@ uint loadVertexFetchData(uint byteOffset)
 #if defined(__spirv__) && defined(BANJO_DEKO3D)
     return g_DkAddressWindow.Load(BANJO_DK_ADDRESS_LOW(560) + byteOffset);
 #elif defined(__spirv__)
+    // vivapinata-nx: the PC's raw address has no bounds: a fetch past the draw's data (or a draw with none, address 0) lost the
+    // device, where D3D12's bound view and deko3d's storage buffer read zero. Zero here too; nothing changes for a fetch inside.
+    if (byteOffset + 4u > g_VertexFetchBytes)
+        return 0u;
     return vk::RawBufferLoad<uint>(g_VertexFetchDataAddress + byteOffset, 4);
 #else
     return g_VertexFetchData.Load(byteOffset);
@@ -762,6 +910,8 @@ uint4 loadVertexFetchData4(uint byteOffset)
 #if defined(__spirv__) && defined(BANJO_DEKO3D)
     return g_DkAddressWindow.Load4(BANJO_DK_ADDRESS_LOW(560) + byteOffset);
 #elif defined(__spirv__)
+    if (byteOffset + 16u > g_VertexFetchBytes)  // vivapinata-nx: as loadVertexFetchData
+        return uint4(0u, 0u, 0u, 0u);
     return vk::RawBufferLoad<uint4>(g_VertexFetchDataAddress + byteOffset, 16);
 #else
     return g_VertexFetchData.Load4(byteOffset);
@@ -921,11 +1071,68 @@ float4 vfetchMemory(uint slot, float indexValue, bool roundIndex, int offsetDwor
 // fetch index, y its offset and z the stream stride in dwords, w its D3DDECLTYPE (bits 0-5
 // format, 8 signed, 9 integer, 10-21 four 3-bit swizzles: 0-3 xyzw, 4 zero, 5 one).
 // slot = g_VertexFetchSlot(element.x).
+// halo3-nx (2026-11-03): vfetchMemoryImpl's decode for a format known only at run time, with the same values for every format: the switch picks each
+// component's word, shift and width, and one decode follows it. vfetchMemoryImpl inlines all its cases at each fetch, since here nothing folds them: about 33 KB of
+// GLSL a fetch, so a shader of 24 fetches came to 623 KB (the host compile of it in Ryujinx takes minutes), and the console's GPU ran the chain at every vertex.
+float4 vfetchBoundDecode(uint4 w, uint format, bool isSigned, bool isInteger, bool signedRfMode, int expAdjust)
+{
+    float4 result = float4(0.0, 0.0, 0.0, 1.0);
+    if (format == 36u || format == 37u || format == 38u || format == 57u)  // 32_FLOAT, 32_32_FLOAT, 32_32_32_32_FLOAT, 32_32_32_FLOAT
+    {
+        const float4 f = asfloat(w);
+        result.x = f.x;
+        if (format != 36u)
+            result.y = f.y;
+        if (format == 38u || format == 57u)
+            result.z = f.z;
+        if (format == 38u)
+            result.w = f.w;
+        return result;
+    }
+    if (format == 31u)  // 16_16_FLOAT
+    {
+        result.xy = f16tof32(uint2(w.x & 0xFFFF, w.x >> 16));
+        return result;
+    }
+    if (format == 32u)  // 16_16_16_16_FLOAT
+        return f16tof32(uint4(w.x & 0xFFFF, w.x >> 16, w.y & 0xFFFF, w.y >> 16));
+    // Each component's width (0: not in the format), shift and word.
+    uint4 bits = uint4(0u, 0u, 0u, 0u), shifts = uint4(0u, 0u, 0u, 0u);
+    uint4 words = uint4(w.x, w.x, w.x, w.x);
+    switch (format)
+    {
+    case 6: bits = uint4(8u, 8u, 8u, 8u); shifts = uint4(0u, 8u, 16u, 24u); break;  // 8_8_8_8
+    case 7: bits = uint4(10u, 10u, 10u, 2u); shifts = uint4(0u, 10u, 20u, 30u); break;  // 2_10_10_10
+    case 16: bits = uint4(11u, 11u, 10u, 0u); shifts = uint4(0u, 11u, 22u, 0u); break;  // 10_11_11
+    case 17: bits = uint4(10u, 11u, 11u, 0u); shifts = uint4(0u, 10u, 21u, 0u); break;  // 11_11_10
+    case 25: bits = uint4(16u, 16u, 0u, 0u); shifts = uint4(0u, 16u, 0u, 0u); break;  // 16_16
+    case 26: bits = uint4(16u, 16u, 16u, 16u); shifts = uint4(0u, 16u, 0u, 16u); words = uint4(w.x, w.x, w.y, w.y); break;  // 16_16_16_16
+    case 33: bits = uint4(32u, 0u, 0u, 0u); break;  // 32
+    case 34: bits = uint4(32u, 32u, 0u, 0u); words = uint4(w.x, w.y, w.x, w.x); break;  // 32_32
+    case 35: bits = uint4(32u, 32u, 32u, 32u); words = w; break;  // 32_32_32_32
+    }
+    [unroll] for (uint i = 0; i < 4; i++)
+    {
+        if (bits[i] != 0u)
+            result[i] = vfetchComponent(words[i], shifts[i], bits[i], isSigned, isInteger, signedRfMode);
+    }
+    if (expAdjust != 0)
+        result *= exp2(float(expAdjust));
+    return result;
+}
+
 float4 vfetchBound(uint4 element, uint slot, float indexValue, bool roundIndex, bool signedRfMode, int expAdjust)
 {
     // banjo-nx: word by word (its offset and stride come from the draw's constants, not the call site).
-    float4 value = vfetchMemoryImpl(slot, indexValue, roundIndex, int(element.y), element.z, element.w & 0x3Fu,
-        (element.w & 0x100u) != 0, (element.w & 0x200u) != 0, signedRfMode, expAdjust, false, false, 0u);
+    const int index = int(roundIndex ? floor(indexValue + 0.5) : floor(indexValue));
+    const uint address = (slot & ~0x3u) + uint(index * int(element.z) + int(element.y)) * 4u;
+    const uint endian = slot & 0x3u;
+    uint4 w;
+    w.x = vfetchSwap(loadVertexFetchData(address), endian);
+    w.y = vfetchSwap(loadVertexFetchData(address + 4), endian);
+    w.z = vfetchSwap(loadVertexFetchData(address + 8), endian);
+    w.w = vfetchSwap(loadVertexFetchData(address + 12), endian);
+    float4 value = vfetchBoundDecode(w, element.w & 0x3Fu, (element.w & 0x100u) != 0, (element.w & 0x200u) != 0, signedRfMode, expAdjust);
     float4 result;
     [unroll] for (uint i = 0; i < 4; i++)
     {
@@ -1024,6 +1231,38 @@ void renutVertexRegisters(uint vertexId, uint instanceId, uint4 tessellation, ou
         float2 uv = float2(position + offset) / float(level);
         r0 = float4(patchIndex, uv, 0.0);
     }
+}
+
+// vivapinata-nx (2026-11-03): a tessellated triangle list (the SDK's primitive processor names this game's beehive building and
+// waterfall): the host draws each three indices as one patch of kind 1 or 3, so r0.xyz is the domain location as for those, and
+// r1.xyz are the three control points' vertex indices, read here from the draw's index buffer, which the host gives a fetch slot
+// of its own. tessellation.w = slot << 8 | (first index odd) << 2 | 1 for 16-bit indices, 2 for 32-bit; 0 for a patch draw, which
+// keeps its r1. Only a vertex shader that fetches by r1.y or r1.z makes this call (ShaderRecompiler::fetchesControlPoints).
+float renutControlPoint(uint word, uint slot, uint position, uint base)
+{
+    const uint endian = slot & 0x3u;
+    uint index;
+    if ((word & 0x3u) == 2u)
+    {
+        index = vfetchSwap(loadVertexFetchData((slot & ~0x3u) + position * 4u), endian);
+    }
+    else
+    {
+        // Two to a word: after the 8in16 swap the first is in the low half, after a swap of the whole word in the high one.
+        position += (word >> 2u) & 1u;
+        const uint pair = vfetchSwap(loadVertexFetchData((slot & ~0x3u) + (position & ~1u) * 2u), endian);
+        index = (pair >> (((position & 1u) != 0u) != (endian >= 2u) ? 16u : 0u)) & 0xFFFFu;
+    }
+    return float(index + base);
+}
+
+void renutControlPoints(uint4 tessellation, uint slot, uint instanceId, inout float4 r1)
+{
+    if (tessellation.x == 0u || tessellation.w == 0u)
+        return;
+    r1.x = renutControlPoint(tessellation.w, slot, instanceId * 3u, tessellation.z);
+    r1.y = renutControlPoint(tessellation.w, slot, instanceId * 3u + 1u, tessellation.z);
+    r1.z = renutControlPoint(tessellation.w, slot, instanceId * 3u + 2u, tessellation.z);
 }
 
 // Memexport, as N&B's own export passes use it (sub_82317020 builds their stream constants before
@@ -1223,8 +1462,21 @@ float4 cube(float4 value, inout CubeMapData cubeMapData)
     uint index = cubeMapData.cubeMapIndex;
     cubeMapData.cubeMapDirections[index] = value.xyz;
     ++cubeMapData.cubeMapIndex;
-    
+
     return float4(0.0, 0.0, 0.0, index);
+}
+
+// vivapinata-nx (2026-11-03): the instruction's own result, for a shader that does no cube fetch and reads these numbers itself:
+// T coordinate, S coordinate, 2 * major axis, face id. This game's fog pass (ps_848B544619C12440) projects a direction onto a cube's
+// faces with it and looks up its fog by face; cube() above returned 0 there, so every pixel got one constant.
+float4 cubeValues(float4 value, inout CubeMapData cubeMapData)
+{
+    const float3 a = abs(value.xyz);
+    if (a.z >= a.x && a.z >= a.y)
+        return float4(-value.y, value.z < 0.0 ? -value.x : value.x, 2.0 * value.z, value.z < 0.0 ? 5.0 : 4.0);
+    if (a.y >= a.x)
+        return float4(value.y < 0.0 ? -value.z : value.z, value.x, 2.0 * value.y, value.y < 0.0 ? 3.0 : 2.0);
+    return float4(-value.y, value.x < 0.0 ? value.z : -value.z, 2.0 * value.x, value.x < 0.0 ? 1.0 : 0.0);
 }
 
 float4 dst(float4 src0, float4 src1)

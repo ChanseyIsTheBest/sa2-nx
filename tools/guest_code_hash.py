@@ -5,7 +5,7 @@
   python tools/guest_code_hash.py 827F05C0 827EFEA0 ...   [--image out/default_image.bin] [--gen app/generated/default]
 
 A function's size is the distance to the next function start of the generated code. The image is the loaded guest
-image (SA2_DUMP_IMAGE, see src/sa2_app.h), based at 0x82000000.
+image (PEGGLE2_DUMP_IMAGE, see src/peggle2_app.h), based at 0x82000000. From sa2-nx.
 """
 import argparse
 import glob

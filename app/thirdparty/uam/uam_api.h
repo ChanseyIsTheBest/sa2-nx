@@ -30,6 +30,9 @@ void shutdown();
 // A compile error, and any fatal error inside Mesa or nv50_ir, returns ok = false with the reason in
 // log; it never exits the process.
 Result compile(Stage stage, const char* glsl);
+// mk9-nx (2026-10-24; port 56): one back-end pass only (pass 16 off for this compile: no CompileBest alternatives), for
+// a compile something waits on; about a quarter of a pixel shader's full compile time. Vertex shaders are the same.
+Result compileFast(Stage stage, const char* glsl);
 
 // banjo-nx (2026-10-18): banjo-nx's codegen passes (nv50_ir_peephole.cpp): 1 PRMT byte moves, 2 the storage buffer
 // offset fold, 4 the shift distribution, 8 the fragment input interpolation cache, 16 choose per fragment shader

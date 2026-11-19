@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -20,6 +21,11 @@
 #include <rex/thread/mutex.h>
 
 #include <span>
+
+// renut-ultimate (2026-11-16, port 143; tw2de_nx's, from nx-mod/rexglue-sdk-nx; off by default).
+REXCVAR_DEFINE_BOOL(kernel_scatter_read_offset_zero, false, "Kernel",
+                    "tw2de_nx (exact): NtReadFileScatter at byte offset 0 reads from offset 0: only -1 and -2 mean the "
+                    "file's own position. false: offset 0 read from wherever the file's position was, as before");
 
 namespace rex::system {
 
@@ -223,11 +229,16 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length, ui
     }
 
     uint32_t bytes_read = 0;
+    // Port 143 (tw2de_nx, kernel_scatter_read_offset_zero): -1 and -2 mean the file's own position; any other value,
+    // 0 included, is an offset. `byte_offset ? ... : -1` read a scatter request at offset 0 from the position.
+    static const bool offset_zero = REXCVAR_GET(kernel_scatter_read_offset_zero);
+    const bool own_position = byte_offset == uint64_t(-1) || byte_offset == uint64_t(-2);
     result = ReadInternal(
         read_buffer, read_length,
-        byte_offset
-            ? ((byte_offset != -1 && byte_offset != -2) ? byte_offset + read_total : byte_offset)
-            : -1,
+        offset_zero ? (own_position ? byte_offset : byte_offset + read_total)
+                    : (byte_offset ? ((byte_offset != -1 && byte_offset != -2) ? byte_offset + read_total
+                                                                               : byte_offset)
+                                   : -1),
         &bytes_read, apc_context, false);
 
     if (result != X_STATUS_SUCCESS) {

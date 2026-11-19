@@ -1,0 +1,73 @@
+#pragma once
+
+#if defined(__SWITCH__)
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+
+// [Switch] Per-thread CPU accounting and a sampling CPU profiler.
+//
+// Threads register themselves with a name. The kernel counts the CPU time of every thread; the GPU
+// pass profiler report prints each registered thread's share of the last report window
+// (AppendThreadCpuUsage). With [Switch] SwitchCpuProfiler = true, a sampler thread also pauses each
+// registered thread every 2 ms, reads where it is (program counter) and resumes it; every 30 seconds
+// it writes the hottest code addresses of each thread to logs/rex/banjo_profiler.log, as offsets into the executable
+// that tools/switch-cpu-profile.py turns into function names (recompiled game functions included).
+namespace os::switch_cpu_profiler
+{
+    // The name is copied (up to 47 characters).
+    void RegisterCurrentThread(const char* name);
+    void RegisterCurrentThreadWithAddress(const char* prefix, uint32_t guestAddress);
+    void UnregisterCurrentThread();
+    // banjo-nx: by kernel handle, for the SDK's thread wrappers (a repeat call renames the thread).
+    void RegisterThread(uint32_t handle, const char* name);
+    void UnregisterThread(uint32_t handle);
+
+    // Starts the per-thread accounting, and the sampler when asked ([Switch] SwitchCpuProfiler).
+    void Start(bool sampler);
+
+    // Round 12, [Switch] SwitchSlowFrameProfileMs (set before Start; 0 = off): frames in which the game thread worked
+    // at least this long get a report of their own. The sampler then takes every sample of the game thread, running
+    // or waiting, with its callers from the stack, and keeps the last two seconds of them; Video::Present marks where
+    // each frame's work ends (FrameWorkEnd, at its start) and the next one's starts (FrameWorkStart, at its end), from
+    // the game thread. The samples inside a slow frame go to the "main in slow frames" part of the next report.
+    void SetSlowFrameThreshold(uint32_t milliseconds);
+    void FrameWorkEnd();
+    void FrameWorkStart();
+
+    // CPU time of every registered thread since the previous call, as "name 12.3%" entries (round 12: with the cores
+    // it ran on for a thread above 5%, "name 12.3% (c0 10, c2 2)"). Never waits for the sampler: while it holds the
+    // thread list, the entries are left out of this report.
+    void AppendThreadCpuUsage(std::string& out);
+
+    // The registered threads (kernel handle and name), for the stall watchdog. Returns how many were copied.
+    struct ThreadInfo
+    {
+        uint32_t handle;
+        char name[48];
+    };
+    size_t CopyThreads(ThreadInfo* out, size_t capacity);
+
+    // banjo-nx (2026-10-28): the CPU time of every registered thread so far, summed, in system ticks (19.2 MHz): the A/B
+    // halves' CPU a game frame (banjo_renut_tuning.cpp). Waits for the thread list.
+    uint64_t TotalThreadTicks();
+
+    // The calling thread's registered name, for a crash report: false (and `out` untouched) when it has none or the
+    // thread list is locked at the moment (the crash handler cannot wait for it).
+    bool TryGetCurrentThreadName(char* out, size_t size);
+
+    // Start and size of the executable's code: the offsets every report prints are relative to it.
+    uint64_t ModuleBase();
+    uint64_t ModuleSize();
+
+    // Appends text to stderr.log in one write. stderr is line-buffered (so that a crash loses nothing), which
+    // made every fwrite of a report one SD card write per line: seconds for a CPU profile, during which the
+    // writer held stderr's lock (and the profiler its thread list).
+    void WriteLog(const char* text, size_t size);
+    inline void WriteLog(const std::string& text) { WriteLog(text.data(), text.size()); }
+    // banjo-nx: printf-style line for the same log (replaces Unleashed's fprintf(stderr, ...)).
+    void WriteLogF(const char* format, ...) __attribute__((format(printf, 1, 2)));
+}
+
+#endif

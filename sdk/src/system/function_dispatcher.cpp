@@ -282,6 +282,18 @@ bool FunctionDispatcher::SetFunction(uint32_t guest_address, ::PPCFunc* func) {
   return nullptr;
 }
 
+size_t FunctionDispatcher::RewriteFunctionTable() {
+  std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
+  size_t differed = 0;
+  for (const auto& [address, func] : function_table_) {
+    if (memory_->TableFunction(address) != func) {
+      ++differed;
+      memory_->SetFunction(address, func);
+    }
+  }
+  return differed;
+}
+
 uint32_t FunctionDispatcher::AllocateThunk(::PPCFunc* func, uint32_t caller_address) {
   std::lock_guard<std::recursive_mutex> lock(dispatch_mutex_);
   auto* mod = FindModuleByAddress(caller_address);

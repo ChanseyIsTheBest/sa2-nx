@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <mutex>
 
 #include <fmt/format.h>
@@ -19,14 +20,13 @@
 #include "me/me_platform_compat.h"  // RexSwitchPinCurrentThreadToCore and the priority helper
 #include "renut_engine/gpu/backend/video.h"
 #include "renut_engine/gpu/banjo_renut_tuning.h"  // StartLongLivedThread
+#include "renut_engine/perf/frame_stats.h"  // port 53: WaitForFrameStart's wait is a game-thread wait
 
 #if REX_PLATFORM_SWITCH
 #include <switch.h>  // viGetDisplayVsyncEvent
 #endif
 
-// sa2-nx (2026-10-20): on by default in SA2 (the user's call: Banjo's latency set); SA2's frame pacing
-// (gpu/sa2_renut_pacing.cpp) takes its releases from here.
-REXCVAR_DEFINE_BOOL(banjo_display_sync, true, "Banjo/Enhancements",
+REXCVAR_DEFINE_BOOL(banjo_display_sync, false, "Banjo/Enhancements",
                     "OFF by default (2026-10-19): in Ryujinx every run with the thread active stalled or hung (runs 65, "
                     "67, 68), the runs without it did not; to be tried on the console with configs/"
                     "banjo_display_sync_on.toml. Latency batch 3 (2026-10-19, the Switch): a thread follows the display's refresh (its vsync "
@@ -46,16 +46,33 @@ REXCVAR_DEFINE_INT32(banjo_display_phase_us, 0, "Banjo/Enhancements",
                      "banjo_display_sync with banjo_display_phase_auto off: the release this long after the refresh "
                      "(microseconds)")
     .range(0, 16000);
-// sa2-nx (2026-10-28, the user: "I want double buffer as an option in the toml so please fix it"): display_sync.h.
-REXCVAR_DEFINE_BOOL(sa2_renut_queue_drain, true, "SA2/Renderer",
-                    "With sa2_renut_double_buffer (two swapchain images): when every new image misses its refresh for "
+
+// sa2-nx (2026-10-28, sa2_renut_queue_drain; ketsui-nx's, passed on by futari-nx): display_sync.h. pacman-nx: on by
+// default, the user's call (2026-11-03).
+REXCVAR_DEFINE_BOOL(pacman_renut_queue_drain, true, "PacMan/Renderer",
+                    "With pacman_renut_double_buffer (two swapchain images): when every new image misses its refresh for "
                     "a second (the display queue stuck one image deep: each image waits for the one the display gives "
                     "back at that same refresh), the game's next frame is released one refresh later, once; the queue "
                     "empties and every image after it is shown a refresh sooner (about 17 ms less input lag). Again at "
-                    "the earliest 5 s later, doubled up to 5 minutes while the queue keeps filling again soon after. "
+                    "the earliest 5 s later, doubled up to 5 minutes while the queue keeps filling again soon after "
+                    "with few images in time. "
                     "Also keeps late input from pushing the frames back into it (1 ms more margin a late image)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DECLARE(bool, sa2_renut_double_buffer);  // gpu/backend/video.cpp
+REXCVAR_DECLARE(bool, pacman_renut_double_buffer);  // gpu/backend/video.cpp
+// pacman-nx (2026-11-03, the user: "look how futari does it"): futari-nx's futari_vblank_display_sync and
+// futari_vblank_phase_auto (futari_renut_vblank.cpp, docs/futari-notes.md "Input lag"). See display_sync.h.
+// renut-ultimate (2026-11-12, port 97; the user's call): off by default. It fixed pacman-nx's input lag at its full
+// frame rate, but in blur-nx, a game under the refresh rate (18-21 fps), it cost 15-18 % of the frame rate with no
+// latency gain (each frame waits for a refresh it has just missed). A game that wants it sets it true in its own toml
+// (with banjo_display_sync, which it needs). docs/off-by-default.md.
+REXCVAR_DEFINE_BOOL(pacman_vblank_display_sync, false, "PacMan/Renderer",
+                    "OFF BY DEFAULT in the base (slower in a game under the refresh rate: blur-nx at 18-21 fps lost 15-18 % "
+                    "of its frame rate with no latency gain; pacman-nx turns it on). "
+                    "The display's refresh starts the game's frames, as the 360's vertical blank paces a game: the game "
+                    "waits at its Swap until the refresh plus the phase (banjo_display_phase_auto). Off: the game runs "
+                    "until the render thread holds it back, with frames queued behind each other (about 3 refreshes of "
+                    "input lag in the first console run). Needs banjo_display_sync; a numeric frame_cap uses the limiter")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 #if REX_PLATFORM_SWITCH
 // banjo-nx (2026-10-20): libnx's default window (default_window.o: __nx_win_init, __nx_win_exit, nwindowGetDefault)
@@ -109,6 +126,11 @@ void __nx_win_exit(void) {
 
 namespace banjo::display_sync {
 namespace {
+// Port 172 (from fnxf_xiii, its notes of 2026-10-27 and 10-29; banjo_vblank_from_display): the display's refreshes, for
+// the SDK's guest vblank worker (sdk/src/graphics/graphics_system.cpp, rex::graphics::g_display_refresh_wait).
+std::atomic<uint64_t> g_refresh_count{0};
+std::mutex g_refresh_mutex;
+std::condition_variable g_refresh_cv;
 
 uint64_t NowNs() {
   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -169,6 +191,14 @@ uint64_t g_refreshes_with_image = 0;
 // and the longest release wait asked for since the last report.
 std::atomic<uint64_t> g_fence_test_max_ns{0}, g_release_wait_max_ns{0}, g_release_clamped{0};
 
+// The phase (the display thread's).
+uint32_t g_floor[kFloorFrames];
+uint32_t g_floor_next = 0, g_floor_count = 0;
+uint32_t g_good = 0;
+uint64_t g_ceiling = 0, g_hold_until = 0;
+
+double Ms(uint64_t from, uint64_t to) { return to > from ? double(to - from) / 1e6 : 0.0; }
+
 // sa2-nx (2026-10-28, sa2_renut_queue_drain): the hold the next release takes (TakeHold), the late input's margin, and
 // the display thread's count of new images in a row not finished at their refresh, the last drain and the least time
 // to the next one; the report's late images and the drains so far.
@@ -176,6 +206,10 @@ std::atomic<bool> g_hold{false};
 std::atomic<uint32_t> g_guard_us{0};
 constexpr uint32_t kDrainAfter = 60;  // a second of new images all late
 constexpr uint64_t kDrainGapNs = 5'000'000'000ull, kDrainGapMaxNs = 300'000'000'000ull;
+// pacman-nx (2026-11-03): this many images in time since the last drain: it worked, and what filled the queue again was
+// something else (a load's slow frame). The third console run: 4 drains in the loads had the gap at about 40 s when play began.
+constexpr uint32_t kDrainWorkedImages = 30;
+uint32_t g_in_time_since_drain = 0;
 constexpr uint32_t kGuardStepUs = 1000, kGuardBackUs = 250, kGuardGood = 180, kGuardMaxUs = 8000;
 uint64_t g_presented_at_vsync = 0;
 uint32_t g_late_run = 0, g_guard_good = 0;
@@ -185,7 +219,7 @@ uint64_t g_late_images = 0, g_drains = 0;
 // At a refresh, the newest image: 1 finished, 0 not (shown a refresh late), -1 no new image since the last refresh or
 // not known. Double buffering only (with three images a late image does not hold the next one back).
 void QueueDrainAtRefresh(int ready, uint64_t now) {
-  static const bool on = REXCVAR_GET(sa2_renut_queue_drain) && REXCVAR_GET(sa2_renut_double_buffer);
+  static const bool on = QueueDrainOn();
   if (!on || ready < 0)
     return;
   if (ready == 0) {
@@ -195,11 +229,15 @@ void QueueDrainAtRefresh(int ready, uint64_t now) {
                      std::memory_order_relaxed);
     // A second of new images all late is the queue one image deep (one late image fills it, and with two images
     // nothing empties it while the game keeps up): the next release a refresh later. A queue that fills again within
-    // twice the gap is real lateness, which a drain does not help: the gap doubles; else it starts again at 5 s.
-    if (++g_late_run >= kDrainAfter && (!g_last_drain || now - g_last_drain >= g_drain_gap)) {
-      g_drain_gap = g_last_drain && now - g_last_drain < 2 * g_drain_gap ? std::min(g_drain_gap * 2, kDrainGapMaxNs)
-                                                                         : kDrainGapNs;
+    // twice the gap is real lateness, which a drain does not help: the gap doubles; else it starts again at 5 s. So
+    // does a drain that worked (kDrainWorkedImages).
+    const bool worked = g_in_time_since_drain >= kDrainWorkedImages;
+    if (++g_late_run >= kDrainAfter && (!g_last_drain || now - g_last_drain >= (worked ? kDrainGapNs : g_drain_gap))) {
+      g_drain_gap = !worked && g_last_drain && now - g_last_drain < 2 * g_drain_gap
+                        ? std::min(g_drain_gap * 2, kDrainGapMaxNs)
+                        : kDrainGapNs;
       g_last_drain = now;
+      g_in_time_since_drain = 0;
       g_hold.store(true, std::memory_order_release);
       ++g_drains;
       g_late_run = 0;
@@ -207,6 +245,7 @@ void QueueDrainAtRefresh(int ready, uint64_t now) {
     return;
   }
   g_late_run = 0;
+  ++g_in_time_since_drain;
   if (++g_guard_good >= kGuardGood) {
     g_guard_good = 0;
     const uint32_t guard = g_guard_us.load(std::memory_order_relaxed);
@@ -214,13 +253,45 @@ void QueueDrainAtRefresh(int ready, uint64_t now) {
   }
 }
 
-// The phase (the display thread's).
-uint32_t g_floor[kFloorFrames];
-uint32_t g_floor_next = 0, g_floor_count = 0;
-uint32_t g_good = 0;
-uint64_t g_ceiling = 0, g_hold_until = 0;
+// pacman-nx (2026-11-03, pacman_vblank_display_sync, futari-nx's): the ticks that start the game's frames, and those
+// not given (a queue drain). g_pacing: the game is waiting for them (the first WaitForFrameStart).
+std::atomic<bool> g_pacing{false};
+std::mutex g_tick_mutex;
+std::condition_variable g_tick_cv;
+std::atomic<uint64_t> g_ticks{0}, g_ticks_skipped{0};
+uint64_t g_ticks_reported = 0;
+constexpr uint32_t kPacingGoodImages = 180;           // 3 s of images in time: the phase 0.25 ms later
+constexpr uint64_t kPacingHoldNs = 300'000'000'000ull;  // after a miss, no later than the phase it left, for 5 minutes
 
-double Ms(uint64_t from, uint64_t to) { return to > from ? double(to - from) / 1e6 : 0.0; }
+// futari_vblank_phase_auto: the frame start as late after the refresh as the newest image is still finished for the next
+// one. An image not finished at its refresh is shown one later: back 2 ms and hold there; else later, slowly.
+void PacingPhaseAtRefresh(int ready, uint64_t now) {
+  if (!REXCVAR_GET(banjo_display_phase_auto))
+    return;
+  const uint64_t max = uint64_t(REXCVAR_GET(banjo_display_phase_max_us)) * 1000;
+  std::lock_guard lock(g_mutex);
+  if (g_hold_until && now > g_hold_until)
+    g_hold_until = 0;
+  if (!g_hold_until)
+    g_ceiling = max;
+  const uint64_t phase = g_phase.load(std::memory_order_relaxed);
+  if (ready == 0) {
+    ++g_misses;
+    ++g_misses_total;
+    const uint64_t back = phase > kPhaseBackNs ? phase - kPhaseBackNs : 0;
+    g_phase.store(back, std::memory_order_relaxed);
+    g_ceiling = back;
+    g_hold_until = now + kPacingHoldNs;
+    g_good = 0;
+  } else if (ready == 1 && ++g_good >= kPacingGoodImages) {
+    g_good = 0;
+    const uint64_t up = std::min(phase + kPhaseStepNs, g_ceiling);
+    if (up > phase) {
+      g_phase.store(up, std::memory_order_relaxed);
+      ++g_phase_ups;
+    }
+  }
+}
 
 // A displayed frame's refresh count from its anchor: the phase's measurement. Requires g_mutex.
 void PhaseFrame(uint32_t refreshes, uint64_t now) {
@@ -369,26 +440,105 @@ void Run() {
     last = now;
     g_period.store(uint64_t(period), std::memory_order_relaxed);
     g_last_vsync.store(now, std::memory_order_release);
-    // sa2-nx (2026-10-28, sa2_renut_queue_drain): the newest image at this refresh, before AtRefresh's own fence tests.
     {
-      const uint64_t presented = renut::gpu::Video::PresentCount();
-      const bool new_image = presented != g_presented_at_vsync;
-      g_presented_at_vsync = presented;
-      QueueDrainAtRefresh(new_image ? renut::gpu::Video::PresentDone(presented) : -1, now);
+      std::lock_guard lock(g_refresh_mutex);  // port 172: a refresh for the vblank worker
+      g_refresh_count.fetch_add(1, std::memory_order_release);
     }
+    g_refresh_cv.notify_all();
+    // sa2-nx (2026-10-28, sa2_renut_queue_drain): the newest image at this refresh, before AtRefresh's own fence tests.
+    const uint64_t presented = renut::gpu::Video::PresentCount();
+    const bool new_image = presented != g_presented_at_vsync;
+    g_presented_at_vsync = presented;
+    const int ready = new_image ? renut::gpu::Video::PresentDone(presented) : -1;
+    QueueDrainAtRefresh(ready, now);
     AtRefresh(now, uint64_t(period));
+    // pacman-nx (2026-11-03, pacman_vblank_display_sync, futari-nx's FromDisplay): this refresh starts the game's next
+    // frame, after the phase. A queue drain gives it no tick: no frame starts in this refresh, the image before makes
+    // it, and every image after it is shown a refresh sooner.
+    if (g_pacing.load(std::memory_order_relaxed)) {
+      PacingPhaseAtRefresh(ready, now);
+      if (TakeHold()) {
+        g_ticks_skipped.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      if (const uint64_t phase = g_phase.load(std::memory_order_relaxed))
+        svcSleepThread(int64_t(phase));
+      {
+        std::lock_guard lock(g_tick_mutex);
+        g_ticks.fetch_add(1, std::memory_order_relaxed);
+      }
+      g_tick_cv.notify_one();
+    }
   }
 #endif
 }
 
 }  // namespace
 
+bool FramePacingOn() {
+  return REXCVAR_GET(pacman_vblank_display_sync) && REXCVAR_GET(banjo_display_sync);
+}
+
+void WaitForFrameStart() {
+  g_pacing.store(true, std::memory_order_relaxed);
+  Start();
+  if (!g_running.load(std::memory_order_acquire))
+    return;  // the display thread is not up yet, or could not get the refresh: the game runs on
+  static uint64_t seen = 0;  // the game's thread only
+  // 50 ms: should the display stop refreshing (sleep mode), the game still gets a frame now and then. A tick that came
+  // while the frame ran starts the next one at once (a late frame), and several give one start, no burst.
+  std::unique_lock lock(g_tick_mutex);
+  // pacman-nx (2026-11-03, the third console run): after a hitch (a load's slow frame, kResyncTicks refreshes or more) the
+  // next frame waits for the next tick. Started at once, part-way through a refresh, it missed the next one and filled the
+  // display queue the hitch had just emptied, a refresh of input lag until a drain. A frame only a little late still goes
+  // at once: no 30 fps in a scene just over the budget.
+  constexpr uint64_t kResyncTicks = 3;
+  if (g_ticks.load(std::memory_order_relaxed) - seen >= kResyncTicks)
+    seen = g_ticks.load(std::memory_order_relaxed);
+  const auto waiting = std::chrono::steady_clock::now();
+  g_tick_cv.wait_for(lock, std::chrono::milliseconds(50),
+                     [] { return g_ticks.load(std::memory_order_relaxed) != seen; });
+  seen = g_ticks.load(std::memory_order_relaxed);
+  lock.unlock();
+  // renut-ultimate port 53 (2026-11-09; sasrt-nx found the same in its own pacing): the wait for the frame's refresh is
+  // the game thread waiting, not its work: frame_stats' CPU time (the FPS overlay's, and sasrt_dynamic_cpu_aware's
+  // budget, port 52) leaves it out. It had counted it, so a paced game's CPU side was its whole frame.
+  renut::frame_stats::OnGameThreadWait(
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waiting).count(), 2);
+}
+
+bool QueueDrainOn() {
+  return REXCVAR_GET(pacman_renut_queue_drain) && REXCVAR_GET(pacman_renut_double_buffer) &&
+         REXCVAR_GET(banjo_display_sync);
+}
+
+bool TakeHold() {
+  if (!g_hold.load(std::memory_order_relaxed))
+    return false;
+  return g_hold.exchange(false, std::memory_order_acquire);
+}
+
+uint32_t LateInputGuardUs() {
+  return g_guard_us.load(std::memory_order_relaxed);
+}
+
+// Port 172: the refreshes counted so far, once one past 'seen' has come or 'timeout_ns' has passed (0: at once).
+uint64_t WaitRefresh(uint64_t seen, uint64_t timeout_ns) {
+  std::unique_lock lock(g_refresh_mutex);
+  if (timeout_ns)
+    g_refresh_cv.wait_for(lock, std::chrono::nanoseconds(timeout_ns),
+                          [&] { return g_refresh_count.load(std::memory_order_acquire) != seen; });
+  return g_refresh_count.load(std::memory_order_acquire);
+}
+
 void Start() {
 #if REX_PLATFORM_SWITCH
   static std::once_flag once;
   std::call_once(once, [] {
-    if (REXCVAR_GET(banjo_display_sync))
+    if (REXCVAR_GET(banjo_display_sync)) {
       banjo::renut_gpu::StartLongLivedThread(&Run, 128 * 1024);
+      rex::graphics::g_display_refresh_wait = &WaitRefresh;  // port 172 (used with banjo_vblank_from_display)
+    }
   });
 #endif
 }
@@ -424,16 +574,6 @@ uint64_t NextRelease(uint64_t now, uint64_t previous, uint64_t frame_ns, bool *a
   }
   *anchored = true;
   return release;
-}
-
-bool TakeHold() {
-  if (!g_hold.load(std::memory_order_relaxed))
-    return false;
-  return g_hold.exchange(false, std::memory_order_acquire);
-}
-
-uint32_t LateInputGuardUs() {
-  return g_guard_us.load(std::memory_order_relaxed);
 }
 
 void NoteRelease(uint64_t at, bool anchored) {
@@ -487,16 +627,23 @@ std::string Report() {
       g_misses_total, g_phase_ups, double(g_fence_test_max_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
       double(g_release_wait_max_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
       g_release_clamped.exchange(0, std::memory_order_relaxed));
-  // sa2-nx (2026-10-28): with double buffering, the queue drain's counts (sa2_renut_queue_drain).
-  static const bool drain_on = REXCVAR_GET(sa2_renut_queue_drain) && REXCVAR_GET(sa2_renut_double_buffer);
+  g_present_display = g_input_display = g_release_display = Sum{};
+  g_refreshes = g_refreshes_with_image = g_superseded = g_misses = g_phase_ups = 0;
+  // sa2-nx (2026-10-28): with double buffering, the queue drain's counts (pacman_renut_queue_drain).
+  static const bool drain_on = QueueDrainOn();
   if (drain_on) {
     line += fmt::format("; double buffering: {} new images not finished at their refresh, {} queue drains in all, late "
-                        "input margin +{:.2f} ms (sa2_renut_queue_drain)",
+                        "input margin +{:.2f} ms (pacman_renut_queue_drain)",
                         g_late_images, g_drains, double(g_guard_us.load(std::memory_order_relaxed)) / 1000.0);
     g_late_images = 0;  // (the display thread's counts, read here without its lock: a report's worth of drift at most)
   }
-  g_present_display = g_input_display = g_release_display = Sum{};
-  g_refreshes = g_refreshes_with_image = g_superseded = g_misses = g_phase_ups = 0;
+  if (g_pacing.load(std::memory_order_relaxed)) {
+    const uint64_t ticks = g_ticks.load(std::memory_order_relaxed);
+    line += fmt::format("; frames started by the display at the refresh plus the phase: {}, {} refreshes skipped in all "
+                        "(pacman_vblank_display_sync)",
+                        ticks - g_ticks_reported, g_ticks_skipped.load(std::memory_order_relaxed));
+    g_ticks_reported = ticks;
+  }
   return line;
 }
 

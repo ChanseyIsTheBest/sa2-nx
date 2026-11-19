@@ -2,7 +2,7 @@
 """Extracts an Xbox 360 game disc image (.iso, XDVDFS) into a folder and prints the information of its default.xex.
 
 Pure Python 3.8+, no dependencies and no external extraction tool. Stage 1 of the build: the result,
-assets/game_root, is the game folder that app/sa2_manifest.toml and the console build read.
+assets/game_root, is the game folder that app/masseffect_manifest.toml and the console build read.
 
 Usage:
     python3 tools/extract_iso.py "path/to/Mass Effect.iso"                 extract into assets/game_root

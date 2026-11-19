@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """fneg / fabs / fnabs as float operations (from sasrt-nx's tool of 2026-10-14, idea 7 of sa2-nx's list; banjo-nx's
 copy).
 The generator writes the three guest sign instructions as integer operations on the register's bits:

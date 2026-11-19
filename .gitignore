@@ -1,67 +1,50 @@
-# Nothing derived from the game is ever committed: its files, the code generated from default.xex, the shaders made
-# from it, and the binaries built from that code. Everyone makes them from their own copy.
-
-# --- Game files and what is made from them -------------------------------------
-/assets/
-/app/generated/
+# Game-derived content: never commit
+assets/
+app/assets/
+app/generated/*
+!app/generated/rexglue.cmake
+app/out/
+out/
 *.xex
-*.xexp
 *.iso
-*.bin
-*.ucode
-*.mesp
-*.mesp.idx
-*.nxpack
-*.nxidx
+logs/
+# Build/temp
+*.log
+__pycache__/
 
-# --- Build output --------------------------------------------------------------
-/out/
-/build/
-/sdk/out/
-/app/out/
-/shaders/wasm/out/
-/mesa/work/
+# 2026-10-19 (the private GitHub upload): built and game-derived files outside out/ and app/out/
+# The NRO holds the recompiled game code; shader libraries, pipeline caches and lists, DKSH caches, shader microcode
+# dumps and the game file index are made from the game's data.
 *.nro
+*.nso
 *.nacp
 *.elf
-*.o
-*.obj
-*.a
-*.gcda
+*.mesp
+*.mesp.idx
+*.dksh
+*.ucode
+*.rgba
+*.mp4
+*.zip
+dist/switch/banjo-nx/*.bin
+dist/switch/banjo-nx/cache/
+dist/switch/banjo-nx/newlogs*/
+dist/switch/banjo-nx/capturas/
+deko3d_shaders*.bin
+pipeline_list*.bin
+vfs_index*.bin
+# Other ports' SDK and shader-tool copies this project started from (not built by it)
+sdk_nfsmw/
+shaders_nfsmw/
+# 2026-10-20: tools/difftest's working files (a translated game shader: dp.frag/dp.dksh/dp.bin) and shtool's build output
+tools/difftest/dp.*
+tools/difftest/shtool/obj/
+tools/difftest/shtool/bin/
+# 2026-10-21: the PGO profile (.gcda files merged from an instrumented run; tools/pgo_merge.py, docs/pgo-lto.md)
+pgo/*
 *.stream
 # ...except the PGO profile of the released NRO (counts of which code ran, no game code or data)
-!/pgo/*.gcda
-
-# --- SDK third-party sources: tools/fetch_thirdparty.py fetches them; only the files this port changed are tracked --
-/sdk/thirdparty/*
-!/sdk/thirdparty/CMakeLists.txt
-!/sdk/thirdparty/FFmpeg
-/sdk/thirdparty/FFmpeg/*
-!/sdk/thirdparty/FFmpeg/config.h
-!/sdk/thirdparty/FFmpeg/config_switch_aarch64.h
-!/sdk/thirdparty/FFmpeg/config_masseffect_wmv3.h
-!/sdk/thirdparty/FFmpeg/libavcodec
-/sdk/thirdparty/FFmpeg/libavcodec/*
-!/sdk/thirdparty/FFmpeg/libavcodec/mdct_template.c
-!/sdk/thirdparty/FFmpeg/libavcodec/fft_template.c
-!/sdk/thirdparty/ffmpeg-overlay
-/sdk/thirdparty/ffmpeg-overlay/*
-!/sdk/thirdparty/ffmpeg-overlay/codec_list.c
-
-# --- Logs, dumps and run data ----------------------------------------------------
-*.log
-*.dmp
-*.err
-/cache/
-/logs/
-
-# --- Tools and editors -------------------------------------------------------------
-__pycache__/
-*.pyc
-.vs/
-.vscode/
-.claude/
-.DS_Store
-
-# --- Third-party binaries that come with vendored sources (sample programs), never needed to build --------------
-/app/thirdparty/plume/contrib/*/bin/*.exe
+!pgo/*.gcda
+# 2026-11-11 (port 81): the in-place copies' form has a profile of its own (CMake BANJO_PGO_DIR_IN_PLACE), kept the same way
+pgo-inplace/*
+!pgo-inplace/*.gcda

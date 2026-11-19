@@ -1,10 +1,10 @@
-// SA2 native renderer: runs of PM4 register writes into the constant/fetch register range (0x4000-0x48BF).
+// Mass Effect native renderer: runs of PM4 register writes into the constant/fetch register range (0x4000-0x48BF).
 //
 // ApplyRunReference is the original per-word loop of NativeGraphicsSystem::WriteConstantRun; ApplyRunRaw does the same
 // from the guest's big-endian words in memory, four registers at a time with NEON (byte swap, compare, store). Both leave
 // the same register values and report which generation group (VS constants 0x4000-0x43FF, PS constants 0x4400-0x47FF,
 // fetch constants 0x4800-0x48BF) had at least one word change. Used by the ring thread behind
-// sa2_native_pm4_fast and by tests/cpu/test_native_pm4_runs.cpp.
+// masseffect_native_pm4_fast and by tests/cpu/test_native_pm4_runs.cpp.
 #pragma once
 
 #include <algorithm>

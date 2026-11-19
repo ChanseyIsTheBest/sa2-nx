@@ -1,5 +1,3 @@
-# Based on the toolchain file of the reference ReXGlue Switch port by StevenSND (GPL-3.0): a generic devkitA64 + libnx
-# toolchain for ReXGlue Switch builds, with no game-specific code.
 # Nintendo Switch / libnx cross toolchain for devkitPro devkitA64.
 #
 # Based on skate3recomp-nx's toolchain, which builds a ReXGlue title for Switch.
@@ -82,7 +80,7 @@ set(_SWITCH_SPECS_CONFIGURED "${CMAKE_BINARY_DIR}/switch.specs")
 file(WRITE "${_SWITCH_SPECS_CONFIGURED}" "${_SWITCH_SPECS_CONTENT}")
 # --allow-multiple-definition: NVK's Rust static libraries each bundle the Rust
 # runtime.
-# sa2-nx: quoted: the build folder can contain spaces ("D:/sonic adventure 2/..."), which GCC would split.
+# banjo-nx: quoted, the build folder may contain spaces ("D:/Banjo kazooie port/...").
 set(CMAKE_EXE_LINKER_FLAGS_INIT "\"-specs=${_SWITCH_SPECS_CONFIGURED}\" -Wl,--gc-sections -Wl,--allow-multiple-definition -Wl,--no-relax")
 set(CMAKE_DL_LIBS "")
 

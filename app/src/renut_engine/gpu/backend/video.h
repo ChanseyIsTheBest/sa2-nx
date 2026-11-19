@@ -27,7 +27,7 @@ namespace renut::gpu {
 
 constexpr uint32_t kFramesInFlight = 2;
 constexpr uint32_t kTextureDescriptorCount = 8192;
-constexpr uint32_t kSamplerDescriptorCount = 256;
+constexpr uint32_t kSamplerDescriptorCount = 1024;  // vivapinata-nx: 256 before the families below
 constexpr uint32_t kInvalidDescriptor = UINT32_MAX;
 
 // Fixed bindless slots. The table is shared by the 2D, 3D and cube arrays the
@@ -38,7 +38,10 @@ constexpr uint32_t kNullTextureCubeSlot = 2;
 constexpr uint32_t kFirstDynamicTextureSlot = 3;
 constexpr uint32_t kLinearClampSamplerSlot = 0;
 constexpr uint32_t kPointClampSamplerSlot = 1;
-constexpr uint32_t kFirstDynamicSamplerSlot = 2;
+// vivapinata-nx (2026-11-03): each sampler made takes this many consecutive slots (render/textures.cpp SamplerSlotUncached), and a
+// shader may add up to 4 to a word. The words of an empty texture slot are the fixed samplers above, so the slots up to 5 are filled.
+constexpr uint32_t kSamplerVariants = 5;
+constexpr uint32_t kFirstDynamicSamplerSlot = 6;
 
 // Depth resolve outputs (shaders/host/depth_resolve.hlsli): the destination
 // texture, and the guest words for 8_8_8_8 textures over its memory.
@@ -58,6 +61,9 @@ static_assert(sizeof(UtilityPush) == 32);
 
 // Matches StreamConvertPush in shaders/host/stream_convert_cs.hlsl.
 constexpr uint32_t kStreamConvertMaxElements = 8;
+// halo3-nx (2026-11-03): a stream of more elements takes several dispatches, 8 elements each (each writes only its own). Halo 3's particles have
+// 12: with the limit at 8 they could not be built on the GPU, and every update draw waited for the GPU to read the pool back.
+constexpr uint32_t kStreamConvertTotalElements = 16;
 struct StreamConvertPush {
   uint32_t source;
   uint32_t source_offset;
@@ -70,6 +76,16 @@ struct StreamConvertPush {
   uint32_t elements[2 * kStreamConvertMaxElements];
 };
 static_assert(sizeof(StreamConvertPush) == 96);
+// sasrt-nx (2026-11-08, sasrt_gpu_fetch_copy_compute): matches FetchCopyPush in shaders/host/fetch_copy_cs.hlsl; its
+// set: the slots' export buffers, the upload chunk, the fetch data buffer.
+struct FetchCopyPush {
+  uint32_t source;  // 0 / 1 the slots' export buffers, 2 the upload chunk
+  uint32_t source_offset;
+  uint32_t dest_offset;
+  uint32_t words;
+};
+static_assert(sizeof(FetchCopyPush) == 16);
+constexpr uint32_t kFetchCopyBuffers = 4;
 // stream_convert_cs: the export buffers of the slots come first in its set.
 constexpr uint32_t kStreamConvertBuffers = kFramesInFlight + 1;
 constexpr uint32_t kStreamConvertMaxStrideWords = 255;
@@ -95,6 +111,8 @@ struct PresentImage {
   uint32_t source_width = 0;   // region to scan out (0 = whole texture)
   uint32_t source_height = 0;
   float gamma = 0.0f;  // banjo-nx (banjo_renut_diag_show_texture): the scan-out's exponent, 0 = the output gamma
+  // vivapinata-nx (2026-11-12, vivapinata_present_lut): the texture holds 8-bit unorm channels (a load gives n / 255)
+  bool unorm8 = false;
 };
 
 using OverlayHook = std::function<void(plume::RenderCommandList *, plume::RenderFramebuffer *,
@@ -126,6 +144,8 @@ struct VideoState {
   plume::RenderCommandList *pending_list = nullptr;
   uint64_t pending_ticket = 0;
   uint32_t list_draws = 0;
+  // Port 164 (banjo_deko3d_progressive_submit): the frame's draws so far and the previous frame's (the piece size).
+  uint32_t frame_draws = 0, last_frame_draws = 0;
   // Bumped each time a command list begins; bound state cached against an
   // older value has to be set again.
   uint64_t list_generation = 0;
@@ -168,6 +188,9 @@ struct VideoState {
   std::unique_ptr<plume::RenderShader> present_vs;
   std::unique_ptr<plume::RenderShader> present_ps;
   std::unique_ptr<plume::RenderPipeline> present_pipeline;
+  // vivapinata-nx (2026-11-12, vivapinata_present_lut): present_lut_ps.hlsl's (none: the plain one)
+  std::unique_ptr<plume::RenderShader> present_lut_ps;
+  std::unique_ptr<plume::RenderPipeline> present_lut_pipeline;
   float output_gamma = 1.0f;
   // The guest texture the last Swap scanned out; stall presents (the guest not
   // presenting for a while) show it again rather than a black frame.
@@ -176,9 +199,26 @@ struct VideoState {
   std::unique_ptr<plume::RenderShader> depth_resolve_ps[2];
   std::unique_ptr<plume::RenderShader> resolve_copy_ps;  // banjo-nx (2026-10-18): DrawResolveCopy
   std::unordered_map<uint32_t, std::unique_ptr<plume::RenderPipeline>> resolve_copy_pipelines;  // by format
+  // halo3-nx (2026-11-03): SyncColorViewLocked's, by the target's format.
+  std::unique_ptr<plume::RenderShader> view_fp10_encode_ps;
+  std::unordered_map<uint32_t, std::unique_ptr<plume::RenderPipeline>> view_fp10_encode_pipelines;
+  // blur-nx (2026-11-10, port 76; its key 216: blur_renut_sample_grid_resolve) and its pipelines by destination format.
+  std::unique_ptr<plume::RenderShader> sample_grid_resolve_ps;
+  std::unordered_map<uint32_t, std::unique_ptr<plume::RenderPipeline>> sample_grid_pipelines;
+  // blur-nx (2026-11-11, port 76; its key 220: blur_renut_edram_inherit): the source / destination sample forms, and the
+  // pipelines by destination format and both sample counts.
+  std::unique_ptr<plume::RenderShader> edram_inherit_ps;
+  std::unique_ptr<plume::RenderShader> edram_inherit_src_ms_ps;
+  std::unique_ptr<plume::RenderShader> edram_inherit_dst_ms_ps;
+  std::unique_ptr<plume::RenderShader> edram_inherit_ms_ms_ps;
+  std::unordered_map<uint32_t, std::unique_ptr<plume::RenderPipeline>> edram_inherit_pipelines;
   std::unique_ptr<plume::RenderPipeline> depth_resolve_pipeline[2];
   // banjo-nx (2026-10-19, banjo_renut_depth_words_lazy): the same with the words target's writes masked off.
   std::unique_ptr<plume::RenderPipeline> depth_resolve_float_pipeline[2];
+  // sasrt-nx (2026-11-08, sasrt_gpu_depth_resolve_float_ps): the single-sampled depth-only pipeline with the float-only
+  // shader (depth_resolve_float_ps).
+  std::unique_ptr<plume::RenderShader> sasrt_depth_float_ps;
+  std::unique_ptr<plume::RenderPipeline> sasrt_depth_float_pipeline;
   // Host mip levels of scaled resolve destinations (textures.cpp); null when
   // it failed to build, which leaves them single-level.
   std::unique_ptr<plume::RenderShader> texture_mip_ps;
@@ -212,6 +252,19 @@ struct VideoState {
   std::unique_ptr<plume::RenderPipeline> stream_convert_pipeline;
   std::unique_ptr<plume::RenderDescriptorSet> stream_convert_set;
   const plume::RenderBuffer *stream_convert_set_buffers[kStreamConvertBuffers] = {};
+  // sasrt-nx (2026-11-08, sasrt_gpu_fetch_copy_compute; deko3d only): the fetch data copies on the 3D engine
+  // (fetch_copy_cs; draw.cpp UploadVertexFetchData). A set per slot, replaced (never rewritten) when its buffers change.
+  std::unique_ptr<plume::RenderPipelineLayout> fetch_copy_layout;
+  std::unique_ptr<plume::RenderShader> fetch_copy_cs;
+  std::unique_ptr<plume::RenderPipeline> fetch_copy_pipeline;
+  std::unique_ptr<plume::RenderDescriptorSet> fetch_copy_set[kFramesInFlight];
+  const plume::RenderBuffer *fetch_copy_set_buffers[kFramesInFlight][kFetchCopyBuffers] = {};
+  // sasrt-nx (2026-11-08, sasrt_gpu_fetch_copy_compute): the memexport windows' seeds (draw.cpp PrepareMemExportLocked)
+  // through fetch_copy_cs too: the set whose destination is the slot's export buffer.
+  std::unique_ptr<plume::RenderDescriptorSet> seed_copy_set[kFramesInFlight];
+  std::unique_ptr<plume::RenderDescriptorSet> readback_copy_set[kFramesInFlight];  // sasrt_gpu_readback_compute
+  const plume::RenderBuffer *readback_copy_set_buffers[kFramesInFlight][kFetchCopyBuffers] = {};
+  const plume::RenderBuffer *seed_copy_set_buffers[kFramesInFlight][kFetchCopyBuffers] = {};
   std::unique_ptr<plume::RenderBuffer> exported_streams[kFramesInFlight];
   uint64_t exported_streams_capacity[kFramesInFlight] = {};
   uint64_t exported_streams_used[kFramesInFlight] = {};
@@ -225,6 +278,12 @@ struct VideoState {
   std::unique_ptr<plume::RenderPipelineLayout> target_readback_layout;
   std::unique_ptr<plume::RenderShader> target_readback_cs;
   std::unique_ptr<plume::RenderPipeline> target_readback_pipeline;
+  // sasrt-nx (2026-11-08, sasrt_gpu_texel_readback_compute; deko3d only): a 1x1 float resolve's texel for the CPU
+  // (texel_readback_cs, in target_readback_layout).
+  std::unique_ptr<plume::RenderShader> texel_readback_cs;
+  std::unique_ptr<plume::RenderPipeline> texel_readback_pipeline;
+  std::unique_ptr<plume::RenderDescriptorSet> texel_readback_set[kFramesInFlight];
+  const plume::RenderBuffer *texel_readback_set_buffer[kFramesInFlight] = {};
 
   // Destruction deferred until the slot's fence has been waited.
   std::vector<std::unique_ptr<plume::RenderTexture>> retired_textures[kFramesInFlight];
@@ -232,6 +291,20 @@ struct VideoState {
   std::vector<std::unique_ptr<plume::RenderBuffer>> retired_buffers[kFramesInFlight];
   std::vector<std::unique_ptr<plume::RenderFramebuffer>> retired_framebuffers[kFramesInFlight];
   std::vector<std::unique_ptr<plume::RenderDescriptorSet>> retired_sets[kFramesInFlight];
+  // blur-nx (2026-11-17, audit #4, blur_renut_texture_pool): render-target images given back by Retire, by the slot of
+  // the frame that last used them, and the images whose frame has finished, kept for Create to reuse (no new image,
+  // no GPU address mapping: 65 a second, 24 ms of the render thread in Blur's race).
+  struct PooledTexture {
+    plume::RenderTextureDesc desc;
+    std::unique_ptr<plume::RenderTexture> texture;
+    uint64_t bytes = 0;
+  };
+  std::vector<PooledTexture> retired_pool[kFramesInFlight];
+  std::vector<PooledTexture> texture_pool;  // oldest first
+  uint64_t texture_pool_bytes = 0;
+  // Counted on the render thread, read and reset by the 10 s report (the game thread): atomics.
+  std::atomic<uint64_t> texture_pool_hits{0}, texture_pool_misses{0}, texture_pool_dropped{0};
+  std::atomic<uint64_t> texture_pool_kept{0}, texture_pool_kept_bytes{0};
   std::vector<uint32_t> retired_texture_slots[kFramesInFlight];
 
   OverlayHook overlay_hook;
@@ -273,6 +346,10 @@ public:
   // Guest D3DDevice_Swap: scan out 'image' (nullptr = no guest image this
   // frame) plus the overlay, submit and present.
   static void Present(const PresentImage *image);
+  // banjo-nx (2026-10-20, banjo_renut_game_gamma): the device's corrected gamma ramp at a Swap (768 big-endian words,
+  // red, green, blue: the 10-bit entry << 6, d3d/hooks/device.cpp StoreGamma); the present applies it when the key is
+  // on. Any thread.
+  static void NoteGameGamma(const uint8_t *ramp, bool piecewise);  // halo3-nx: piecewise, D3DDevice_SetPWLGamma's form
   // banjo-nx (2026-10-20, input latency): the guest Swap the next present ends (the render thread, right before it),
   // and banjo_deko3d_latency_trim's 10 s report line (empty when off).
   static void NotePresentingSwap(uint64_t swap);
@@ -288,11 +365,6 @@ public:
   // overlay stays usable. Skips the tick instead of waiting when the renderer
   // is busy.
   static void PresentOverlayOnly();
-
-  // sa2-nx (2026-10-20, sa2_renut_gamma_ramp): the game's display gamma ramp, as its Direct3D keeps it in the device
-  // (768 big-endian words: red, green, blue, 256 each, the 10-bit value << 6), for the scan-out to apply as the Xbox
-  // 360's display controller does. Any thread; a copy that has not changed costs a compare.
-  static void SetGammaRamp(const uint8_t *big_endian_words);
 
   // The guest D3DDevice (guest VA) created by the Direct3D_CreateDevice hook.
   static void SetGuestDevice(uint32_t device_va);
@@ -310,6 +382,14 @@ public:
   static plume::RenderCommandList *CommandListLocked();
   static UploadRing &UploadsLocked();
 
+  // blur-nx (2026-11-17, audit #4, blur_renut_texture_pool): a render-target image given back (reused once the in-flight
+  // frames are done with it), and one of the same description taken from the pool (null: none there; make one).
+  static void RetirePooledLocked(std::unique_ptr<plume::RenderTexture> texture, const plume::RenderTextureDesc &desc);
+  static std::unique_ptr<plume::RenderTexture> TakePooledLocked(const plume::RenderTextureDesc &desc);
+  static std::string TexturePoolReportLocked();
+  // renut-ultimate (2026-11-17, port 148): the pool's images destroyed now (memory pressure: textures.cpp's
+  // EvictColdTexturesLocked). They are out of every frame in flight already (DrainSlot put them there). The number gone.
+  static size_t DropTexturePoolLocked();
   static uint32_t AllocateTextureSlotLocked();
   static void SetTextureSlotLocked(uint32_t slot, plume::RenderTexture *texture,
                                    plume::RenderTextureView *view);

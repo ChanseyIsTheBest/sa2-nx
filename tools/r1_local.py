@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """cpu_aggressive (proposed post-codegen step): the guest stack pointer r1 as a C++ local mirror in every calling
 function, so the compiler does not reload ctx.r1 after each call.
 

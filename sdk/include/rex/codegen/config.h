@@ -89,14 +89,14 @@ struct RecompilerConfig {
 
   // === Code generation options (optional) ===
   bool skipLr = false;
-  /// Codegen diet: `ctx.lr = <return address>;` stores before bl/bctrl/blrl are dropped (nothing but a stack
+  /// Mass Effect diet: `ctx.lr = <return address>;` stores before bl/bctrl/blrl are dropped (nothing but a stack
   /// slot reads the guest LR), except at the return addresses listed in lrKeepReturns (hooks that compare
   /// ctx.lr) and at PIC `bl` to a local label (the LR is then the data).
   bool elideLrStores = false;
-  /// Codegen diet: D-form loads/stores pass the register and the displacement apart
+  /// Mass Effect diet: D-form loads/stores pass the register and the displacement apart
   /// (REX_LOAD_D_*(reg, disp) = base + zext(reg) + disp) instead of (u32)(reg + disp).
   bool dformDispSplit = false;
-  /// Codegen diet: fctiwz as an fcvtzs plus a NaN select (rex::ppc::fctiwz).
+  /// Mass Effect diet: fctiwz as an fcvtzs plus a NaN select (rex::ppc::fctiwz).
   bool fctiwzInline = false;
   /// sa2-nx round 7: no host flush-mode switch (an `msr fpcr` on AArch64, very slow on the A57) for floating-point
   /// moves: lfd/stfd and their indexed/update forms, stfiwx, fmr, fabs, fnabs and fneg only move bits. And in VMX
@@ -123,13 +123,13 @@ struct RecompilerConfig {
   // mask reaches the upper half, so the result is the same; the compiler then sees a plain shift, bit-field
   // extract or AND (one instruction instead of three on AArch64).
   bool rotateWordNarrow = false;
-  // banjo-nx (2026-10-16, measured by its CPU codegen agent; ported to sa2-nx 2026-10-19): rlwinm / rlwimi with an
-  // immediate shift and a mask that does not wrap (mb <= me) written as the plain 32-bit operation the mask makes of it:
-  // a left shift when the mask takes only bits the left shift supplies, a right shift when it takes only bits the right
-  // shift supplies, a 32-bit rotate otherwise (and an AND when the mask is narrower). GCC makes lsl / lsr / ubfiz / ubfx
-  // of those (one instruction) where the 64-bit rotate of the duplicated word took two or three. Same zero-extended
-  // value (banjo-nx's sdk/tests/rotate_word_test.cpp, every shift and mask). Takes precedence over rotate_word_narrow
-  // for rlwinm / rlwimi; rlwnm (a register shift) unchanged.
+  // banjo-nx (2026-10-16, measured by its CPU codegen agent): rlwinm / rlwimi with an immediate shift and a mask that
+  // does not wrap (mb <= me) written as the plain 32-bit operation the mask makes of it: a left shift when the mask
+  // takes only bits the left shift supplies, a right shift when it takes only bits the right shift supplies, a 32-bit
+  // rotate otherwise (and an AND when the mask is narrower). GCC 16 makes lsl / lsr / ubfiz / ubfx of those (one
+  // instruction) where the 64-bit rotate of the duplicated word took two or three; rotate_word_narrow's rotate-and-mask
+  // form did not get there with the Switch compiler. Same zero-extended value (sdk/tests/rotate_word_test.cpp, every
+  // shift and mask). Takes precedence over rotate_word_narrow for rlwinm / rlwimi; rlwnm (a register shift) unchanged.
   bool rotateWordShifts = false;
   // sa2-nx (second CPU round, 2026-10-12): fctid, fctiw and fctidz as rex::ppc::fctid / fctiw / fctidz
   // (rex/ppc/diet_ops.h) instead of an isnan test, a range compare and simde's scalar conversion around each. On
@@ -149,12 +149,15 @@ struct RecompilerConfig {
   // Used where VMX mode is known to be current: there the plain forms would switch the mode off and back, and the
   // any-mode helpers they otherwise go through cost a test and a conversion each.
   bool fpCopyPairs = false;
-  // banjo-nx (2026-10-19, CPU proposal 15; ported to sa2-nx 2026-10-19): with fpCopyPairs, a store of loaded bits
-  // whatever the mode, and through other instructions: going back from the stfs / stfsx in its block, the first
-  // instruction that writes its register must be the lfs / lfsx of it or an fneg / fabs / fnabs of the register in
-  // place (bit 31 of the bits flipped, cleared or set: the double's sign is the single's), and nothing between is a
-  // branch, call or trap. An lfs / lfsx whose bits such a store writes takes the copy form as well, so the bits local is
-  // always written: the two decisions are the same test. The forms need no mode.
+  // banjo-nx (2026-10-19, CPU proposal 15): with fpCopyPairs, a store of loaded bits whatever the mode, and through
+  // other instructions: going back from the stfs / stfsx in its block, the first instruction that writes its register
+  // must be the lfs / lfsx of it or an fneg / fabs / fnabs of the register in place (bit 31 of the bits flipped,
+  // cleared or set: the double's sign is the single's), and nothing between is a branch, call or trap (other
+  // instructions, float and vector ones too, may stand there: they write other registers). An lfs / lfsx whose bits
+  // such a store writes takes the copy form as well, so the bits local is always written: the two decisions are the
+  // same test. The forms need no mode: SingleToDoublePure is exact in either, and the stored bits are what the plain
+  // conversions give with the mode off (the culling loop of sub_829A6DE8: lfs, fneg, stfs paid two range checks and
+  // two conversions).
   bool fpCopyForwarding = false;
   // sa2-nx (second CPU round): with fpCopyPairs, also in every copy-only function (no instruction that needs FPU
   // mode, every lfs / stfs form an lfs / lfsx or a store of loaded bits), whatever the mode: such a function then
@@ -173,6 +176,67 @@ struct RecompilerConfig {
   // select for the signed overflow case, without a branch. Same results on every platform. A divisor the compiler
   // knows keeps the C expression (it turns that into a multiplication).
   bool divInline = false;
+  // futari-nx (2026-10-26; port 55, from feedingfrenzy2-nx's SDK): VMX float results as the Xbox 360 gives them,
+  // where the code generator wrote x86's (simde emulates x86 on AArch64 too, so the PC and the Switch builds agreed
+  // with each other and not with the 360). Each its own key, so one can be put back. The helpers are in
+  // rex/ppc/intrinsics.h. All off: the generated code is what it was.
+  //   vmx_exact_minmax       vmaxfp / vminfp: a NaN operand gives that NaN quieted (vA's first), max(+0, -0) = +0
+  //                          and min(+0, -0) = -0. x86's maxps / minps return the second operand for a NaN or two
+  //                          zeros. AArch64: FMAX / FMIN, one instruction.
+  //   vmx_fused_madd         vmaddfp / vmaddcfp128 / vnmsubfp fused (one rounding), as AltiVec's are; they were a
+  //                          multiply and an add (two roundings; +max * 2 - +max overflowed). AArch64: FMLA.
+  //   vmx_expte_range        vexptefp: 0 below -126 (the 360 flushes the denormal results), +inf from 128, a NaN
+  //                          quieted; the polynomial's exponent arithmetic made garbage outside [-126, 128).
+  //   vmx_cmpb_nan           vcmpbfp: a NaN operand sets both bound bits (out of bounds), as on the 360.
+  //   vmx_dot_overflow_qnan  vmsum3fp128 / vmsum4fp128: QNaN where the sum of finite inputs overflows
+  //                          (rexglue-sdk PR #492).
+  bool vmxExactMinMax = false;
+  bool vmxFusedMadd = false;
+  bool vmxExpteRange = false;
+  bool vmxCmpbNan = false;
+  bool vmxDotOverflowQnan = false;
+  // renut-ultimate (2026-11-16, port 144; tw2de_nx's fixes, found with Xenia's hardware-recorded instruction tests).
+  // Each its own key, all off by default (the user: "make sure its off by default"): the generated code is what it was.
+  //   vcmpbfp_cr6_exact      vcmpbfp.: CR6 is only "eq" (every element within its bounds); the mask test also set "lt"
+  //                          when every element was out of bounds (the hardware gives CR6 = 0 there).
+  //   vupkd3d_exact          vupkd3d128: NORMPACKED64 (4:20:20:20) from the guest's low doubleword with its 3.0 / 1.0
+  //                          biases (it read the high one, dropped the bias and shifted an int32 by more than 31); the
+  //                          most negative field a quiet NaN in NORMSHORT2, NORMSHORT4 and NORMPACKED32's y and z too,
+  //                          as Xenia's x64 unpack (from nx-mod/rexglue-sdk-nx).
+  //   fpscr_moves_exact      mtfsf's field mask in the PowerPC's order (FM 0x80 is field 0, FPSCR 0xF0000000: it was
+  //                          reversed, so `mtfsf 1` did not set the rounding mode), mffs's upper word 0xFFF80000, and
+  //                          builders for mtfsfi, mtfsb0, mtfsb1 and mcrfs (REX_UNIMPLEMENTED traps without).
+  //   extra_instructions     builders for the instructions with none (builders/extra.cpp, instruction_dispatch.cpp:
+  //                          vaddcuw ... vpkpx, lmw, ldbrx, stdbrx, rotld, mcrxr, mfvscr, mtvscr, isync, icbi, mtmsr,
+  //                          lvsl128 / lvsr128, the LRU-hint vector loads and stores, and every OE form).
+  bool vcmpbfpCr6Exact = false;
+  bool vupkd3dExact = false;
+  bool fpscrMovesExact = false;
+  bool extraInstructions = false;
+  // renut-ultimate (2026-11-16, port 144; tw2de_nx's, ON by default at the user's word: "port the speed ups as on by
+  // default"): spin_hint_yield: the Xenon's spin-wait hints (db16cyc, or r1,r1,r1) call rex_spin_hint
+  // (rex/ppc/context.h), which yields the core (the base's MaybeYield, with its backoff); they were nothing. false in
+  // the game's codegen toml: nothing, as before.
+  bool spinHintYield = true;
+  // renut-ultimate (2026-11-16, port 144; tw2de_nx's, off by default): the console's own results where the host's
+  // differ (rex/ppc/vmx_est360.h). vmx_360_estimates: vrefp, vrsqrtefp, vexptefp, vlogefp, fres and frsqrte from
+  // the hardware's tables (Xenia's and xenia-edge's; the default is the exact division, square root, polynomial and
+  // log2f; port 72's NEON estimates replace those, not these). vmx_dot_360: vmsum3fp128 / vmsum4fp128 with the
+  // console's rounding (float64 sums truncated to single), slower than the float32 dot product.
+  bool vmx360Estimates = false;
+  bool vmxDot360 = false;
+  // renut-ultimate (2026-11-16, port 144; tw2de_nx's of 2026-11-01, off by default): exact_fp: the FPU and vector float
+  // results the Xbox 360 gives where the host's differ (rex/ppc/fpu_exact.h: the NaN of the first NaN operand in the
+  // 360's order, quieted, QNaN 0x7FF8... for an invalid operation, the single-precision instructions with a double
+  // denormal operand). A game's code with valid inputs never sees a difference; each helper adds a test of the result.
+  // exact_fp_functions = [addr, ...]: exact_fp in these functions only. exact_fp_log (diagnostic): the host's result
+  // kept, and every instruction exact_fp would change reported once with its function (the line to copy into
+  // exact_fp_functions). fp_origin_log (diagnostic): every float instruction that makes a NaN or an infinity out of
+  // finite operands reported, with the guest's callers (sdk/src/core/ppc_exact_log.cpp).
+  bool exactFp = false;
+  std::unordered_set<uint32_t> exactFpFunctions;
+  bool exactFpLog = false;
+  bool fpOriginLog = false;
   std::unordered_set<uint32_t> lrKeepReturns;
   bool ctrAsLocalVariable = false;
   bool xerAsLocalVariable = false;
@@ -180,15 +244,37 @@ struct RecompilerConfig {
   bool skipMsr = false;
   bool crRegistersAsLocalVariables = false;
   bool nonArgumentRegistersAsLocalVariables = false;
-  /// sa2-nx: with non_argument_as_local, the functions that keep r0, r2, r11, r12, f0 and v32-v63 in ctx
-  /// (`non_argument_as_local_keep = [0x82XXXXXX, ...]`, additive): callees that take an argument there (the stack
-  /// probe reads the frame size in r12) and callers that hand one over through an indirect call (the C++ EH
-  /// dispatcher passes the frame to a funclet in r12 and calls it through the LR). Everything else in them stays
-  /// localized. A function that localizes these registers hands its values over around a call to one of them and
-  /// takes back what it leaves (emit_call_handing_non_arguments). The SDK's __save* / __rest* helpers (r12 and r11
-  /// arguments) keep them in ctx without being listed.
+  /// non_argument_as_local_keep = [addr, ...] (sa2-nx, via peggle2-nx): functions that keep r0/r2/r11/r12/f0/v32-v63
+  /// in ctx under non_argument_as_local: a callee that takes an argument there (the stack probe's frame size in r12),
+  /// or a caller that passes one through an indirect call (the C++ EH dispatcher). Their callers hand the localized
+  /// registers over (emit_call_handing_non_arguments). Found by tools/non_argument_audit.py on code generated without
+  /// the option.
   std::unordered_set<uint32_t> nonArgumentKeep;
   bool nonVolatileRegistersAsLocalVariables = false;
+  /// non_volatile_as_local_exclude = [[start, end], ...]: functions starting in [start, end) keep r14-r31,
+  /// f14-f31, v14-v31 and v64-v127 in ctx and really call the __save*/__rest* helpers (whose bodies then
+  /// work on ctx too), i.e. the code generated without non_volatile_as_local. For hand-written asm libraries
+  /// with their own register conventions (banjo-nx: the WMV video decoder). A localized caller never reads
+  /// ctx's non-volatiles and an excluded function preserves them as the guest ABI says, so the two mix.
+  std::vector<std::pair<uint32_t, uint32_t>> nonVolatileLocalExclude;
+  /// non_volatile_as_local_keep = ["v64-v77", "v92", "r30", ...]: non-volatile registers that stay in ctx in
+  /// every function, for a game whose code uses them outside the ABI: as global registers set once and read
+  /// everywhere (banjo-nx: VMX128 constants in v64-v77), or as implicit arguments a caller sets for a callee
+  /// (banjo-nx: v92). A save/restore helper whose range covers one of them is called, not elided.
+  uint32_t nonVolatileKeepR = 0;     ///< bit i: ri
+  uint32_t nonVolatileKeepF = 0;     ///< bit i: fi
+  uint64_t nonVolatileKeepV[2] = {};  ///< bit i of [i / 64]: vi
+  bool nonVolatileKept(char kind, size_t index) const {
+    if (kind == 'r') return index < 32 && (nonVolatileKeepR >> index & 1);
+    if (kind == 'f') return index < 32 && (nonVolatileKeepF >> index & 1);
+    return index < 128 && (nonVolatileKeepV[index / 64] >> (index % 64) & 1);
+  }
+  bool nonVolatileLocalExcluded(uint32_t address) const {
+    for (const auto& [first, end] : nonVolatileLocalExclude)
+      if (address >= first && address < end)
+        return true;
+    return false;
+  }
   bool generateExceptionHandlers = false;  ///< Generate SEH exception handler wrappers
 
   /// Arguments in registers (codegen/args_in_registers.h): direct calls between recompiled functions pass

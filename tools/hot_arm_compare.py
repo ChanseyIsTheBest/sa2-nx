@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """banjo-nx: the AArch64 code of each localized native copy against the recompiled original it replaces, weighted by
 how often each part really runs (docs/enhancements.md, "Hot guest functions as localized copies").
 
@@ -93,7 +92,7 @@ def compile_all(scratch, files, jobs):
         hot_extra = ['-fno-math-errno', '-fomit-frame-pointer']
     if recomp is None or hot is None:
         sys.exit('hot_arm_compare: app/out/switch/build.ninja has no rule for the game code (configure the Switch build)')
-    pch = ['-include', os.path.join(GEN, 'sa2_pch.h')]
+    pch = ['-include', os.path.join(GEN, 'renut_pch.h')]
     tasks = []
     for f in sorted(files):
         src = os.path.join(GEN, f)

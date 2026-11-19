@@ -20,6 +20,8 @@
  */
 #pragma once
 
+#include <string>
+
 #include <rex/types.h>
 
 #include "renut_engine/gpu/render/draw.h"
@@ -28,6 +30,11 @@ namespace renut::gpu {
 
 // True while the device records a command buffer.
 bool IsRecordingCommandBuffer(u32 device_va);
+
+// halo3-nx (2026-11-03, banjo_renut_recorded_binds; d3d/hooks/shader.cpp): a game thread, at a draw: the id of the
+// D3DVertexShader_Bind its shader has now (0: none). The render thread, before that draw: the shader record takes it.
+u32 LastBindingOf(u32 shader_va);
+void ApplyBindingLocked(u32 id);
 
 // After the original BeginCommandBuffer: drops what the buffer held before.
 void BeginRecording(u32 device_va, u32 command_buffer_va);
@@ -50,6 +57,13 @@ void RecordResolve(u32 device_va, u32 flags, const ClearRect *source_rect, u32 d
 
 // D3DDevice_RunCommandBuffer on a recording device: records the run.
 void RecordRun(u32 device_va, u32 command_buffer_va);
+// banjo-nx (2026-10-26, banjo_renut_diag_fast_census): replayed recordings against the frame before's; empty when none.
+// (2026-10-29: its own name; it shared render/draw.h's, one definition of the two was linked.)
+std::string ReplayRepeatCensusReport();
+// banjo-nx (2026-10-28, banjo_renut_diag_packet_census): replayed draws a whole-state keyed cache would answer.
+std::string PacketCensusReport();
+std::string StateSourceReport();  // banjo-nx (2026-10-26, banjo_renut_diag_fast_census)
+std::string RecordLockReport();  // blur-nx (2026-11-17): NewOp's memo census and the record lock's slow paths
 
 // Copies the data of the device's recorded Begin*Vertices draw, if any. Any
 // thread, with or without State().mutex.
@@ -62,6 +76,13 @@ void QueueRunCommandBuffer(u32 device_va, u32 command_buffer_va);
 
 void ReleaseCommandBuffer(u32 command_buffer_va);
 
+// banjo-nx (2026-10-28, the heap): the spare buffers given back while the heap's room is below 256 MB (checked every
+// 5 s; the frame's hook calls it).
+void ReleaseSpareBuffersWhenHeapShort();
+// banjo-nx (2026-10-28, the console's OOM): the spare buffers given back now (plume's memory pressure callback: a GPU
+// memory block found no room in the heap). Any thread; takes only the spares' own lock.
+void ReleaseSpareBuffersNow();
+
 // For the memory report: the capacity of the recordings the game's command
 // buffers hold now, and of the spare recordings kept for reuse; 'live'
 // counts every recording, including older ones queued runs still hold.
@@ -73,5 +94,18 @@ struct CommandBufferMemory {
   size_t live = 0;
 };
 CommandBufferMemory CommandBufferMemoryUsage();
+
+// banjo-nx (2026-10-26, banjo_renut_tags): the 10 s "[renut] recording from marks" line (empty with nothing recorded);
+// resets its counts.
+std::string TagsReport();
+// banjo-nx (2026-10-27, banjo_renut_shadow_sort): the 10 s "[renut] shadow sort" line; resets its counts.
+std::string ShadowSortReport();
+// banjo-nx (2026-10-27, banjo_renut_shadow_sort): a shader object's content hash and whether its draws may be reordered
+// (draw.h ShaderSortableByHash), where it is made; any thread.
+void NoteShaderSortKey(u32 va, uint64_t hash, bool sortable);
+
+// sasrt-nx (2026-10-21, sasrt_renut_constant_f4_pending): for a game's D3DDevice_BeginShaderConstantF4 hook, after the original
+// succeeded: the range's float constant groups pending again on the device, so a recorded draw takes them from it.
+void KeepConstantF4Pending(u32 device_va, bool pixel, u32 start, u32 count);
 
 } // namespace renut::gpu

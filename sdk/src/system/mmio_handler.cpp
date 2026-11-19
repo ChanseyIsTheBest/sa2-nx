@@ -11,7 +11,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <string>
 #include <utility>
 
 #include <rex/assert.h>
@@ -22,29 +21,9 @@
 #include <rex/system/mmio_handler.h>
 #include <rex/types.h>
 
-#if REX_PLATFORM_WINDOWS
-#include <windows.h>
+#if REX_PLATFORM_WIN32
+#include "../core/platform_win.h"
 #endif
-
-namespace {
-// " (module.exe+0xRVA)" for a host code address, so a crash under ASLR can be symbolized afterwards
-// (llvm-symbolizer --obj=module.exe 0x<preferred base + RVA>). Empty where the platform has no lookup.
-std::string DescribeHostCode(uint64_t pc) {
-#if REX_PLATFORM_WINDOWS
-  HMODULE module = nullptr;
-  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                         reinterpret_cast<LPCSTR>(pc), &module) && module) {
-    char path[MAX_PATH] = {};
-    GetModuleFileNameA(module, path, MAX_PATH);
-    const char* name = std::strrchr(path, '\\');
-    return fmt::format(" ({}+0x{:X})", name ? name + 1 : path, pc - reinterpret_cast<uint64_t>(module));
-  }
-#else
-  (void)pc;
-#endif
-  return {};
-}
-}  // namespace
 
 using namespace rex::arch;
 
@@ -445,8 +424,21 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
       const bool handled = access_violation_callback_(
           std::move(lock), access_violation_callback_context_, fault_host_address, is_write);
       if (!handled) {
-        REXLOG_ERROR("Unhandled guest access violation at host PC {:p}{}",
-                     reinterpret_cast<const void*>(ex->pc()), DescribeHostCode(ex->pc()));
+#if REX_PLATFORM_WIN32
+        // banjo-nx: the module and the offset in it, so the PC can be named with llvm-symbolizer and the PDB.
+        HMODULE module = nullptr;
+        char module_name[MAX_PATH] = {};
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(ex->pc()), &module)) {
+          GetModuleFileNameA(module, module_name, sizeof(module_name));
+        }
+        REXLOG_ERROR("Unhandled guest access violation at host PC {:p} ({}+0x{:X})",
+                     reinterpret_cast<const void*>(ex->pc()), module_name,
+                     uint64_t(ex->pc()) - uint64_t(reinterpret_cast<uintptr_t>(module)));
+#else
+        REXLOG_ERROR("Unhandled guest access violation at host PC {:p}",
+                     reinterpret_cast<const void*>(ex->pc()));
+#endif
       }
       return handled;
     }

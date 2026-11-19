@@ -1,0 +1,1435 @@
+diff --git a/src/xenia/cpu/ppc/testing/instr_addeo.s b/src/xenia/cpu/ppc/testing/instr_addeo.s
+new file mode 100644
+index 0000000..17cded2
+--- /dev/null
++++ b/src/xenia/cpu/ppc/testing/instr_addeo.s
+@@ -0,0 +1,9 @@
++# The carry in takes the low word past INT32_MAX.
++test_addeo_1:
++  #_ REGISTER_IN r4 0x000000007FFFFFFF
++  #_ REGISTER_IN r5 0x0000000000000000
++  #_ REGISTER_IN xer 0x20000000
++  addeo r3, r4, r5
++  blr
++  #_ REGISTER_OUT r3 0x0000000080000000
++  #_ REGISTER_OUT xer 0xC0000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_addo.s b/src/xenia/cpu/ppc/testing/instr_addo.s
+new file mode 100644
+index 0000000..764abe5
+--- /dev/null
++++ b/src/xenia/cpu/ppc/testing/instr_addo.s
+@@ -0,0 +1,59 @@
++test_addo_1:
++  #_ REGISTER_IN r4 0x0000000000000001
++  #_ REGISTER_IN r5 0x0000000000000002
++  addo r3, r4, r5
++  blr
++  #_ REGISTER_OUT r3 0x0000000000000003
++  #_ REGISTER_OUT xer 0x00000000
++
++test_addo_2:
++  #_ REGISTER_IN r4 0x000000007FFFFFFF
++  #_ REGISTER_IN r5 0x0000000000000001
++  addo r3, r4, r5
++  blr
++  #_ REGISTER_OUT r3 0x0000000080000000
++  #_ REGISTER_OUT xer 0xC0000000
++
++# Only a 64-bit overflow, which 32-bit mode ignores.
++test_addo_3:
++  #_ REGISTER_IN r4 0x7FFFFFFFFFFFFFFF
++  #_ REGISTER_IN r5 0x0000000000000001
++  addo r3, r4, r5
++  blr
++  #_ REGISTER_OUT r3 0x8000000000000000
++  #_ REGISTER_OUT xer 0x00000000
++
++# XER[OV] clears on the second add, XER[SO] does not.
++test_addo_4:
++  #_ REGISTER_IN r4 0x000000007FFFFFFF
++  #_ REGISTER_IN r5 0x0000000000000001
++  #_ REGISTER_IN r7 0x0000000000000001
++  #_ REGISTER_IN r8 0x0000000000000002
++  addo r6, r4, r5
++  addo r3, r7, r8
++  blr
++  #_ REGISTER_OUT r3 0x0000000000000003
++  #_ REGISTER_OUT xer 0x80000000
++
++# A compare into any field copies XER[SO] into that field's summary bit.
++test_addo_5:
++  #_ REGISTER_IN r4 0x000000007FFFFFFF
++  #_ REGISTER_IN r5 0x0000000000000001
++  #_ REGISTER_IN r6 0x0000000000000000
++  addo r3, r4, r5
++  cmpwi cr1, r6, 0
++  blr
++  #_ REGISTER_OUT xer 0xC0000000
++  #_ REGISTER_OUT cr 0x03000000
++
++# mtxer clears the sticky bit, and the next compare must not resurrect it.
++test_addo_6:
++  #_ REGISTER_IN r4 0x000000007FFFFFFF
++  #_ REGISTER_IN r5 0x0000000000000001
++  #_ REGISTER_IN r6 0x0000000000000000
++  addo r3, r4, r5
++  mtxer r6
++  cmpwi cr1, r6, 0
++  blr
++  #_ REGISTER_OUT xer 0x00000000
++  #_ REGISTER_OUT cr 0x02000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_divwo.s b/src/xenia/cpu/ppc/testing/instr_divwo.s
+new file mode 100644
+index 0000000..6a22007
+--- /dev/null
++++ b/src/xenia/cpu/ppc/testing/instr_divwo.s
+@@ -0,0 +1,42 @@
++# A divide that cannot overflow still has to clear XER[OV].
++test_divwo_1:
++  #_ REGISTER_IN r4 0x000000007FFFFFFF
++  #_ REGISTER_IN r5 0x0000000000000001
++  #_ REGISTER_IN r7 0x0000000000000064
++  #_ REGISTER_IN r8 0x0000000000000002
++  addo r6, r4, r5
++  divwo r3, r7, r8
++  blr
++  #_ REGISTER_OUT r3 0x0000000000000032
++  #_ REGISTER_OUT xer 0x80000000
++
++# RT is undefined for both overflowing forms, so only XER is asserted.
++test_divwo_2:
++  #_ REGISTER_IN r4 0x0000000000000064
++  #_ REGISTER_IN r5 0x0000000000000000
++  divwo r3, r4, r5
++  blr
++  #_ REGISTER_OUT xer 0xC0000000
++
++test_divwo_3:
++  #_ REGISTER_IN r4 0xFFFFFFFF80000000
++  #_ REGISTER_IN r5 0xFFFFFFFFFFFFFFFF
++  divwo r3, r4, r5
++  blr
++  #_ REGISTER_OUT xer 0xC0000000
++
++# The unsigned form has no unrepresentable quotient, only the zero divisor.
++test_divwuo_1:
++  #_ REGISTER_IN r4 0xFFFFFFFF80000000
++  #_ REGISTER_IN r5 0xFFFFFFFFFFFFFFFF
++  divwuo r3, r4, r5
++  blr
++  #_ REGISTER_OUT r3 0x0000000000000000
++  #_ REGISTER_OUT xer 0x00000000
++
++test_divwuo_2:
++  #_ REGISTER_IN r4 0x0000000000000064
++  #_ REGISTER_IN r5 0x0000000000000000
++  divwuo r3, r4, r5
++  blr
++  #_ REGISTER_OUT xer 0xC0000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_fabsx.s b/src/xenia/cpu/ppc/testing/instr_fabsx.s
+index c797455..b48070d 100644
+--- a/src/xenia/cpu/ppc/testing/instr_fabsx.s
++++ b/src/xenia/cpu/ppc/testing/instr_fabsx.s
+@@ -1,27 +1,27 @@
+ test_fabsx_1:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
+   fabs. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [3FF0000000000000]
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
++  #_ REGISTER_OUT f3 0x3FF0000000000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
+ 
+ test_fabsx_2:
+-  #_ REGISTER_IN f4 [BFF0000000000000]
++  #_ REGISTER_IN f4 0xBFF0000000000000
+   fabs. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [3FF0000000000000]
+-  #_ REGISTER_OUT f4 [BFF0000000000000]
++  #_ REGISTER_OUT f3 0x3FF0000000000000
++  #_ REGISTER_OUT f4 0xBFF0000000000000
+ 
+ test_fabsx_3:
+-  #_ REGISTER_IN f4 [8000000000000000]
++  #_ REGISTER_IN f4 0x8000000000000000
+   fabs. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f4 [8000000000000000]
++  #_ REGISTER_OUT f3 0x0000000000000000
++  #_ REGISTER_OUT f4 0x8000000000000000
+ 
+ test_fabsx_4:
+-  #_ REGISTER_IN f4 [C005000000000000]
++  #_ REGISTER_IN f4 0xC005000000000000
+   fabs. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [4005000000000000]
+-  #_ REGISTER_OUT f4 [C005000000000000]
++  #_ REGISTER_OUT f3 0x4005000000000000
++  #_ REGISTER_OUT f4 0xC005000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_faddsx.s b/src/xenia/cpu/ppc/testing/instr_faddsx.s
+index 944c1ad..19283d0 100644
+--- a/src/xenia/cpu/ppc/testing/instr_faddsx.s
++++ b/src/xenia/cpu/ppc/testing/instr_faddsx.s
+@@ -1,35 +1,35 @@
+ test_faddsx_1:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
+-  #_ REGISTER_IN f5 [4000000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
++  #_ REGISTER_IN f5 0x4000000000000000
+   fadds. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [4008000000000000]
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
+-  #_ REGISTER_OUT f5 [4000000000000000]
++  #_ REGISTER_OUT f3 0x4008000000000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
++  #_ REGISTER_OUT f5 0x4000000000000000
+ 
+ test_faddsx_2:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
+-  #_ REGISTER_IN f5 [BFF0000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
++  #_ REGISTER_IN f5 0xBFF0000000000000
+   fadds. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
+-  #_ REGISTER_OUT f5 [BFF0000000000000]
++  #_ REGISTER_OUT f3 0x0000000000000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
++  #_ REGISTER_OUT f5 0xBFF0000000000000
+ 
+ test_faddsx_3:
+-  #_ REGISTER_IN f4 [4000000000000000]
+-  #_ REGISTER_IN f5 [4008000000000000]
++  #_ REGISTER_IN f4 0x4000000000000000
++  #_ REGISTER_IN f5 0x4008000000000000
+   fadds. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [4010000000000000]
+-  #_ REGISTER_OUT f4 [4000000000000000]
+-  #_ REGISTER_OUT f5 [4008000000000000]
++  #_ REGISTER_OUT f3 0x4014000000000000
++  #_ REGISTER_OUT f4 0x4000000000000000
++  #_ REGISTER_OUT f5 0x4008000000000000
+ 
+ test_faddsx_4:
+-  #_ REGISTER_IN f4 [0000000000000000]
+-  #_ REGISTER_IN f5 [0000000000000000]
++  #_ REGISTER_IN f4 0x0000000000000000
++  #_ REGISTER_IN f5 0x0000000000000000
+   fadds. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f4 [0000000000000000]
+-  #_ REGISTER_OUT f5 [0000000000000000]
++  #_ REGISTER_OUT f3 0x0000000000000000
++  #_ REGISTER_OUT f4 0x0000000000000000
++  #_ REGISTER_OUT f5 0x0000000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_faddx.s b/src/xenia/cpu/ppc/testing/instr_faddx.s
+index e86fe5e..5fe2248 100644
+--- a/src/xenia/cpu/ppc/testing/instr_faddx.s
++++ b/src/xenia/cpu/ppc/testing/instr_faddx.s
+@@ -1,35 +1,35 @@
+ test_faddx_1:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
+-  #_ REGISTER_IN f5 [4000000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
++  #_ REGISTER_IN f5 0x4000000000000000
+   fadd. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [4008000000000000]
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
+-  #_ REGISTER_OUT f5 [4000000000000000]
++  #_ REGISTER_OUT f3 0x4008000000000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
++  #_ REGISTER_OUT f5 0x4000000000000000
+ 
+ test_faddx_2:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
+-  #_ REGISTER_IN f5 [BFF0000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
++  #_ REGISTER_IN f5 0xBFF0000000000000
+   fadd. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
+-  #_ REGISTER_OUT f5 [BFF0000000000000]
++  #_ REGISTER_OUT f3 0x0000000000000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
++  #_ REGISTER_OUT f5 0xBFF0000000000000
+ 
+ test_faddx_3:
+-  #_ REGISTER_IN f4 [4000000000000000]
+-  #_ REGISTER_IN f5 [4008000000000000]
++  #_ REGISTER_IN f4 0x4000000000000000
++  #_ REGISTER_IN f5 0x4008000000000000
+   fadd. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [4010000000000000]
+-  #_ REGISTER_OUT f4 [4000000000000000]
+-  #_ REGISTER_OUT f5 [4008000000000000]
++  #_ REGISTER_OUT f3 0x4014000000000000
++  #_ REGISTER_OUT f4 0x4000000000000000
++  #_ REGISTER_OUT f5 0x4008000000000000
+ 
+ test_faddx_4:
+-  #_ REGISTER_IN f4 [0000000000000000]
+-  #_ REGISTER_IN f5 [0000000000000000]
++  #_ REGISTER_IN f4 0x0000000000000000
++  #_ REGISTER_IN f5 0x0000000000000000
+   fadd. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f4 [0000000000000000]
+-  #_ REGISTER_OUT f5 [0000000000000000]
++  #_ REGISTER_OUT f3 0x0000000000000000
++  #_ REGISTER_OUT f4 0x0000000000000000
++  #_ REGISTER_OUT f5 0x0000000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_fcmpo.s b/src/xenia/cpu/ppc/testing/instr_fcmpo.s
+index 6369ecd..4f35629 100644
+--- a/src/xenia/cpu/ppc/testing/instr_fcmpo.s
++++ b/src/xenia/cpu/ppc/testing/instr_fcmpo.s
+@@ -1,39 +1,39 @@
+ test_fcmpo_1:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
+-  #_ REGISTER_IN f5 [4000000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
++  #_ REGISTER_IN f5 0x4000000000000000
+   fcmpo cr0, f4, f5
+   mfcr r3
+   blr
+-  #_ REGISTER_OUT r3 0x20000000
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
+-  #_ REGISTER_OUT f5 [4000000000000000]
++  #_ REGISTER_OUT r3 0x80000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
++  #_ REGISTER_OUT f5 0x4000000000000000
+ 
+ test_fcmpo_2:
+-  #_ REGISTER_IN f4 [4000000000000000]
+-  #_ REGISTER_IN f5 [4000000000000000]
++  #_ REGISTER_IN f4 0x4000000000000000
++  #_ REGISTER_IN f5 0x4000000000000000
+   fcmpo cr0, f4, f5
+   mfcr r3
+   blr
+   #_ REGISTER_OUT r3 0x20000000
+-  #_ REGISTER_OUT f4 [4000000000000000]
+-  #_ REGISTER_OUT f5 [4000000000000000]
++  #_ REGISTER_OUT f4 0x4000000000000000
++  #_ REGISTER_OUT f5 0x4000000000000000
+ 
+ test_fcmpo_3:
+-  #_ REGISTER_IN f4 [4008000000000000]
+-  #_ REGISTER_IN f5 [3FF0000000000000]
++  #_ REGISTER_IN f4 0x4008000000000000
++  #_ REGISTER_IN f5 0x3FF0000000000000
+   fcmpo cr0, f4, f5
+   mfcr r3
+   blr
+-  #_ REGISTER_OUT r3 0x20000000
+-  #_ REGISTER_OUT f4 [4008000000000000]
+-  #_ REGISTER_OUT f5 [3FF0000000000000]
++  #_ REGISTER_OUT r3 0x40000000
++  #_ REGISTER_OUT f4 0x4008000000000000
++  #_ REGISTER_OUT f5 0x3FF0000000000000
+ 
+ test_fcmpo_4:
+-  #_ REGISTER_IN f4 [0000000000000000]
+-  #_ REGISTER_IN f5 [0000000000000000]
++  #_ REGISTER_IN f4 0x0000000000000000
++  #_ REGISTER_IN f5 0x0000000000000000
+   fcmpo cr0, f4, f5
+   mfcr r3
+   blr
+   #_ REGISTER_OUT r3 0x20000000
+-  #_ REGISTER_OUT f4 [0000000000000000]
+-  #_ REGISTER_OUT f5 [0000000000000000]
++  #_ REGISTER_OUT f4 0x0000000000000000
++  #_ REGISTER_OUT f5 0x0000000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_fcmpu.s b/src/xenia/cpu/ppc/testing/instr_fcmpu.s
+index 2a7fa59..a7065b8 100644
+--- a/src/xenia/cpu/ppc/testing/instr_fcmpu.s
++++ b/src/xenia/cpu/ppc/testing/instr_fcmpu.s
+@@ -1,39 +1,39 @@
+ test_fcmpu_1:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
+-  #_ REGISTER_IN f5 [4000000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
++  #_ REGISTER_IN f5 0x4000000000000000
+   fcmpu cr0, f4, f5
+   mfcr r3
+   blr
+-  #_ REGISTER_OUT r3 0x20000000
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
+-  #_ REGISTER_OUT f5 [4000000000000000]
++  #_ REGISTER_OUT r3 0x80000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
++  #_ REGISTER_OUT f5 0x4000000000000000
+ 
+ test_fcmpu_2:
+-  #_ REGISTER_IN f4 [4000000000000000]
+-  #_ REGISTER_IN f5 [4000000000000000]
++  #_ REGISTER_IN f4 0x4000000000000000
++  #_ REGISTER_IN f5 0x4000000000000000
+   fcmpu cr0, f4, f5
+   mfcr r3
+   blr
+   #_ REGISTER_OUT r3 0x20000000
+-  #_ REGISTER_OUT f4 [4000000000000000]
+-  #_ REGISTER_OUT f5 [4000000000000000]
++  #_ REGISTER_OUT f4 0x4000000000000000
++  #_ REGISTER_OUT f5 0x4000000000000000
+ 
+ test_fcmpu_3:
+-  #_ REGISTER_IN f4 [4008000000000000]
+-  #_ REGISTER_IN f5 [3FF0000000000000]
++  #_ REGISTER_IN f4 0x4008000000000000
++  #_ REGISTER_IN f5 0x3FF0000000000000
+   fcmpu cr0, f4, f5
+   mfcr r3
+   blr
+-  #_ REGISTER_OUT r3 0x20000000
+-  #_ REGISTER_OUT f4 [4008000000000000]
+-  #_ REGISTER_OUT f5 [3FF0000000000000]
++  #_ REGISTER_OUT r3 0x40000000
++  #_ REGISTER_OUT f4 0x4008000000000000
++  #_ REGISTER_OUT f5 0x3FF0000000000000
+ 
+ test_fcmpu_4:
+-  #_ REGISTER_IN f4 [0000000000000000]
+-  #_ REGISTER_IN f5 [0000000000000000]
++  #_ REGISTER_IN f4 0x0000000000000000
++  #_ REGISTER_IN f5 0x0000000000000000
+   fcmpu cr0, f4, f5
+   mfcr r3
+   blr
+   #_ REGISTER_OUT r3 0x20000000
+-  #_ REGISTER_OUT f4 [0000000000000000]
+-  #_ REGISTER_OUT f5 [0000000000000000]
++  #_ REGISTER_OUT f4 0x0000000000000000
++  #_ REGISTER_OUT f5 0x0000000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_fctixz.s b/src/xenia/cpu/ppc/testing/instr_fctixz.s
+index 4f132a6..b213aac 100644
+--- a/src/xenia/cpu/ppc/testing/instr_fctixz.s
++++ b/src/xenia/cpu/ppc/testing/instr_fctixz.s
+@@ -79,22 +79,21 @@ test_fctiwz_10:
+   #_ REGISTER_OUT f0 0xfff0000000000000
+   #_ REGISTER_OUT f1 0xFFFFFFFF80000000
+ 
+-# TODO(DrChat): Xenia doesn't handle NaNs yet.
+-# # QNaN
+-# test_fctiwz_11:
+-#   #_ REGISTER_IN f0 0xfff8000000000000
+-#   fctiwz f1, f0
+-#   blr
+-#   #_ REGISTER_OUT f0 0xfff8000000000000
+-#   #_ REGISTER_OUT f1 0xFFFFFFFF80000000
+-# 
+-# # SNaN
+-# test_fctiwz_12:
+-#   #_ REGISTER_IN f0 0xfff4000000000000
+-#   fctiwz f1, f0
+-#   blr
+-#   #_ REGISTER_OUT f0 0xfff4000000000000
+-#   #_ REGISTER_OUT f1 0xFFFFFFFF80000000
++# QNaN
++test_fctiwz_11:
++  #_ REGISTER_IN f0 0xfff8000000000000
++  fctiwz f1, f0
++  blr
++  #_ REGISTER_OUT f0 0xfff8000000000000
++  #_ REGISTER_OUT f1 0xFFFFFFFF80000000
++
++# SNaN
++test_fctiwz_12:
++  #_ REGISTER_IN f0 0xfff4000000000000
++  fctiwz f1, f0
++  blr
++  #_ REGISTER_OUT f0 0xfff4000000000000
++  #_ REGISTER_OUT f1 0xFFFFFFFF80000000
+ 
+ # +0
+ test_fctidz_1:
+@@ -176,19 +175,18 @@ test_fctidz_10:
+   #_ REGISTER_OUT f0 0xfff0000000000000
+   #_ REGISTER_OUT f1 0x8000000000000000
+ 
+-# TODO(DrChat): Xenia doesn't handle NaNs yet.
+-# # QNaN
+-# test_fctidz_11:
+-#   #_ REGISTER_IN f0 0xfff8000000000000
+-#   fctidz f1, f0
+-#   blr
+-#   #_ REGISTER_OUT f0 0xfff8000000000000
+-#   #_ REGISTER_OUT f1 0x8000000000000000
+-# 
+-# # SNaN
+-# test_fctidz_12:
+-#   #_ REGISTER_IN f0 0xfff4000000000000
+-#   fctidz f1, f0
+-#   blr
+-#   #_ REGISTER_OUT f0 0xfff4000000000000
+-#   #_ REGISTER_OUT f1 0x8000000000000000
++# QNaN
++test_fctidz_11:
++  #_ REGISTER_IN f0 0xfff8000000000000
++  fctidz f1, f0
++  blr
++  #_ REGISTER_OUT f0 0xfff8000000000000
++  #_ REGISTER_OUT f1 0x8000000000000000
++
++# SNaN
++test_fctidz_12:
++  #_ REGISTER_IN f0 0xfff4000000000000
++  fctidz f1, f0
++  blr
++  #_ REGISTER_OUT f0 0xfff4000000000000
++  #_ REGISTER_OUT f1 0x8000000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_fmrx.s b/src/xenia/cpu/ppc/testing/instr_fmrx.s
+index 132aacb..2469a0d 100644
+--- a/src/xenia/cpu/ppc/testing/instr_fmrx.s
++++ b/src/xenia/cpu/ppc/testing/instr_fmrx.s
+@@ -1,27 +1,27 @@
+ test_fmrx_1:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
+   fmr. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [3FF0000000000000]
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
++  #_ REGISTER_OUT f3 0x3FF0000000000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
+ 
+ test_fmrx_2:
+-  #_ REGISTER_IN f4 [BFF0000000000000]
++  #_ REGISTER_IN f4 0xBFF0000000000000
+   fmr. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [BFF0000000000000]
+-  #_ REGISTER_OUT f4 [BFF0000000000000]
++  #_ REGISTER_OUT f3 0xBFF0000000000000
++  #_ REGISTER_OUT f4 0xBFF0000000000000
+ 
+ test_fmrx_3:
+-  #_ REGISTER_IN f4 [0000000000000000]
++  #_ REGISTER_IN f4 0x0000000000000000
+   fmr. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f4 [0000000000000000]
++  #_ REGISTER_OUT f3 0x0000000000000000
++  #_ REGISTER_OUT f4 0x0000000000000000
+ 
+ test_fmrx_4:
+-  #_ REGISTER_IN f4 [4005000000000000]
++  #_ REGISTER_IN f4 0x4005000000000000
+   fmr. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [4005000000000000]
+-  #_ REGISTER_OUT f4 [4005000000000000]
++  #_ REGISTER_OUT f3 0x4005000000000000
++  #_ REGISTER_OUT f4 0x4005000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_fmulsx.s b/src/xenia/cpu/ppc/testing/instr_fmulsx.s
+index d5580b8..3e3f62b 100644
+--- a/src/xenia/cpu/ppc/testing/instr_fmulsx.s
++++ b/src/xenia/cpu/ppc/testing/instr_fmulsx.s
+@@ -1,35 +1,35 @@
+ test_fmulsx_1:
+-  #_ REGISTER_IN f4 [4000000000000000]
+-  #_ REGISTER_IN f5 [4008000000000000]
++  #_ REGISTER_IN f4 0x4000000000000000
++  #_ REGISTER_IN f5 0x4008000000000000
+   fmuls. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [4018000000000000]
+-  #_ REGISTER_OUT f4 [4000000000000000]
+-  #_ REGISTER_OUT f5 [4008000000000000]
++  #_ REGISTER_OUT f3 0x4018000000000000
++  #_ REGISTER_OUT f4 0x4000000000000000
++  #_ REGISTER_OUT f5 0x4008000000000000
+ 
+ test_fmulsx_2:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
+-  #_ REGISTER_IN f5 [BFF0000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
++  #_ REGISTER_IN f5 0xBFF0000000000000
+   fmuls. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [BFF0000000000000]
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
+-  #_ REGISTER_OUT f5 [BFF0000000000000]
++  #_ REGISTER_OUT f3 0xBFF0000000000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
++  #_ REGISTER_OUT f5 0xBFF0000000000000
+ 
+ test_fmulsx_3:
+-  #_ REGISTER_IN f4 [0000000000000000]
+-  #_ REGISTER_IN f5 [4008000000000000]
++  #_ REGISTER_IN f4 0x0000000000000000
++  #_ REGISTER_IN f5 0x4008000000000000
+   fmuls. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f4 [0000000000000000]
+-  #_ REGISTER_OUT f5 [4008000000000000]
++  #_ REGISTER_OUT f3 0x0000000000000000
++  #_ REGISTER_OUT f4 0x0000000000000000
++  #_ REGISTER_OUT f5 0x4008000000000000
+ 
+ test_fmulsx_4:
+-  #_ REGISTER_IN f4 [3FE0000000000000]
+-  #_ REGISTER_IN f5 [4000000000000000]
++  #_ REGISTER_IN f4 0x3FE0000000000000
++  #_ REGISTER_IN f5 0x4000000000000000
+   fmuls. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [3FF0000000000000]
+-  #_ REGISTER_OUT f4 [3FE0000000000000]
+-  #_ REGISTER_OUT f5 [4000000000000000]
++  #_ REGISTER_OUT f3 0x3FF0000000000000
++  #_ REGISTER_OUT f4 0x3FE0000000000000
++  #_ REGISTER_OUT f5 0x4000000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_fmulx.s b/src/xenia/cpu/ppc/testing/instr_fmulx.s
+index 9a8b90e..61ce77e 100644
+--- a/src/xenia/cpu/ppc/testing/instr_fmulx.s
++++ b/src/xenia/cpu/ppc/testing/instr_fmulx.s
+@@ -1,35 +1,35 @@
+ test_fmulx_1:
+-  #_ REGISTER_IN f4 [4000000000000000]
+-  #_ REGISTER_IN f5 [4008000000000000]
++  #_ REGISTER_IN f4 0x4000000000000000
++  #_ REGISTER_IN f5 0x4008000000000000
+   fmul. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [4018000000000000]
+-  #_ REGISTER_OUT f4 [4000000000000000]
+-  #_ REGISTER_OUT f5 [4008000000000000]
++  #_ REGISTER_OUT f3 0x4018000000000000
++  #_ REGISTER_OUT f4 0x4000000000000000
++  #_ REGISTER_OUT f5 0x4008000000000000
+ 
+ test_fmulx_2:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
+-  #_ REGISTER_IN f5 [BFF0000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
++  #_ REGISTER_IN f5 0xBFF0000000000000
+   fmul. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [BFF0000000000000]
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
+-  #_ REGISTER_OUT f5 [BFF0000000000000]
++  #_ REGISTER_OUT f3 0xBFF0000000000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
++  #_ REGISTER_OUT f5 0xBFF0000000000000
+ 
+ test_fmulx_3:
+-  #_ REGISTER_IN f4 [0000000000000000]
+-  #_ REGISTER_IN f5 [4008000000000000]
++  #_ REGISTER_IN f4 0x0000000000000000
++  #_ REGISTER_IN f5 0x4008000000000000
+   fmul. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f4 [0000000000000000]
+-  #_ REGISTER_OUT f5 [4008000000000000]
++  #_ REGISTER_OUT f3 0x0000000000000000
++  #_ REGISTER_OUT f4 0x0000000000000000
++  #_ REGISTER_OUT f5 0x4008000000000000
+ 
+ test_fmulx_4:
+-  #_ REGISTER_IN f4 [3FE0000000000000]
+-  #_ REGISTER_IN f5 [4000000000000000]
++  #_ REGISTER_IN f4 0x3FE0000000000000
++  #_ REGISTER_IN f5 0x4000000000000000
+   fmul. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [3FF0000000000000]
+-  #_ REGISTER_OUT f4 [3FE0000000000000]
+-  #_ REGISTER_OUT f5 [4000000000000000]
++  #_ REGISTER_OUT f3 0x3FF0000000000000
++  #_ REGISTER_OUT f4 0x3FE0000000000000
++  #_ REGISTER_OUT f5 0x4000000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_fnabsx.s b/src/xenia/cpu/ppc/testing/instr_fnabsx.s
+index a832ebb..56eb40b 100644
+--- a/src/xenia/cpu/ppc/testing/instr_fnabsx.s
++++ b/src/xenia/cpu/ppc/testing/instr_fnabsx.s
+@@ -1,27 +1,27 @@
+ test_fnabsx_1:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
+   fnabs. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [BFF0000000000000]
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
++  #_ REGISTER_OUT f3 0xBFF0000000000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
+ 
+ test_fnabsx_2:
+-  #_ REGISTER_IN f4 [BFF0000000000000]
++  #_ REGISTER_IN f4 0xBFF0000000000000
+   fnabs. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [BFF0000000000000]
+-  #_ REGISTER_OUT f4 [BFF0000000000000]
++  #_ REGISTER_OUT f3 0xBFF0000000000000
++  #_ REGISTER_OUT f4 0xBFF0000000000000
+ 
+ test_fnabsx_3:
+-  #_ REGISTER_IN f4 [0000000000000000]
++  #_ REGISTER_IN f4 0x0000000000000000
+   fnabs. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [8000000000000000]
+-  #_ REGISTER_OUT f4 [0000000000000000]
++  #_ REGISTER_OUT f3 0x8000000000000000
++  #_ REGISTER_OUT f4 0x0000000000000000
+ 
+ test_fnabsx_4:
+-  #_ REGISTER_IN f4 [4005000000000000]
++  #_ REGISTER_IN f4 0x4005000000000000
+   fnabs. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [C005000000000000]
+-  #_ REGISTER_OUT f4 [4005000000000000]
++  #_ REGISTER_OUT f3 0xC005000000000000
++  #_ REGISTER_OUT f4 0x4005000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_fnegx.s b/src/xenia/cpu/ppc/testing/instr_fnegx.s
+index d7cac61..56058f0 100644
+--- a/src/xenia/cpu/ppc/testing/instr_fnegx.s
++++ b/src/xenia/cpu/ppc/testing/instr_fnegx.s
+@@ -1,27 +1,27 @@
+ test_fnegx_1:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
+   fneg. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [BFF0000000000000]
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
++  #_ REGISTER_OUT f3 0xBFF0000000000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
+ 
+ test_fnegx_2:
+-  #_ REGISTER_IN f4 [BFF0000000000000]
++  #_ REGISTER_IN f4 0xBFF0000000000000
+   fneg. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [3FF0000000000000]
+-  #_ REGISTER_OUT f4 [BFF0000000000000]
++  #_ REGISTER_OUT f3 0x3FF0000000000000
++  #_ REGISTER_OUT f4 0xBFF0000000000000
+ 
+ test_fnegx_3:
+-  #_ REGISTER_IN f4 [0000000000000000]
++  #_ REGISTER_IN f4 0x0000000000000000
+   fneg. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [8000000000000000]
+-  #_ REGISTER_OUT f4 [0000000000000000]
++  #_ REGISTER_OUT f3 0x8000000000000000
++  #_ REGISTER_OUT f4 0x0000000000000000
+ 
+ test_fnegx_4:
+-  #_ REGISTER_IN f4 [4005000000000000]
++  #_ REGISTER_IN f4 0x4005000000000000
+   fneg. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [C005000000000000]
+-  #_ REGISTER_OUT f4 [4005000000000000]
++  #_ REGISTER_OUT f3 0xC005000000000000
++  #_ REGISTER_OUT f4 0x4005000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_fresx.s b/src/xenia/cpu/ppc/testing/instr_fresx.s
+index 75f9a65..ffdb5a4 100644
+--- a/src/xenia/cpu/ppc/testing/instr_fresx.s
++++ b/src/xenia/cpu/ppc/testing/instr_fresx.s
+@@ -2,26 +2,26 @@ test_fresx_1:
+   #_ REGISTER_IN f1 2.0
+   fres. f3, f1
+   blr
+-  #_ REGISTER_OUT f3 0.5
++  #_ REGISTER_OUT f3 0x3FDFE00000000000
+   #_ REGISTER_OUT f1 2.0
+ 
+ test_fresx_2:
+   #_ REGISTER_IN f1 4.0
+   fres. f3, f1
+   blr
+-  #_ REGISTER_OUT f3 0.25
++  #_ REGISTER_OUT f3 0x3FCFE00000000000
+   #_ REGISTER_OUT f1 4.0
+ 
+ test_fresx_3:
+   #_ REGISTER_IN f1 0.5
+   fres. f3, f1
+   blr
+-  #_ REGISTER_OUT f3 2.0
++  #_ REGISTER_OUT f3 0x3FFFE00000000000
+   #_ REGISTER_OUT f1 0.5
+ 
+ test_fresx_4:
+   #_ REGISTER_IN f1 1.0
+   fres. f3, f1
+   blr
+-  #_ REGISTER_OUT f3 1.0
++  #_ REGISTER_OUT f3 0x3FEFE00000000000
+   #_ REGISTER_OUT f1 1.0
+diff --git a/src/xenia/cpu/ppc/testing/instr_frspx.s b/src/xenia/cpu/ppc/testing/instr_frspx.s
+index 8c7bf68..f72fdb4 100644
+--- a/src/xenia/cpu/ppc/testing/instr_frspx.s
++++ b/src/xenia/cpu/ppc/testing/instr_frspx.s
+@@ -1,27 +1,27 @@
+ test_frspx_1:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
+   frsp. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [3FF0000000000000]
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
++  #_ REGISTER_OUT f3 0x3FF0000000000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
+ 
+ test_frspx_2:
+-  #_ REGISTER_IN f4 [4000000000000000]
++  #_ REGISTER_IN f4 0x4000000000000000
+   frsp. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [4000000000000000]
+-  #_ REGISTER_OUT f4 [4000000000000000]
++  #_ REGISTER_OUT f3 0x4000000000000000
++  #_ REGISTER_OUT f4 0x4000000000000000
+ 
+ test_frspx_3:
+-  #_ REGISTER_IN f4 [0000000000000000]
++  #_ REGISTER_IN f4 0x0000000000000000
+   frsp. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f4 [0000000000000000]
++  #_ REGISTER_OUT f3 0x0000000000000000
++  #_ REGISTER_OUT f4 0x0000000000000000
+ 
+ test_frspx_4:
+-  #_ REGISTER_IN f4 [4008000000000000]
++  #_ REGISTER_IN f4 0x4008000000000000
+   frsp. f3, f4
+   blr
+-  #_ REGISTER_OUT f3 [4008000000000000]
+-  #_ REGISTER_OUT f4 [4008000000000000]
++  #_ REGISTER_OUT f3 0x4008000000000000
++  #_ REGISTER_OUT f4 0x4008000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_fselx.s b/src/xenia/cpu/ppc/testing/instr_fselx.s
+index eb99060..4a25c10 100644
+--- a/src/xenia/cpu/ppc/testing/instr_fselx.s
++++ b/src/xenia/cpu/ppc/testing/instr_fselx.s
+@@ -1,43 +1,43 @@
+ test_fselx_1:
+-  #_ REGISTER_IN f3 [3FF0000000000000]
+-  #_ REGISTER_IN f4 [4000000000000000]
+-  #_ REGISTER_IN f5 [4008000000000000]
++  #_ REGISTER_IN f3 0x3FF0000000000000
++  #_ REGISTER_IN f4 0x4000000000000000
++  #_ REGISTER_IN f5 0x4008000000000000
+   fsel. f6, f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f6 [4000000000000000]
+-  #_ REGISTER_OUT f3 [3FF0000000000000]
+-  #_ REGISTER_OUT f4 [4000000000000000]
+-  #_ REGISTER_OUT f5 [4008000000000000]
++  #_ REGISTER_OUT f6 0x4000000000000000
++  #_ REGISTER_OUT f3 0x3FF0000000000000
++  #_ REGISTER_OUT f4 0x4000000000000000
++  #_ REGISTER_OUT f5 0x4008000000000000
+ 
+ test_fselx_2:
+-  #_ REGISTER_IN f3 [BFF0000000000000]
+-  #_ REGISTER_IN f4 [4000000000000000]
+-  #_ REGISTER_IN f5 [4008000000000000]
++  #_ REGISTER_IN f3 0xBFF0000000000000
++  #_ REGISTER_IN f4 0x4000000000000000
++  #_ REGISTER_IN f5 0x4008000000000000
+   fsel. f6, f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f6 [4008000000000000]
+-  #_ REGISTER_OUT f3 [BFF0000000000000]
+-  #_ REGISTER_OUT f4 [4000000000000000]
+-  #_ REGISTER_OUT f5 [4008000000000000]
++  #_ REGISTER_OUT f6 0x4008000000000000
++  #_ REGISTER_OUT f3 0xBFF0000000000000
++  #_ REGISTER_OUT f4 0x4000000000000000
++  #_ REGISTER_OUT f5 0x4008000000000000
+ 
+ test_fselx_3:
+-  #_ REGISTER_IN f3 [0000000000000000]
+-  #_ REGISTER_IN f4 [4000000000000000]
+-  #_ REGISTER_IN f5 [4008000000000000]
++  #_ REGISTER_IN f3 0x0000000000000000
++  #_ REGISTER_IN f4 0x4000000000000000
++  #_ REGISTER_IN f5 0x4008000000000000
+   fsel. f6, f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f6 [4000000000000000]
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f4 [4000000000000000]
+-  #_ REGISTER_OUT f5 [4008000000000000]
++  #_ REGISTER_OUT f6 0x4000000000000000
++  #_ REGISTER_OUT f3 0x0000000000000000
++  #_ REGISTER_OUT f4 0x4000000000000000
++  #_ REGISTER_OUT f5 0x4008000000000000
+ 
+ test_fselx_4:
+-  #_ REGISTER_IN f3 [4010000000000000]
+-  #_ REGISTER_IN f4 [4000000000000000]
+-  #_ REGISTER_IN f5 [4008000000000000]
++  #_ REGISTER_IN f3 0x4010000000000000
++  #_ REGISTER_IN f4 0x4000000000000000
++  #_ REGISTER_IN f5 0x4008000000000000
+   fsel. f6, f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f6 [4000000000000000]
+-  #_ REGISTER_OUT f3 [4010000000000000]
+-  #_ REGISTER_OUT f4 [4000000000000000]
+-  #_ REGISTER_OUT f5 [4008000000000000]
++  #_ REGISTER_OUT f6 0x4000000000000000
++  #_ REGISTER_OUT f3 0x4010000000000000
++  #_ REGISTER_OUT f4 0x4000000000000000
++  #_ REGISTER_OUT f5 0x4008000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_fsubsx.s b/src/xenia/cpu/ppc/testing/instr_fsubsx.s
+index 961d33e..7f15084 100644
+--- a/src/xenia/cpu/ppc/testing/instr_fsubsx.s
++++ b/src/xenia/cpu/ppc/testing/instr_fsubsx.s
+@@ -1,35 +1,35 @@
+ test_fsubsx_1:
+-  #_ REGISTER_IN f4 [4008000000000000]
+-  #_ REGISTER_IN f5 [3FF0000000000000]
++  #_ REGISTER_IN f4 0x4008000000000000
++  #_ REGISTER_IN f5 0x3FF0000000000000
+   fsubs. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [4000000000000000]
+-  #_ REGISTER_OUT f4 [4008000000000000]
+-  #_ REGISTER_OUT f5 [3FF0000000000000]
++  #_ REGISTER_OUT f3 0x4000000000000000
++  #_ REGISTER_OUT f4 0x4008000000000000
++  #_ REGISTER_OUT f5 0x3FF0000000000000
+ 
+ test_fsubsx_2:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
+-  #_ REGISTER_IN f5 [3FF0000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
++  #_ REGISTER_IN f5 0x3FF0000000000000
+   fsubs. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
+-  #_ REGISTER_OUT f5 [3FF0000000000000]
++  #_ REGISTER_OUT f3 0x0000000000000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
++  #_ REGISTER_OUT f5 0x3FF0000000000000
+ 
+ test_fsubsx_3:
+-  #_ REGISTER_IN f4 [4010000000000000]
+-  #_ REGISTER_IN f5 [4000000000000000]
++  #_ REGISTER_IN f4 0x4010000000000000
++  #_ REGISTER_IN f5 0x4000000000000000
+   fsubs. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [4008000000000000]
+-  #_ REGISTER_OUT f4 [4010000000000000]
+-  #_ REGISTER_OUT f5 [4000000000000000]
++  #_ REGISTER_OUT f3 0x4000000000000000
++  #_ REGISTER_OUT f4 0x4010000000000000
++  #_ REGISTER_OUT f5 0x4000000000000000
+ 
+ test_fsubsx_4:
+-  #_ REGISTER_IN f4 [0000000000000000]
+-  #_ REGISTER_IN f5 [0000000000000000]
++  #_ REGISTER_IN f4 0x0000000000000000
++  #_ REGISTER_IN f5 0x0000000000000000
+   fsubs. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f4 [0000000000000000]
+-  #_ REGISTER_OUT f5 [0000000000000000]
++  #_ REGISTER_OUT f3 0x0000000000000000
++  #_ REGISTER_OUT f4 0x0000000000000000
++  #_ REGISTER_OUT f5 0x0000000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_fsubx.s b/src/xenia/cpu/ppc/testing/instr_fsubx.s
+index 48b4a74..605c275 100644
+--- a/src/xenia/cpu/ppc/testing/instr_fsubx.s
++++ b/src/xenia/cpu/ppc/testing/instr_fsubx.s
+@@ -1,35 +1,35 @@
+ test_fsubx_1:
+-  #_ REGISTER_IN f4 [4008000000000000]
+-  #_ REGISTER_IN f5 [3FF0000000000000]
++  #_ REGISTER_IN f4 0x4008000000000000
++  #_ REGISTER_IN f5 0x3FF0000000000000
+   fsub. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [4000000000000000]
+-  #_ REGISTER_OUT f4 [4008000000000000]
+-  #_ REGISTER_OUT f5 [3FF0000000000000]
++  #_ REGISTER_OUT f3 0x4000000000000000
++  #_ REGISTER_OUT f4 0x4008000000000000
++  #_ REGISTER_OUT f5 0x3FF0000000000000
+ 
+ test_fsubx_2:
+-  #_ REGISTER_IN f4 [3FF0000000000000]
+-  #_ REGISTER_IN f5 [3FF0000000000000]
++  #_ REGISTER_IN f4 0x3FF0000000000000
++  #_ REGISTER_IN f5 0x3FF0000000000000
+   fsub. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f4 [3FF0000000000000]
+-  #_ REGISTER_OUT f5 [3FF0000000000000]
++  #_ REGISTER_OUT f3 0x0000000000000000
++  #_ REGISTER_OUT f4 0x3FF0000000000000
++  #_ REGISTER_OUT f5 0x3FF0000000000000
+ 
+ test_fsubx_3:
+-  #_ REGISTER_IN f4 [4010000000000000]
+-  #_ REGISTER_IN f5 [4000000000000000]
++  #_ REGISTER_IN f4 0x4010000000000000
++  #_ REGISTER_IN f5 0x4000000000000000
+   fsub. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [4008000000000000]
+-  #_ REGISTER_OUT f4 [4010000000000000]
+-  #_ REGISTER_OUT f5 [4000000000000000]
++  #_ REGISTER_OUT f3 0x4000000000000000
++  #_ REGISTER_OUT f4 0x4010000000000000
++  #_ REGISTER_OUT f5 0x4000000000000000
+ 
+ test_fsubx_4:
+-  #_ REGISTER_IN f4 [0000000000000000]
+-  #_ REGISTER_IN f5 [0000000000000000]
++  #_ REGISTER_IN f4 0x0000000000000000
++  #_ REGISTER_IN f5 0x0000000000000000
+   fsub. f3, f4, f5
+   blr
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f4 [0000000000000000]
+-  #_ REGISTER_OUT f5 [0000000000000000]
++  #_ REGISTER_OUT f3 0x0000000000000000
++  #_ REGISTER_OUT f4 0x0000000000000000
++  #_ REGISTER_OUT f5 0x0000000000000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_mcrxr.s b/src/xenia/cpu/ppc/testing/instr_mcrxr.s
+index 6ee2f99..d2108d6 100644
+--- a/src/xenia/cpu/ppc/testing/instr_mcrxr.s
++++ b/src/xenia/cpu/ppc/testing/instr_mcrxr.s
+@@ -7,6 +7,8 @@ test_mcrxr_1:
+   #_ REGISTER_OUT r3 0x0000000000000001
+   #_ REGISTER_OUT r4 0x0000000000000001
+   #_ REGISTER_OUT r5 0x0000000000000002
++  #_ REGISTER_OUT cr 0x00000000
++  #_ REGISTER_OUT xer 0x00000000
+ 
+ test_mcrxr_2:
+   #_ REGISTER_IN r3 0xFFFFFFFFFFFFFFFF
+@@ -17,3 +19,16 @@ test_mcrxr_2:
+   #_ REGISTER_OUT r3 0xFFFFFFFFFFFFFFFF
+   #_ REGISTER_OUT r4 0x0000000000000001
+   #_ REGISTER_OUT r5 0x0000000000000000
++  #_ REGISTER_OUT cr 0x00200000
++  #_ REGISTER_OUT xer 0x00000000
++
++# XER[SO] and XER[OV] reach a CR field.
++test_mcrxr_3:
++  #_ REGISTER_IN r3 0x000000007FFFFFFF
++  #_ REGISTER_IN r4 0x0000000000000001
++  addo r5, r3, r4
++  mcrxr 0
++  blr
++  #_ REGISTER_OUT r5 0x0000000080000000
++  #_ REGISTER_OUT cr 0xC0000000
++  #_ REGISTER_OUT xer 0x00000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_mffsx.s b/src/xenia/cpu/ppc/testing/instr_mffsx.s
+index da5268e..94b0d3e 100644
+--- a/src/xenia/cpu/ppc/testing/instr_mffsx.s
++++ b/src/xenia/cpu/ppc/testing/instr_mffsx.s
+@@ -1,31 +1,31 @@
+ test_mffsx_1:
+-  #_ REGISTER_IN f1 [0000000000000000]
++  #_ REGISTER_IN f1 0x0000000000000000
+   mtfsf 0xFF, f1
+   mffs. f3
+   blr
+-  #_ REGISTER_OUT f3 [0000000000000000]
+-  #_ REGISTER_OUT f1 [0000000000000000]
++  #_ REGISTER_OUT f3 0xFFF8000000000000
++  #_ REGISTER_OUT f1 0x0000000000000000
+ 
+ test_mffsx_2:
+-  #_ REGISTER_IN f1 [0000000000000005]
++  #_ REGISTER_IN f1 0x0000000000000005
+   mtfsf 0xFF, f1
+   mffs. f4
+   blr
+-  #_ REGISTER_OUT f4 [0000000000000005]
+-  #_ REGISTER_OUT f1 [0000000000000005]
++  #_ REGISTER_OUT f4 0xFFF8000000000001
++  #_ REGISTER_OUT f1 0x0000000000000005
+ 
+ test_mffsx_3:
+-  #_ REGISTER_IN f1 [00000000000000F0]
++  #_ REGISTER_IN f1 0x00000000000000F0
+   mtfsf 0xFF, f1
+   mffs. f5
+   blr
+-  #_ REGISTER_OUT f5 [00000000000000F0]
+-  #_ REGISTER_OUT f1 [00000000000000F0]
++  #_ REGISTER_OUT f5 0xFFF80000000000F0
++  #_ REGISTER_OUT f1 0x00000000000000F0
+ 
+ test_mffsx_4:
+-  #_ REGISTER_IN f1 [0000000012345678]
++  #_ REGISTER_IN f1 0x0000000012345678
+   mtfsf 0xFF, f1
+   mffs. f6
+   blr
+-  #_ REGISTER_OUT f6 [0000000012345678]
+-  #_ REGISTER_OUT f1 [0000000012345678]
++  #_ REGISTER_OUT f6 0xFFF8000072345678
++  #_ REGISTER_OUT f1 0x0000000012345678
+diff --git a/src/xenia/cpu/ppc/testing/instr_mtfsb.s b/src/xenia/cpu/ppc/testing/instr_mtfsb.s
+new file mode 100644
+index 0000000..4055cd3
+--- /dev/null
++++ b/src/xenia/cpu/ppc/testing/instr_mtfsb.s
+@@ -0,0 +1,51 @@
++test_mtfsb_1:
++  #_ REGISTER_IN f1 0x0000000000000100
++  mtfsf 0xFF, f1
++  mtfsb0 23
++  mffs f2
++  blr
++  #_ REGISTER_OUT f2 0xFFF8000000000000
++
++# FX rises with OX and the record form copies both into CR1.
++test_mtfsb_2:
++  #_ REGISTER_IN f1 0x0000000000000000
++  #_ REGISTER_IN cr 0x00000000
++  mtfsf 0xFF, f1
++  mtfsb1. 3
++  mffs f2
++  blr
++  #_ REGISTER_OUT f2 0xFFF8000090000000
++  #_ REGISTER_OUT cr 0x09000000
++
++# No FX for a bit that was already set and VX can't be set directly.
++test_mtfsb_3:
++  #_ REGISTER_IN f1 0x0000000010000000
++  mtfsf 0xFF, f1
++  mtfsb1 3
++  mtfsb1 2
++  mffs f2
++  blr
++  #_ REGISTER_OUT f2 0xFFF8000010000000
++
++# A VX cause sets the VX summary too.
++test_mtfsb_4:
++  #_ REGISTER_IN f1 0x0000000000000000
++  mtfsf 0xFF, f1
++  mtfsb1 23
++  mffs f2
++  blr
++  #_ REGISTER_OUT f2 0xFFF80000A0000100
++
++# Round toward zero gives 1 + 1 ulp for 1 + 1.5 ulp, where nearest gives 2 ulp.
++test_mtfsb_5:
++  #_ REGISTER_IN f1 0x0000000000000000
++  #_ REGISTER_IN f2 0x3FF0000000000000
++  #_ REGISTER_IN f3 0x3CB8000000000000
++  mtfsf 0xFF, f1
++  mtfsb1 31
++  mffs f4
++  fadd f5, f2, f3
++  mtfsb0 31
++  blr
++  #_ REGISTER_OUT f4 0xFFF8000000000001
++  #_ REGISTER_OUT f5 0x3FF0000000000001
+diff --git a/src/xenia/cpu/ppc/testing/instr_mtfsfx.s b/src/xenia/cpu/ppc/testing/instr_mtfsfx.s
+index bad0f12..4765941 100644
+--- a/src/xenia/cpu/ppc/testing/instr_mtfsfx.s
++++ b/src/xenia/cpu/ppc/testing/instr_mtfsfx.s
+@@ -1,23 +1,23 @@
+ test_mtfsfx_1:
+-  #_ REGISTER_IN f1 [0000000000000001]
++  #_ REGISTER_IN f1 0x0000000000000001
+   mtfsf. 0xFF, f1
+   blr
+-  #_ REGISTER_OUT f1 [0000000000000001]
++  #_ REGISTER_OUT f1 0x0000000000000001
+ 
+ test_mtfsfx_2:
+-  #_ REGISTER_IN f1 [0000000000000000]
++  #_ REGISTER_IN f1 0x0000000000000000
+   mtfsf. 0xFF, f1
+   blr
+-  #_ REGISTER_OUT f1 [0000000000000000]
++  #_ REGISTER_OUT f1 0x0000000000000000
+ 
+ test_mtfsfx_3:
+-  #_ REGISTER_IN f1 [0000000000000007]
++  #_ REGISTER_IN f1 0x0000000000000007
+   mtfsf. 0xFF, f1
+   blr
+-  #_ REGISTER_OUT f1 [0000000000000007]
++  #_ REGISTER_OUT f1 0x0000000000000007
+ 
+ test_mtfsfx_4:
+-  #_ REGISTER_IN f1 [00000000000000FF]
++  #_ REGISTER_IN f1 0x00000000000000FF
+   mtfsf. 0xFF, f1
+   blr
+-  #_ REGISTER_OUT f1 [00000000000000FF]
++  #_ REGISTER_OUT f1 0x00000000000000FF
+diff --git a/src/xenia/cpu/ppc/testing/instr_mullwo.s b/src/xenia/cpu/ppc/testing/instr_mullwo.s
+new file mode 100644
+index 0000000..d777ca4
+--- /dev/null
++++ b/src/xenia/cpu/ppc/testing/instr_mullwo.s
+@@ -0,0 +1,41 @@
++test_mullwo_1:
++  #_ REGISTER_IN r4 0x0000000000001000
++  #_ REGISTER_IN r5 0x0000000000001000
++  mullwo r3, r4, r5
++  blr
++  #_ REGISTER_OUT r3 0x0000000001000000
++  #_ REGISTER_OUT xer 0x00000000
++
++# The product no longer fits back into a word.
++test_mullwo_2:
++  #_ REGISTER_IN r4 0x0000000000010000
++  #_ REGISTER_IN r5 0x0000000000010000
++  mullwo r3, r4, r5
++  blr
++  #_ REGISTER_OUT r3 0x0000000100000000
++  #_ REGISTER_OUT xer 0xC0000000
++
++test_mullwo_3:
++  #_ REGISTER_IN r4 0xFFFFFFFFFFFFFFFF
++  #_ REGISTER_IN r5 0x0000000000000002
++  mullwo r3, r4, r5
++  blr
++  #_ REGISTER_OUT r3 0xFFFFFFFFFFFFFFFE
++  #_ REGISTER_OUT xer 0x00000000
++
++# The doubleword form overflows only when 64 bits cannot hold the product.
++test_mulldo_1:
++  #_ REGISTER_IN r4 0x0000000000010000
++  #_ REGISTER_IN r5 0x0000000000010000
++  mulldo r3, r4, r5
++  blr
++  #_ REGISTER_OUT r3 0x0000000100000000
++  #_ REGISTER_OUT xer 0x00000000
++
++test_mulldo_2:
++  #_ REGISTER_IN r4 0x0000000100000000
++  #_ REGISTER_IN r5 0x0000000100000000
++  mulldo r3, r4, r5
++  blr
++  #_ REGISTER_OUT r3 0x0000000000000000
++  #_ REGISTER_OUT xer 0xC0000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_nego.s b/src/xenia/cpu/ppc/testing/instr_nego.s
+new file mode 100644
+index 0000000..888a18e
+--- /dev/null
++++ b/src/xenia/cpu/ppc/testing/instr_nego.s
+@@ -0,0 +1,22 @@
++# The low word is INT32_MIN.
++test_nego_1:
++  #_ REGISTER_IN r4 0x0000000180000000
++  nego r3, r4
++  blr
++  #_ REGISTER_OUT r3 0xFFFFFFFE80000000
++  #_ REGISTER_OUT xer 0xC0000000
++
++# Only a 64-bit overflow, which 32-bit mode ignores.
++test_nego_2:
++  #_ REGISTER_IN r4 0x8000000000000000
++  nego r3, r4
++  blr
++  #_ REGISTER_OUT r3 0x8000000000000000
++  #_ REGISTER_OUT xer 0x00000000
++
++test_nego_3:
++  #_ REGISTER_IN r4 0x0000000000000005
++  nego r3, r4
++  blr
++  #_ REGISTER_OUT r3 0xFFFFFFFFFFFFFFFB
++  #_ REGISTER_OUT xer 0x00000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_subfco.s b/src/xenia/cpu/ppc/testing/instr_subfco.s
+new file mode 100644
+index 0000000..94090b5
+--- /dev/null
++++ b/src/xenia/cpu/ppc/testing/instr_subfco.s
+@@ -0,0 +1,8 @@
++# Overflows only in the low word.
++test_subfco_1:
++  #_ REGISTER_IN r4 0x0000000023280000
++  #_ REGISTER_IN r5 0x000000008AD00000
++  subfco r3, r4, r5
++  blr
++  #_ REGISTER_OUT r3 0x0000000067A80000
++  #_ REGISTER_OUT xer 0xE0000000
+diff --git a/src/xenia/cpu/ppc/testing/instr_vexptefp128.s b/src/xenia/cpu/ppc/testing/instr_vexptefp128.s
+index 79e258d..94ef3d8 100644
+--- a/src/xenia/cpu/ppc/testing/instr_vexptefp128.s
++++ b/src/xenia/cpu/ppc/testing/instr_vexptefp128.s
+@@ -20,7 +20,7 @@ test_vexptefp128_3:
+   vexptefp128 v5, v4
+   blr
+   #_ REGISTER_OUT v4 [3F000000, 3E800000, 3E000000, 3D800000]
+-  #_ REGISTER_OUT v5 [3FB504F3, 3F9837F0, 3F8B95C2, 3F85AAC3]
++  #_ REGISTER_OUT v5 [3FB50000, 3F980000, 3F8C0000, 3F860000]
+ 
+ test_vexptefp128_4:
+   # 2^x estimate for larger values
+diff --git a/src/xenia/cpu/ppc/testing/instr_vlogefp.s b/src/xenia/cpu/ppc/testing/instr_vlogefp.s
+index aed7e77..24cc6b3 100644
+--- a/src/xenia/cpu/ppc/testing/instr_vlogefp.s
++++ b/src/xenia/cpu/ppc/testing/instr_vlogefp.s
+@@ -24,11 +24,11 @@ test_vlogefp_4:
+   vlogefp v5, v4
+   blr
+   #_ REGISTER_OUT v4 [40400000, 40A00000, 40C00000, 40E00000]
+-  #_ REGISTER_OUT v5 [3FCAE00D, 40149A78, 40257007, 4033ABB4]
++  #_ REGISTER_OUT v5 [3FCB0000, 40148000, 40258000, 4033F800]
+ 
+ test_vlogefp_5:
+   #_ REGISTER_IN v4 [42C80000, 43480000, 43C80000, 44480000]
+   vlogefp v5, v4
+   blr
+   #_ REGISTER_OUT v4 [42C80000, 43480000, 43C80000, 44480000]
+-  #_ REGISTER_OUT v5 [40D49A78, 40F49A78, 410A4D3C, 411A4D3C]
++  #_ REGISTER_OUT v5 [40D4BC00, 40F4BC00, 410A5E00, 411A5E00]
+diff --git a/src/xenia/cpu/ppc/testing/instr_vlogefp128.s b/src/xenia/cpu/ppc/testing/instr_vlogefp128.s
+index 9d93614..a64fd0f 100644
+--- a/src/xenia/cpu/ppc/testing/instr_vlogefp128.s
++++ b/src/xenia/cpu/ppc/testing/instr_vlogefp128.s
+@@ -36,4 +36,4 @@ test_vlogefp128_5:
+   vlogefp128 v5, v4
+   blr
+   #_ REGISTER_OUT v4 [3FB504F3, 3FC00000, 3FD744FD, 3FECCCCD]
+-  #_ REGISTER_OUT v5 [3EFFFFFF, 3F15C01A, 3F400000, 3F6334DB]
++  #_ REGISTER_OUT v5 [3F000000, 3F160000, 3F40A000, 3F630000]
+diff --git a/src/xenia/cpu/ppc/testing/instr_vmsum3fp128.s b/src/xenia/cpu/ppc/testing/instr_vmsum3fp128.s
+index 84d23ff..7571e3c 100644
+--- a/src/xenia/cpu/ppc/testing/instr_vmsum3fp128.s
++++ b/src/xenia/cpu/ppc/testing/instr_vmsum3fp128.s
+@@ -7,7 +7,7 @@ test_vmsum3fp128_1:
+   blr
+   #_ REGISTER_OUT v3 [3f800000, 3fc00000, 3f8ccccd, 01020304]
+   #_ REGISTER_OUT v4 [40000000, 40700000, 4013d70a, 01020304]
+-  #_ REGISTER_OUT v5 [4122A7F0, 4122A7F0, 4122A7F0, 4122A7F0]
++  #_ REGISTER_OUT v5 [4122A7EF, 4122A7EF, 4122A7EF, 4122A7EF]
+ 
+ test_vmsum3fp128_2:
+   # Denormal output flushed to +0.0: FLT_MIN * 0.5 + 0 + 0 = denormal -> +0.0
+diff --git a/src/xenia/cpu/ppc/testing/instr_vmsum4fp128.s b/src/xenia/cpu/ppc/testing/instr_vmsum4fp128.s
+index 8dd32c1..eefab61 100644
+--- a/src/xenia/cpu/ppc/testing/instr_vmsum4fp128.s
++++ b/src/xenia/cpu/ppc/testing/instr_vmsum4fp128.s
+@@ -5,7 +5,7 @@ test_vmsum4fp128_1:
+   blr
+   #_ REGISTER_OUT v3 [3f800000, 3fc00000, 3f8ccccd, 3ff33333]
+   #_ REGISTER_OUT v4 [40000000, 40700000, 4013d70a, 40b051eb]
+-  #_ REGISTER_OUT v5 [41A5147B, 41A5147B, 41A5147B, 41A5147B]
++  #_ REGISTER_OUT v5 [41A5147A, 41A5147A, 41A5147A, 41A5147A]
+ 
+ test_vmsum4fp128_2:
+   # Denormal output flushed to +0.0: FLT_MIN * 0.5 + 0 + 0 + 0 = denormal -> +0.0
+diff --git a/src/xenia/cpu/ppc/testing/instr_vrefp.s b/src/xenia/cpu/ppc/testing/instr_vrefp.s
+index dd26131..29c0258 100644
+--- a/src/xenia/cpu/ppc/testing/instr_vrefp.s
++++ b/src/xenia/cpu/ppc/testing/instr_vrefp.s
+@@ -3,32 +3,32 @@ test_vrefp_1:
+   vrefp v5, v4
+   blr
+   #_ REGISTER_OUT v4 [3F800000, 40000000, 40400000, 40800000]
+-  #_ REGISTER_OUT v5 [3F800000, 3F000000, 3EAAAAAB, 3E800000]
++  #_ REGISTER_OUT v5 [3F7FF800, 3EFFF800, 3EAAA800, 3E7FF800]
+ 
+ test_vrefp_2:
+   #_ REGISTER_IN v4 [40A00000, 40C00000, 40E00000, 41000000]
+   vrefp v5, v4
+   blr
+   #_ REGISTER_OUT v4 [40A00000, 40C00000, 40E00000, 41000000]
+-  #_ REGISTER_OUT v5 [3E4CCCCD, 3E2AAAAB, 3E124925, 3E000000]
++  #_ REGISTER_OUT v5 [3E4CC800, 3E2AA800, 3E124400, 3DFFF800]
+ 
+ test_vrefp_3:
+   #_ REGISTER_IN v4 [3F000000, 3E800000, 3E000000, 3D800000]
+   vrefp v5, v4
+   blr
+   #_ REGISTER_OUT v4 [3F000000, 3E800000, 3E000000, 3D800000]
+-  #_ REGISTER_OUT v5 [40000000, 40800000, 41000000, 41800000]
++  #_ REGISTER_OUT v5 [3FFFF800, 407FF800, 40FFF800, 417FF800]
+ 
+ test_vrefp_4:
+   #_ REGISTER_IN v4 [BF800000, C0000000, C0400000, C0800000]
+   vrefp v5, v4
+   blr
+   #_ REGISTER_OUT v4 [BF800000, C0000000, C0400000, C0800000]
+-  #_ REGISTER_OUT v5 [BF800000, BF000000, BEAAAAAB, BE800000]
++  #_ REGISTER_OUT v5 [BF7FF800, BEFFF800, BEAAA800, BE7FF800]
+ 
+ test_vrefp_5:
+   #_ REGISTER_IN v4 [42C80000, 43480000, 43960000, 44160000]
+   vrefp v5, v4
+   blr
+   #_ REGISTER_OUT v4 [42C80000, 43480000, 43960000, 44160000]
+-  #_ REGISTER_OUT v5 [3C23D70A, 3BA3D70A, 3B5A740E, 3ADA740E]
++  #_ REGISTER_OUT v5 [3C23D600, 3BA3D600, 3B5A7800, 3ADA7800]
+diff --git a/src/xenia/cpu/ppc/testing/instr_vrefp128.s b/src/xenia/cpu/ppc/testing/instr_vrefp128.s
+index cfb68a6..e3fe55b 100644
+--- a/src/xenia/cpu/ppc/testing/instr_vrefp128.s
++++ b/src/xenia/cpu/ppc/testing/instr_vrefp128.s
+@@ -4,7 +4,7 @@ test_vrefp128_1:
+   vrefp128 v5, v4
+   blr
+   #_ REGISTER_OUT v4 [3F800000, 40000000, 40400000, 40800000]
+-  #_ REGISTER_OUT v5 [3F800000, 3F000000, 3EAAAAAB, 3E800000]
++  #_ REGISTER_OUT v5 [3F7FF800, 3EFFF800, 3EAAA800, 3E7FF800]
+ 
+ test_vrefp128_2:
+   # Reciprocal of larger values: 1/[5.0, 6.0, 7.0, 8.0]
+@@ -12,7 +12,7 @@ test_vrefp128_2:
+   vrefp128 v5, v4
+   blr
+   #_ REGISTER_OUT v4 [40A00000, 40C00000, 40E00000, 41000000]
+-  #_ REGISTER_OUT v5 [3E4CCCCD, 3E2AAAAB, 3E124925, 3E000000]
++  #_ REGISTER_OUT v5 [3E4CC800, 3E2AA800, 3E124400, 3DFFF800]
+ 
+ test_vrefp128_3:
+   # Reciprocal of fractions: 1/[0.5, 0.25, 0.125, 0.0625]
+@@ -20,7 +20,7 @@ test_vrefp128_3:
+   vrefp128 v5, v4
+   blr
+   #_ REGISTER_OUT v4 [3F000000, 3E800000, 3E000000, 3D800000]
+-  #_ REGISTER_OUT v5 [40000000, 40800000, 41000000, 41800000]
++  #_ REGISTER_OUT v5 [3FFFF800, 407FF800, 40FFF800, 417FF800]
+ 
+ test_vrefp128_4:
+   # Reciprocal of negative values: 1/[-1.0, -2.0, -3.0, -4.0]
+@@ -28,7 +28,7 @@ test_vrefp128_4:
+   vrefp128 v5, v4
+   blr
+   #_ REGISTER_OUT v4 [BF800000, C0000000, C0400000, C0800000]
+-  #_ REGISTER_OUT v5 [BF800000, BF000000, BEAAAAAB, BE800000]
++  #_ REGISTER_OUT v5 [BF7FF800, BEFFF800, BEAAA800, BE7FF800]
+ 
+ test_vrefp128_5:
+   # Reciprocal of large values: 1/[100.0, 200.0, 300.0, 600.0]
+@@ -36,4 +36,4 @@ test_vrefp128_5:
+   vrefp128 v5, v4
+   blr
+   #_ REGISTER_OUT v4 [42C80000, 43480000, 43960000, 44160000]
+-  #_ REGISTER_OUT v5 [3C23D70A, 3BA3D70A, 3B5A740E, 3ADA740E]
++  #_ REGISTER_OUT v5 [3C23D600, 3BA3D600, 3B5A7800, 3ADA7800]

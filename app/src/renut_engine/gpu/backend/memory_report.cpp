@@ -16,7 +16,9 @@
 #if defined(__SWITCH__)
 #include <malloc.h>
 #include <switch.h>
+#include <unistd.h>  // banjo-nx (2026-10-28): sbrk (the heap's room, O(1))
 extern "C" size_t __nx_heap_size;  // libnx; the SDK's runtime_switch.cpp sets it
+extern "C" char *fake_heap_start, *fake_heap_end;  // libnx: the malloc heap's bounds
 #endif
 
 #include <rex/cvar.h>
@@ -30,10 +32,26 @@ extern "C" size_t __nx_heap_size;  // libnx; the SDK's runtime_switch.cpp sets i
 #include "renut_engine/gpu/render/surfaces.h"
 #include "renut_engine/gpu/render/textures.h"
 #include "renut_engine/gpu/backend/video.h"
+#if defined(PLUME_DEKO3D)
+#include <plume_deko3d.h>  // banjo-nx (2026-10-28, h10): the GPU region's figures
+#endif
+#include <rex/filesystem/devices/host_path_file.h>  // sasrt-nx (2026-11-09 night; port 58): the range cache's bytes
+#if defined(__SWITCH__)
+#include <threading_switch.h>  // sasrt-nx (2026-11-09 night; port 58): RexSwitchStackFigures
+#include <guest_memory_switch.h>  // sasrt-nx (2026-11-09 night; port 58): RexGmDecommitFigures
+#endif
+REXCVAR_DECLARE(int32_t, switch_guest_stack_mb);  // sasrt-nx (2026-11-09 night; port 58): sdk system/xthread.cpp
 
 REXCVAR_DEFINE_DOUBLE(renut_memory_report, 30.0, "Nuts&Bolts/Debug",
                       "Seconds between memory reports in the log (process, GPU and the "
                       "renderer's pools); 0 turns them off.");
+// banjo-nx (2026-10-28, per-draw night: the heap): see the Switch heap line below.
+REXCVAR_DEFINE_INT32(banjo_renut_heap_walk_every, 10, "Nuts&Bolts/Debug",
+                     "Switch: the heap's in-use figures (mallinfo, which walks every free piece of the heap with the "
+                     "malloc lock held: 25-46 ms on the render thread in the d4 city) every Nth memory report (10: "
+                     "every 5 minutes at the 30 s default); the reports between print the heap's room only (O(1)). "
+                     "1: every report (as before); 0: never.")
+    .range(0, 1000);
 
 namespace renut::gpu {
 
@@ -121,15 +139,69 @@ void MaybeReportMemory() {
             Mb(gpu.local_used), Mb(gpu.local_budget), Mb(gpu.shared_used), Mb(gpu.shared_budget));
 #if defined(__SWITCH__)
   // banjo-nx (2026-10-17): the Switch's malloc heap is fixed (__nx_heap_size, or the loader's), the guest's memory in
-  // it: what the process line above cannot show there. GPU memory is not in it.
+  // it: what the process line above cannot show there. (deko3d's memory blocks are in it too: since h10 in the GPU
+  // region at its top, below.)
+  // banjo-nx (2026-10-28, per-draw night): mallinfo walks every free piece (newlib's bins) with the malloc lock held, on
+  // the render thread under State().mutex: 25-46 ms in the d4 city (150,000-260,000 pieces), every report. Now every
+  // banjo_renut_heap_walk_every-th report (the first one included), timed; the others print the room sbrk has left.
   {
-    const struct mallinfo mi = mallinfo();
     const size_t heap = envHasHeapOverride() ? size_t(envGetHeapOverrideSize()) : __nx_heap_size;
-    RGPU_INFO("Memory: heap {:.0f} MB in use of {:.0f} MB ({:.0f} MB taken from it so far, {:.0f} MB of that free in "
-              "{} pieces)",
-              Mb(mi.uordblks), Mb(heap), Mb(mi.arena), Mb(mi.fordblks), size_t(mi.ordblks));
+    static uint32_t reports = 0;
+    const int every = REXCVAR_GET(banjo_renut_heap_walk_every);
+    if (every > 0 && reports++ % uint32_t(every) == 0) {
+      const auto walk_start = std::chrono::steady_clock::now();
+      const struct mallinfo mi = mallinfo();
+      const double walk_ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - walk_start).count();
+      RGPU_INFO("Memory: heap {:.0f} MB in use of {:.0f} MB ({:.0f} MB taken from it so far, {:.0f} MB of that free in "
+                "{} pieces; the walk took {:.1f} ms, every {} reports, banjo_renut_heap_walk_every)",
+                Mb(mi.uordblks), Mb(heap), Mb(mi.arena), Mb(mi.fordblks), size_t(mi.ordblks), walk_ms, every);
+    } else {
+      const char *top = static_cast<const char *>(sbrk(0));
+      const uint64_t room = (top && fake_heap_end > top) ? uint64_t(fake_heap_end - top) : 0;
+      const uint64_t taken = (top && top > fake_heap_start) ? uint64_t(top - fake_heap_start) : 0;
+      RGPU_INFO("Memory: heap {:.0f} MB taken from it so far of {:.0f} MB, {:.0f} MB never handed out (the in-use "
+                "figures every {} reports, banjo_renut_heap_walk_every)",
+                Mb(taken), Mb(heap), Mb(room), every);
+    }
+  }
+#if defined(PLUME_DEKO3D)
+  // banjo-nx (2026-10-28, h10): the GPU region at the heap's top (banjo_deko3d_gpu_region); the heap's room above is
+  // newlib's, below the region.
+  {
+    plume::Deko3DGpuRegionInfo r;
+    plume::Deko3DGpuRegionFigures(r);
+    if (r.on)
+      RGPU_INFO("Memory: GPU region {:.0f} MB at the heap's top: {} blocks {:.0f} MB (peak {:.0f}), {:.0f} MB free in {} "
+                "ranges (largest {:.0f} MB); grown {} times, {} times given back ({:.0f} MB), {} blocks not placed in it",
+                Mb(r.size), r.blocks, Mb(r.used), Mb(r.peak), Mb(r.freeBytes), r.freeRanges, Mb(r.largestFree),
+                r.growths, r.givebacks, Mb(r.givenBack), r.refused);
+    // sasrt-nx (2026-11-11, sasrt_target_block_cache_mb)
+    plume::Deko3DTargetCacheInfo c;
+    plume::Deko3DTargetCacheFigures(c);
+    RGPU_INFO("Memory: kept target blocks {} ({:.0f} MB); so far {} targets took one, {} made a new one, {} kept, {} "
+              "dropped over the cap, {} given back (sasrt_target_block_cache_mb)",
+              c.blocks, Mb(c.bytes), c.hits, c.misses, c.kept, c.evicted, c.released);
   }
 #endif
+#endif
+  // sasrt-nx (2026-11-09 night; port 58): the CPU side's known holders (the command buffers are in the GPU line).
+  {
+    size_t live = 0, kept = 0, kept_bytes = 0;
+#if defined(__SWITCH__)
+    RexSwitchStackFigures(&live, &kept, &kept_bytes);
+#endif
+    const rex::filesystem::StatsRanges ranges = rex::filesystem::ReadStatsRanges();
+    const uint64_t stack_mb = uint64_t(REXCVAR_GET(switch_guest_stack_mb));
+    RGPU_INFO("Memory: CPU: guest thread stacks {} in use x {} MB ({} MB) + {} kept ({:.0f} MB); I/O range cache {:.0f} "
+              "MB", live, stack_mb, uint64_t(live) * stack_mb, kept, Mb(kept_bytes), Mb(ranges.bytes_live));
+#if defined(__SWITCH__)
+    size_t committed = 0, chunks = 0, asked = 0, freed = 0;
+    RexGmDecommitFigures(&committed, &chunks, &asked, &freed);
+    RGPU_INFO("Memory: guest: {:.0f} MB committed in {} chunks; decommits asked for {:.0f} MB and freed {:.0f} MB (a "
+              "chunk goes only when a decommit covers all of it)", Mb(committed), chunks, Mb(asked), Mb(freed));
+#endif
+  }
   RGPU_INFO("Memory: GPU: {} render targets {:.0f} MB (x{:.3g} scale), {} textures {:.0f} MB (of "
             "which {} resolve targets {:.0f} MB), memexport {:.0f} MB",
             targets, Mb(target_bytes), ResolutionScale().Factor(), textures.textures, Mb(textures.bytes),
@@ -137,11 +209,12 @@ void MaybeReportMemory() {
   RGPU_INFO("Memory: host: upload rings {:.0f} MB, stream cache {:.0f} MB in a {:.0f} MB pool "
             "({} streams, {} index ranges), memexport readback {:.0f} MB, command buffers "
             "{:.0f} MB in {} ({} live) + {:.0f} MB in {} spare, shader cache {:.0f} MB, "
-            "pipelines {} built + {} prebuilt unused (of {} listed, {} waiting for their shaders)",
+            "pipelines {} built + {} prebuilt unused (of {} listed, {} waiting for their shaders; {} given back "
+            "unused so far, banjo_renut_prebuild_release_s)",
             Mb(uploads), Mb(streams.cached_bytes), Mb(streams.pool_bytes), streams.streams,
             streams.index_ranges, Mb(readback), Mb(commands.recorded_bytes), commands.recorded,
             commands.live, Mb(commands.spare_bytes), commands.spare, Mb(ShaderCacheHostBytes()),
-            pipelines.built, pipelines.prebuilt_unused, pipelines.listed, pipelines.waiting);
+            pipelines.built, pipelines.prebuilt_unused, pipelines.listed, pipelines.waiting, pipelines.released);
 }
 
 } // namespace renut::gpu

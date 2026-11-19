@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
+#include <rex/kernel/xboxkrnl/threading.h>  // port 143: XamSwapDisc's event
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -16,6 +18,7 @@
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/flags.h>  // blur-nx (2026-11-18): EffectiveLanguage
 #include <rex/system/user_module.h>
 #include <rex/system/xenumerator.h>
 #include <rex/system/xthread.h>
@@ -28,9 +31,13 @@
 #include <fmt/format.h>
 #include <fmt/xchar.h>
 
-#include <rex/cvar.h>
-
-REXCVAR_DECLARE(uint32_t, user_language);  // defined in xam_user.cpp
+REXCVAR_DECLARE(uint32_t, user_language);  // xam_user.cpp
+// renut-ultimate (2026-11-16, port 143; tw2de_nx's, off by default).
+REXCVAR_DEFINE_BOOL(xam_swap_disc_signal, false, "Kernel",
+                    "tw2de_nx (exact): XamSwapDisc (with no title handler, SetSwapDiscHandler) sets the completion "
+                    "event the game passes and waits on: every disc's files are in the one game folder, so the swap is "
+                    "done at once. FINAL FANTASY XIII waited for ever at the end of chapter 4 (insert disc 2). false: "
+                    "success returned and the event left unset, as before");
 
 namespace rex {
 namespace kernel {
@@ -186,13 +193,10 @@ u32 XGetGameRegion_entry() {
   return xeXGetGameRegion();
 }
 
-// sa2-nx: the system language is user_language (the app sets it from its "language" setting; on the Switch "auto"
-// follows the console's language). It was always English, whatever user_language said.
 u32 XGetLanguage_entry() {
-  const uint32_t language = REXCVAR_GET(user_language);
-  return language > uint32_t(XLanguage::kInvalid) && language < uint32_t(XLanguage::kMaxLanguages)
-             ? language
-             : uint32_t(XLanguage::kEnglish);
+  // katamari-nx (2026-11-02): the player's language (user_language, as the console's system setting), which this call
+  // used to ignore: it always answered English, and this is the only language query Beautiful Katamari makes.
+  return rex::system::EffectiveLanguage();  // blur-nx (2026-11-18): the language key, "System" by default
 }
 
 u32 XamGetCurrentTitleId_entry() {
@@ -319,9 +323,19 @@ u32 XamLoaderGetDvdTrayState_entry(mapped_u32 out_state) {
   return X_STATUS_SUCCESS;
 }
 
-u32 XamSwapDisc_entry(u32 disc_number) {
+// XamSwapDisc(disc, the completion event, the dialog's texts). Port 143 (tw2de_nx, xam_swap_disc_signal): the event
+// set, as the swap is done; without it a multi-disc game waits on it for ever.
+u32 XamSwapDisc_entry(u32 disc_number, ppc_ptr_t<X_KEVENT> completion, u32 texts) {
+  (void)texts;
   // Stub for multi-disc games. Single-disc games (like Blue Dragon's reblue test)
   // don't need this, but the game may look it up dynamically via XexGetProcedureAddress.
+  static const bool signal = REXCVAR_GET(xam_swap_disc_signal);
+  if (signal && completion) {
+    REXKRNL_INFO("XamSwapDisc({}): every disc is the game folder, the swap is done (xam_swap_disc_signal)",
+                 (uint32_t)disc_number);
+    rex::kernel::xboxkrnl::xeKeSetEvent(completion, 1, 0);
+    return X_ERROR_SUCCESS;
+  }
   REXKRNL_DEBUG("XamSwapDisc({}) - stub, returning success", (uint32_t)disc_number);
   return X_STATUS_SUCCESS;
 }
@@ -359,4 +373,19 @@ REX_EXPORT(__imp__XamAlloc, rex::kernel::xam::XamAlloc_entry)
 REX_EXPORT(__imp__XamFree, rex::kernel::xam::XamFree_entry)
 REX_EXPORT(__imp__XamQueryLiveHiveW, rex::kernel::xam::XamQueryLiveHiveW_entry)
 REX_EXPORT(__imp__XamLoaderGetDvdTrayState, rex::kernel::xam::XamLoaderGetDvdTrayState_entry)
-REX_EXPORT(__imp__XamSwapDisc, rex::kernel::xam::XamSwapDisc_entry)
+// ds3-nx (2026-10-24, sdk-patches/0014; port 57): a multi-disc title can take the request over (switch its disc
+// mounts, signal the completion event the guest passes in r4) with rex::kernel::xam::SetSwapDiscHandler (module.h);
+// the stub above stays the default. The handler gets the guest call as it is.
+namespace rex::kernel::xam {
+static void (*g_swap_disc_handler)(PPCContext& ctx, uint8_t* base) = nullptr;
+void SetSwapDiscHandler(void (*handler)(PPCContext& ctx, uint8_t* base)) { g_swap_disc_handler = handler; }
+}  // namespace rex::kernel::xam
+extern "C" REX_FUNC(__imp__XamSwapDisc) {
+  REX_EXPORT_CENSUS("__imp__XamSwapDisc");
+  if (rex::kernel::xam::g_swap_disc_handler) {
+    rex::kernel::xam::g_swap_disc_handler(ctx, base);
+    return;
+  }
+  rex::ppc::HostToGuestFunction<rex::kernel::xam::XamSwapDisc_entry>(ctx, base);
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__XamSwapDisc("__imp__XamSwapDisc", &__imp__XamSwapDisc);

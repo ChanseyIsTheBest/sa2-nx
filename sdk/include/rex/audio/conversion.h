@@ -109,6 +109,30 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
     _mm_storeu_ps(&output[(sample + 2) * 2], _mm_unpackhi_ps(left, right));
   }
 }
+
+// blur-nx (2026-11-13, #62 of Blur's docs/cpu-near-exact-50-1113.md, exact): sequential_6_BE_to_interleaved_2_LE for a
+// frame whose channels 2-5 are all +-0 (StereoFrameGain's rest_silent): the fold adds only zeros to the front pair, so
+// its result is front-left / front-right times the scale (a zero's sign aside, which the +0 mix it is added to drops),
+// clamped the same way.
+inline void front_2_of_6_BE_to_interleaved_2_LE(float* output, const float* input, size_t ch_sample_count,
+                                                float scale) {
+  assert_true(ch_sample_count % 4 == 0);
+  const __m128i byte_swap_shuffle =
+      _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
+  const __m128 s = _mm_set1_ps(scale);
+  const __m128 lo = _mm_set1_ps(-1.0f);
+  const __m128 hi = _mm_set1_ps(1.0f);
+  for (size_t sample = 0; sample < ch_sample_count; sample += 4) {
+    __m128 fl = _mm_loadu_ps(&input[sample]);
+    __m128 fr = _mm_loadu_ps(&input[ch_sample_count + sample]);
+    fl = _mm_castsi128_ps(_mm_shuffle_epi8(_mm_castps_si128(fl), byte_swap_shuffle));
+    fr = _mm_castsi128_ps(_mm_shuffle_epi8(_mm_castps_si128(fr), byte_swap_shuffle));
+    const __m128 left = _mm_min_ps(_mm_max_ps(_mm_mul_ps(fl, s), lo), hi);
+    const __m128 right = _mm_min_ps(_mm_max_ps(_mm_mul_ps(fr, s), lo), hi);
+    _mm_storeu_ps(&output[sample * 2], _mm_unpacklo_ps(left, right));
+    _mm_storeu_ps(&output[(sample + 2) * 2], _mm_unpackhi_ps(left, right));
+  }
+}
 #else
 inline void sequential_6_BE_to_interleaved_6_LE(float* output, const float* input,
                                                 size_t ch_sample_count, const SurroundMix& mix,
@@ -140,6 +164,15 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
     const float mid = fc * fold.center + lf * fold.lfe;
     output[sample * 2] = std::clamp((fl + mid + bl * fold.surround) * scale, -1.0f, 1.0f);
     output[sample * 2 + 1] = std::clamp((fr + mid + br * fold.surround) * scale, -1.0f, 1.0f);
+  }
+}
+
+// blur-nx (2026-11-13, #62): the AMD64 branch's front_2_of_6_BE_to_interleaved_2_LE, as this branch clamps.
+inline void front_2_of_6_BE_to_interleaved_2_LE(float* output, const float* input, size_t ch_sample_count,
+                                                float scale) {
+  for (size_t sample = 0; sample < ch_sample_count; sample++) {
+    output[sample * 2] = std::clamp(rex::byte_swap(input[sample]) * scale, -1.0f, 1.0f);
+    output[sample * 2 + 1] = std::clamp(rex::byte_swap(input[ch_sample_count + sample]) * scale, -1.0f, 1.0f);
   }
 }
 #endif

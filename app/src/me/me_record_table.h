@@ -1,4 +1,4 @@
-// SA2 native renderer: the ring thread's table of draw records (game thread -> ring, see NoteDrawCall).
+// Mass Effect native renderer: the ring thread's table of draw records (game thread -> ring, see NoteDrawCall).
 //
 // Records are keyed by the command-buffer address the game was about to write (`start`, a physical address below 2^29).
 // 8 KB address buckets of 8 slots; a DRAW_INDX finds the record whose start is the closest one at or below the packet,
@@ -7,7 +7,7 @@
 //   FindDense - the same selection over a dense array of the start addresses (empty = 0xFFFFFFFF, above any address):
 //               two 32-byte rows instead of ~16 cold slots.
 // Both structures are kept in sync by Insert/Consume whichever lookup is used, so the choice can change at any time.
-// Used by me_native_system.cpp (sa2_native_fast_pair) and tests/cpu/test_native_record_table.cpp.
+// Used by me_native_system.cpp (masseffect_native_fast_pair) and tests/cpu/test_native_record_table.cpp.
 #pragma once
 
 #include <cstdint>

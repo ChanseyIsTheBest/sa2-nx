@@ -433,7 +433,9 @@ __asm__(".text\n"
  * abort() and exit() use it too, see switch_crash_hooks.c. That is why ctx can be null: then there
  * are no registers, only the stack from 'stack'.
  */
-extern "C" void _start(void);
+// renut-ultimate (2026-11-12, port 89; sasrt-nx): a variable, as switch_code_blocks.cpp and guest_memory_switch.cpp
+// declare it: in one LTO link lto1 refuses a function and a variable of the same name. Only its address is used.
+extern "C" char _start;
 
 namespace {
 
@@ -508,21 +510,6 @@ void WriteCrashFile(const char* data, size_t len) {
       (fsdevTranslatePath("sdmc:/switch/rex_crash.log", &fs, path) < 0 || !fs)) {
     return;
   }
-  // sa2-nx: logs/ and logs/rex/ are only created when something is written there (switch_crash_hooks.c). Both levels,
-  // with the file system's own calls (no allocation here); each fails harmlessly when it exists.
-  {
-    char folder[FS_MAX_PATH];
-    std::snprintf(folder, sizeof(folder), "%s", path);
-    if (char* last = std::strrchr(folder, '/')) {
-      *last = '\0';
-      if (char* parent = std::strrchr(folder, '/')) {
-        *parent = '\0';
-        fsFsCreateDirectory(fs, folder);
-        *parent = '/';
-      }
-      fsFsCreateDirectory(fs, folder);
-    }
-  }
   fsFsCreateFile(fs, path, 0, 0);  // fails if it already exists, which is fine
   FsFile f;
   if (R_FAILED(fsFsOpenFile(fs, path, FsOpenMode_Write | FsOpenMode_Append, &f))) {
@@ -535,6 +522,9 @@ void WriteCrashFile(const char* data, size_t len) {
 }
 
 }  // namespace
+
+// blur-nx (2026-11-18): sdk/src/ui/switch_crash_hooks.c's (weak: an executable without the crash hooks has none).
+extern "C" __attribute__((weak)) const char* RexSwitchStderrRecent(size_t* len);
 
 extern "C" void RexSwitchCrashLog(const char* reason, const ThreadExceptionDump* ctx,
                                   uint64_t stack, uint64_t pc) {
@@ -609,6 +599,16 @@ extern "C" void RexSwitchCrashLog(const char* reason, const ThreadExceptionDump*
   ScanStack(b, ctx ? ctx->sp.x : stack, base, text_lo, text_hi);
   Append(b, "\n");
   WriteCrashFile(b.data, b.len);
+  // blur-nx (2026-11-18): with every log off, stderr is kept in memory (switch_crash_hooks.c): its last lines go into
+  // the crash report, the one file a release writes.
+  size_t recent_len = 0;
+  const char* recent = RexSwitchStderrRecent ? RexSwitchStderrRecent(&recent_len) : nullptr;
+  if (recent && recent_len) {
+    static const char kHead[] = "==== stderr before the crash (kept in memory: logging is off) ====\n";
+    WriteCrashFile(kHead, sizeof(kHead) - 1);
+    WriteCrashFile(recent, recent_len);
+    WriteCrashFile("\n", 1);
+  }
   // The log's last lines, which its writer thread had not put in the log file yet (log_file_writer).
   static char tail[12288];
   const size_t tail_len = RexLogUnwrittenTail(tail, sizeof(tail));

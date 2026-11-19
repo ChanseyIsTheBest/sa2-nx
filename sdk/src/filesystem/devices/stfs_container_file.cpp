@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 
 #include <rex/math.h>
 
@@ -28,8 +29,14 @@ void StfsContainerFile::Destroy() {
   delete this;
 }
 
+// ds3-nx (2026-10-24, sdk-patches/0010; port 57): the data files are the device's shared FILE*s, read with a seek
+// then a read: two threads reading at once (games stream on several) could each read from where the other one
+// seeked. One read at a time, for every package.
+static std::mutex g_stfs_read_mutex;
+
 X_STATUS StfsContainerFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
                                      size_t* out_bytes_read) {
+  std::lock_guard<std::mutex> lock(g_stfs_read_mutex);
   if (byte_offset >= entry_->size()) {
     return X_STATUS_END_OF_FILE;
   }

@@ -81,6 +81,54 @@ MACROS = MARKER + '''
 '''
 
 
+INSN = re.compile(r'^\t// (\S+) ?(.*)$')
+STORE_OPS = {'stw', 'std', 'stwu', 'stdu', 'stb', 'sth', 'stwx', 'stdx', 'stfs', 'stfd', 'stvx', 'stvx128', 'stwux',
+             'stdux', 'cmpw', 'cmplw', 'cmpwi', 'cmplwi', 'cmpd', 'cmpdi', 'cmpld', 'cmpldi', 'b', 'bl', 'beq', 'bne',
+             'blt', 'bgt', 'ble', 'bge', 'mtctr', 'mtlr', 'tw', 'twi', 'td', 'tdi'}
+
+
+def find_chain_walkers(gen, files):
+    """blur-nx (2026-11-16): the functions that read beyond their own frame through the back chain, by the generator's
+    instruction comments in text order (over-approximate: a register keeps its chain level until an instruction names
+    it as a destination). Level 0 is r1 and its copies (mr); a load at offset 0 from level n gives level n + 1.
+    A load from level 1 or more (other than a frame pop back into r1) reads another frame."""
+    walkers = set()
+    for f in files:
+        fn = None
+        level = {}
+        for line in open(os.path.join(gen, f), encoding='utf-8', errors='replace'):
+            m = FUNC.match(line.rstrip('\n'))
+            if m:
+                fn, level = m.group(1), {'r1': 0}
+                continue
+            if fn is None:
+                continue
+            m = INSN.match(line.rstrip('\n'))
+            if not m:
+                continue
+            op, args = m.group(1), m.group(2).replace(' ', '').split(',')
+            if op == 'mr' and len(args) == 2:
+                if args[1] in level:
+                    level[args[0]] = level[args[1]]
+                else:
+                    level.pop(args[0], None)
+                continue
+            if op[0] == 'l' and len(args) == 2:
+                mm = re.match(r'(-?\d+)\((r\d+)\)$', args[1])
+                if mm and mm.group(2) in level:
+                    lv = level[mm.group(2)]
+                    if lv >= 1 and not (args[0] == 'r1' and int(mm.group(1)) == 0):
+                        walkers.add(fn)
+                    if int(mm.group(1)) == 0 and op in ('lwz', 'ld') and args[0] != 'r1':
+                        level[args[0]] = lv + 1
+                        continue
+                    if args[0] == 'r1':
+                        continue
+            if args and re.fullmatch(r'r\d+', args[0]) and args[0] != 'r1' and op not in STORE_OPS:
+                level.pop(args[0], None)
+    return walkers
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--gen', required=True, help='generated folder (*_recomp.N.cpp and *_pch.h)')
@@ -92,6 +140,15 @@ def main():
         sys.exit('ERROR (post-codegen patch): frame_traffic: no *_recomp.N.cpp or no single *_pch.h in %s' % a.gen)
     stats = dict(functions=0, lr_functions=0, mflr=0, mtlr=0, lr_saves=0, nv_saves=0, chains=0, lr_data=0, changed=0,
                  already=0)
+    # blur-nx (2026-11-16, the 15 ms batch, #145): a function only reads its OWN frame's back chain (the cases
+    # chain_read below keeps). Another function's would be read only through a chain value: a load at an offset from
+    # a register loaded from 0(r1) (a stack walker, or a callee reading its caller's frame). If the program has one,
+    # no back-chain store is marked at all, so REX_BACK_CHAIN_ELIDE can never take a store such a read needs; with
+    # none the elision is exact for the game (the host reads the chain only in a crash report's diagnostics).
+    walkers = find_chain_walkers(a.gen, files)
+    if walkers:
+        print('frame_traffic: %d functions read past their own frame through the back chain (%s): no back-chain '
+              'store marked' % (len(walkers), ', '.join(sorted(walkers)[:8])))
     for f in files:
         path = os.path.join(a.gen, f)
         lines = open(path, encoding='utf-8').read().split('\n')
@@ -139,7 +196,7 @@ def main():
                 if m:
                     name, operands = m.group(1), m.group(2) or ''
                     if name in ('stwu', 'stdu') and operands.startswith('r1,'):
-                        if not chain_read and k + 2 < j and CHAIN.match(lines[k + 2]):
+                        if not chain_read and not walkers and k + 2 < j and CHAIN.match(lines[k + 2]):
                             new[k + 2] = '\tREX_CHAIN_STORE(' + lines[k + 2].strip().rstrip(';') + ');'
                             stats['chains'] += 1
                         frame_seen = True

@@ -5,16 +5,6 @@
  * Offsets come from N&B's own default.xex IDB (typed D3DDevice / D3DConstants /
  * GPU_*PACKET and resource structs); every one is static_asserted. Only fields
  * the renderer reads or maintains are named.
- *
- * sa2-nx (2026-10-20): Sonic Adventure 2's XDK (Direct3D 2.0.21076, N&B's is
- * 2.0.7645). The public device, the packets, the constants and the resource,
- * shader and surface headers are N&B's byte for byte; the CDevice-private part
- * is not: N&B's 0x2A88-0x2ABF block lies 128 bytes later, the vertex
- * declaration 420 later, the bound objects (0x3094-0x3400) 376 later and the
- * fields from 0x3400 on 400-412 later, and the device is 0x6080 bytes. Each
- * private offset below was read from SA2's own code (named in the comment);
- * N&B's value follows it. Sonic & All-Stars Racing Transformed (21119) has the
- * same layout.
  */
 #pragma once
 
@@ -68,7 +58,7 @@ struct TextureFetchConstant {
 static_assert(sizeof(TextureFetchConstant) == 24);
 
 // A texture header holds the CPU addresses of its base and mip data; the
-// GPU address is what D3DDevice_SetTexture (0x8222F410) writes into the
+// GPU address is what D3DDevice_SetTexture (0x821FE558) writes into the
 // device's fetch constant: the low 29 bits, plus 4 KB for the 0xE0000000
 // (4 KB page) physical view, which starts at physical 0x1000.
 constexpr u32 CpuToGpuAddress(u32 cpu_address) {
@@ -224,9 +214,8 @@ struct ControlPacket {
 static_assert(sizeof(ControlPacket) == 48);
 
 // Public D3DDevice (0x2B00 bytes in N&B's XDK) followed by the CDevice-private
-// tail of the allocation Direct3D_CreateDevice makes: 0x6080 bytes in SA2's
-// (sub_8254FC10 allocates 24704, aligned 128; N&B 0x5E00).
-constexpr u32 kDeviceAllocSize = 0x6080;
+// tail of the 0x5E00-byte allocation Direct3D_CreateDevice makes.
+constexpr u32 kDeviceAllocSize = 0x5700;  // katamari-nx: 0x5E00->0x5700
 constexpr u32 kDeviceAlignment = 0x80;
 
 struct Device {
@@ -277,24 +266,26 @@ static_assert(offsetof(Device, m_MaxAnisotropy) == 0x2A70);
 static_assert(offsetof(Device, m_ZFilter) == 0x2A8A);
 
 // CDevice-private fields Direct3D_CreateDevice initialises (byte offsets into
-// the allocation, from its decompilation at 0x8264DF28).
-// sa2-nx: SA2's sub_8255C808 and sub_8254FC10 (N&B 10888, 10892, 23980).
-constexpr u32 kDeviceOffsetCreationThreadId = 11016;  // GetCurrentThreadId()
-constexpr u32 kDeviceOffsetIsTitleProcess = 11020;    // KeGetCurrentProcessType() == 2
-constexpr u32 kDeviceOffsetBehaviorFlags = 24392;     // Direct3D_CreateDevice arg 4
+// the allocation, from its decompilation at 0x82634990).
+constexpr u32 kDeviceOffsetCreationThreadId = 10888;  // GetCurrentThreadId()
+constexpr u32 kDeviceOffsetIsTitleProcess = 10892;    // KeGetCurrentProcessType() == 2
+constexpr u32 kDeviceOffsetBehaviorFlags = 22264;     // Direct3D_CreateDevice arg 4 (katamari-nx: 23980->22264)
 
 // Bound objects the Set* calls store in the CDevice-private area (guest VAs).
-// sa2-nx: SA2's "is the resource bound" test (sub_825498C8) reads every one of
-// these but the strides (sub_82565758, BeginVertices). N&B's in brackets.
-constexpr u32 kDeviceOffsetVertexDeclaration = 12240;  // SetVertexDeclaration [0x2E2C]
-constexpr u32 kDeviceOffsetIndexBuffer = 12812;        // SetIndices [0x3094]
-constexpr u32 kDeviceOffsetRenderTargets = 12816;      // SetRenderTarget, [4] [0x3098]
-constexpr u32 kDeviceOffsetDepthStencil = 12832;       // SetDepthStencilSurface [0x30A8]
-constexpr u32 kDeviceOffsetStreamSources = 12836;      // SetStreamSource, [16] [0x30AC]
-constexpr u32 kDeviceOffsetStreamStrides = 12904;      // SetStreamSource, u8[16], stride / 4 [0x30F0]
-constexpr u32 kDeviceOffsetTextures = 12920;           // SetTexture, [kTextureFetchSlots] [0x3100]
-constexpr u32 kDeviceOffsetPixelShader = 13068;        // SetPixelShader [0x3194]
-constexpr u32 kDeviceOffsetVertexShader = 13072;       // SetVertexShader [0x3198]
+// TU3's CDevice grew by 4 bytes from 0x2AC0 and by 8 from 0x2E30; the fields
+// from 0x3390 on are where they were.
+constexpr u32 kDeviceOffsetVertexDeclaration = 0x2E24;  // SetVertexDeclaration (katamari-nx: 0x2E30->0x2E24)
+constexpr u32 kDeviceOffsetIndexBuffer = 0x308C;        // SetIndices (katamari-nx: 0x309C->0x308C)
+constexpr u32 kDeviceOffsetRenderTargets = 0x3090;      // SetRenderTarget, [4] (katamari-nx: 0x30A0->0x3090)
+constexpr u32 kDeviceOffsetDepthStencil = 0x30A0;       // SetDepthStencilSurface (katamari-nx: 0x30B0->0x30A0)
+constexpr u32 kDeviceOffsetStreamSources = 0x30A4;      // SetStreamSource, [16] (katamari-nx: 0x30B4->0x30A4)
+constexpr u32 kDeviceOffsetStreamStrides = 0x30E8;      // SetStreamSource, u8[16], stride / 4 (katamari-nx: 0x30F8->0x30E8)
+constexpr u32 kDeviceOffsetTextures = 0x30F8;           // SetTexture, [kTextureFetchSlots] (katamari-nx: 0x3108->0x30F8)
+constexpr u32 kDeviceOffsetPixelShader = 0x318C;        // SetPixelShader (katamari-nx: 0x319C->0x318C)
+constexpr u32 kDeviceOffsetVertexShader = 0x3190;       // SetVertexShader (katamari-nx: 0x31A0->0x3190)
+// renut-ultimate (2026-11-14, port 138; blur-nx's #55): CDevice's viewport floats (x, y, width, height), which D3D
+// clamps a clear to (katamari-nx: 0x3170->0x3160; blur-nx's XDK: 0x3218). A port at another XDK sets its own.
+constexpr u32 kDeviceOffsetViewport = 0x3160;
 // In m_TessellatorPacket, which holds registers 0x2280 on: VGT_HOS_CNTL
 // (tessellation mode in bits 0-1: 0 discrete, 1 continuous, 2 adaptive) and
 // the float VGT_HOS_MAX_TESS_LEVEL / VGT_HOS_MIN_TESS_LEVEL.
@@ -302,32 +293,26 @@ constexpr u32 kDeviceOffsetTessellationControl = 0x2978;
 constexpr u32 kDeviceOffsetMaxTessellationLevel = 0x297C;
 constexpr u32 kDeviceOffsetMinTessellationLevel = 0x2980;
 // Tile predication mask of the draws that follow, ~0 for none
-// (D3DDevice_SetPredication 0x8222AA18 and SetCommandBufferPredication
-// 0x82658678). Bits 2i and 2i+1 run the commands in tile i's pass of
-// predicated tiling (Z and render).
-// sa2-nx: 13084 by the +376 of the fields around it (N&B 0x31A4); SA2 never
-// tiles, and the renderer reads it only while tiling (PredicatedTile).
-constexpr u32 kDeviceOffsetPredication = 13084;
+// (D3DDevice_SetPredication 0x821C9240 and SetCommandBufferPredication).
+// Bits 2i and 2i+1 run the commands in tile i's pass of predicated tiling (Z
+// and render).
+constexpr u32 kDeviceOffsetPredication = 0x319C;  // katamari-nx: 0x31AC->0x319C
 // D3DCommandBuffer being recorded (BeginCommandBuffer sets, End clears).
-// sa2-nx: SA2's AllocateInlineData (sub_8254D9A8) reads it (N&B 13516).
-constexpr u32 kDeviceOffsetCommandBuffer = 13920;
+constexpr u32 kDeviceOffsetCommandBuffer = 13492;  // katamari-nx: 13516->13492
 // The leading part of the device the draw, clear and resolve paths read (up
 // to and including kDeviceOffsetPredication); a copy of it stands in for the
 // device when a recorded command buffer is replayed.
-constexpr u32 kDeviceSnapshotSize = 13088;  // sa2-nx (N&B 0x31A8)
+constexpr u32 kDeviceSnapshotSize = 0x31A0;  // katamari-nx: 0x31B0->0x31A0
 static_assert(kDeviceOffsetVertexShader + 4 <= kDeviceSnapshotSize);
 static_assert(kDeviceOffsetPredication + 4 <= kDeviceSnapshotSize);
 // m_pRing the inline end of BeginVertices / BeginIndexedVertices restores.
-// sa2-nx: SA2's BeginVertices (sub_82565758) stores it, and the game's 11
-// inline ends load it (N&B 0x3484).
-constexpr u32 kDeviceOffsetVerticesRingEnd = 13844;
-// Swap bookkeeping (D3DDevice_Swap 0x82287590; SA2's sub_82558E98, which
-// also sets the pending flag in SynchronizeToPresentationInterval sub_825589D8).
-constexpr u32 kDeviceOffsetSwapCount = 16968;        // [0x40B0]
-constexpr u32 kDeviceOffsetFenceTag = 11036;         // current fence tag [0x2A9C]
-constexpr u32 kDeviceOffsetSwapFenceTag = 11056;     // fence tag at the last Swap [0x2AB0]
-constexpr u32 kDeviceOffsetPresentFenceTag = 15344;  // fence tag of the last presented frame [0x3A5C]
-constexpr u32 kDeviceOffsetSwapFlags = 11069;        // [0x2ABD]
+constexpr u32 kDeviceOffsetVerticesRingEnd = 0x3474;  // katamari-nx: 0x3484->0x3474
+// Swap bookkeeping (D3DDevice_Swap 0x822554F8).
+constexpr u32 kDeviceOffsetSwapCount = 0x4098;  // katamari-nx: 0x40B0->0x4098
+constexpr u32 kDeviceOffsetFenceTag = 0x2A9C;         // current fence tag
+constexpr u32 kDeviceOffsetSwapFenceTag = 0x2AB0;     // fence tag at the last Swap
+constexpr u32 kDeviceOffsetPresentFenceTag = 0x3A44;  // fence tag of the last presented frame (katamari-nx: 0x3A5C->0x3A44)
+constexpr u32 kDeviceOffsetSwapFlags = 0x2ABD;
 constexpr u8 kSwapFlagPending = 0x10;
 
 constexpr u32 kMaxStreams = 16;
@@ -344,7 +329,7 @@ constexpr u32 IndexBufferEndian(u32 common) {
   return (common >> 29) & 3;
 }
 
-// D3DSURFACE after its Resource header (SetSurfaceHeader 0x82655A40).
+// D3DSURFACE after its Resource header (SetSurfaceHeader 0x8263E60C).
 struct SurfaceDesc {
   be_u32 SurfaceInfo;  // +0x18 RB_SURFACE_INFO: pitch 0-13, msaa 16-17
   be_u32 ColorInfo;    // +0x1C RB_COLOR_INFO / RB_DEPTH_INFO: EDRAM base, format at 16

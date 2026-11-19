@@ -18,6 +18,7 @@
 #include <sys/select.h>
 #endif
 
+#include <rex/cvar.h>
 #include <rex/chrono/clock.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
@@ -43,6 +44,8 @@
 #include <netinet/ip.h>
 #include <sys/socket.h>
 #endif
+
+REXCVAR_DECLARE(bool, net_offline_sockets);  // system/xsocket.cpp (port 55)
 
 namespace rex {
 namespace kernel {
@@ -578,7 +581,19 @@ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
   return rex::byte_swap(addr);
 }
 
+// banjo-nx: the game's own sockets (Xbox Live / system link) open host sockets, and a listening one makes
+// Windows Firewall ask for permission on every new build. With guest_network = false socket() fails with
+// WSAENETDOWN, as on a console with no network cable, and nothing is ever opened on the host.
+REXCVAR_DEFINE_BOOL(guest_network, false, "Kernel",
+                    "Let the game open network sockets (Xbox Live / system link). false = no network, as with the "
+                    "cable unplugged");
+
 u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
+  // port 55: net_offline_sockets gives the game sockets without a host socket (XSocket::Initialize) instead.
+  if (!REXCVAR_GET(guest_network) && !REXCVAR_GET(net_offline_sockets)) {
+    XThread::SetLastError(0x2742);  // WSAENETDOWN
+    return uint32_t(-1);
+  }
   XSocket* socket = new XSocket(REX_KERNEL_STATE());
   X_STATUS result =
       socket->Initialize(XSocket::AddressFamily((uint32_t)af), XSocket::Type((uint32_t)type),
@@ -883,6 +898,11 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
   }
 
   if (ret == -1) {
+    if (socket->offline()) {
+      // peggle2-nx: an offline socket names its own error (WSAEWOULDBLOCK, or WSAEINTR when it was closed).
+      XThread::SetLastError(socket->last_error());
+      return ret;
+    }
 // TODO: Better way of getting the error code
 #if REX_PLATFORM_WIN32
     uint32_t error_code = WSAGetLastError();

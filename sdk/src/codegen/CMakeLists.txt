@@ -49,6 +49,7 @@ set(CODEGEN_BUILDER_SOURCES
     builders/memory.cpp
     builders/system.cpp
     builders/vector.cpp
+    builders/extra.cpp  # renut-ultimate (2026-11-16, port 144): tw2de_nx's missing instructions
 )
 
 # Inja templates

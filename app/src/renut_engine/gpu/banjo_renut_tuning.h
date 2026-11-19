@@ -46,6 +46,7 @@ struct Latched {
   bool output_trim = false;
   bool depth_words_view = false;
   bool tess_spec = false;
+  bool fetch_spec = false;
   bool alpha_spec = false;
   bool draw_resolves = false;
   bool resolve_skip = false;
@@ -76,14 +77,27 @@ struct Latched {
   bool cpu_memos = false;
   bool store_cards = false;
   bool store_cards_verify = false;
+  // bangaio-nx (2026-10-29, the v4 console profile: a load-acquire of a function static's guard for each switch
+  // CaptureDelta read, every draw on the game thread): the delta chain's switches (backend/queued.cpp).
+  bool deltas_narrow = false;
+  bool deltas_verify = false;
+  bool neon_compare = false;
+  bool capture_batches = false;
+  bool small_captures = false;
+  bool delta_masks = false;
+  bool delta_prefetch = false;  // bangaio-nx (2026-10-29, v6)
 };
 extern Latched g_latched;
 extern std::atomic<bool> g_latched_ready;
 extern std::atomic<int> g_ab_off;
-void LatchTuning();
+[[gnu::cold, gnu::noinline]] void LatchTuning();
 // banjo-nx (2026-10-19, render-thread proposal 11): always inline (it was emitted out of line and called 7 times a draw).
+// banjo-nx (2026-10-27, render thread night): a plain load of the flag, not a load-acquire: an LDAR at each of the
+// switches a draw reads kept the A57 from starting the draw's later loads early (0.3-0.4 % of the render thread at
+// each site in the setters2 console profile). The values come from the configuration only, the render thread latches
+// them as it starts (OnRenderThreadStart), before any draw; a thread that finds the flag unset latches them itself.
 [[gnu::always_inline]] inline const Latched &Latch() {
-  if (!g_latched_ready.load(std::memory_order_acquire)) [[unlikely]]
+  if (!g_latched_ready.load(std::memory_order_relaxed)) [[unlikely]]
     LatchTuning();
   return g_latched;
 }
@@ -98,42 +112,62 @@ void StartLongLivedThread(void (*fn)(), size_t stack_bytes);
 
 // On the render thread, as it starts (backend/render_thread.cpp).
 void OnRenderThreadStart();
+// On an untile helper of render/textures.cpp, as it starts (port 171: core 0 or 2, the render thread's priority).
+void OnCopyHelperStart(uint32_t index);
 // On a pipeline prebuild worker, as it starts (render/pipeline.cpp).
 void OnPrebuildWorkerStart();
 // On any other background worker of the renderer, as it starts (the content verifier, render/draw.cpp): the
 // background core and priority, as the prebuild workers.
 void OnBackgroundThreadStart(const char *what);
+// blur-nx (2026-11-18, the Renut host batch's #11): OnBackgroundThreadStart's priority.
+int BackgroundThreadPriority();
 // How many prebuild workers to start; Renut's own count off the Switch.
 uint32_t PrebuildWorkers(uint32_t renut_count);
+// banjo-nx (2026-10-28, the heap): banjo_renut_prebuild_release_s (0: prebuilt pipelines stay).
+uint32_t PrebuildReleaseSeconds();
 // banjo_renut_upload_cached (the Switch only): the upload ring in CPU-cached memory (backend/video.cpp).
 bool UploadCached();
 // banjo_renut_push_point_only: the draw's push constant only for point sprites (render/draw.cpp).
-inline bool PushPointOnly() { return Latch().push_point_only && g_ab_off.load(std::memory_order_relaxed) != 4; }
+[[gnu::always_inline]] inline bool PushPointOnly() { return Latch().push_point_only && g_ab_off.load(std::memory_order_relaxed) != 4; }
 // banjo_renut_pipeline_memo (2026-10-19, CPU proposal 6): the GetPipelineLocked memo.
-inline bool PipelineMemoOn() { return Latch().pipeline_memo; }
+[[gnu::always_inline]] inline bool PipelineMemoOn() { return Latch().pipeline_memo; }
 // banjo_renut_cpu_memos (2026-10-19, CPU proposals 2, 4, 8, 11): the render thread's per-draw lookups memoised.
-inline bool CpuMemosOn() { return Latch().cpu_memos; }
+[[gnu::always_inline]] inline bool CpuMemosOn() { return Latch().cpu_memos; }
 // banjo_renut_store_cards (2026-10-19, CPU proposal 1): cached vertex and index copies proven by the store cards
 // (tools/store_cards.py) instead of a hash at every kick; on only when the generated code marks them.
-inline bool StoreCardsOn() { return Latch().store_cards; }
+[[gnu::always_inline]] inline bool StoreCardsOn() { return Latch().store_cards; }
 // banjo_renut_store_cards_verify (PC test): every copy the cards prove is hashed as well; a difference names a writer of
 // guest memory that marks no card.
-inline bool StoreCardsVerifyOn() { return Latch().store_cards_verify; }
+[[gnu::always_inline]] inline bool StoreCardsVerifyOn() { return Latch().store_cards_verify; }
 void CountCards(uint64_t bytes, bool clean);
 void CountCardsMissed(uint64_t bytes);
+// banjo-nx (2026-10-23, batch 6, banjo_renut_kick_reuse): an earlier kick's fetch copy (kind 0) or converted stream (1)
+// of this frame drawn again instead of a new one; kind 2: verify mode found its bytes stale (not used).
+void CountKickReuse(int kind, uint64_t bytes);
 // banjo-nx (2026-10-19, render-thread proposal 1): texture checks answered by the cards (bytes not hashed), hashed,
 // dynamic re-uploads not made, and (verify mode) textures changed under clean cards.
 void CountTextureCards(uint64_t bytes, int what);
 // banjo_renut_capture_pool: draw captures from a pool (backend/queued.cpp).
-inline bool CapturePoolOn() { return Latch().capture_pool && g_ab_off.load(std::memory_order_relaxed) != 5; }
+[[gnu::always_inline]] inline bool CapturePoolOn() { return Latch().capture_pool && g_ab_off.load(std::memory_order_relaxed) != 5; }
 // banjo_renut_neon_swap (ARM): the vertex conversion's byte swaps 16 bytes at a time (render/vertex_format.cpp).
-inline bool NeonSwapOn() { return Latch().neon_swap; }
+[[gnu::always_inline]] inline bool NeonSwapOn() { return Latch().neon_swap; }
 // banjo_renut_queue_notify_idle: a queued item wakes the render thread only while it waits (backend/render_thread.cpp).
-inline bool QueueNotifyIdleOn() { return Latch().queue_notify_idle; }
+[[gnu::always_inline]] inline bool QueueNotifyIdleOn() { return Latch().queue_notify_idle; }
 // banjo_renut_shared_dedupe: a draw whose SharedConstants equal the last upload's reuses it (render/draw.cpp), counted
 // for the [renut] report.
-inline bool SharedDedupeOn() { return Latch().shared_dedupe && g_ab_off.load(std::memory_order_relaxed) != 3; }
-void CountSharedConstants(bool reused);
+[[gnu::always_inline]] inline bool SharedDedupeOn() { return Latch().shared_dedupe && g_ab_off.load(std::memory_order_relaxed) != 3; }
+// sasrt-nx (2026-11-09, the render-thread round, RT4; port 54): inline (a load and a store, as Bump in
+// banjo_renut_tuning.cpp), not a call into another file at every draw (~0.7 % of Sonic Transformed's render thread without
+// LTO). The same counts.
+extern std::atomic<uint64_t> g_shared_reused, g_shared_uploaded;
+// sasrt-nx (2026-11-09; port 54): the draws so far (CountSharedConstants: every draw, the render thread only), for the
+// A/B halves' draws a frame and render-thread microseconds a draw.
+extern uint64_t g_ab_draws;
+[[gnu::always_inline]] inline void CountSharedConstants(bool reused) {
+  std::atomic<uint64_t> &c = reused ? g_shared_reused : g_shared_uploaded;
+  c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+  ++g_ab_draws;
+}
 
 // banjo_renut_exact_streams (package 27): Renut keeps converted copies of vertex streams and index ranges whose guest
 // bytes held for a few flushes, and checks them on a background thread once every 4 frames, so a range the game
@@ -142,13 +176,20 @@ void CountSharedConstants(bool reused);
 // renderer proves its persistent vertex blocks: a changed range is converted again before the draw. Not an
 // enhancement but the exact rule: no master switch. Counted for the [renut] report: checks, bytes hashed, stale copies
 // caught (and, with the key off, the ones Renut's background check found after the fact).
-inline bool ExactStreamsOn() { return Latch().exact_streams && g_ab_off.load(std::memory_order_relaxed) != 6; }
+[[gnu::always_inline]] inline bool ExactStreamsOn() { return Latch().exact_streams && g_ab_off.load(std::memory_order_relaxed) != 6; }
 void CountExactCheck(uint64_t bytes, bool stale, bool repeat_in_frame);
 void CountKick();        // a KickOff reached the render thread (FlushVertexFillsLocked)
 void CountDrawKind(bool depth_only, bool depth_only_plain, bool writes_nothing, bool partial_mask);  // package 28
+// blur-nx (2026-11-13, #47 of Blur's docs/cpu-near-exact-50-1113.md): a draw's shaders that index their float
+// constants (their masks hold every register: all of them uploaded), and the registers the others upload.
+void CountConstantUse(bool vs_indexed, bool ps_indexed, uint32_t registers);
 void CountExactMemoHit(uint64_t bytes);  // a check answered by the interval memo (no bytes read)
 void CountFenceQuery();  // the game asked whether a fence is done (BlockOnFence / IsFencePending)
 void CountLateStale(uint64_t copies);
+// banjo_renut_stream_cache_pressure (2026-10-23): copies refused at the stream cache's cap, and the bytes the pressure
+// pass dropped (render/draw.cpp, every 60 frames).
+bool StreamCachePressureOn();
+void CountStreamCachePressure(uint64_t refused, uint64_t dropped_bytes);
 
 // banjo_renut_memory_policy (package 27; on by default on the Switch): Renut's memory limits are sized for a PC's
 // gigabytes; NVK on the console gives about 1,280 MB of GPU memory budget. Not an enhancement (no master switch): the
@@ -164,6 +205,16 @@ void CountLateStale(uint64_t copies);
 //     banjo_renut_upload_trim_frames frames without such a frame (render/upload_ring.cpp).
 uint64_t TextureReserveBytes();
 uint64_t StreamCacheMaxBytes(uint64_t renut_max);
+// sasrt-nx (2026-11-09, sasrt_memory_governor; port 58): the heap's free MB (surfaces.cpp's governor, every 10 frames on
+// the Switch; UINT32_MAX before the first look and on other platforms), and whether it is under sasrt_memory_low_mb /
+// sasrt_memory_critical_mb.
+extern std::atomic<uint32_t> g_heap_free_mb;
+bool MemoryLow();
+bool MemoryCritical();
+// sasrt-nx (2026-11-09 night, sasrt_memory_emergency; port 58): the governor's looks left in an emergency (a texture or
+// a block plume could not make); MemoryLow and MemoryCritical answer true meanwhile. And the low mark in MB.
+extern std::atomic<uint32_t> g_memory_emergency_looks;
+uint32_t MemoryLowMarkMb();
 uint64_t StreamCacheIdleFrames(uint64_t renut_frames);
 uint32_t UploadTrimResets(uint32_t renut_resets, uint32_t frames_in_flight);
 void CountReserveEviction(uint64_t textures);
@@ -172,7 +223,7 @@ void CountReserveEviction(uint64_t textures);
 // an eviction rule. Renut's resolves stay on the GPU (nothing is written back to guest memory), so such a texture made
 // again from guest memory would hold whatever that memory holds: Renut's own backstop released them after 3,600 idle
 // frames. The game freeing or reusing their memory still replaces them. Not an enhancement: no master switch.
-inline bool KeepGpuWritten() { return Latch().keep_gpu_written; }
+[[gnu::always_inline]] inline bool KeepGpuWritten() { return Latch().keep_gpu_written; }
 // banjo_gpu_nvk_draw_contract under Renut's renderer (package 27; the Switch): NVK's per-draw paths (draw emission in
 // one go, only the dirty cbuf slots and dynamic state groups, pipeline prefetch) and its dynamic descriptors by
 // differences (masseffect_native_set4_differences: sets 5-7 are re-bound with new offsets every draw) are process-wide
@@ -184,48 +235,63 @@ void ControlNvkLocked();
 // banjo_gpu_bool_spec under Renut's renderer (package 27; Vulkan): the bools a draw's shaders test as specialization
 // constants with the draw's values (banjo_bool_spec.h in the translator, the key's bool words in render/pipeline.h). A
 // combination not built yet draws with the generic pipeline while a prebuild worker builds it. In-run A/B target 7.
-inline bool BoolSpecOn() { return Latch().bool_spec && g_ab_off.load(std::memory_order_relaxed) != 7; }
+[[gnu::always_inline]] inline bool BoolSpecOn() { return Latch().bool_spec && g_ab_off.load(std::memory_order_relaxed) != 7; }
 // banjo_gpu_blend_skip under Renut's renderer (package 27; Vulkan): pixels the blend would not change are discarded
 // (BlendSkipMode in render/pipeline.cpp, banjoBlendSkip in shader_common.h). In-run A/B target 8.
-inline bool BlendSkipOn() { return Latch().blend_skip && g_ab_off.load(std::memory_order_relaxed) != 8; }
+[[gnu::always_inline]] inline bool BlendSkipOn() { return Latch().blend_skip && g_ab_off.load(std::memory_order_relaxed) != 8; }
 // banjo_renut_alpha_to_mask_test (2026-10-18): alpha to coverage on a single-sample target drawn as an alpha test at 0.5.
-inline bool AlphaToMaskTestOn() { return Latch().alpha_to_mask_test; }
+[[gnu::always_inline]] inline bool AlphaToMaskTestOn() { return Latch().alpha_to_mask_test; }
 // banjo_renut_depth_words_stencil (2026-10-18): the depth resolve's words carry the stencil.
-inline bool DepthWordsStencilOn() { return Latch().depth_words_stencil; }
+[[gnu::always_inline]] inline bool DepthWordsStencilOn() { return Latch().depth_words_stencil; }
 // banjo_renut_point_minmax_radius (2026-10-18): PA_SU_POINT_MINMAX read as radii (value / 8 is the diameter).
-inline bool PointMinMaxRadiusOn() { return Latch().point_minmax_radius; }
+[[gnu::always_inline]] inline bool PointMinMaxRadiusOn() { return Latch().point_minmax_radius; }
 // banjo_renut_half_pixel_offset (2026-10-18): the viewport moved half a pixel for D3D9 pixel centres.
-inline bool HalfPixelOffsetOn() { return Latch().half_pixel_offset; }
+[[gnu::always_inline]] inline bool HalfPixelOffsetOn() { return Latch().half_pixel_offset; }
 // banjo_gpu_depth_only under Renut's renderer (package 28): depth-only draws without their pixel shader
 // (DrawsWithoutPixelShader in render/draw.cpp). In-run A/B target 11. Counted for the [renut] report.
-inline bool DepthOnlyOn() { return Latch().depth_only && g_ab_off.load(std::memory_order_relaxed) != 11; }
+[[gnu::always_inline]] inline bool DepthOnlyOn() { return Latch().depth_only && g_ab_off.load(std::memory_order_relaxed) != 11; }
 void CountDepthOnly();
 // banjo_gpu_output_trim under Renut's renderer (package 28; Vulkan): the colour channels a pipeline never uses are 0
 // from the pixel shader's exits on (OutputTrimMask in render/pipeline.cpp, banjoTrim in shader_common.h). A/B 12.
-inline bool OutputTrimOn() { return Latch().output_trim && g_ab_off.load(std::memory_order_relaxed) != 12; }
-inline bool DiagTrimPoison() { return Latch().diag_trim_poison; }  // banjo_renut_diag_trim_poison: its test
-inline bool DiagGpuShadersOn() { return Latch().diag_gpu_shaders; }  // banjo_renut_diag_gpu_shaders (package 28b): the GPU profile split by pixel shader
+[[gnu::always_inline]] inline bool OutputTrimOn() { return Latch().output_trim && g_ab_off.load(std::memory_order_relaxed) != 12; }
+[[gnu::always_inline]] inline bool DiagTrimPoison() { return Latch().diag_trim_poison; }  // banjo_renut_diag_trim_poison: its test
+[[gnu::always_inline]] inline bool DiagGpuShadersOn() { return Latch().diag_gpu_shaders; }  // banjo_renut_diag_gpu_shaders (package 28b): the GPU profile split by pixel shader
 // banjo_gpu_depth_words_view under Renut's renderer (package 28): textures over a depth resolve's memory sample its
 // words texture through a view instead of a copy (WordsViewSlot in render/textures.cpp). In-run A/B target 13. Counted:
 // binds of such a texture through the view or with the copy path.
-inline bool DepthWordsViewOn() { return Latch().depth_words_view && g_ab_off.load(std::memory_order_relaxed) != 13; }
+[[gnu::always_inline]] inline bool DepthWordsViewOn() { return Latch().depth_words_view && g_ab_off.load(std::memory_order_relaxed) != 13; }
 // banjo_renut_record_worker's half of the in-run A/B (target 14), read when a command list is opened.
 bool RecordWorkerAbOn();
 void CountDepthWords(bool viewed);
+// vivapinata-nx (2026-11-12, vivapinata_depth_resolve_skip_unread, A/B 156; port 115): left out (0), drawn late from an
+// unchanged source (1), drawn late from newer content or not at all (2).
+bool DepthResolveSkipUnreadOn();
+void CountDepthResolveSkip(int what);
 // banjo_deko3d_draw_resolves (2026-10-18): colour resolves drawn instead of copied on deko3d.
-inline bool DrawResolvesOn() { return Latch().draw_resolves; }
+[[gnu::always_inline]] inline bool DrawResolvesOn() { return Latch().draw_resolves; }
 // 2026-10-18, a census: binds of a depth resolve's float (R32F) target, not its words.
 void CountDepthFloatSampled();
 // banjo_deko3d_depth_compression / banjo_deko3d_zcull (2026-10-18): read before the deko3d device is made.
 bool Deko3DDepthCompressionOn();
 bool Deko3DZcullOn();
+// 2026-10-30, from sasrt-nx: banjo_deko3d_msaa_positions, _a2c_dither, _strip_restart (plume Deko3DOptions).
+bool Deko3DMsaaPositionsOn();
+bool Deko3DA2cDitherOn();
+bool Deko3DStripRestartOn();
+bool Deko3DGpuRegionOn();  // banjo-nx (2026-10-28, h10): banjo_deko3d_gpu_region
 // banjo_deko3d_barrier_merge / _lean (2026-10-19, GPU): fewer pipeline drains and texture cache invalidations.
 bool Deko3DBarrierMergeOn();
 bool Deko3DBarrierLeanOn();
+bool Deko3DVtxDedupeOn();  // banjo-nx (2026-10-26)
+bool Deko3DTextureSkipOn();  // banjo-nx (2026-10-27)
+bool Deko3DProvisionalCountOn();  // banjo-nx (2026-10-28): banjo_deko3d_provisional_count
+bool Deko3DAsyncVariantsOn();  // banjo_deko3d_async_variants (2026-10-21)
 // banjo_deko3d_alpha_spec (2026-10-18): the alpha test's function in the pipeline key (constant 903).
-inline bool AlphaSpecOn() { return Latch().alpha_spec; }
+[[gnu::always_inline]] inline bool AlphaSpecOn() { return Latch().alpha_spec; }
 // banjo_deko3d_tess_spec / banjo_deko3d_vs_outputs (2026-10-18): constants 904 and 905 of the deko3d shaders.
-inline bool TessSpecOn() { return Latch().tess_spec; }
+[[gnu::always_inline]] inline bool TessSpecOn() { return Latch().tess_spec; }
+// banjo_gpu_fetch_spec: a tessellated draw's constants 904 and 920-923 (render/draw.cpp FetchSpecWords).
+[[gnu::always_inline]] inline bool FetchSpecOn() { return Latch().fetch_spec; }
 bool Deko3DVsOutputsOn();
 // banjo_deko3d_uam_prmt (2026-10-18): uam's PRMT pass, and the DKSH cache file that goes with it.
 bool Deko3DUamPrmtOn();
@@ -250,7 +316,14 @@ bool SkinOnceOn();
 // banjo_deko3d_eager_kicks (2026-10-20, input latency A/B): kick lists of 100 draws, up to 6 a frame, each submitted at
 // its own kick (backend/video.cpp KickLocked); false in the off half of the in-run A/B (target 18).
 bool EagerKicksOn();
-// (banjo_late_input_gpu removed 2026-10-20: false slack where frames just hold their rate, banjo-nx's console runs.)
+bool ProgressiveSubmitOn();  // port 164 (banjo_deko3d_progressive_submit)
+// banjo_renut_smaa (2026-10-21): SMAA on the final composite (render/smaa.cpp); false in the off half of the in-run A/B
+// (target 19). Its preset (1 medium, 2 high), luma threshold and the composite's pixel shaders (hex, comma separated).
+bool SmaaOn();
+int SmaaQuality();
+double SmaaThreshold();
+std::string SmaaAfterPsList();
+int32_t SmaaCompareSeconds();  // banjo_renut_diag_smaa_compare_s
 void CountSkinOnce(uint32_t kind);
 // 2026-10-20: a texture bind whose fetch constant has an exponent adjust (not applied by Renut).
 void CountExpAdjust(int adjust);
@@ -274,20 +347,52 @@ void CountHeaderDescDiffer(uint32_t dwords);
 uint32_t FurShellEvery();
 // banjo_renut_portrait_fur_shells: the same for targets of 128 x 128 or less (the dialogue portrait).
 uint32_t PortraitFurShellEvery();
+// banjo_renut_fur_shells_percent (2026-10-21, NOT exact): the share of each fur part's shells drawn (100 = all).
+uint32_t FurShellPercent();
+// banjo_renut_portrait_fur_shells_percent / banjo_renut_portrait_msaa_samples (2026-10-21, NOT exact): the dialogue
+// portrait (targets of 128 x 128 or less): its fur shells' share (100 = as the rest) and its MSAA samples (0 = the
+// game's, 1 = none, 2 = 2x).
+uint32_t PortraitFurShellPercent();
+uint32_t PortraitMsaaSamples();
+// msaa_level (2026-11-02, katamari-nx, the player's setting): the most samples any target gets: 4 (the game's), 2 or 1.
+uint32_t MsaaLevel();
 void CountFurShell(bool drawn);
+// banjo-nx (2026-10-23): banjo_renut_chain_reuse's answer for one draw (what: 0 targets, 1 textures, 2 viewport,
+// 3 pipeline key, 4 pipeline), for the "[renut] chain reuse" line.
+void CountChainReuse(int what, bool reused);
+// banjo-nx (2026-10-26): many answers at once ([what][0] draws, [what][1] reused), from the render thread's own counts.
+void CountChainReuseN(const uint64_t counts[5][2]);
 // uam's banjo flags (banjo_deko3d_uam_prmt, banjo_deko3d_uam_gvn, banjo_deko3d_uam_uniform_branches,
 // banjo_deko3d_uam_wide_rows); 1471 by default.
 unsigned Deko3DUamFlags();
 // banjo_background_compile_core / banjo_deko3d_compile_priority (2026-10-18): the uam thread's core and priority.
 int Deko3DCompileCore();
 int Deko3DCompilePriority();
+int Deko3DBackgroundCompileShare();  // banjo_deko3d_background_compile_share (2026-10-23)
+bool Deko3DCompileWaitBoostOn();  // banjo_deko3d_compile_wait_boost (2026-10-23)
+bool Deko3DFastFirstCompileOn();  // banjo_deko3d_fast_first_compile (port 56, from mk9-nx)
+bool Deko3DAsyncCacheReadsOn();  // banjo_deko3d_async_cache_reads (2026-10-23)
 void CountDrawnResolve();
+void CountSmaa();  // banjo_renut_smaa: a frame done
+// banjo-nx (2026-10-21, internal resolution, NOT exact): the 3D image's heights by mode, the display's when docked, the
+// upscale's filter (0 bilinear, 1 bicubic), and a composite scaled up for the HUD (or drawn at the display's size).
+int32_t RenderHeightHandheld();
+int32_t RenderHeightDocked();
+int32_t DisplayHeightDocked();
+int UpscaleFilter();
+bool HostMipsOn();  // banjo_renut_host_mips (read at start)
+void CountUiUpscale(bool scaled);
+// A UI depth target filled (true), or a draw that kept a depth target smaller than its colour target (false).
+void CountUiDepth(bool filled);
+// 2026-10-20 (the Renut CPU port from sa2-nx): where the render thread's draws come from: 0 immediate (a whole device
+// copy queued by the game thread), 1 replayed from a recorded command buffer (device deltas).
+void CountDrawSource(int source, uint64_t draws = 1);
 // banjo_renut_resolve_skip (2026-10-19): a resolve whose source and destination are as at the same resolve before is
 // not done again (render/draw.cpp ResolveStateLocked); counted per kind.
-inline bool ResolveSkipOn() { return Latch().resolve_skip; }
+[[gnu::always_inline]] inline bool ResolveSkipOn() { return Latch().resolve_skip; }
 // banjo_renut_depth_words_lazy (2026-10-19): depth resolve words only where read; counted 0 a resolve without them,
 // 1 written late, 2 read stale (the source had changed).
-inline bool DepthWordsLazyOn() { return Latch().depth_words_lazy; }
+[[gnu::always_inline]] inline bool DepthWordsLazyOn() { return Latch().depth_words_lazy; }
 void CountLazyWords(int what);
 // 2026-10-20: a draw's fetch data checked for the 16-byte alignment the aw4 shader pass relies on.
 void CountFetchAlignment(bool aligned);
@@ -295,21 +400,53 @@ void CountFetchAlignment(bool aligned);
 // hand-over"). Counted: 0 resolves handed over, 1 binds of a target's image, 2 images taken at a whole clear,
 // 3 resolves done after all (the target bound or gone, or the destination needed in its texture), 4 of them from a
 // taken image, 5 contents lost (none expected).
-inline bool DepthHandOverOn() { return Latch().depth_handover; }
+[[gnu::always_inline]] inline bool DepthHandOverOn() { return Latch().depth_handover; }
+// banjo-nx (2026-10-28, GPU block): banjo_deko3d_depth_handover_readonly (A/B 64).
+bool DepthHandOverReadOnlyOn();
+// kameo-nx (2026-11-03, the GPU round from the third console run; docs/kameo-notes.md). A/B targets 73-79.
+bool ColorHandOverOn();          // banjo_deko3d_color_handover (73)
+// blur-nx (2026-11-10/11, port 76): its renderer fixes, A/B targets 211-221 (210 and 214 not ported).
+bool ExpandAliasOn();            // blur_renut_expand_alias (211, blur-nx)
+bool ResolveKeepDestOn();        // blur_renut_resolve_keep_dest (212, blur-nx)
+bool OcclusionQueriesOn();       // blur_renut_occlusion_queries (213, blur-nx)
+bool StackSurfaceHeadersOn();    // blur_renut_stack_surface_headers (215, blur-nx)
+bool SampleGridResolveOn();      // blur_renut_sample_grid_resolve (216, blur-nx)
+bool SurfaceSizeGuardOn();       // blur_renut_surface_size_guard (217, blur-nx)
+bool WipeOverwrittenOn();        // blur_renut_wipe_overwritten (218, blur-nx)
+bool ResolveExpBiasOn();         // blur_renut_resolve_exp_bias (219, blur-nx)
+bool EdramInheritOn();           // blur_renut_edram_inherit (220, blur-nx)
+bool MsSliceResolveOn();         // blur_renut_ms_slice_resolve (221, blur-nx)
+bool ScanOutHandOverOn();        // banjo_deko3d_scanout_handover (74)
+bool DepthHandOverSampledOn();   // banjo_deko3d_depth_handover_sampled (75)
+bool DepthReadLayoutOn();        // banjo_deko3d_depth_read_layout (76)
+bool ResolveKeepsTargetOn();     // banjo_deko3d_resolve_keeps_target (77)
+bool PresentNoPowOn();           // banjo_renut_present_no_pow (78)
+bool PresentTexelLoadOn();       // banjo_renut_present_texel_load (79)
+bool GammaUploadOnceOn();        // banjo_renut_gamma_upload_once
+// The colour hand-over's counts, as CountHandOver's: 0 not drawn, 1 binds of an image, 2 taken at a whole clear, 3 drawn after
+// all, 4 of them from a taken image, 5 lost, 7 drawn for a draw writing the target, 8 for a draw sampling it, 9 other.
+void CountColorHandOver(int what);
+// Why a colour resolve was drawn: 0 smaller than the target, into a texture of another size; 1 part of a target into a
+// texture of its size; 2 whole, but the texture is another size or scale; 3 the texture has levels; 4 format or kind.
+void CountColorNotLeft(int why);
 // banjo_deko3d_depth24 (2026-10-19, GPU): D24S8 depth targets as 24-bit unorm (render/format.cpp).
-inline bool Depth24On() { return Latch().depth24; }
+[[gnu::always_inline]] inline bool Depth24On() { return Latch().depth24; }
 // banjo_deko3d_push_constants (2026-10-19, render-thread proposals 2 and 5): the float constants and SharedConstants
 // pushed into fixed uniform buffers by what changed (render/draw.cpp, "Pushed constants"); _verify checks the model.
-inline bool PushConstantsOn() { return Latch().push_constants; }
+[[gnu::always_inline]] inline bool PushConstantsOn() { return Latch().push_constants; }
 // banjo_deko3d_kick_submit (2026-10-19, input latency): a frame's command lists are submitted at the game's kicks, not
 // only at the present; banjo_deko3d_ring_cleaner (render-thread proposal 23): the upload ring cleaned by another core.
-inline bool KickSubmitOn() { return Latch().kick_submit; }
+[[gnu::always_inline]] inline bool KickSubmitOn() { return Latch().kick_submit; }
 // banjo_late_input (2026-10-19, input latency): backend/render_thread.cpp.
-inline bool LateInputOn() { return Latch().late_input; }
-inline bool RingCleanerOn() { return Latch().ring_cleaner; }
+[[gnu::always_inline]] inline bool LateInputOn() { return Latch().late_input; }
+[[gnu::always_inline]] inline bool RingCleanerOn() { return Latch().ring_cleaner; }
 void CountKickSubmit(int what);
-inline bool PushConstantsVerifyOn() { return Latch().push_constants_verify; }
-void CountPushedConstants(uint64_t bytes, int what);
+[[gnu::always_inline]] inline bool PushConstantsVerifyOn() { return Latch().push_constants_verify; }
+// sasrt-nx (2026-11-09, RT4; port 54): inline, as CountSharedConstants.
+extern std::atomic<uint64_t> g_pushed[4];
+[[gnu::always_inline]] inline void CountPushedConstants(uint64_t bytes, int what) {
+  g_pushed[what].store(g_pushed[what].load(std::memory_order_relaxed) + bytes, std::memory_order_relaxed);
+}
 // banjo-nx (2026-10-19, render-thread proposal 23): upload ring bytes cleaned at the submits.
 void CountRingPublished(uint64_t bytes);
 void CountHandOver(int what);
@@ -319,7 +456,7 @@ void NotePipelineBuilt();
 // banjo_gpu_tess_grid under Renut's renderer (package 27): tessellated draws indexed by grid vertex, so the vertex
 // shader runs once per grid vertex instead of once per triangle corner (TessellationGridFor in render/draw.cpp). In-run
 // A/B target 9. Counted: corners drawn and grid vertices, for the [renut] report.
-inline bool TessGridOn() { return Latch().tess_grid && g_ab_off.load(std::memory_order_relaxed) != 9; }
+[[gnu::always_inline]] inline bool TessGridOn() { return Latch().tess_grid && g_ab_off.load(std::memory_order_relaxed) != 9; }
 void CountTessGrid(uint64_t corners, uint64_t vertices);
 enum class BoolSpecEvent { kDraw, kGeneric, kBuilt };
 void CountBoolSpec(BoolSpecEvent event);
@@ -327,7 +464,7 @@ void ReportNvk();
 void BeforePipelineBind(plume::RenderPipeline *pipeline);
 // banjo_renut_diag_poison_slots (a test): a descriptor slot given back points at a magenta texture instead of the null
 // one, so a draw that still samples a released texture shows magenta in the captures (backend/video.cpp).
-inline bool PoisonSlotsOn() { return Latch().poison_slots; }
+[[gnu::always_inline]] inline bool PoisonSlotsOn() { return Latch().poison_slots; }
 int DiagBuildDelayMs();
 void ResolveTraceFrameStart();  // banjo_renut_diag_resolve_trace: the render thread's frame boundary
 // banjo-nx (2026-10-19, render-thread proposal 22): inline (read per resolve, per bind and per target change).

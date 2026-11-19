@@ -26,7 +26,7 @@ namespace rex::codegen {
 class FunctionNode;
 
 /// A setjmp site leaves these two markers in the body; FunctionGraph::emit replaces them once the
-/// function's whole set of C++-local registers is known (BuilderContext::emit_function_call; from banjo-nx).
+/// function's whole set of C++-local registers is known (BuilderContext::emit_function_call).
 inline constexpr std::string_view kSetjmpSaveLocalsMarker = "/*REX_SETJMP_SAVE_LOCALS*/";
 inline constexpr std::string_view kSetjmpRestoreLocalsMarker = "/*REX_SETJMP_RESTORE_LOCALS*/";
 
@@ -116,6 +116,12 @@ struct BuilderContext {
 
   /// Get the recompiler configuration
   const RecompilerConfig& config() const;
+
+  /// renut-ultimate (2026-11-16, port 144; tw2de_nx's): exact_fp here (the option, or this function in
+  /// exact_fp_functions), and the two diagnostics (rex/codegen/config.h).
+  bool exact_fp() const;
+  bool exact_fp_log() const;
+  bool fp_origin_log() const;
 
   /// Get the function graph (single source of truth for function info)
   const FunctionGraph& graph() const;
@@ -262,13 +268,18 @@ struct BuilderContext {
    * @param copyBack    also take r/f/v back from ctx into the locals (bl, not tail)
    * @param indent      leading tabs of the emitted lines
    */
+  /// non_volatile_as_local_exclude (or a __save*/__rest* helper): non-volatiles stay in ctx.
+  bool keepsNonVolatilesInCtx() const;
+  /// A save/restore helper whose register range covers a non_volatile_as_local_keep register.
+  bool helperCoversKeptRegister(const std::string& name) const;
+
   void emit_call_sharing_registers(const std::string& call, bool copyBack, const char* indent);
 
   /// True if this function keeps anything in locals that a sharing callee would need.
   bool localizesAnything() const;
 
   /// True if r0/r2/r11/r12/f0/v32-v63 are locals here (non_argument_as_local, and the function
-  /// does not share its registers and does not keep them in ctx).
+  /// does not share its registers).
   bool localizeNonArguments() const;
 
   /// True if a function keeps r0/r2/r11/r12/f0/v32-v63 in ctx under non_argument_as_local: a
@@ -282,7 +293,7 @@ struct BuilderContext {
    * these registers in ctx (keepsNonArgumentsInCtx): the callee may read an argument there (the stack
    * probe's frame size in r12) and leaves its results there. The localized ones are copied in before
    * the call and, for a bl, taken back afterwards; ctx is put back as before. Nothing is emitted in a
-   * function that does not localize them.
+   * function that does not localize them. (sa2-nx, via peggle2-nx.)
    * @param call        the C++ statement(s) that make the call
    * @param copyBack    take the registers back from ctx into the locals (bl, not tail)
    * @param indent      leading tabs of the emitted lines

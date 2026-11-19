@@ -529,6 +529,21 @@ void RtlLeaveCriticalSection_entry(ppc_ptr_t<X_RTL_CRITICAL_SECTION> cs) {
   }
 }
 
+// sasrt-nx (2026-11-12, batch C/D, item C1; port 93): the game's leaves through a raw export, as its enters (no
+// HostToGuestFunction thunk translating the pointer on every leave); the same body as RtlLeaveCriticalSection_entry
+// (its asserts are compiled out in the release builds).
+void RtlLeaveCriticalSection_raw(PPCContext& ctx, uint8_t* base) {
+  auto* cs = rex::memory::GuestPtr<X_RTL_CRITICAL_SECTION*>(base, ctx.r3.u32);
+  if (--cs->recursion_count != 0) {
+    rex::thread::atomic_dec(&cs->lock_count);
+    return;
+  }
+  cs->owning_thread = 0;
+  if (rex::thread::atomic_dec(&cs->lock_count) != -1) {
+    xeKeSetEvent(reinterpret_cast<X_KEVENT*>(cs), 1, 0);
+  }
+}
+
 struct X_TIME_FIELDS {
   rex::be<uint16_t> year;
   rex::be<uint16_t> month;
@@ -712,7 +727,11 @@ REX_HOOK_RAW(__imp__RtlTryEnterCriticalSection) {
 }
 static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__RtlTryEnterCriticalSection(
     "__imp__RtlTryEnterCriticalSection", &__imp__RtlTryEnterCriticalSection);
-REX_EXPORT(__imp__RtlLeaveCriticalSection, rex::kernel::xboxkrnl::RtlLeaveCriticalSection_entry)
+REX_HOOK_RAW(__imp__RtlLeaveCriticalSection) {  // sasrt-nx (2026-11-12, batch C/D, item C1; port 93)
+  rex::kernel::xboxkrnl::RtlLeaveCriticalSection_raw(ctx, base);
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__RtlLeaveCriticalSection(
+    "__imp__RtlLeaveCriticalSection", &__imp__RtlLeaveCriticalSection);
 REX_EXPORT(__imp__RtlTimeToTimeFields, rex::kernel::xboxkrnl::RtlTimeToTimeFields_entry)
 REX_EXPORT(__imp__RtlTimeFieldsToTime, rex::kernel::xboxkrnl::RtlTimeFieldsToTime_entry)
 REX_EXPORT(__imp__RtlComputeCrc32, rex::kernel::xboxkrnl::RtlComputeCrc32_entry)

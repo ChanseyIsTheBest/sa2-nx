@@ -1,0 +1,7 @@
+# Pixel shaders that keep Renut's early alpha test under vivapinata_shader_noearly (tools/deko3d_glsl_opt.py pass noearly
+# leaves them as they are). From the console's A/B 91 (run c18, 2026-11-12, the garden at 720p): without the test these
+# were slower; every other measured shader was as fast or faster.
+# renut-ultimate (2026-11-12, port 95): these two are Viva Pinata's (its hashes match no other game's shaders). A game
+# that turns vivapinata_shader_noearly on measures A/B 151 on the console and adds its own slower shaders here.
+540A0DF66A97D8E0  # +0.28 ms without the test (0.49 -> 0.77)
+04A47417EF86397F  # +0.06 ms without the test (0.49 -> 0.55)

@@ -82,7 +82,34 @@ struct PipelineKey {
   // alpha_test_func; 8 = always, the test off), the pixel shader's specialization constant 903 (tools/deko3d_glsl_opt.py,
   // pass alpha); 0 = read at run time. Like the bools: a key with it not built yet draws with the generic one (0).
   uint32_t alpha_func;
-  uint32_t reserved;  // 0 (the key is compared and hashed as bytes)
+  // Bits 0-2 the in-run A/B's off halves (draw.cpp); halo3-nx: bits 4-7 the targets of the guest's gamma format, bits 8-31 the
+  // targets' colour exponent biases (6 bits each). The key is compared and hashed as bytes.
+  // sasrt-nx (2026-11-08, sasrt_gpu_clip_spec): bit 3 set: the draw's vertex shader writes its user clip distance (a
+  // plane is set, or the key is off); clear: constant 929 = 0 and the clip slot off. Lists made before have it clear.
+  uint32_t reserved;
+  // vivapinata-nx (2026-11-03, banjo-nx's banjo_gpu_fetch_spec): a tessellated draw's own values for its vertex shader: the type
+  // words of its first four bound fetches + 1 as constants 920-923, the patch kind (SharedConstants.tessellation[0]) + 1 as 904.
+  // 0: read at run time (every other draw). Like the bools: a key not built yet draws with the generic one.
+  uint32_t fetch_types[4];
+  uint32_t tess_kind;
+  // renut-ultimate (port 44, 2026-11-08; sasrt-nx's sasrt_gpu_plain_fetches, was fetch_pad, 0): the pixel shader's
+  // constant 926, bit r for each fetch constant it samples whose words have no signs, gamma or exponent adjust
+  // (render/draw.cpp PlainFetchMask; tools/deko3d_glsl_opt.py pass plainfetch). 0: read at run time. Like the bools: a
+  // key not built yet draws with the generic one. Kept in the list's key as before (the field's place and the key's size
+  // are the same).
+  uint32_t fetch_pad;
+  // sasrt-nx (2026-11-08, the third GPU round; list version 6): the draw's values its shaders read at run time, as
+  // specialization constants (render/draw.cpp SasrtSpecWordsOf; 0: read at run time, the generic pipeline a key not built
+  // yet draws with):
+  //   [0] the vertex shader's 932: bit 0 set: bit 1 is screen_space != 0; bit 2 set: bit 3 is depth_remap[0] != 0
+  //   [1] [2] [3] the pixel shader's 934 935 936: bit 31 set: bit r is fetch constant r's 3D word's stacked / layer
+  //       filter / Z wrap bit
+  //   [4] the vertex shader's 937: bit i set: fetch slot 64 + i's byte order is in [5] (938, i < 16) or [6] (939),
+  //       two bits at 2 * (i % 16)
+  //   [7] the pixel shader's 910 (32 registers at most) when bit 0 (sasrt_gpu_gpr_cap) or bit 1 (sasrt_gpu_gpr_cap_filter)
+  //   [8] the vertex shader's 940: bit r set: float constant r (r < 31) is an export address register whose z word (as
+  //       the shader's constant buffer has it) is [9], [10] or [11] (941-943) by its order among the set bits
+  uint32_t sasrt_words[20];  // sasrt-nx: [12]-[19] the fifth round (2026-11-09, constants 950-973)
 };
 
 // banjo-nx (banjo_gpu_blend_skip): for the key's other fields, 1 when its one target keeps its value for a source alpha
@@ -106,7 +133,7 @@ struct PipelineInputs {
 // Built pipeline for the key, compiling it on first use unless the pipeline
 // list (below) built it ahead. nullptr on failure (logged once per key).
 plume::RenderPipeline *GetPipelineLocked(const PipelineKey &key, const PipelineInputs &inputs);
-// sa2-nx (2026-10-20, sa2_renut_chain_reuse): GetPipelineLocked's calls so far, and the prebuild epoch.
+// banjo-nx (2026-10-20, from sa2-nx, banjo_renut_chain_reuse): GetPipelineLocked's calls so far, and the prebuild epoch.
 uint64_t PipelineLookupsLocked();
 uint64_t PrebuildEpochLocked();
 
@@ -135,7 +162,14 @@ struct PipelineCounts {
   size_t prebuilt_unused = 0;
   size_t waiting = 0;
   size_t listed = 0;
+  size_t released = 0;  // banjo-nx (2026-10-28): prebuilt ones given back unused so far (ReleaseIdlePrebuiltPipelines)
 };
 PipelineCounts PipelineCountsLocked();
+// banjo-nx (2026-10-28, per-draw night): whether the last GetPipelineLocked answer was provisional (a specialised key's
+// generic pipeline while its own is built: the answer changes with the prebuild epoch). Render thread.
+bool LastPipelineProvisionalLocked();
+// banjo-nx (2026-10-28, the heap): the prebuilt pipelines no draw has taken for banjo_renut_prebuild_release_s go
+// back to the heap (their jobs stay: built again if a draw asks). Render thread, once a frame (checks every 20 s).
+void ReleaseIdlePrebuiltPipelines();
 
 } // namespace renut::gpu

@@ -106,85 +106,103 @@ void main(uint3 id : SV_DispatchThreadID)
     const uint format = type & 0x3F;
     const bool isSigned = (type >> 8) & 1;
     const bool isInteger = (type >> 9) & 1;
-    float c[6] = { 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 1.0f };
+    // Port 164 (from fnxf_xiii, its note of 2026-10-27): the components as four scalars and the swizzle's pick a switch,
+    // not a float[6] indexed at run time (uam put that array in local memory: 5 KB of scratch a warp). The same values.
+    float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 1.0f;
     const uint w0 = SwapWord(LoadSource(src), endian);
     switch (format)
     {
     case 6: // 8_8_8_8
-        for (uint i = 0; i < 4; ++i)
-            c[i] = DecodeComponent(w0, i * 8, 8, isSigned, isInteger);
+        c0 = DecodeComponent(w0, 0, 8, isSigned, isInteger);
+        c1 = DecodeComponent(w0, 8, 8, isSigned, isInteger);
+        c2 = DecodeComponent(w0, 16, 8, isSigned, isInteger);
+        c3 = DecodeComponent(w0, 24, 8, isSigned, isInteger);
         break;
     case 7: // 2_10_10_10
-        c[0] = DecodeComponent(w0, 0, 10, isSigned, isInteger);
-        c[1] = DecodeComponent(w0, 10, 10, isSigned, isInteger);
-        c[2] = DecodeComponent(w0, 20, 10, isSigned, isInteger);
-        c[3] = DecodeComponent(w0, 30, 2, isSigned, isInteger);
+        c0 = DecodeComponent(w0, 0, 10, isSigned, isInteger);
+        c1 = DecodeComponent(w0, 10, 10, isSigned, isInteger);
+        c2 = DecodeComponent(w0, 20, 10, isSigned, isInteger);
+        c3 = DecodeComponent(w0, 30, 2, isSigned, isInteger);
         break;
     case 16: // 10_11_11
-        c[0] = DecodeComponent(w0, 0, 11, isSigned, isInteger);
-        c[1] = DecodeComponent(w0, 11, 11, isSigned, isInteger);
-        c[2] = DecodeComponent(w0, 22, 10, isSigned, isInteger);
+        c0 = DecodeComponent(w0, 0, 11, isSigned, isInteger);
+        c1 = DecodeComponent(w0, 11, 11, isSigned, isInteger);
+        c2 = DecodeComponent(w0, 22, 10, isSigned, isInteger);
         break;
     case 17: // 11_11_10
-        c[0] = DecodeComponent(w0, 0, 10, isSigned, isInteger);
-        c[1] = DecodeComponent(w0, 10, 11, isSigned, isInteger);
-        c[2] = DecodeComponent(w0, 21, 11, isSigned, isInteger);
+        c0 = DecodeComponent(w0, 0, 10, isSigned, isInteger);
+        c1 = DecodeComponent(w0, 10, 11, isSigned, isInteger);
+        c2 = DecodeComponent(w0, 21, 11, isSigned, isInteger);
         break;
     case 25: // 16_16
-        c[0] = DecodeComponent(w0, 0, 16, isSigned, isInteger);
-        c[1] = DecodeComponent(w0, 16, 16, isSigned, isInteger);
+        c0 = DecodeComponent(w0, 0, 16, isSigned, isInteger);
+        c1 = DecodeComponent(w0, 16, 16, isSigned, isInteger);
         break;
     case 26: // 16_16_16_16
     {
         const uint w1 = SwapWord(LoadSource(src + 4), endian);
-        c[0] = DecodeComponent(w0, 0, 16, isSigned, isInteger);
-        c[1] = DecodeComponent(w0, 16, 16, isSigned, isInteger);
-        c[2] = DecodeComponent(w1, 0, 16, isSigned, isInteger);
-        c[3] = DecodeComponent(w1, 16, 16, isSigned, isInteger);
+        c0 = DecodeComponent(w0, 0, 16, isSigned, isInteger);
+        c1 = DecodeComponent(w0, 16, 16, isSigned, isInteger);
+        c2 = DecodeComponent(w1, 0, 16, isSigned, isInteger);
+        c3 = DecodeComponent(w1, 16, 16, isSigned, isInteger);
         break;
     }
     case 31: // 16_16_FLOAT
-        c[0] = f16tof32(w0);
-        c[1] = f16tof32(w0 >> 16);
+        c0 = f16tof32(w0);
+        c1 = f16tof32(w0 >> 16);
         break;
     case 32: // 16_16_16_16_FLOAT
     {
         const uint w1 = SwapWord(LoadSource(src + 4), endian);
-        c[0] = f16tof32(w0);
-        c[1] = f16tof32(w0 >> 16);
-        c[2] = f16tof32(w1);
-        c[3] = f16tof32(w1 >> 16);
+        c0 = f16tof32(w0);
+        c1 = f16tof32(w0 >> 16);
+        c2 = f16tof32(w1);
+        c3 = f16tof32(w1 >> 16);
         break;
     }
     case 33: // 32
     case 34: // 32_32
     case 35: // 32_32_32_32
-    {
-        const uint components = format == 33 ? 1 : (format == 34 ? 2 : 4);
-        for (uint i = 0; i < components; ++i)
-            c[i] = DecodeComponent(i == 0 ? w0 : SwapWord(LoadSource(src + i * 4), endian), 0, 32,
-                                   isSigned, isInteger);
+        c0 = DecodeComponent(w0, 0, 32, isSigned, isInteger);
+        if (format != 33)
+            c1 = DecodeComponent(SwapWord(LoadSource(src + 4), endian), 0, 32, isSigned, isInteger);
+        if (format == 35)
+        {
+            c2 = DecodeComponent(SwapWord(LoadSource(src + 8), endian), 0, 32, isSigned, isInteger);
+            c3 = DecodeComponent(SwapWord(LoadSource(src + 12), endian), 0, 32, isSigned, isInteger);
+        }
         break;
-    }
     case 36: // 32_FLOAT
     case 37: // 32_32_FLOAT
     case 38: // 32_32_32_32_FLOAT
     case 57: // 32_32_32_FLOAT
-    {
-        const uint components = format == 36 ? 1 : (format == 37 ? 2 : (format == 57 ? 3 : 4));
-        for (uint i = 0; i < components; ++i)
-            c[i] = asfloat(i == 0 ? w0 : SwapWord(LoadSource(src + i * 4), endian));
+        c0 = asfloat(w0);
+        if (format != 36)
+            c1 = asfloat(SwapWord(LoadSource(src + 4), endian));
+        if (format == 38 || format == 57)
+            c2 = asfloat(SwapWord(LoadSource(src + 8), endian));
+        if (format == 38)
+            c3 = asfloat(SwapWord(LoadSource(src + 12), endian));
         break;
-    }
     default:
         break;
     }
     uint4 result;
+    [unroll]
     for (uint i = 0; i < 4; ++i)
     {
-        uint pick = (type >> (10 + 3 * i)) & 7;
-        pick = pick < 6 ? pick : 4;  // 4: 0, 5: 1; the rest read 0
-        result[i] = asuint(c[pick]);
+        const uint pick = (type >> (10 + 3 * i)) & 7;  // 0-3 the components, 5: 1; 4 and the rest read 0
+        float v = 0.0f;
+        switch (pick)
+        {
+        case 0: v = c0; break;
+        case 1: v = c1; break;
+        case 2: v = c2; break;
+        case 3: v = c3; break;
+        case 5: v = 1.0f; break;
+        default: break;
+        }
+        result[i] = asuint(v);
     }
     g_Buffers[kStreamBuffer].Store4(dst, result);
 }

@@ -7,6 +7,8 @@
 #include "shader.h"
 #include "shader_code.h"
 
+#include <set>
+
 struct StringBuffer
 {
     std::string out;
@@ -55,6 +57,13 @@ struct ShaderRecompiler : StringBuffer
     // from its constant buffer (register, then its four words), for the renderer to write there (main.cpp's
     // g_shaderLiterals).
     std::vector<std::array<uint32_t, 5>> cbufLiterals;
+    // vivapinata-nx (2026-11-03, the title's tall grass): every literal register, and the literal registers an indexed read starts
+    // from. Such an array and the literals running on from it go in cbufLiterals, not only the ones NAK cannot encode: VS
+    // D6F1A0B2's c[240+a0] blade heights have clean values, were inlined, and read as zero. Not every literal of a shader that
+    // indexes: the skinning shaders' c[0+a0] bones run over their c248-c251 on big skeletons, the game writes those after binding
+    // the shader, and overlaying the literals there broke the skinning (the tower's smoke went).
+    std::vector<std::array<uint32_t, 5>> allLiterals;
+    std::set<uint32_t> indexedLiteralBases;
     uint32_t loopDepth = 0;
     // Mini vertex fetches reuse the fetch constant, stride and index of the last full fetch.
     VertexFetchInstruction lastFullVertexFetch{};
@@ -94,6 +103,16 @@ struct ShaderRecompiler : StringBuffer
     // sets PA_CL_CLIP_CNTL.vtx_kill_or). The grass kills its blades where the density map is
     // below their threshold.
     bool hasVertexKill = false;
+    bool userClipPlane = false;  // vivapinata-nx (from rr6-nx): set by the caller, this vertex shader writes SV_ClipDistance0 (renut-ultimate: every vertex shader, main.cpp)
+    // vivapinata-nx (2026-11-03): the vertex shader fetches by r1.y or r1.z: a tessellated list's control points, which the
+    // host gives it through renutControlPoints (shader_common.h).
+    bool fetchesControlPoints = false;
+    // vivapinata-nx (2026-11-03): a cube instruction, and a cube fetch: without a fetch the shader reads the cube's numbers itself.
+    bool hasCubeOp = false;
+    bool hasCubeFetch = false;
+    // vivapinata-nx (2026-11-03, census): the texture fetches that name their own filters (slot: mag, min, mip).
+    std::string fetchFilterCensus;
+    std::string fetchLodCensus;
     // banjo-nx (banjo_gpu_depth_only, package 28): what a pixel shader does besides its colours, which a draw without
     // it would lose: SHADER_FLAG_PIXEL_KILL a kill instruction (clip), SHADER_FLAG_PIXEL_DEPTH a depth export (SV_Depth).
     // The alpha test and banjoBlendSkip are the draw's (the renderer knows them); memexport is memExportConstants.

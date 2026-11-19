@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # Direct calls to game functions that have no hook (post-codegen step, run after every codegen).
 #
-# (From masseffect-nx; sa2-nx: file names and hook sources adapted, run on generated/default and generated/data_dll.)
+# (From masseffect-nx via sa2-nx; banjo-nx: Banjo's hook sources and its flat app/generated tree.)
 # With GCC every recompiled function sub_X is a weak alias of __imp__sub_X (DEFINE_REX_FUNC, <project>_pch.h),
 # so that one of our REX_HOOK_RAW(sub_X) replaces it at link time. The codegen always calls sub_X, and the
 # compiler cannot inline a weak function into another (a hook could replace it): not within the same file
 # and not with LTO. This step changes `sub_X(ctx, base);` into `__imp__sub_X(ctx, base);` when sub_X has no
 # hook, which is exactly the same function, but can now be inlined.
 #
-# Any 82xxxxxx address that appears in the code of the app or SDK sources (comments and __imp__sub_X references
-# left out, see CodeOnly) or in the toml / txt files counts as hooked (the D3D trace builds its hooks with
-# sub_##addr). That is slightly more than needed and safe.
+# Any 82xxxxxx address that appears in the app or SDK sources or in the hook tomls (banjo-nx: not
+# config/renut_funcs.toml, the list of every function boundary) counts as hooked (the
+# D3D trace builds its hooks with sub_##addr). That is slightly more than needed and safe.
 #
-# It does not touch sa2_init.cpp or sa2_register.cpp: the dispatch table for indirect calls still
+# It does not touch masseffect_init.cpp or masseffect_register.cpp: the dispatch table for indirect calls still
 # points to sub_X and sees the hooks. It has to be run again after every codegen (tools/codegen.sh does).
 #
 # Usage: python3 tools/direct_calls.py [--undo] [--dry-run] [--check] [--gen <generated folder>] [--hooked-list <file>]
@@ -28,21 +28,43 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repository root
 APP = os.path.join(ROOT, 'app')
-GEN = os.path.join(APP, 'generated', 'default')
+GEN = os.path.join(APP, 'generated')
 SDK = os.environ.get('REXSDK_DIR') or os.path.join(ROOT, 'sdk')
 SOURCES = [os.path.join(APP, 'src'), os.path.join(SDK, 'src'), os.path.join(SDK, 'include'),
-           os.path.join(APP, 'overrides.toml'), os.path.join(APP, 'overrides_data_dll.toml'),
-           os.path.join(APP, 'perf_overrides.toml'), os.path.join(APP, 'sa2_manifest.toml'),
+           os.path.join(APP, 'config', 'renut_hooks.toml'),
+           os.path.join(APP, 'config', 'renut_gpu_funcs.toml'), os.path.join(APP, 'renut_config.toml'), os.path.join(APP, 'renut_manifest.toml'),
            os.path.join(APP, 'CMakeLists.txt')]
-# Diagnostic builds (e.g. the Direct3D census) list hooks that live outside the scanned sources here, one sub_X per
-# line; an empty or missing file adds nothing. Every run reads it, so a codegen re-run keeps them.
-EXTRA_LIST = os.path.join(ROOT, 'out', 'extra_hooks.txt')
 
 
-def hooked():
+# In C/C++ files only the code counts (from peggle2-nx, 2026-10-15; futari-nx found it first). Comments name addresses
+# for the reader, and a native calls the original through __imp__sub_X: neither defines a hook. Before, 128 of the 592
+# "hooked" names came only from them, and 208 calls to 28 functions stayed weak (not inlinable; 124 to sub_823E4A38
+# because of a comment in cvar_menu.cpp). The .txt files (localized.txt among them) are still read whole; the tomls and CMakeLists.txt
+# without their # comments (2026-10-19).
+CODE_SUFFIXES = ('.cpp', '.cc', '.c', '.h', '.hpp', '.inc')
+
+
+def CodeOnly(text):
+    text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.S)
+    text = re.sub(r'//[^\n]*', ' ', text)
+    return re.sub(r'__imp__sub_[0-9A-Fa-f]{8}', ' ', text)
+
+
+def code_address_re(gen):
+    """renut-ultimate (2026-11-16, port 144; tw2de_nx's): the guest code addresses the hook sources name: 82xxxxxx, and
+    83xxxxxx too when the game's code runs there (its function table, <project>_init.cpp, has entries at 0x83000000 and
+    above: TW2's sub_833C2518 ...); a hook there was not seen, so its calls went past it. A tree without such entries
+    reads the sources as before (an 83xxxxxx number there is not a function)."""
+    import glob as _glob
+    for p in _glob.glob(os.path.join(gen, '*_init.cpp')):
+        if re.search(r'\{ 0x83[0-9A-Fa-f]{6},', open(p, encoding='utf-8', errors='ignore').read()):
+            return r'(?<![0-9A-Fa-f])(8[23][0-9A-Fa-f]{6})(?![0-9A-Fa-f])'
+    return r'(?<![0-9A-Fa-f])(82[0-9A-Fa-f]{6})(?![0-9A-Fa-f])'
+
+
+def hooked(gen=GEN):
     names = set()
-    if os.path.isfile(EXTRA_LIST):
-        names |= set(open(EXTRA_LIST, encoding='utf-8').read().split())
+    addr_re = code_address_re(gen)  # port 144
     for root in SOURCES:
         if os.path.isfile(root):
             paths = [root]
@@ -54,36 +76,19 @@ def hooked():
                 text = open(path, encoding='utf-8', errors='ignore').read()
             except OSError:
                 continue
-            if os.path.join('src', 'renut_engine') in path:
-                # sa2-nx (2026-10-20): Renut's renderer (app/src/renut_engine) names N&B's addresses in constants and
-                # in files the build leaves out; only its hook macros at SA2's addresses hook (BANJO_RENUT_HOOK*).
-                for m in re.findall(r'BANJO_RENUT_HOOK[A-Z_]*\(sub_([0-9A-Fa-f]{8})', CodeOnly(text)):
-                    names.add('sub_' + m.upper())
-                continue
             if path.endswith(CODE_SUFFIXES):
                 text = CodeOnly(text)
             elif path.endswith('.toml') or os.path.basename(path) == 'CMakeLists.txt':
-                # From banjo-nx (2026-10-19): a # comment names addresses for the reader, not hooks, and
-                # non_argument_as_local's keep list names functions that keep r11/r12 in ctx. Both kept their
-                # functions on the weak alias (not inlinable).
+                # banjo-nx (2026-10-19, CPU proposal 7): a # comment names addresses for the reader, not hooks.
+                # renut_config.toml's comment on the scalar/vector alternators kept 99 calls to 24 functions on the
+                # weak alias (not inlinable; 56 of them to sub_82CE9250).
                 text = re.sub(r'(?m)(^|[ \t])#[^\n]*', ' ', text)
+            if os.path.basename(path) == 'renut_config.toml':
+                # non_argument_as_local's keep list names functions that keep r11/r12 in ctx, not hooks
                 text = re.sub(r'non_argument_as_local_keep\s*=\s*\[.*?\]', ' ', text, flags=re.S)
-            for m in re.findall(r'(?<![0-9A-Fa-f])(82[0-9A-Fa-f]{6})(?![0-9A-Fa-f])', text):
+            for m in re.findall(addr_re, text):
                 names.add('sub_' + m.upper())
     return names
-
-
-# In C/C++ files only the code counts (2026-10-07, after futari-nx found the same in its tool). Comments name
-# addresses for the reader, and a native layer calls originals through __imp__sub_X: neither hooks sub_X. Before,
-# both did: 1,021 of 1,136 "hooked" names came from them, and 651 calls stayed weak (not inlinable). The .toml and
-# .txt files are still read whole, as before.
-CODE_SUFFIXES = ('.cpp', '.cc', '.c', '.h', '.hpp', '.inc')
-
-
-def CodeOnly(text):
-    text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.S)
-    text = re.sub(r'//[^\n]*', ' ', text)
-    return re.sub(r'__imp__sub_[0-9A-Fa-f]{8}', ' ', text)
 
 
 def main():
@@ -97,7 +102,7 @@ def main():
     if '--hooked-list' in sys.argv:
         with_hook = set(open(sys.argv[sys.argv.index('--hooked-list') + 1], encoding='utf-8').read().split())
     else:
-        with_hook = hooked()
+        with_hook = hooked(gen)
     call = re.compile(r'(?<![\w])sub_([0-9A-F]{8})\(ctx, base\);')
     direct = re.compile(r'__imp__sub_([0-9A-F]{8})\(ctx, base\);')
     changed = 0

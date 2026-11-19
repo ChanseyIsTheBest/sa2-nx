@@ -12,6 +12,7 @@
 #include <rex/logging.h>
 #include <rex/stream.h>
 #include <rex/sys_counters.h>
+#include <rex/system/wait_registry.h>
 #include <rex/system/xevent.h>
 
 namespace rex::system {
@@ -76,21 +77,26 @@ void XEvent::Query(uint32_t* out_type, uint32_t* out_state) {
 
 int32_t XEvent::Set(uint32_t priority_increment, bool wait) {
   REX_SYS_CENSUS(rex::syscount::kCensusEventSet, 1);
+  // blur-nx (2026-11-14, rex/system/wait_registry.h): the stall dumps' record of this set.
+  waitreg::NoteSignalOf(this, waitreg::kSet);
   event_->Set();
   return 1;
 }
 
 int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
+  waitreg::NoteSignalOf(this, waitreg::kPulse);
   event_->Pulse();
   return 1;
 }
 
 int32_t XEvent::Reset() {
+  waitreg::NoteSignalOf(this, waitreg::kReset);
   event_->Reset();
   return 1;
 }
 
 void XEvent::Clear() {
+  waitreg::NoteSignalOf(this, waitreg::kReset);
   event_->Reset();
 }
 

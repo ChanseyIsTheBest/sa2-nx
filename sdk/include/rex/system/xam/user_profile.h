@@ -113,6 +113,9 @@ class UserProfile {
     uint32_t loaded_title_id;
     Setting(uint32_t setting_id, Type type, size_t size, bool is_set)
         : setting_id(setting_id), type(type), size(size), is_set(is_set), loaded_title_id(0) {}
+    // Port 159 (from fnxf_xiii): the settings are deleted through unique_ptr<Setting>; UnicodeSetting and
+    // BinarySetting hold a u16string and a vector, which a non-virtual destructor left undestroyed (undefined).
+    virtual ~Setting() = default;
     virtual void Append(X_USER_PROFILE_SETTING_DATA* data, SettingByteStream* stream) {
       (void)stream;
       data->type = static_cast<uint8_t>(type);

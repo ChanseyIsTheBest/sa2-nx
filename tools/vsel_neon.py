@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """banjo-nx (package 27, codegen round): the guest's vsel as one NEON bit select.
 
 The generator writes VMX vsel (vD = (vA & ~vC) | (vB & vC)) through simde's SSE2 forms:
@@ -15,6 +14,17 @@ import glob
 import os
 import re
 import sys
+
+
+def gen_file(gen, suffix):
+    """renut-ultimate (2026-11-19, port 186; found by sasrt-nx's sync): the generator names its files after the project
+    (<project>_pch.h, <project>_init.cpp, <project>_recomp.N.cpp): renut_ in the base, a port's own name otherwise."""
+    for name in sorted(os.listdir(gen)):
+        m = re.fullmatch(r'(\w+)_recomp\.\d+\.cpp', name)
+        if m:
+            return os.path.join(gen, m.group(1) + '_' + suffix)
+    return os.path.join(gen, 'renut_' + suffix)
+
 
 PCH_MACRO = '''
 // banjo-nx (package 27): tools/vsel_neon.py. VMX vsel, (A & ~C) | (B & C), as one NEON bit select on AArch64.
@@ -98,7 +108,7 @@ def main():
                     pos = end
                 open(path, 'w', encoding='utf-8', newline='\n').write(''.join(out))
         return
-    pch = os.path.join(gen, 'sa2_pch.h')
+    pch = gen_file(gen, 'pch.h')
     if os.path.isfile(pch):
         p = open(pch, encoding='utf-8').read()
         if 'REX_VSEL' not in p:

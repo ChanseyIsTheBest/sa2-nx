@@ -285,12 +285,13 @@ bool HostPathDevice::SaveIndex(HostPathEntry* root, uint64_t inputs, std::string
    * Windows') refuses to replace an existing file, so on failure the old one is removed first and
    * the rename retried. In that window there is no index at all, which only means one more full scan.
    */
-  // std::filesystem::rename takes the native path type (wide on Windows).
-  std::filesystem::rename(temporal, path, ec);
-  if (ec) {
+  // banjo-nx: std::filesystem::rename instead of std::rename, which takes char* (path is wchar_t on Windows).
+  std::error_code rename_ec;
+  std::filesystem::rename(temporal, path, rename_ec);
+  if (rename_ec) {
     std::filesystem::remove(path, ec);
-    std::filesystem::rename(temporal, path, ec);
-    if (ec) {
+    std::filesystem::rename(temporal, path, rename_ec);
+    if (rename_ec) {
       std::filesystem::remove(temporal, ec);
       *reason = "could not rename to " + rex::path_to_utf8(path);
       return false;

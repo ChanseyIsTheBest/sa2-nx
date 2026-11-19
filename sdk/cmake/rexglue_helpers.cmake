@@ -90,13 +90,6 @@ function(rexglue_configure_target target_name)
     target_compile_definitions(${target_name} PRIVATE
         REXGLUE_BUILD_CONFIG="$<CONFIG>")
 
-    # rex_app.cpp includes imgui.h, but rexruntime links imgui privately, so its include path does not reach the
-    # title (the same fix as rexglue_switch_configure_target). In-tree builds only: an installed SDK ships the headers.
-    if(TARGET imgui)
-        target_include_directories(${target_name} PRIVATE
-            $<TARGET_PROPERTY:imgui,INTERFACE_INCLUDE_DIRECTORIES>)
-    endif()
-
     if(UNIX AND NOT APPLE)
         set_target_properties(${target_name} PROPERTIES
             INSTALL_RPATH "$ORIGIN"

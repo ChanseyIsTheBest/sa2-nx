@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """banjo-nx (package 27, codegen round): the tiny leaf functions a generated file calls in another file, as inline
 copies in the calling file.
 
@@ -30,6 +29,17 @@ import os
 import re
 import sys
 
+
+def gen_file(gen, suffix):
+    """renut-ultimate (2026-11-19, port 186; found by sasrt-nx's sync): the generator names its files after the project
+    (<project>_pch.h, <project>_init.cpp, <project>_recomp.N.cpp): renut_ in the base, a port's own name otherwise."""
+    for name in sorted(os.listdir(gen)):
+        m = re.fullmatch(r'(\w+)_recomp\.\d+\.cpp', name)
+        if m:
+            return os.path.join(gen, m.group(1) + '_' + suffix)
+    return os.path.join(gen, 'renut_' + suffix)
+
+
 BEGIN = '// banjo-nx: inline copies of tiny leaf functions of other files (tools/inline_leaves.py)'
 END = '// banjo-nx: end of the inline copies (tools/inline_leaves.py)'
 FUNC_RE = re.compile(r'^DEFINE_REX_FUNC\((sub_[0-9A-F]+)\) \{$')
@@ -53,9 +63,9 @@ def restore_text(text):
     if BEGIN in text:
         a = text.index(BEGIN)
         b = text.index(END) + len(END) + 1
-        # peggle2-nx (2026-10-19): the empty line main() puts after END goes too. Before, every run of
-        # tools/post_codegen.py on a processed tree left one more empty line in each file with copies.
-        if text[b:b + 1] == '\n':
+        # The insertion adds an empty line after END (copies + ['']): take it too, or every run on a processed tree
+        # left one more blank line (2026-10-19, found by peggle2-nx and sasrt-nx).
+        if text.startswith('\n', b):
             b += 1
         text = text[:a] + text[b:]
     return INL_RE.sub(lambda m: f'__imp__{m.group(1)}(ctx, base);', text)
@@ -85,8 +95,7 @@ def parse_functions(files, max_ins, hot=None, hot_max=0):
             calls = [c for c in CALL_ANY_RE.findall(text)]
             if calls:
                 continue
-            if 'static ' in text or 'thread_local' in text or 'REX_HOT_' in text or 'banjo_' in text or 'sa2_' in text or \
-                    '&ctx' in text:
+            if 'static ' in text or 'thread_local' in text or 'REX_HOT_' in text or 'banjo_' in text:
                 continue
             leaves[name] = (path, body)
     return leaves
@@ -112,7 +121,7 @@ def main():
             open(path, 'w', encoding='utf-8', newline='\n').write(new)
     if '--restore' in args:
         return
-    pch = os.path.join(gen, 'sa2_pch.h')
+    pch = gen_file(gen, 'pch.h')
     if os.path.isfile(pch):
         p = open(pch, encoding='utf-8').read()
         if 'REX_INL(' not in p:

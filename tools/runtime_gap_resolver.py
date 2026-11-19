@@ -59,6 +59,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--generated", type=Path, default=ROOT / "app" / "generated" / "default")
     parser.add_argument("--overrides", type=Path, default=ROOT / "app" / "overrides.toml")
+    # Port 167 (from fnxf_xiii, its note of 2026-10-23): the manifest's [entrypoint.functions] count as declared too (a
+    # second key for the same address is a TOML error the code generator stops on).
+    parser.add_argument("--manifest", type=Path, default=ROOT / "app" / "renut_manifest.toml",
+                        help="its [entrypoint.functions] count as declared too")
     parser.add_argument(
         "--find-gaps",
         type=Path,
@@ -108,9 +112,17 @@ def override_addresses(overrides_text: str) -> set[str]:
     return {
         canonical_address(match)
         for match in re.findall(
-            r'^"(0x[0-9A-Fa-f]+)"\s*=', overrides_text, re.MULTILINE
+            # port 167 (fnxf_xiii): quoted and bare keys both name the same TOML key
+            r'^\s*"?(0x[0-9A-Fa-f]+)"?\s*=', overrides_text, re.MULTILINE
         )
     }
+
+
+def last_table(text: str) -> str | None:
+    # Port 167 (from fnxf_xiii): the entry is appended only while [functions] is the file's last table (a key appended
+    # after a later table lands in that table: the "[input_p2]" trap).
+    tables = re.findall(r"^\s*\[([^\]]+)\]\s*(?:#.*)?$", text, re.MULTILINE)
+    return tables[-1].strip() if tables else None
 
 
 def classify_report(report_text: str, address: str) -> tuple[GapEvidence | None, str]:
@@ -181,6 +193,8 @@ def main() -> int:
 
     overrides_text = args.overrides.read_text()
     existing = override_addresses(overrides_text)
+    if args.manifest.is_file():  # port 167
+        existing |= override_addresses(args.manifest.read_text())
     command = [
         sys.executable,
         str(args.find_gaps),
@@ -229,6 +243,8 @@ def main() -> int:
         return 0
 
     selected = select_apply_candidate(eligible, args.address)
+    if last_table(overrides_text) != "functions":  # port 167 (fnxf_xiii)
+        die(f"the last table of {args.overrides} is not [functions]: add the entry by hand")
     location = (
         "Exact start" if selected.offset == 0 else f"Observed entry +0x{selected.offset:X} inside"
     )

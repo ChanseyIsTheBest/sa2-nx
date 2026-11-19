@@ -122,10 +122,14 @@ endmacro()
 # A cross build (Nintendo Switch) has no rexglue it could run: the tool is a
 # host program. There the generated sources must already exist, produced by
 # running codegen with a host SDK.
+# renut-ultimate (port 69, 2026-11-10, blur-nx's report): the PCH header is a byproduct too. Codegen writes it and
+# a post-codegen step may edit it after; unlisted, a codegen that re-ran in a build left the PCH as it was, and
+# every recomp object failed ("has been modified since the precompiled header") until a second build.
 if(TARGET rex::rexglue)
 add_custom_command(
     OUTPUT "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.build.stamp"
            {{ cmake_var("REXGLUE_ENTRYPOINT_GENERATED_SOURCES") }}
+    BYPRODUCTS "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/{{ names.snake_case }}_pch.h"
     COMMAND $<TARGET_FILE:rex::rexglue> codegen {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ names.snake_case }}_manifest.toml
     DEPFILE "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.d"
     WORKING_DIRECTORY {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}

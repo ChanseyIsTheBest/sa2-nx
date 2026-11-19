@@ -13,6 +13,7 @@
 #include "helpers.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 #include <rex/codegen/binary_view.h>
 #include <rex/logging.h>
@@ -38,6 +39,18 @@ const RecompilerConfig& BuilderContext::config() const {
   return emitCtx.config;
 }
 
+// renut-ultimate (2026-11-16, port 144; tw2de_nx's): exact_fp, exact_fp_functions, exact_fp_log, fp_origin_log.
+bool BuilderContext::exact_fp() const {
+  const auto& c = config();
+  return c.exactFp || (!c.exactFpFunctions.empty() && c.exactFpFunctions.count(fn.base()) != 0);
+}
+bool BuilderContext::exact_fp_log() const {
+  return config().exactFpLog && !exact_fp();
+}
+bool BuilderContext::fp_origin_log() const {
+  return config().fpOriginLog;
+}
+
 const FunctionGraph& BuilderContext::graph() const {
   return emitCtx.graph;
 }
@@ -49,7 +62,33 @@ const FunctionGraph& BuilderContext::graph() const {
 // Localizing a non-volatile assumes the function owns it across its whole body.
 // An SEH funclet does not: it inherits its owner's live registers through ctx.
 bool BuilderContext::localizeNonVolatiles() const {
-  return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters();
+  return config().nonVolatileRegistersAsLocalVariables && !fn.sharesRegisters() && !keepsNonVolatilesInCtx();
+}
+
+// A __save*/__rest* helper (__savegprlr_N: rN..r31, __savefpr_N: fN..f31, __savevmx_N: vN..v31 or vN..v127)
+// whose range covers a non_volatile_as_local_keep register: that register lives in ctx, so the call stays.
+bool BuilderContext::helperCoversKeptRegister(const std::string& name) const {
+  const auto& cfg = config();
+  if (!cfg.nonVolatileKeepR && !cfg.nonVolatileKeepF && !cfg.nonVolatileKeepV[0] && !cfg.nonVolatileKeepV[1])
+    return false;
+  size_t us = name.rfind('_');
+  if (us == std::string::npos)
+    return false;
+  unsigned n = static_cast<unsigned>(std::strtoul(name.c_str() + us + 1, nullptr, 10));
+  char kind = name.find("gprlr") != std::string::npos ? 'r' : name.find("fpr") != std::string::npos ? 'f' : 'v';
+  unsigned last = (kind == 'v' && n >= 64) ? 127 : 31;
+  for (unsigned i = n; i <= last; ++i)
+    if (cfg.nonVolatileKept(kind, i))
+      return true;
+  return false;
+}
+
+// non_volatile_as_local_exclude: the function keeps its non-volatiles in ctx and calls the save/restore
+// helpers, whose bodies therefore work on ctx as well (a localized function never calls them).
+bool BuilderContext::keepsNonVolatilesInCtx() const {
+  const auto& name = fn.name();
+  return name.rfind("__save", 0) == 0 || name.rfind("__rest", 0) == 0 ||
+         config().nonVolatileLocalExcluded(fn.base());
 }
 
 // Same for r0, r2, r11, r12, f0 and v32-v63 (non_argument_as_local). A share_registers callee (an SEH
@@ -62,10 +101,10 @@ bool BuilderContext::localizeNonArguments() const {
   return config().nonArgumentRegistersAsLocalVariables && !fn.sharesRegisters() && !keepsNonArgumentsInCtx(fn);
 }
 
-// sa2-nx: non_argument_as_local_keep, and the save/restore helpers: __savegprlr_N / __savefpr_N store the
-// r12 their caller set up (the LR or a frame address), __restfpr_N and the vector helpers address through
-// r12 (and r11). Their calls are elided with non_volatile_as_local; without it they are real calls that
-// must find these arguments in ctx.
+// sa2-nx (via peggle2-nx): non_argument_as_local_keep, and the save/restore helpers: __savegprlr_N /
+// __savefpr_N store the r12 their caller set up (the LR or a frame address), __restfpr_N and the vector
+// helpers address through r12 (and r11). Their calls are elided with non_volatile_as_local except in a
+// non_volatile_as_local_exclude function, where they are real calls that must find these arguments in ctx.
 bool BuilderContext::keepsNonArgumentsInCtx(const FunctionNode& function) const {
   const auto& name = function.name();
   return config().nonArgumentKeep.count(function.base()) != 0 || name.rfind("__save", 0) == 0 ||
@@ -74,7 +113,7 @@ bool BuilderContext::keepsNonArgumentsInCtx(const FunctionNode& function) const 
 
 std::string BuilderContext::r(size_t index) {
   if ((localizeNonArguments() && (index == 0 || index == 2 || index == 11 || index == 12)) ||
-      (localizeNonVolatiles() && index >= 14)) {
+      (localizeNonVolatiles() && index >= 14 && !config().nonVolatileKept('r', index))) {
     locals.r[index] = true;
     return fmt::format("r{}", index);
   }
@@ -82,7 +121,8 @@ std::string BuilderContext::r(size_t index) {
 }
 
 std::string BuilderContext::f(size_t index) {
-  if ((localizeNonArguments() && index == 0) || (localizeNonVolatiles() && index >= 14)) {
+  if ((localizeNonArguments() && index == 0) ||
+      (localizeNonVolatiles() && index >= 14 && !config().nonVolatileKept('f', index))) {
     locals.f[index] = true;
     return fmt::format("f{}", index);
   }
@@ -91,7 +131,8 @@ std::string BuilderContext::f(size_t index) {
 
 std::string BuilderContext::v(size_t index) {
   if ((localizeNonArguments() && (index >= 32 && index <= 63)) ||
-      (localizeNonVolatiles() && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)))) {
+      (localizeNonVolatiles() && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127)) &&
+       !config().nonVolatileKept('v', index))) {
     locals.v[index] = true;
     return fmt::format("v{}", index);
   }
@@ -209,9 +250,9 @@ void BuilderContext::emit_function_call(uint32_t address) {
     // Save PPCContext for restoration after longjmp
     println("\t{} = ctx;", env());
     // Registers kept in C++ locals (cr/ctr/xer_as_local, non_volatile_as_local, ...) are not in ctx: copy them
-    // into env as well and take them back after a longjmp (from banjo-nx). The guest's longjmp gives the setjmp
-    // caller its registers as they were at the setjmp; C++ leaves a local that changed in between indeterminate.
-    // The full set of locals is known only at the end of the function, so FunctionGraph fills in the markers.
+    // into env as well and take them back after a longjmp. The guest's longjmp gives the setjmp caller its
+    // registers as they were at the setjmp; C++ leaves a local that changed in between indeterminate. The
+    // full set of locals is known only at the end of the function, so FunctionGraph fills in the markers.
     println("\t{}", kSetjmpSaveLocalsMarker);
     // Use custom ppc_setjmp that uses guest address as key
     println("\t{}.s64 = ppc_setjmp({}.u32);", temp(), r(3));
@@ -228,11 +269,11 @@ void BuilderContext::emit_function_call(uint32_t address) {
       const auto& name = targetFn->name();
 
       // Handle save/restore helpers. Gated on the global setting, not this
-      // function's: the helper bodies are emitted under it too, so once they
-      // spill to locals they are no-ops that scribble zeros on the caller's
-      // frame. A share_registers function still has to elide them.
-      if (cfg.nonVolatileRegistersAsLocalVariables &&
-          (name.find("__rest") == 0 || name.find("__save") == 0)) {
+      // function's localization: a share_registers function still elides them
+      // (it works on its owner's frame). Only a non_volatile_as_local_exclude
+      // function calls them; the helper bodies keep ctx for it.
+      if (cfg.nonVolatileRegistersAsLocalVariables && !keepsNonVolatilesInCtx() &&
+          (name.find("__rest") == 0 || name.find("__save") == 0) && !helperCoversKeptRegister(name)) {
         // print nothing - these are handled by local variable tracking
         return;
       }
@@ -426,9 +467,11 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
           if (targetFn->sharesRegisters())
             emit_call_sharing_registers(fmt::format("{}(ctx, base);", targetFn->name()), false,
                                         "\t\t");
-          else if (keepsNonArgumentsInCtx(*targetFn))
-            emit_call_handing_non_arguments(fmt::format("{}(ctx, base);", targetFn->name()), false,
-                                            "\t\t");
+          // banjo-nx (2026-10-15): a conditional tail branch to a function that keeps r0/r2/r11/r12/f0/v32-v63 in
+          // ctx (non_argument_as_local_keep; typically a fragment split off this function that goes on with its r11)
+          // hands the localized ones over too. non_argument_audit.py --with-option found it (sub_82C83DD8).
+          else if (keepsNonArgumentsInCtx(*targetFn) && localizeNonArguments())
+            emit_call_handing_non_arguments(fmt::format("{}(ctx, base);", targetFn->name()), false, "\t\t");
           else
             println("\t\t{}(ctx, base);", targetFn->name());
           println("\t\treturn;");
@@ -665,24 +708,32 @@ FloatKind ClassifyFloat(const ppc_insn& insn) {
     return FloatKind::kOther;
   }
   switch (insn.opcode->id) {
-    case PPC_INST_VADDFP:
-    case PPC_INST_VADDFP128:
+    // blur-nx (2026-11-11, docs/vector-ideas-2.md VX-01 / VX-03): the conversions and the round to nearest / to zero
+    // need no mode (vector.cpp says why), and vcmpeqfp v, v, v (the NaN test) neither: as their builders.
     case PPC_INST_VCFPSXWS128:
     case PPC_INST_VCFPUXWS128:
     case PPC_INST_VCFSX:
     case PPC_INST_VCFUX:
-    case PPC_INST_VCMPBFP:
-    case PPC_INST_VCMPBFP128:
-    case PPC_INST_VCMPEQFP:
-    case PPC_INST_VCMPEQFP128:
-    case PPC_INST_VCMPGEFP:
-    case PPC_INST_VCMPGEFP128:
-    case PPC_INST_VCMPGTFP:
-    case PPC_INST_VCMPGTFP128:
     case PPC_INST_VCSXWFP128:
     case PPC_INST_VCTSXS:
     case PPC_INST_VCTUXS:
     case PPC_INST_VCUXWFP128:
+    case PPC_INST_VRFIN:
+    case PPC_INST_VRFIN128:
+    case PPC_INST_VRFIZ:
+    case PPC_INST_VRFIZ128:
+      return FloatKind::kOther;
+    case PPC_INST_VCMPEQFP:
+    case PPC_INST_VCMPEQFP128:
+      return insn.operands[1] == insn.operands[2] ? FloatKind::kOther : FloatKind::kVmx;
+    case PPC_INST_VADDFP:
+    case PPC_INST_VADDFP128:
+    case PPC_INST_VCMPBFP:
+    case PPC_INST_VCMPBFP128:
+    case PPC_INST_VCMPGEFP:
+    case PPC_INST_VCMPGEFP128:
+    case PPC_INST_VCMPGTFP:
+    case PPC_INST_VCMPGTFP128:
     case PPC_INST_VEXPTEFP:
     case PPC_INST_VEXPTEFP128:
     case PPC_INST_VLOGEFP:
@@ -704,12 +755,8 @@ FloatKind ClassifyFloat(const ppc_insn& insn) {
     case PPC_INST_VREFP128:
     case PPC_INST_VRFIM:
     case PPC_INST_VRFIM128:
-    case PPC_INST_VRFIN:
-    case PPC_INST_VRFIN128:
     case PPC_INST_VRFIP:
     case PPC_INST_VRFIP128:
-    case PPC_INST_VRFIZ:
-    case PPC_INST_VRFIZ128:
     case PPC_INST_VRSQRTEFP:
     case PPC_INST_VRSQRTEFP128:
     case PPC_INST_VSUBFP:

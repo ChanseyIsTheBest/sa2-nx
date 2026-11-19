@@ -5,18 +5,18 @@
  *
  * Every field and rule here comes from the game's statically linked
  * libraries (addresses in the N&B database):
- * - The fetch constant: D3D::SetTextureHeader (0x8228E990) writes the data
- *   fields, D3DDevice_SetTexture (0x8222F410) merges them with the sampler
+ * - The fetch constant: D3D::SetTextureHeader (0x8225C878) writes the data
+ *   fields, D3DDevice_SetTexture (0x821FE558) merges them with the sampler
  *   state the D3DDevice_SetSamplerState_* setters keep.
- * - Sizes: GetGpuTextureDimensions (0x82655540); per-format bits per pixel
- *   (table 0x820052F8) and block size (BlockSizeOfGpuFormat, 0x82207B90);
- *   alignment (AlignTextureDimensions, 0x82207C28); total sizes
- *   (FindTextureSize, 0x82287E60).
+ * - Sizes: GetGpuTextureDimensions (0x8263DCA8); per-format bits per pixel
+ *   (table 0x82005200) and block size (BlockSizeOfGpuFormat, 0x821D70A8);
+ *   alignment (AlignTextureDimensions, 0x821D7140); total sizes
+ *   (FindTextureSize, 0x82255DC0).
  * - Level placement: the subresource layout D3D and XGGetTextureLayout use
- *   (0x82207680) and the packed mip tail (GetMipTailLevelOffsetCoords,
- *   0x826555E0).
- * - Tiling: XGRAPHICS::UntileSurface (0x8280A050) and
- *   XGAddress3DTiledOffset (0x8280D318).
+ *   (0x8263DFA0) and the packed mip tail (GetMipTailLevelOffsetCoords,
+ *   0x8263DD48).
+ * - Tiling: XGRAPHICS::UntileSurface (0x827E4CE8) and
+ *   XGAddress3DTiledOffset (0x827E7F68).
  */
 #pragma once
 
@@ -80,7 +80,13 @@ enum class TextureSign : u32 {
 struct TextureFetch {
   u32 dword[6] = {};
 
-  static TextureFetch FromGuest(const d3d::TextureFetchConstant &guest);
+  // banjo-nx (2026-10-27, render thread night): inline (it was a call at each slot's conversion on the draw paths).
+  static TextureFetch FromGuest(const d3d::TextureFetchConstant &guest) {
+    TextureFetch fetch;
+    for (u32 i = 0; i < 6; ++i)
+      fetch.dword[i] = guest.dword[i];
+    return fetch;
+  }
   // The constant D3DDevice_SetTexture builds from a texture header: its CPU
   // base and mip addresses become GPU addresses.
   static TextureFetch FromHeader(const d3d::TextureFetchConstant &header);
@@ -102,6 +108,8 @@ struct TextureFetch {
   u32 BasePage() const { return dword[1] >> 12; }
 
   u32 Swizzle() const { return (dword[3] >> 1) & 0xFFF; }
+  // banjo-nx (2026-10-20): the exponent adjust, dword 3 bits 13-18 (signed): the fetch result times 2^adjust.
+  int ExpAdjust() const { return int32_t(dword[3] << 13) >> 26; }
   TextureFilter MagFilter() const { return TextureFilter((dword[3] >> 19) & 3); }
   TextureFilter MinFilter() const { return TextureFilter((dword[3] >> 21) & 3); }
   TextureFilter MipFilter() const { return TextureFilter((dword[3] >> 23) & 3); }

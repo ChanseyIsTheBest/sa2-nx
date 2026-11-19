@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Fills in the object summary of PGO .gcda files merged from the console's streams (tools/win/pgo_merge.ps1).
+"""Fills in the object summary of PGO .gcda files merged from the streams (tools/pgo_merge.py).
 
-The instrumented NRO streams its counts with __gcov_info_to_gcda (app/src/sa2_pgo.cpp), which writes every object's
+banjo-nx: from sa2-nx (tools/pgo_summary.py, GPL-3.0, same project family), unchanged but for the names.
+
+The instrumented NRO streams its counts with __gcov_info_to_gcda (app/src/banjo_pgo.cpp), which writes every object's
 OBJECT_SUMMARY as zero (runs = 0, sum_max = 0). libgcov's own exit dump writes runs = 1 and sum_max = the largest arc
 count of the whole program, and GCC's -fprofile-use derives its hot / never-executed thresholds from them (hot:
 count >= sum_max / hot-bb-count-fraction; never executed: count * unlikely-bb-count-fraction < runs). With zeros every

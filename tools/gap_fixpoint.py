@@ -25,7 +25,7 @@ if len(sys.argv) < 2:
 scratch = os.path.abspath(sys.argv[1])
 rexglue = os.path.abspath(os.environ.get("REXGLUE", os.path.join(root, "sdk", "out", "host", "rexglue")))
 overrides_path = os.path.join(app, "overrides.toml")
-manifest_path = os.path.join(app, "sa2_manifest.toml")
+manifest_path = os.path.join(app, "masseffect_manifest.toml")
 gen = os.path.join(app, "generated", "default")
 evidence_path = os.path.join(scratch, "gapscan-accepted.txt")
 tools = os.path.join(root, "tools")

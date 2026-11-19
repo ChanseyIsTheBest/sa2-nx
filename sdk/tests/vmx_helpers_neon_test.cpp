@@ -74,6 +74,26 @@ void CheckPerm(const uint8_t* a, const uint8_t* b, const uint8_t* c) {
   if (std::memcmp(neon, want, 16) != 0) Report("vperm", c, neon, want);
 }
 
+// banjo-nx (from sasrt-nx, 2026-10-14): the one-source vperm (simde_mm_perm1_epi8_, tools/vperm_one_source.py): its
+// x86 form and its NEON form (one-register TBL of (c & 0x0F) ^ 0x0F) against the two-source x86 form with a == b.
+uint64_t g_checked_perm1 = 0;
+void CheckPerm1(const uint8_t* a, const uint8_t* c) {
+  simde__m128i va, vc;
+  std::memcpy(&va, a, 16);
+  std::memcpy(&vc, c, 16);
+  const simde__m128i two = rex::ppc::simde_mm_perm_epi8_(va, va, vc);
+  const simde__m128i one = rex::ppc::simde_mm_perm1_epi8_(va, vc);
+  const simde_uint8x16_t index =
+      simde_veorq_u8(simde_vandq_u8(simde_vld1q_u8(c), simde_vdupq_n_u8(0x0F)), simde_vdupq_n_u8(0x0F));
+  uint8_t neon[16], x86[16], want[16];
+  simde_vst1q_u8(neon, simde_vqtbl1q_u8(simde_vld1q_u8(a), index));
+  std::memcpy(x86, &one, 16);
+  std::memcpy(want, &two, 16);
+  ++g_checked_perm1;
+  if (std::memcmp(neon, want, 16) != 0) Report("vperm1 (NEON form)", c, neon, want);
+  if (std::memcmp(x86, want, 16) != 0) Report("vperm1 (x86 form)", c, x86, want);
+}
+
 void CheckConversions(const float* f) {
   simde__m128 v;
   std::memcpy(&v, f, 16);
@@ -104,6 +124,7 @@ int main() {
       for (int i = 0; i < 16; ++i) c[i] = uint8_t(Next());
       c[position] = uint8_t(value);
       CheckPerm(a, b, c);
+      CheckPerm1(a, c);
     }
   }
   for (int k = 0; k < 3000000; ++k) {
@@ -113,6 +134,7 @@ int main() {
     std::memcpy(b, &r[2], 16);
     std::memcpy(c, &r[4], 16);
     CheckPerm(a, b, c);
+    CheckPerm1(a, c);
   }
   // The conversions: edge values in every lane position, then random bit patterns (exponents near 2^31 and 2^32 half
   // of the time).
@@ -141,6 +163,8 @@ int main() {
   }
   std::printf("%llu comparisons of the NEON forms with the x86 forms (vperm, vctsxs, vctuxs)\n",
               static_cast<unsigned long long>(g_checked));
+  std::printf("%llu comparisons of the one-source vperm (simde_mm_perm1_epi8_, both forms) with the two-source form\n",
+              static_cast<unsigned long long>(g_checked_perm1));
   std::printf(g_failures ? "RESULT: FAILED (%llu differences)\n" : "RESULT: ok (0 differences)\n",
               static_cast<unsigned long long>(g_failures));
   return g_failures ? 1 : 0;

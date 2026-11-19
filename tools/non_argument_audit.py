@@ -103,7 +103,7 @@ def compute_ud(lines):
             continue
         reg = m.group(1)
         mentions = re.compile(r'(?<![.\w])' + reg + r'\b')
-        covered, j, ok = 0, i, True
+        covered, j, ok, last = 0, i, True, i
         while j < n:
             mj = elem_w.match(lines[j])
             if not mj or mj.group(1) != reg:
@@ -123,13 +123,16 @@ def compute_ud(lines):
                 ok = False
                 break
             covered |= bits
+            last = j
             j += 1
         if ok and covered == 0xFFFF:
             b = 1 << IDX[reg]
-            for t in range(i, j):
+            for t in range(i, last + 1):
                 u, d = ud[t]
                 ud[t] = (u & ~b, d | b)
-            i = j
+            # peggle2-nx: continue after this register's last element write, not after the statements skipped past
+            # it: those may hold another register's run (vlogefp128 v60 then v59), which must be matched too.
+            i = last + 1
         else:
             i += 1
     return ud
@@ -256,7 +259,9 @@ def main():
     proven = set()
     for a in sys.argv[2:]:
         if a.startswith('--noreturn='):
-            noreturn |= {'sub_' + x.upper() for x in a.split('=', 1)[1].split(',') if x}
+            # banjo-nx: an address (sub_X) or a function's own name (Banjo's renut_funcs.toml names many: rex_exit, ...)
+            noreturn |= {('sub_' + x.upper()) if re.fullmatch(r'[0-9A-Fa-f]{8}', x) else x
+                         for x in a.split('=', 1)[1].split(',') if x}
         if a.startswith('--proven='):
             # functions whose v32-v63 entry reads are proven not to matter (tools/vec_shiftout.py): not passed on
             # to their callers
@@ -274,7 +279,9 @@ def main():
                 return True
             if i in fn.calls and any(x in noreturn for x in fn.calls[i][0]):
                 continue
-            if i == len(fn.raw) - 1 and not fn.succ[i] and not s.startswith(('goto ', '__builtin_trap', 'REX_FATAL')):
+            # banjo-nx: a function whose last statement is the direct ppc_longjmp does not fall off its end
+            if (i == len(fn.raw) - 1 and not fn.succ[i] and not s.startswith(('goto ', '__builtin_trap', 'REX_FATAL'))
+                    and 'ppc_longjmp(' not in s):
                 return True
             for j in fn.succ[i]:
                 if j not in seen:

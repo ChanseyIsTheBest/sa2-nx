@@ -1,25 +1,19 @@
 // banjo-nx: the boot-time choice between banjo-nx's native renderer and Renut's (banjo_renut_select.h).
 #include "renut_engine/gpu/banjo_renut_select.h"
 
-#include <rex/logging.h>
-
-#if defined(PLUME_DEKO3D)
-#include "renut_engine/gpu/banjo_renut_deko3d.h"  // sa2-nx 1.0.3: MissingGameShaders
-#endif
-
 #include <string>
 
 #include <rex/cvar.h>
+#include <rex/logging/macros.h>
 
-// sa2-nx (2026-10-20): SA2's key. "xenos" keeps the renderer SA2 had (ReXGlue's emulated Xenos GPU, or the PM4-ring
-// native renderer with sa2_renderer_native); "renut" is Renut's Direct3D-level renderer (no PM4 ring, no EDRAM), on
-// plume's deko3d back end on the Switch.
-REXCVAR_DEFINE_STRING(sa2_renderer, "xenos", "SA2",
-                      "Renderer, chosen at boot. xenos = the emulated Xenos GPU (PM4 ring and EDRAM; or the native "
-                      "PM4 renderer with sa2_renderer_native). renut = Renut's Direct3D-level renderer "
-                      "(github.com/masterspike52/reNut, through banjo-nx): SA2's Direct3D draws natively through plume "
-                      "(deko3d on the Switch), with no PM4 ring and no EDRAM; its own renut_* keys apply")
-    .allowed({"xenos", "renut"})
+REXCVAR_DEFINE_STRING(banjo_renderer, "native", "Banjo",
+                      "Renderer, chosen at boot. native = banjo-nx's own native renderer (the default; the exact "
+                      "reference, with every banjo_* GPU and ring key). renut = Renut's Direct3D-level renderer "
+                      "(github.com/masterspike52/reNut): N&B's Direct3D runs natively through plume, with no PM4 and no "
+                      "EDRAM tile model; its own renut_* keys apply. emulated (katamari-nx, PC only) = the SDK's "
+                      "emulated Xbox 360 GPU (gpu_plugin = \"xenos\"): the game's own command stream, the reference "
+                      "image for a picture question (slow)")
+    .allowed({"native", "renut", "emulated"})
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace banjo::renut_gpu {
@@ -28,22 +22,31 @@ namespace banjo::renut_gpu {
 namespace detail {
 int8_t g_active = 0;
 bool LatchActive() {
-#if SA2_SWITCH_NO_NVK
-  // sa2-nx (2026-10-20): a Switch build without the Vulkan driver (REXGLUE_SWITCH_NO_NVK) has no other renderer.
+#if BANJO_SWITCH_NO_VULKAN
+  // banjo-nx (2026-10-20): a Switch build without the Vulkan driver has only Renut's renderer on deko3d (the native
+  // renderer and the emulated GPU need Vulkan).
   static const bool active = [] {
-#if defined(PLUME_DEKO3D)
-    // sa2-nx 1.0.3 (from peggle2-nx): a build without translated game shaders (SA2_RENUT_RELEASE_SHADERS) needs the web
-    // installer's deko3d_glsl.bin beside the NRO; without it the game's own pictures are not drawn.
-    if (const size_t missing = deko3d::MissingGameShaders()) {
-      REXLOG_ERROR("[deko3d] {} of the game's shaders are in no GLSL package: deko3d_glsl.bin is missing beside the "
-                   "NRO (the web installer makes it from your game files); the game's own pictures will not be drawn",
-                   missing);
-    }
-#endif
+    if (REXCVAR_GET(banjo_renderer) != "renut")
+      REXLOG_WARN("banjo_renderer = \"{}\" needs Vulkan, which this build does not have: Renut's renderer on deko3d "
+                  "instead", REXCVAR_GET(banjo_renderer));
     return true;
   }();
 #else
-  static const bool active = REXCVAR_GET(sa2_renderer) == "renut";
+  // banjo-nx (2026-10-29, title update 3): the native renderer (app/src/me, app/src/native) reads the base game's
+  // CDevice layout, which title update 3 changed (4 bytes more from 0x2AC0, 8 from 0x2E30; render/draw.h); it is kept
+  // as source only, and Renut's renderer runs whatever banjo_renderer says.
+  static const bool active = [] {
+    // katamari-nx (2026-11-01, the user's question about the presents screen): the emulated GPU as a reference. With
+    // Renut inactive its hooks run the game's own Direct3D and the app loads the SDK's GPU plugin (renut_app.h).
+    if (REXCVAR_GET(banjo_renderer) == "emulated") {
+      REXLOG_WARN("banjo_renderer = \"emulated\": the SDK's emulated Xbox 360 GPU (gpu_plugin), Renut's renderer off");
+      return false;
+    }
+    if (REXCVAR_GET(banjo_renderer) != "renut")
+      REXLOG_WARN("banjo_renderer = \"{}\": the native renderer reads the base game's Direct3D device layout, not "
+                  "title update 3's: Renut's renderer instead", REXCVAR_GET(banjo_renderer));
+    return true;
+  }();
 #endif
   g_active = active ? 1 : -1;
   return active;

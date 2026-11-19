@@ -43,6 +43,16 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
 
 REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
 
+// blur-nx (2026-11-17, CG-08): the indirect call sites' caches (tools/indirect_calls.py). The section's bounds come from
+// the linker (weak: a build without generated code has no such section); the flag says a word was filled since.
+extern "C" {
+unsigned char g_rex_site_cache_dirty = 0;
+#if defined(__SWITCH__)
+extern uint64_t __start_rex_site_cache[] __attribute__((weak));
+extern uint64_t __stop_rex_site_cache[] __attribute__((weak));
+#endif
+}
+
 namespace rex::memory {
 
 uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_shift) {
@@ -158,7 +168,17 @@ bool UnwatchHotReadPage(uint64_t host_address) {
 }  // namespace
 #endif
 
-u8* g_store_cards = nullptr;  // sa2-nx (2026-10-20, banjo-nx): the store cards (xmemory.h)
+u8* g_store_cards = nullptr;  // banjo-nx (2026-10-19): the store cards (xmemory.h)
+
+#if !REX_PLATFORM_SWITCH
+namespace {
+std::atomic<uint64_t> g_host_card_bytes[3];
+}
+void NoteHostStoreCards(u32 guest_address, u32 length) noexcept {
+  g_host_card_bytes[guest_address >= 0x7F000000u ? 0 : 1].fetch_add(length, std::memory_order_relaxed);
+  g_host_card_bytes[2].fetch_add(1, std::memory_order_relaxed);
+}
+#endif
 
 bool Memory::Initialize() {
   file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
@@ -244,9 +264,9 @@ bool Memory::Initialize() {
                               0x1FD00000, 4096, &heaps_.physical);
 
   // Protect the first and last 64kb of memory.
-  // sa2-nx (2026-10-20, banjo-nx): the first MB holds the store cards (xmemory.h: g_store_cards), which every guest
-  // store outside the stack writes: readable and writable whatever protect_zero says (a guest access there would have
-  // faulted before, so the game makes none).
+  // banjo-nx (2026-10-19): the first MB holds the store cards (xmemory.h: g_store_cards), which every guest store
+  // outside the stack writes: readable and writable whatever protect_zero says (a guest access there would have faulted
+  // before, so the game makes none).
   heaps_.v00000000.AllocFixed(0x00000000, 0x100000, 0x10000,
                               memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
                               memory::kMemoryProtectRead | memory::kMemoryProtectWrite);
@@ -1012,12 +1032,47 @@ bool Memory::SetFunction(uint32_t guest_address, PPCFunc* host_function) {
   }
   auto* slot = TranslateVirtual<PPCFunc**>(table_address);
   *slot = host_function;
+#if defined(__SWITCH__)
+  // blur-nx (2026-11-17, CG-08): the indirect call sites' one-entry caches (tools/indirect_calls.py, section
+  // rex_site_cache) may hold the old function: emptied, when any was filled since the last time.
+  if (__atomic_load_n(&g_rex_site_cache_dirty, __ATOMIC_RELAXED)) {
+    __atomic_store_n(&g_rex_site_cache_dirty, 0, __ATOMIC_RELAXED);
+    for (uint64_t* p = __start_rex_site_cache; p < __stop_rex_site_cache; ++p) __atomic_store_n(p, 0, __ATOMIC_RELAXED);
+  }
+#endif
   return true;
 }
 
 bool Memory::HasAnyFunctionTable() const {
   std::lock_guard lock(function_tables_mutex_);
   return !function_tables_.empty();
+}
+
+uint32_t Memory::FunctionTableBaseIn(uint32_t address, uint32_t size) const {
+  std::lock_guard lock(function_tables_mutex_);
+  uint32_t lowest = 0;
+  for (const auto& entry : function_tables_) {
+    if (entry.table_base >= address && uint64_t(entry.table_base) < uint64_t(address) + size &&
+        (!lowest || entry.table_base < lowest)) {
+      lowest = entry.table_base;
+    }
+  }
+  return lowest;
+}
+
+PPCFunc* Memory::TableFunction(uint32_t guest_address) const {
+  uint32_t table_address = 0;
+  {
+    std::lock_guard lock(function_tables_mutex_);
+    for (const auto& entry : function_tables_) {
+      uint32_t range_end = entry.code_base + entry.code_size + entry.thunk_reserve;
+      if (guest_address >= entry.code_base && guest_address < range_end) {
+        table_address = entry.table_base + uint32_t((uint64_t(guest_address) - entry.code_base) * 2);
+        break;
+      }
+    }
+  }
+  return table_address ? *TranslateVirtual<PPCFunc**>(table_address) : nullptr;
 }
 
 rex::memory::PageAccess ToPageAccess(uint32_t protect) {
@@ -1608,6 +1663,20 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
          base_page_number -= page_scan_stride) {
       if (page_table_[base_page_number].state != 0) {
         // Base page not free, skip to next usable page.
+        // mk9-nx (2026-10-26; port 56): past the whole region it belongs to, to the highest base whose range ends below
+        // the region (every base above it has a range that holds the region's first page, so the stride-by-stride scan
+        // ends at the same address): a match load's physical allocations stepped through tens of thousands of used
+        // pages each (the worst load frame 880 -> 350 ms on mk9-nx's console).
+        const PageEntry& used = page_table_[base_page_number];
+        if (used.region_page_count && used.base_address <= base_page_number &&
+            base_page_number < int64_t(used.base_address) + used.region_page_count) {
+          int64_t next = int64_t(used.base_address) - int64_t(page_count);
+          if (next < int64_t(low_page_number)) {
+            break;
+          }
+          next -= next % page_scan_stride;
+          base_page_number = next + page_scan_stride;  // cancel out loop logic
+        }
         continue;
       }
       // Check requested range to ensure free.
@@ -1646,6 +1715,18 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
          base_page_number += page_scan_stride) {
       if (page_table_[base_page_number].state != 0) {
         // Base page not free, skip to next usable page.
+        // mk9-nx (2026-10-26; port 56): past the whole region it belongs to (every base inside it is used: the same
+        // result as stepping a stride at a time).
+        const PageEntry& used = page_table_[base_page_number];
+        if (used.region_page_count && uint32_t(used.base_address) <= base_page_number &&
+            base_page_number < uint32_t(used.base_address) + uint32_t(used.region_page_count)) {
+          const uint64_t next = rex::round_up(uint64_t(used.base_address) + used.region_page_count,
+                                              uint64_t(page_scan_stride));
+          if (next > max_base_page_number) {
+            break;
+          }
+          base_page_number = uint32_t(next) - page_scan_stride;  // cancel out loop logic
+        }
         continue;
       }
       // Check requested range to ensure free.
@@ -2382,8 +2463,8 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
     return false;
   }
   length = std::min(length, heap_size_ - heap_relative_address);
-  // sa2-nx (2026-10-20, banjo-nx): a host write of physical memory (a file read into it, a decommit or release) marks
-  // its store cards as a guest store would.
+  // banjo-nx (2026-10-19): a host write of physical memory (a file read into it, a decommit or release) marks its
+  // store cards as a guest store would.
   MarkStoreCards(virtual_address, length);
   if (length == 0) {
     return false;
@@ -2550,3 +2631,11 @@ uint32_t PhysicalHeap::GetPhysicalAddress(uint32_t address) const {
 }
 
 }  // namespace rex::memory
+
+#if !REX_PLATFORM_SWITCH
+// banjo-nx (2026-10-19): the PC diagnostics of the store cards, read and reset (which: 0 physical bytes, 1 other
+// bytes, 2 calls).
+extern "C" uint64_t RexStoreCardsHostBytes(int which) {
+  return rex::memory::g_host_card_bytes[which].exchange(0, std::memory_order_relaxed);
+}
+#endif

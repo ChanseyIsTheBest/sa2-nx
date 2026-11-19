@@ -30,6 +30,7 @@
 #include <rex/codegen/codegen_context.h>
 #include <rex/codegen/function_graph.h>
 #include <rex/codegen/function_scanner.h>
+#include <rex/codegen/manifest.h>
 #include <rex/codegen/template_registry.h>
 #include <rex/codegen/test_support.h>
 #include <rex/logging.h>
@@ -127,7 +128,12 @@ RegValue ParseRegisterDirective(const std::string& line, size_t directive_idx) {
 
   RegValue rv;
   rv.reg = std::move(reg);
-  rv.value = line.substr(sp2 + 1);
+  rv.value = rex::string::trim_string(line.substr(sp2 + 1));
+  // renut-ultimate (2026-11-16, port 147; tw2de_nx's of 2026-11-01): "f1 [3FF0000000000000]", the raw bits of a floating-point register, as hex.
+  if (rv.value.size() > 2 && rv.value.front() == '[' && rv.value.back() == ']') {
+    rv.value = "0x" + rex::string::trim_string(rv.value.substr(1, rv.value.size() - 2));
+    return rv;
+  }
   rv.is_float = (line.find('.', sp2) != std::string::npos);
   return rv;
 }
@@ -137,6 +143,9 @@ MemValue ParseMemoryDirective(const std::string& line, size_t directive_idx) {
   auto sp2 = line.find(' ', sp1 + 1);
   MemValue mv;
   mv.address = line.substr(sp1 + 1, sp2 - sp1 - 1);
+  // renut-ultimate (2026-11-16, port 147; tw2de_nx's of 2026-11-01): the template writes 0x{{ address }}; the tests write 0x0000000010001000.
+  if (mv.address.starts_with("0x") || mv.address.starts_with("0X"))
+    mv.address = mv.address.substr(2);
   mv.data = ParseHexBytes(line.substr(sp2 + 1));
   return mv;
 }
@@ -251,6 +260,9 @@ nlohmann::json SerializeRegisters(const std::vector<RegValue>& regs) {
     if (rv.reg == "cr") {
       reg["type"] = "cr";
       reg["value"] = rv.value;
+    } else if (rv.reg == "xer") {  // port 147 (tw2de_nx's): SO OV CA, bits 31 30 29 (it had no .u64)
+      reg["type"] = "xer";
+      reg["value"] = rv.value;
     } else if (rv.is_vector) {
       reg["type"] = "vector";
       reg["values"] = {rv.vec_values[3], rv.vec_values[2], rv.vec_values[1], rv.vec_values[0]};
@@ -299,7 +311,54 @@ std::string CategoryFromStem(std::string_view stem) {
   return "misc";
 }
 
-bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::string_view outDir) {
+bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::string_view outDir,
+                    const std::string& configPath, bool exactFp) {
+  // renut-ultimate (2026-11-16, port 147; tw2de_nx's of 2026-11-01): --config: the code generator options of a project's manifest
+  // (fcti_inline, ...), so that the tests are generated as that project's code is. Only the options that change how an
+  // instruction is written are taken (not the project's function list, hooks or addresses, which name places in its
+  // own binary; nor the registers-as-locals options: the tests read the registers from the context after the call).
+  // --exact-fp: exact_fp on (the 360's NaN rules), so that every Xenia test can pass.
+  codegen::RecompilerConfig baseConfig;
+  if (!configPath.empty()) {
+    auto manifest = codegen::ManifestConfig::Load(configPath);
+    if (!manifest) {
+      REXLOG_ERROR("Cannot load the manifest {}", configPath);
+      return false;
+    }
+    const auto& src = manifest->entrypoint.recompiler;
+    auto& dst = baseConfig;
+    dst.dformDispSplit = src.dformDispSplit;
+    dst.fctiwzInline = src.fctiwzInline;
+    dst.fpMovesModeless = src.fpMovesModeless;
+    dst.fpComparesModeless = src.fpComparesModeless;
+    dst.fpModeLookahead = src.fpModeLookahead;
+    dst.fpModeLookaheadPastBranch = src.fpModeLookaheadPastBranch;
+    dst.rotateWordNarrow = src.rotateWordNarrow;
+    dst.rotateWordShifts = src.rotateWordShifts;
+    dst.fctiInline = src.fctiInline;
+    dst.fpCopyPairs = src.fpCopyPairs;
+    dst.fpCopyForwarding = src.fpCopyForwarding;
+    dst.dcbtPrefetch = src.dcbtPrefetch;
+    dst.divInline = src.divInline;
+    dst.skipMsr = src.skipMsr;
+    dst.vmxExactMinMax = src.vmxExactMinMax;
+    dst.vmxFusedMadd = src.vmxFusedMadd;
+    dst.vmxExpteRange = src.vmxExpteRange;
+    dst.vmxCmpbNan = src.vmxCmpbNan;
+    dst.vmxDotOverflowQnan = src.vmxDotOverflowQnan;
+    dst.vcmpbfpCr6Exact = src.vcmpbfpCr6Exact;
+    dst.vupkd3dExact = src.vupkd3dExact;
+    dst.fpscrMovesExact = src.fpscrMovesExact;
+    dst.extraInstructions = src.extraInstructions;
+    dst.spinHintYield = src.spinHintYield;
+    dst.vmx360Estimates = src.vmx360Estimates;
+    dst.vmxDot360 = src.vmxDot360;
+    dst.exactFp = src.exactFp;
+    dst.exactFpLog = src.exactFpLog;
+    dst.fpOriginLog = src.fpOriginLog;
+  }
+  if (exactFp)
+    baseConfig.exactFp = true;
   std::array<ui::KeyValueRow, 3> header_rows = {{
       {"Bin dir", std::string(binDir)},
       {"ASM dir", std::string(asmDir)},
@@ -345,7 +404,7 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
     module.Load(kTestBaseAddress, fileData.data(), fileData.size());
     module.set_name(stem);
 
-    codegen::RecompilerConfig config;
+    codegen::RecompilerConfig config = baseConfig;
     config.outDirectoryPath = std::string(outDir);
     auto ctx =
         codegen::CodegenContext::Create(codegen::BinaryView::fromModule(module), std::move(config));
@@ -375,8 +434,11 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
     functionsOut << recompiledCode << '\n';
   }
 
-  std::unordered_map<std::string, std::string> allSymbols;
+  // renut-ultimate (2026-11-16, port 147; tw2de_nx's of 2026-11-01): the labels per file. One map for all files gave a label two files share
+  // (test_vcmpbfp_1 is in instr_vcmpbfp.s and instr_vcmpxxfp.s) the other file's function.
+  std::map<std::string, std::unordered_map<std::string, std::string>> symbolsByFile;
   for (const auto& [stem, addresses] : functionsByFile) {
+    auto& allSymbols = symbolsByFile[stem];
     auto mapPath = fmt::format("{}/{}.map", binDir, stem);
     auto mapSymbols = ParseMapFile(mapPath);
     for (const auto& [addr, name] : mapSymbols) {
@@ -420,7 +482,7 @@ bool RecompileTests(std::string_view binDir, std::string_view asmDir, std::strin
   templateData["tests"] = nlohmann::json::array();
   size_t totalTests = 0;
   for (const auto& [stem, addresses] : functionsByFile) {
-    auto specs = ParseTestSpecs(fmt::format("{}/{}.s", asmDir, stem), allSymbols);
+    auto specs = ParseTestSpecs(fmt::format("{}/{}.s", asmDir, stem), symbolsByFile[stem]);
     std::string category = CategoryFromStem(stem);
     for (const auto& spec : specs) {
       nlohmann::json testJson;
@@ -456,6 +518,8 @@ struct RecompileTestsArgs {
   std::string bin_dir;
   std::string asm_dir;
   std::string output;
+  std::string config;    // port 147
+  bool exact_fp = false;  // port 147
 };
 
 }  // namespace
@@ -474,9 +538,13 @@ void RegisterRecompileTests(CLI::App& parent, const CliContext& ctx, DeferredAct
   sub->add_option("--output", args->output, "Output path for recompile-tests")
       ->type_name("PATH")
       ->required();
+  sub->add_option("--config", args->config,
+                  "Project manifest whose code generator options the tests are generated with (port 147)")
+      ->type_name("PATH");
+  sub->add_flag("--exact-fp", args->exact_fp, "Generate with exact_fp on (the FPU's and VMX's NaN rules of the 360)");
   sub->callback([args, &pending]() {
     pending = [args]() -> rex::Result<void> {
-      if (!RecompileTests(args->bin_dir, args->asm_dir, args->output)) {
+      if (!RecompileTests(args->bin_dir, args->asm_dir, args->output, args->config, args->exact_fp)) {
         return Err<void>(rex::ErrorCategory::Validation, "Test recompilation failed");
       }
       return rex::Ok();

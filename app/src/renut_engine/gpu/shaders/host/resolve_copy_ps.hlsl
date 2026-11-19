@@ -8,5 +8,7 @@
 float4 main(float4 position : SV_Position) : SV_Target0
 {
     const int2 texel = int2(position.xy) + int2(g_Push.translate);
-    return g_Textures[NonUniformResourceIndex(g_Push.textureIndex)].Load(int3(texel, 0));
+    // blur-nx (2026-11-10, port 76; its key 219: blur_renut_resolve_exp_bias): scale.x is the resolve's colour scale,
+    // 2^exponent bias (1 without).
+    return g_Textures[NonUniformResourceIndex(g_Push.textureIndex)].Load(int3(texel, 0)) * g_Push.scale.x;
 }

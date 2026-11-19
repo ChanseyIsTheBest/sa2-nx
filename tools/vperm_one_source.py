@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# sa2-nx: copied from banjo-nx on 2026-10-19 (its codegen round), adapted to sa2-nx's tree.
 """A vperm of one vector as a one-register table lookup (from sasrt-nx's tool of 2026-10-14, idea 8 of sa2-nx's
 list; banjo-nx's copy).
 The generator writes every vperm as rex::ppc::simde_mm_perm_epi8_(A, B, C): on AArch64 a two-register TBL, whose

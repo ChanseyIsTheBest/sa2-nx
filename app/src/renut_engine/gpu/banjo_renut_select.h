@@ -27,6 +27,26 @@ inline bool Active() {
 
 }  // namespace banjo::renut_gpu
 
+// katamari-nx (2026-10-30): Renut's hooks are written at N&B's addresses. Until each is moved to Beautiful Katamari's
+// function (docs/katamari-notes.md, "Renut's renderer at Katamari's addresses"), KATAMARI_RENUT_HOOKS = 0 compiles the
+// handlers but overrides no guest function: an N&B address is an unrelated function in this game.
+#ifndef KATAMARI_RENUT_HOOKS
+#define KATAMARI_RENUT_HOOKS 0
+#endif
+// katamari-nx: a hook tools/renut_hook_remap_katamari.py could not place in this game (no counterpart in XDK 2.0.5632,
+// or not proven): the handler compiles, nothing is registered.
+#define BANJO_RENUT_UNHOOKED_HOOK(subroutine, function) \
+  [[maybe_unused]] static constexpr auto banjo_renut_unhooked_##subroutine = &function;
+#define BANJO_RENUT_UNHOOKED_HOOK_SHARED(subroutine, function) BANJO_RENUT_UNHOOKED_HOOK(subroutine, function)
+#define BANJO_RENUT_UNHOOKED_HOOK_RAW(subroutine) \
+  [[maybe_unused]] static void banjo_renut_raw_##subroutine([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base)
+#define BANJO_RENUT_UNHOOKED_HOOK_RAW_SHARED(subroutine) BANJO_RENUT_UNHOOKED_HOOK_RAW(subroutine)
+#if !KATAMARI_RENUT_HOOKS
+#define BANJO_RENUT_HOOK(subroutine, function) \
+  [[maybe_unused]] static constexpr auto banjo_renut_unhooked_##subroutine = &function;
+#define BANJO_RENUT_HOOK_RAW(subroutine) \
+  [[maybe_unused]] static void banjo_renut_raw_##subroutine([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base)
+#else
 // Renut's hook at an address banjo-nx does not hook.
 #define BANJO_RENUT_HOOK(subroutine, function)                                         \
   REX_EXTERN(__imp__##subroutine);                                                     \
@@ -56,6 +76,7 @@ inline bool Active() {
     __imp__##subroutine(ctx, base);                                                    \
   }                                                                                    \
   static void banjo_renut_raw_##subroutine([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base)
+#endif  // KATAMARI_RENUT_HOOKS
 
 #define BANJO_RENUT_HOOK_RAW_SHARED(subroutine) \
   extern "C" void renut_native_##subroutine([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base)

@@ -1,19 +1,17 @@
 # ReXGlue SDK fork with the Horizon (Nintendo Switch) layer
 
 This is a fork of the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) v0.10.0 (commit `c94f5eb`) used by the
-Sonic Adventure 2 Xbox 360 to Nintendo Switch static-recompilation port (it came from masseffect-nx's fork, with the
-fixes of the other ports). `patches/rexglue-sdk-v0.10.0.patch` at the root of the repository is the whole fork as one
-diff against upstream. It adds:
+Mass Effect Xbox 360 to Nintendo Switch static-recompilation port. It adds:
 
 - **Horizon layer** (`src/**/*_switch.*`, `src/ui/switch_*.cpp`, `src/input/switch/`, `src/audio/switch/`,
   `cmake/rexglue_switch.cmake`, `switch_compat/`): guest memory, exception handling, clock, threading, filesystem,
-  input, audio, presentation and performance profile for devkitA64 + libnx. The Horizon layer is by StevensND (nfsmw-nx).
+  input, audio, presentation and performance profile for devkitA64 + libnx. The Horizon layer is by StevenSND.
 - **Codegen options** of the `rexglue` tool that shrink and speed up the recompiled C++ (arguments passed in
   registers, "diet" lowerings of single PPC instructions, registers as C++ locals, sharded registration, and so on).
   They are selected from the game's TOML configuration; see `src/codegen/codegen_flags.*` and
   `include/rex/codegen/config.h`.
 - Console tuning of the Vulkan graphics backend, XMA audio, the VFS read caches and the kernel I/O path. The cvars
-  added by the fork are prefixed `sa2_` (for example `sa2_io_ranges_mb`).
+  added by the fork are prefixed `masseffect_` (for example `masseffect_io_ranges_mb`).
 
 ## Third-party sources
 

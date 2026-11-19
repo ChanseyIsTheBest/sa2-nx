@@ -37,9 +37,9 @@ import switch_check as sc  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODULES = {
-    # name: (image dump, base, code range lo, hi (code only: the DLL's import thunks start at 0x88014470), gen dir)
-    'default': ('out/default_image.bin', 0x82000000, 0x82120000, 0x82970600, 'app/generated/default'),
-    'dll': ('out/default_image.Data_DLL.bin', 0x88000000, 0x88010000, 0x88014470, 'app/generated/data_dll'),
+    # name: (image dump, base, code range lo, hi, gen dir). Peggle 2 has one module (REX_CODE_BASE/SIZE of the
+    # generated peggle2_pch.h); a guest DLL would get its own entry here.
+    'default': ('out/default_image.bin', 0x82000000, 0x82140000, 0x828AF6A8, 'app/generated/default'),
 }
 
 

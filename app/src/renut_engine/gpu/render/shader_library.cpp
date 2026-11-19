@@ -63,7 +63,63 @@ const uint8_t *Decompress(DecompressedCache &cache, const uint8_t *compressed,
 std::mutex g_capture_mutex;
 std::unordered_set<uint64_t> g_captured;  // CaptureMissingShader
 
+// banjo-nx (2026-10-22): the table FindShaderEntry searches.
+struct ShaderTable {
+  std::once_flag once;
+  const ShaderCacheEntry *entries = nullptr;
+  size_t count = 0;
+  std::vector<ShaderCacheEntry> merged_entries;
+  std::vector<ShaderVertexInput> merged_inputs;
+  std::vector<ShaderLiteral> merged_literals;
+};
+ShaderTable g_table;
+
+ShaderTable &Table() {
+  std::call_once(g_table.once, [] {
+    ShaderTable &t = g_table;
+    t.entries = g_shaderCacheEntries;
+    t.count = g_shaderCacheEntryCount;
+#if defined(PLUME_DEKO3D)
+    // Not IsDeko3D(): the pipeline list can look shaders up before the device is made (and the Switch build has only
+    // the deko3d back end).
+    if (!banjo::renut_gpu::deko3d::InstalledShaderTable(t.merged_entries, t.merged_inputs, t.merged_literals))
+      return;
+    // The installer's shaders, then the build's own for those its package lacks (the ones the game makes at runtime,
+    // which no installer finds in the game's files), their inputs and literals after the package's.
+    const size_t installed = t.merged_entries.size();
+    for (size_t i = 0; i < g_shaderCacheEntryCount; ++i) {
+      ShaderCacheEntry e = g_shaderCacheEntries[i];
+      const auto begin = t.merged_entries.begin(), end = begin + installed;
+      const auto it = std::lower_bound(begin, end, e.hash,
+                                       [](const ShaderCacheEntry &a, uint64_t h) { return a.hash < h; });
+      if (it != end && it->hash == e.hash)
+        continue;
+      const uint32_t inputs = uint32_t(t.merged_inputs.size()), literals = uint32_t(t.merged_literals.size());
+      t.merged_inputs.insert(t.merged_inputs.end(), g_shaderVertexInputs + e.vertexInputOffset,
+                             g_shaderVertexInputs + e.vertexInputOffset + e.vertexInputCount);
+      t.merged_literals.insert(t.merged_literals.end(), g_shaderLiterals + e.literalOffset,
+                               g_shaderLiterals + e.literalOffset + e.literalCount);
+      e.vertexInputOffset = inputs;
+      e.literalOffset = literals;
+      t.merged_entries.push_back(e);
+    }
+    const size_t own = t.merged_entries.size() - installed;
+    std::sort(t.merged_entries.begin(), t.merged_entries.end(),
+              [](const ShaderCacheEntry &a, const ShaderCacheEntry &b) { return a.hash < b.hash; });
+    t.entries = t.merged_entries.data();
+    t.count = t.merged_entries.size();
+    g_activeShaderVertexInputs = t.merged_inputs.data();
+    g_activeShaderLiterals = t.merged_literals.data();
+    RGPU_INFO("Shader table: {} shaders from the installed package, {} of this build's own", installed, own);
+#endif
+  });
+  return g_table;
+}
+
 } // namespace
+
+const ShaderVertexInput *g_activeShaderVertexInputs = g_shaderVertexInputs;
+const ShaderLiteral *g_activeShaderLiterals = g_shaderLiterals;
 
 uint64_t HashShaderContainer(const uint8_t *container) {
   const auto *header = reinterpret_cast<const d3d::ShaderContainer *>(container);
@@ -81,8 +137,9 @@ const ShaderCacheEntry *FindShaderEntry(uint64_t hash) {
     }
     return nullptr;
   }
-  const ShaderCacheEntry *begin = g_shaderCacheEntries;
-  const ShaderCacheEntry *end = begin + g_shaderCacheEntryCount;
+  const ShaderTable &table = Table();
+  const ShaderCacheEntry *begin = table.entries;
+  const ShaderCacheEntry *end = begin + table.count;
   const ShaderCacheEntry *it = std::lower_bound(
       begin, end, hash, [](const ShaderCacheEntry &e, uint64_t h) { return e.hash < h; });
   return (it != end && it->hash == hash) ? it : nullptr;

@@ -28,6 +28,7 @@
 #include <rex/system/info/file.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/util/string_utils.h>
+#include <rex/system/wait_registry.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xfile.h>
 #include <rex/system/xiocompletion.h>
@@ -52,12 +53,12 @@
  *
  * A monotonic clock read per call is a few nanoseconds next to a trip to the SD. It is on.
  */
-REXCVAR_DEFINE_INT32(sa2_io_warning_ms, 8, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_warning_ms, 8, "Filesystem",
                      "Logs a warning for every open or read that takes more than this many ms (0 = never).");
-REXCVAR_DEFINE_INT32(sa2_io_us_per_kb, 0, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_us_per_kb, 0, "Filesystem",
                      "Diagnostic (Mac): every NtReadFile sleeps this many microseconds per KiB read after the read, to "
                      "emulate the Switch SD card (~100 = 13 ms per 128 KiB); 0 = off.");
-REXCVAR_DEFINE_INT32(sa2_io_summary_s, 15, "Filesystem",
+REXCVAR_DEFINE_INT32(masseffect_io_summary_s, 15, "Filesystem",
                      "How many seconds between [io] summaries (0 = never).");
 
 namespace rex::kernel::xboxkrnl {
@@ -193,7 +194,7 @@ inline void MaxAtomic(std::atomic<uint64_t>& target, uint64_t value) {
 
 // A single thread writes the summary: whichever wins the exchange of the next deadline.
 void MaybeSummaryIo(uint64_t now_us) {
-  const int32_t period_s = REXCVAR_GET(sa2_io_summary_s);
+  const int32_t period_s = REXCVAR_GET(masseffect_io_summary_s);
   if (period_s <= 0) {
     return;
   }
@@ -306,7 +307,7 @@ void MaybeSummaryIo(uint64_t now_us) {
       evictions);
 
   /*
-   * The cache of large reads by exact range (sa2_io_ranges_mb).
+   * The cache of large reads by exact range (masseffect_io_ranges_mb).
    *
    * It is accumulated since startup, not per interval: there are few events and what matters is
    * the session total. And it is always printed, whether it is on or not and whether there was
@@ -344,7 +345,7 @@ inline void NoteOpening(uint64_t us, bool ok, const std::string_view path) {
   g_io.us_opens.fetch_add(us, std::memory_order_relaxed);
   MaxAtomic(g_io.us_opening_worst, us);
 
-  const int32_t warning_ms = REXCVAR_GET(sa2_io_warning_ms);
+  const int32_t warning_ms = REXCVAR_GET(masseffect_io_warning_ms);
   if (warning_ms > 0 && us >= static_cast<uint64_t>(warning_ms) * 1000ull &&
       g_io_warnings.fetch_add(1, std::memory_order_relaxed) < 300) {
     REXKRNL_WARN("[io] SLOW: open '{}' took {:.1f} ms ({})", path, us / 1000.0,
@@ -361,7 +362,7 @@ inline void NoteRead(uint64_t us, uint32_t bytes, const std::string_view path,
 
   const bool reread = NoteRange(path, displacement, bytes);
 
-  const int32_t warning_ms = REXCVAR_GET(sa2_io_warning_ms);
+  const int32_t warning_ms = REXCVAR_GET(masseffect_io_warning_ms);
   if (warning_ms > 0 && us >= static_cast<uint64_t>(warning_ms) * 1000ull &&
       g_io_warnings.fetch_add(1, std::memory_order_relaxed) < 300) {
     // The offset is included. Without it a sequential sweep cannot be told apart from a reread.
@@ -533,6 +534,8 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
                      mapped_void buffer, u32 buffer_length, mapped_u64 byte_offset_ptr) {
   uint64_t byte_offset = byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : 0;
   const bool apc_requested = (static_cast<uint32_t>(apc_routine_ptr) & ~1u) != 0;
+  // blur-nx (2026-11-14, rex/system/wait_registry.h): the stall watchdog's quiet trigger counts the reads.
+  rex::system::waitreg::NoteFileRead(buffer_length);
   REXKRNL_IMPORT_TRACE(
       "NtReadFile",
       "handle={:#x} event={:#x} apc={:#x} apc_ctx={:#x} iosb={:#x} buf={:#x} len={:#x} offset={}",
@@ -589,7 +592,7 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
       result = file->Read(buffer.guest_address(), buffer_length,
                           byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
                           &bytes_read, apc_context.guest_address());
-      if (const int32_t us_kb = REXCVAR_GET(sa2_io_us_per_kb); us_kb > 0 && bytes_read) {
+      if (const int32_t us_kb = REXCVAR_GET(masseffect_io_us_per_kb); us_kb > 0 && bytes_read) {
         std::this_thread::sleep_for(std::chrono::microseconds(uint64_t(us_kb) * bytes_read / 1024));
       }
       const uint64_t io_us_end = NowUs();

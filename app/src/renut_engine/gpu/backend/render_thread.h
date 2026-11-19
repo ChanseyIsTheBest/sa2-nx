@@ -26,6 +26,11 @@
 
 namespace renut::gpu::render_thread {
 
+// vivapinata-nx (2026-11-11, vivapinata_tiles_once): a function every queue and wait calls first on any thread but the
+// render thread, so work held back on the game's side (a tile's command buffer run waiting for its twin) is queued
+// before anything after it. Set once at start-up; null for none.
+void SetBeforePushHook(void (*hook)());
+
 // Runs 'work' on the render thread after everything queued before it, with
 // State().mutex held.
 void Queue(std::function<void()> work);
@@ -33,8 +38,8 @@ void Queue(std::function<void()> work);
 // The same without taking State().mutex, for work that takes it itself
 // (Video::Present, record destruction).
 void QueueUnlocked(std::function<void()> work);
-// sa2-nx (2026-10-20, sa2_renut_prefetch_next): as Queue, and the two addresses (each may be null) are prefetched while
-// the item before it runs.
+// banjo-nx (2026-10-20, from sa2-nx, banjo_renut_prefetch_next): as Queue, and the two addresses (each may be null)
+// are prefetched while the item before it runs.
 void QueuePrefetched(const void *prefetch0, const void *prefetch1, std::function<void()> work);
 
 // Writes 'fence' to the guest word at 'completion_va' (the device's fence
@@ -60,7 +65,9 @@ bool WaitForFenceProgress(std::chrono::milliseconds timeout);
 // A guest frame: 'work' (the Swap) is queued; then the game thread waits while
 // more than kMaxFramesAhead frames are queued but not yet done. Returns the
 // number of frames the render thread has finished.
-constexpr uint64_t kMaxFramesAhead = 1;
+// blur-nx (2026-11-13, #37 of Blur's docs/cpu-near-exact-50-1113.md): 2, so rr6_frames_ahead = 2 can be tried (its
+// default stays 1; two frames ahead lets the game rewrite data the render thread has yet to read: not exact).
+constexpr uint64_t kMaxFramesAhead = 2;
 uint64_t QueueFrame(std::function<void()> work);
 // banjo-nx (2026-10-19, banjo_late_input): the late input delay (rex::latency's frame read delay), and its line for the
 // 10 s report.

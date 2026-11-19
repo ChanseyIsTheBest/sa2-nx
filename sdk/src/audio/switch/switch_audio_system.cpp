@@ -23,6 +23,10 @@
 
 #include <switch.h>
 
+// banjo-nx (2026-10-27): the system core (core/threading_switch.h; declared here, that header clashes with switch.h).
+extern "C" bool RexSwitchMoveCurrentThreadToSystemCore(int priority);
+extern "C" void RexSwitchSampleCoreIdle(void);
+
 // Passive counters: the audio thread neither writes reports nor pauses the game.
 extern "C" void RexSwitchPerfAdd(unsigned id, u64 value);
 extern "C" void RexSwitchPerfMax(unsigned id, u64 value);
@@ -33,10 +37,24 @@ REXCVAR_DEFINE_BOOL(audio_switch_pump, true, "Audio",
                     "MarathonRecomp-NX) instead of 4 in a row when each audout buffer is consumed, which "
                     "left the game's audio server voice without a packet (robotic audio); "
                     "read when the audio is opened");
+// blur-nx (2026-11-13, M-43 of docs/cpu-moonshots-50-1113.md; the user's go-ahead: "M43 is good implement").
+REXCVAR_DEFINE_BOOL(audio_switch_pump_pairs, false, "Audio",
+                    "With audio_switch_pump: ask the game for two frames back to back every 10.667 ms instead of one "
+                    "every 5.333 ms. The title's callback waits for its audio engine to render each frame, so the "
+                    "engine renders the second right after the first, its voices' and effects' state still in the "
+                    "caches. One more frame of latency (5.3 ms); the game's audio parameters take effect at 10.7 ms "
+                    "steps; read when the audio is opened");
+// blur-nx (2026-11-16, the 15 ms batch, #196): M-43 widened: 1-4 frames back to back per pump tick (0: as
+// audio_switch_pump_pairs says). The engine renders the later frames of a tick with its voices' and effects' state still
+// in the caches; each frame of a tick past the first adds 5.3 ms of latency, and the game's audio parameters take effect
+// at the tick's steps. The same frames, rendered sooner or later: exact output.
+REXCVAR_DEFINE_INT32(audio_switch_pump_frames, 0, "Audio",
+                     "With audio_switch_pump: frames asked back to back per tick, 1-4 (0: audio_switch_pump_pairs "
+                     "decides, 2 or 1); read when the audio is opened");
 REXCVAR_DEFINE_INT32(audio_switch_frames_in_queue, 10, "Audio",
                      "With audio_switch_pump: game frames kept queued before audout "
                      "(cushion; 10 = 53 ms, 6 up to build 105). A longer queue lets the game wait without cutting the "
-                     "output, at the cost of latency: sa2_audio_wait_server_ms waits up to 30 ms; read "
+                     "output, at the cost of latency: masseffect_audio_wait_server_ms waits up to 30 ms; read "
                      "when the audio is opened");
 
 namespace rex::audio::nx {
@@ -65,6 +83,10 @@ constexpr u64 kWaitTimeoutNs = 100'000'000;
 constexpr u64 kPumpIntervalNs = 1'000'000'000ull * SwitchAudioDriver::kChannelSamples / 48000;
 constexpr size_t kTargetQueuedFrames = 6;
 constexpr size_t kMinQueuedFrames = 2;
+// mk9-nx (2026-10-21; port 56): pump ticks with the queue above its target before the oldest frame is dropped to make
+// room (~0.34 s). Without it, an audout that stops releasing buffers (seen in Ryujinx) stops the game's audio engine
+// altogether, and a game that waits for a voice to drain waits forever (mk9-nx's main-menu freeze).
+constexpr uint32_t kStalledTicksBeforeDrop = 64;
 
 }  // namespace
 
@@ -116,8 +138,13 @@ bool SwitchAudioDriver::MixFrameInto(float* stereo_out, const StereoFold& fold, 
     frames_queued_.pop();
   }
   std::array<float, kChannelSamples * 2> folded;
-  conversion::sequential_6_BE_to_interleaved_2_LE(folded.data(), frame, kChannelSamples, fold,
-                                                  gain);
+  bool rest_silent = false;  // blur-nx (2026-11-13, #62)
+  const float frame_gain = gain * StereoFrameGain(frame, kChannelSamples, &rest_silent);
+  if (rest_silent) {
+    conversion::front_2_of_6_BE_to_interleaved_2_LE(folded.data(), frame, kChannelSamples, fold.scale * frame_gain);
+  } else {
+    conversion::sequential_6_BE_to_interleaved_2_LE(folded.data(), frame, kChannelSamples, fold, frame_gain);
+  }
   for (size_t i = 0; i < folded.size(); ++i) {
     stereo_out[i] += folded[i];
   }
@@ -139,6 +166,16 @@ size_t SwitchAudioDriver::QueuedFrames() {
   return frames_queued_.size();
 }
 
+bool SwitchAudioDriver::DropOldestFrame() {
+  std::lock_guard<std::mutex> guard(frames_mutex_);
+  if (frames_queued_.empty()) {
+    return false;
+  }
+  frames_unused_.push(frames_queued_.front());
+  frames_queued_.pop();
+  return true;
+}
+
 void SwitchAudioDriver::RequestFrame() {
   // The semaphore has a maximum: if the game does not serve the requests, the excess ones are lost.
   semaphore_->Release(1, nullptr);
@@ -151,6 +188,9 @@ struct SwitchAudioSystem::Output {
   bool thread_created = false;
   std::atomic<bool> running{false};
   bool pump = false;  // audio_switch_pump, read when audio is opened
+  uint32_t frames_per_tick = 1;  // blur-nx (2026-11-13, M-43): audio_switch_pump_pairs: 2
+  uint32_t stalled_ticks = 0;   // port 56 (mk9-nx): PumpTick ticks with the queue above frames_in_queue
+  uint64_t dropped_frames = 0;  // port 56 (mk9-nx): frames dropped because audout stopped consuming
   size_t frames_in_queue = kTargetQueuedFrames;  // audio_switch_frames_in_queue, read when audio is opened
   bool audout_initialized = false;
   bool audout_started = false;
@@ -202,8 +242,15 @@ void SwitchAudioSystem::DestroyDriver(AudioDriver* driver) {
 bool SwitchAudioSystem::StartOutput() {
   auto output = std::make_unique<Output>();
   output->pump = REXCVAR_GET(audio_switch_pump);
+  output->frames_per_tick = REXCVAR_GET(audio_switch_pump_pairs) ? 2 : 1;  // blur-nx (2026-11-13, M-43)
+  if (const int32_t n = REXCVAR_GET(audio_switch_pump_frames); n >= 1) {  // blur-nx (2026-11-16, #196)
+    output->frames_per_tick = uint32_t(n > 4 ? 4 : n);
+  }
   output->frames_in_queue = static_cast<size_t>(std::clamp(REXCVAR_GET(audio_switch_frames_in_queue), 2, 32));
-  REXLOG_INFO("SwitchAudioSystem: 187.5 Hz pump {}, {} frames queued", output->pump ? "active" : "off",
+  REXLOG_INFO("SwitchAudioSystem: 187.5 Hz pump {}{}, {} frames queued", output->pump ? "active" : "off",
+              output->frames_per_tick == 2   ? " (two frames every 10.7 ms: audio_switch_pump_pairs)"
+              : output->frames_per_tick > 2 ? " (frames back to back per tick: audio_switch_pump_frames)"
+                                            : "",
               output->frames_in_queue);
 
   Result rc = audoutInitialize();
@@ -343,6 +390,21 @@ void SwitchAudioSystem::FillAndAppend(size_t buffer_index) {
     RexSwitchPerfAdd(26, pcm_nonzero ? 1 : 0);
     RexSwitchPerfAdd(27, 1);
   }
+  // blur-nx (2026-11-12, diagnostic): audout's own count of the samples it has played, beside the buffers appended
+  // (counter 27). Blur's console races appended ~12 % more 1,024-sample buffers than 48 kHz plays (52.9 a second
+  // against 46.9; the menus at 60 fps 47.1): either the device releases some buffers without playing them, or the
+  // count is wrong. Counter 57: samples played in the interval (the output thread is the only caller).
+  // renut-ultimate (2026-11-17, port 153): asked every 16th buffer (about 12 times a second), not at every one: an IPC
+  // request to audout each time, in every game. The count is audout's running total, so the sum is the same.
+  static uint32_t played_ask = 0;
+  if ((++played_ask & 15) == 0) {
+    static u64 last_played = 0;
+    u64 played = 0;
+    if (R_SUCCEEDED(audoutGetAudioOutPlayedSampleCount(&played))) {
+      if (last_played && played >= last_played) RexSwitchPerfAdd(57, played - last_played);
+      last_played = played;
+    }
+  }
   if (R_FAILED(rc)) {
     REXLOG_ERROR("SwitchAudioSystem: audoutAppendAudioOutBuffer failed: 0x{:08X}", rc);
   }
@@ -351,11 +413,24 @@ void SwitchAudioSystem::FillAndAppend(size_t buffer_index) {
 void SwitchAudioSystem::PumpTick() {
   std::lock_guard<std::mutex> guard(drivers_mutex_);
   for (SwitchAudioDriver* driver : drivers_) {
-    const size_t queued = driver->QueuedFrames();
-    if (queued <= output_->frames_in_queue) {
-      driver->RequestFrame();
+    // blur-nx (2026-11-13, M-43): a tick asks for frames_per_tick frames (two every 10.7 ms with
+    // audio_switch_pump_pairs), each with the one-frame rule below; those asked this tick are not queued yet.
+    const size_t queued_at_tick = driver->QueuedFrames();
+    for (uint32_t k = 0; k < output_->frames_per_tick; ++k) {
+      const size_t queued = queued_at_tick + k;
+      if (queued <= output_->frames_in_queue) {
+        driver->RequestFrame();
+        output_->stalled_ticks = 0;
+      } else if (++output_->stalled_ticks >= kStalledTicksBeforeDrop && driver->DropOldestFrame()) {
+        // port 56 (mk9-nx): audout is not consuming; keep the game's audio clock running (see kStalledTicksBeforeDrop).
+        driver->RequestFrame();
+        if (output_->dropped_frames++ == 0) {
+          REXLOG_WARN("SwitchAudioSystem: audout stopped consuming frames; dropping the oldest to keep the game's "
+                      "audio running");
+        }
+      }
     }
-    if (queued < kMinQueuedFrames) {
+    if (queued_at_tick < kMinQueuedFrames) {
       driver->RequestFrame();  // the queue has emptied: one more to catch up
     }
   }
@@ -363,12 +438,17 @@ void SwitchAudioSystem::PumpTick() {
 
 void SwitchAudioSystem::OutputThreadMain() {
   Output& output = *output_;
+  // banjo-nx (2026-10-27): on the system core when the process has it (threading_switch.h, banjo_system_core), above
+  // the Audio Worker and the XMA Decoder there (0x2B; Horizon does not preempt between equal priorities). It also
+  // samples that core's idle time for the report.
+  const bool on_system_core = RexSwitchMoveCurrentThreadToSystemCore(kOutputThreadPriority - 1);
   for (size_t i = 0; i < kBufferCount; ++i) {
     FillAndAppend(i);
   }
-  const u64 interval = armNsToTicks(kPumpIntervalNs);
+  const u64 interval = armNsToTicks(kPumpIntervalNs * output.frames_per_tick);  // blur-nx (2026-11-13, M-43)
   u64 deadline = armGetSystemTick() + interval;
   while (output.running.load(std::memory_order_relaxed)) {
+    if (on_system_core) RexSwitchSampleCoreIdle();  // banjo-nx (2026-10-27): at most every 100 ms
     u64 timeout_ns = kWaitTimeoutNs;
     if (output.pump) {
       const u64 now = armGetSystemTick();
@@ -387,7 +467,9 @@ void SwitchAudioSystem::OutputThreadMain() {
     Result rc = audoutWaitPlayFinish(&released, &released_count, timeout_ns);
     // libnx hands back one released buffer per call; drain the rest so none is
     // left out of the rotation.
+    uint32_t released_in_wake = 0;  // blur-nx (2026-11-12, diagnostic): counter 58, below
     while (R_SUCCEEDED(rc) && released && released_count) {
+      ++released_in_wake;
       const ptrdiff_t index = released - output.buffers.data();
       if (index >= 0 && index < ptrdiff_t(kBufferCount)) {
         FillAndAppend(size_t(index));
@@ -396,6 +478,8 @@ void SwitchAudioSystem::OutputThreadMain() {
       released_count = 0;
       rc = audoutGetReleasedAudioOutBuffer(&released, &released_count);
     }
+    // blur-nx (2026-11-12, diagnostic): a wake that found every buffer released: the device had nothing left to play.
+    if (released_in_wake >= kBufferCount) RexSwitchPerfAdd(58, 1);
   }
 }
 

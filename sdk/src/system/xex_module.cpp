@@ -417,8 +417,14 @@ int XexModule::ApplyPatch(XexModule* module) {
     if (original_image_size > new_image_size) {
       uint32_t size_delta = original_image_size - new_image_size;
       uint32_t addr_free_mem = module->base_address_ + new_image_size;
+      // banjo-nx (2026-10-29): not the function table that follows the new image (the base image covered its
+      // start; UserModule writes the table again after the patch).
+      if (uint32_t table = memory()->FunctionTableBaseIn(addr_free_mem, size_delta)) {
+        size_delta = table - addr_free_mem;
+      }
 
-      bool free_result = memory()->LookupHeap(addr_free_mem)->Decommit(addr_free_mem, size_delta);
+      bool free_result =
+          !size_delta || memory()->LookupHeap(addr_free_mem)->Decommit(addr_free_mem, size_delta);
 
       if (!free_result) {
         REXLOG_ERROR("Unable to decommit XEX memory at {:08X}-{:08X}.", addr_free_mem, size_delta);

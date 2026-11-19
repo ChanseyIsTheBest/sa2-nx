@@ -3,11 +3,17 @@
 #ifdef RENUT_RECOMP
 #include "banjo_pred_select.h"  // banjo-nx: predicated blocks without a branch
 #include "banjo_bool_spec.h"    // banjo-nx: bool constants as specialization constants
+#include <set>
 #endif
 
 #ifdef RENUT_RECOMP
 // Stands in the vertex shader's parameter list for the kill output (hasVertexKill).
 static constexpr std::string_view KILL_OUTPUT_PLACEHOLDER = "/*renut kill output*/";
+static constexpr std::string_view LOOP_CONSTANTS_PLACEHOLDER = "/*renut loop constants*/";  // halo3-nx
+// vivapinata-nx (2026-11-03): stands for the cube instruction's helper: cube, or cubeValues in a shader with no cube fetch.
+static constexpr std::string_view CUBE_OP_PLACEHOLDER = "renutCubeOp";
+// vivapinata-nx (2026-11-03): stands after renutVertexRegisters for the control points' read (fetchesControlPoints).
+static constexpr std::string_view CONTROL_POINTS_PLACEHOLDER = "/*renut control points*/";
 #endif
 
 static constexpr char SWIZZLES[] = 
@@ -164,6 +170,11 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
     { DeclUsage::Normal, 2 },
     { DeclUsage::Tangent, 0 },
     { DeclUsage::Binormal, 0 },
+    // katamari-nx (2026-10-30): Beautiful Katamari's shaders also pass the fog interpolator (oFog0 / iFog0: two of the
+    // first PC run's captures did not compile without it). Last, so every interpolator before it keeps its location.
+    { DeclUsage::Fog, 0 },
+    // halo3-nx (tools/halo3_shader_usages.py): 2 vertex shaders and 1 pixel shader pass a vector through POSITION2.
+    { DeclUsage::Position, 2 },
 #endif
 };
 
@@ -221,6 +232,9 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         lastFullFetchBaked = baked;
         lastFullFetchByVertexIndex = !baked || byVertexIndex;
         lastFullFetchBoundByOtherIndex = !baked && !byVertexIndex;
+        // vivapinata-nx (2026-11-03): a fetch by r1.y or r1.z only reads a tessellated list's control points.
+        if (instr.srcRegister == 1 && (instr.srcSwizzle == 1 || instr.srcSwizzle == 2))
+            fetchesControlPoints = true;
     }
 
     // A bound declaration's element read by another index: the input layout cannot deliver it,
@@ -498,8 +512,20 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
 {
 #ifdef RENUT_RECOMP
     textureFetchMask |= 1u << (instr.constIndex & 31);
+    if (instr.dimension == TextureDimension::TextureCube)
+        hasCubeFetch = true;  // vivapinata-nx (2026-11-03): see CUBE_OP_PLACEHOLDER
     if (!isPixelShader && instr.opcode != FetchOpcode::SetTextureLod && instr.dstRegister == 0)
         vertexIndexOverwritten = true;  // see recompile(const AluInstruction&)
+    // vivapinata-nx (2026-11-03, census): a fetch that names its own filters (3: as the fetch constant says). The host's sampler
+    // comes from the fetch constant alone, so this says which shaders that gets wrong.
+    if (instr.opcode == FetchOpcode::TextureFetch && (instr.magFilter != 3 || instr.minFilter != 3 || instr.mipFilter != 3))
+        fetchFilterCensus += fmt::format(" t{}:{}{}{}", uint32_t(instr.constIndex), uint32_t(instr.magFilter),
+            uint32_t(instr.minFilter), uint32_t(instr.mipFilter));
+    // vivapinata-nx (2026-11-03, census): a fetch whose LOD is not simply the computed one (xenia 8a64861: computed, register and
+    // bias LODs add up). The translator takes the register LOD as absolute and ignores the bias and an off computed LOD.
+    if (instr.opcode == FetchOpcode::TextureFetch && (!instr.useCompLod || instr.useRegLod || instr.lodBias != 0))
+        fetchLodCensus += fmt::format(" t{}:c{}r{}b{}", uint32_t(instr.constIndex), uint32_t(instr.useCompLod),
+            uint32_t(instr.useRegLod), int32_t(instr.lodBias));
 
     // setTexLOD stores the LOD that following useRegLod fetches sample at.
     if (instr.opcode == FetchOpcode::SetTextureLod)
@@ -657,8 +683,40 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     const bool explicitLod = instr.opcode == FetchOpcode::TextureFetch && (!isPixelShader || instr.useRegLod);
     if (explicitLod)
         out += "Level";
+    // vivapinata-nx (2026-11-03): a fetch's own LOD bias, in 16ths, added to the computed LOD (xenia 8a64861). This game's ground
+    // layers (0F8483A3 and three more) ask for +2 on one texture; without it those stones were speckled with mips too sharp.
+    // The census shows no other case with a bias: no register LOD, no vertex shader, no other dimension.
+    const bool biasedLod = instr.opcode == FetchOpcode::TextureFetch && isPixelShader && !instr.useRegLod &&
+        instr.useCompLod && instr.lodBias != 0 && instr.dimension == TextureDimension::Texture2D;
+    if (biasedLod)
+        out += "Bias";
 #endif
 
+#ifdef RENUT_RECOMP
+    // vivapinata-nx (2026-11-03): a fetch can name its own filters over the fetch constant's: this game's ground reads its
+    // 129x129 height and density map (a point fetch constant) with linear ones. The host's sampler word is the fetch constant's;
+    // each sampler slot has its variants in the slots after it (render/textures.cpp SamplerSlotUncached), and the shader adds
+    // the variant's number. The combinations this game's shaders have: mag, min, mip (0 point, 1 linear, 3 as the constant).
+    uint32_t samplerVariant = 0;
+    if (instr.opcode == FetchOpcode::TextureFetch)
+    {
+        const uint32_t filters = instr.magFilter << 4 | instr.minFilter << 2 | instr.mipFilter;
+        switch (filters)
+        {
+        case 1u << 4 | 1u << 2 | 3u: samplerVariant = 1; break;
+        case 0u << 4 | 0u << 2 | 3u: samplerVariant = 2; break;
+        case 0u: samplerVariant = 3; break;
+        case 1u << 4 | 1u << 2 | 0u: samplerVariant = 4; break;
+        case 3u << 4 | 3u << 2 | 3u: break;
+        default:
+            fetchFilterCensus += " (not handled)";
+            break;
+        }
+    }
+    if (samplerVariant != 0)
+        print("({0}_Texture{1}DescriptorIndex, ({0}_SamplerDescriptorIndex + {2}), ", constNamePtr, dimension, samplerVariant);  // no suffix: tools/renut_early_alpha.py parses this
+    else
+#endif
     print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
 #ifdef RENUT_RECOMP
     // texCoordDenorm fetches address texels rather than normalized coordinates.
@@ -702,6 +760,8 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
 #ifdef RENUT_RECOMP
     if (explicitLod)
         out += instr.useRegLod ? ", lod" : ", 0.0";
+    if (biasedLod)
+        print(", {:.4f}", instr.lodBias * 0.0625f);
 #endif
 
     out += ").";
@@ -875,7 +935,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                 const bool literal = !relative && literalConstants.count(reg) != 0;
                 // Everything else reads the register file; an indexed read may reach any register.
                 if (relative)
+                {
                     std::fill(std::begin(floatConstants), std::end(floatConstants), ~0u);
+                    if (literalConstants.count(reg) != 0)
+                        indexedLiteralBases.insert(reg);
+                }
                 else if (!literal)
                     floatConstants[(reg & 0xFF) / 32] |= 1u << (reg % 32);
 
@@ -1130,8 +1194,18 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
             default:
             {
+                // dishonored-nx (2026-10-29): a vertex shader may export to an interpolator register its table does
+                // not list (Dishonored's vs_d89d5e1d550db316 has no table at all and writes o0): the assert, and a
+                // crash in release builds, before. The register's TEXCOORD (what a pixel shader without a table of
+                // its own reads it as); past 15, a scratch output.
                 auto findResult = interpolators.find(instr.vectorDest);
-                assert(findResult != interpolators.end());
+                if (findResult == interpolators.end())
+                {
+                    fmt::println(stderr, "vertex export to interpolator register {} the shader does not list",
+                        uint32_t(instr.vectorDest));
+                    findResult = interpolators.emplace(uint32_t(instr.vectorDest), instr.vectorDest < 16
+                        ? fmt::format("oTexCoord{}", uint32_t(instr.vectorDest)) : std::string("oUnused")).first;
+                }
                 exportRegister = findResult->second;
                 break;
             }
@@ -1177,7 +1251,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     }
 
     uint32_t vectorWriteMask = instr.vectorWriteMask;
-    if (instr.exportData)
+    // Port 175 (from rehatched-nx, its commit 58ad78b0): an export to a register with no name (not oC0-3 or oDepth)
+    // is a plain register write: its masks are not cut, and no '.x = ...' without a name is written.
+    if (instr.exportData && !exportRegister.empty())
         vectorWriteMask &= ~instr.scalarWriteMask;
 
 #ifdef REBLUE_RECOMP
@@ -1328,7 +1404,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             const uint32_t reg = instr.src1Register & 0x3F;
             const bool srcAbs = (instr.src1Register & 0x80) != 0;
             auto lane = [&](uint32_t i) { return SWIZZLES[((instr.src1Swizzle >> (i * 2)) + i) & 0x3]; };
-            print("cube({}{}r{}.{}{}{}{}{}, cubeMapData)",
+            // vivapinata-nx (2026-11-03): which helper is decided at the end, by whether the shader has a cube fetch.
+            hasCubeOp = true;
+            print("{}({}{}r{}.{}{}{}{}{}, cubeMapData)", CUBE_OP_PLACEHOLDER,
                 instr.src1Negate ? "-" : "", srcAbs ? "abs(" : "", reg,
                 lane(2), lane(3), lane(0), lane(0), srcAbs ? ")" : "");
             break;
@@ -1663,7 +1741,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     }
 
     uint32_t scalarWriteMask = instr.scalarWriteMask;
-    if (instr.exportData)
+    if (instr.exportData && !exportRegister.empty())  // port 175
         scalarWriteMask &= ~instr.vectorWriteMask;
 
     if (scalarWriteMask != 0)
@@ -1699,7 +1777,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     }
 #endif
 
-    if (instr.exportData)
+    if (instr.exportData && !exportRegister.empty())  // port 175
     {
         uint32_t zeroMask = instr.scalarDestRelative ? (0b1111 & ~(instr.vectorWriteMask | instr.scalarWriteMask)) : 0;
         uint32_t oneMask = instr.vectorWriteMask & instr.scalarWriteMask;
@@ -1872,6 +1950,11 @@ void ShaderRecompiler::recompileConstants(const uint8_t* shaderData)
 
 void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include)
 {
+#ifdef RENUT_RECOMP
+    // halo3-nx (2026-11-02): loop constants this shader defines, and those its loops use. A loop on one it does not define
+    // reads the device's (g_LoopConstant): Halo 3's material shaders loop on counts the game sets per draw.
+    std::set<uint32_t> definedLoops, usedLoops;
+#endif
     const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
 
     assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
@@ -2121,10 +2204,52 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     {
         out += "\tin float4 iPos : SV_Position,\n";
 
+#ifdef RENUT_RECOMP
+        // katamari-nx (2026-11-01): which inputs the GPU samples at the centroid of the covered samples under MSAA.
+        // The shader's header holds the two registers the D3D runtime loads with it (both checked against the
+        // emulated GPU's register log, 14 pixel shaders): fieldC is its SQ_CONTEXT_MISC (sc_sample_cntl in bits 2-3),
+        // field18 its SQ_INTERPOLATOR_CNTL (sampling_pattern in the high half, 1 = the centre). The rule is Xenia's
+        // GetInterpolatorSamplingPattern: sc_sample_cntl 0 every interpolator at centroids (most of Beautiful
+        // Katamari's shaders), 1 every one at centres, 2 the pattern's choice per interpolator register. Without a
+        // multisampled target a pixel's centroid is its centre, so this changes only MSAA draws. Before it every
+        // input was at the centre: where an edge runs through pixel centres the pixel was shaded on the edge itself,
+        // e.g. the line across the presents menu's big circle (its two halves meet there with the texture coordinate
+        // on the border of the circle's image).
+        // katamari-nx (2026-11-02): BANJO_CENTROID=0 leaves it out (every input at the centre: rc9's shaders). Checked
+        // on the PC's Renut (Vulkan, the presents menu without the line) and on the console (rc10b: the presents menu
+        // without the line; one first visit drew nothing, not seen again in three more). Ryujinx does not sample at
+        // the centroid (its captures keep the line), so it cannot check this.
+        bool centroidInput[16][16]{};
+        static const bool centroidOn = [] {
+            const char* value = std::getenv("BANJO_CENTROID");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (centroidOn)
+        {
+            const auto pixelShader = reinterpret_cast<const PixelShader*>(shader);
+            const uint32_t sampleControl = (shader->fieldC >> 2) & 3;
+            const uint32_t pattern = pixelShader->field18 >> 16;
+            const uint32_t count = (shader->interpolatorInfo >> 5) & 0x1F;
+            for (uint32_t i = 0; i < count; i++)
+            {
+                union
+                {
+                    Interpolator interpolator;
+                    uint32_t value;
+                };
+                value = pixelShader->interpolators[i];
+                const bool centroid = sampleControl == 0 || (sampleControl == 2 && !((pattern >> interpolator.reg) & 1));
+                centroidInput[uint32_t(interpolator.usage) & 15][uint32_t(interpolator.usageIndex) & 15] = centroid;
+            }
+        }
+#endif
+
         for (auto& [usage, usageIndex] : INTERPOLATORS)
         {
 #ifdef REBLUE_RECOMP
             const char* interpolation = (usage == DeclUsage::Color) ? "centroid " : "";
+#elif defined(RENUT_RECOMP)
+            const char* interpolation = centroidInput[uint32_t(usage) & 15][usageIndex & 15] ? "centroid " : "";
 #else
             const char* interpolation = "";
 #endif
@@ -2320,6 +2445,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     }();
                     const uint32_t reg = definition->registerIndex + i - (isPixelShader ? 256 : 0);
                     const uint32_t words[4] = { value[0].get(), value[1].get(), value[2].get(), value[3].get() };
+                    if (reg < 256)
+                        allLiterals.push_back({ reg, words[0], words[1], words[2], words[3] });
                     std::string comps[4];
                     bool fromBuffer = false;
                     for (uint32_t k = 0; k < 4; ++k)
@@ -2378,6 +2505,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
                 println("\tint4 i{} = int4({}, {}, {}, {});",
                     (definition->registerIndex - 8992) / 4 + i, x, y, z, w);
+#ifdef RENUT_RECOMP
+                definedLoops.insert((definition->registerIndex - 8992) / 4 + i);
+#endif
             }
 #ifdef RENUT_RECOMP
             // One (register, count) header word followed by the values.
@@ -2390,6 +2520,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         out += "\n";
     }
+
+#ifdef RENUT_RECOMP
+    out += LOOP_CONSTANTS_PLACEHOLDER;  // halo3-nx
+#endif
 
     bool printedRegisters[32]{};
 
@@ -2453,7 +2587,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             // sparkles have only that); usually both, 6. With neither the register byte is
             // meaningless (0). With bit 2 alone it can also be 0 when r0 is an interpolator,
             // which the printed check above skips.
-            if (isPixelShader && (shader->fieldC & 0x6) != 0 && i == ((shader->fieldC >> 8) & 0xFF))
+            // kameo-nx (2026-11-04): Kameo's sprites (dust motes, water cannon spray) have neither bit with the register
+            // byte set, 1 or 2, the first register after their interpolators: 4 of its 4,490 pixel shaders, none of which
+            // writes that register first. They read its zw, which was left at zero: one fixed texel.
+            if (isPixelShader && ((shader->fieldC & 0x6) != 0 || ((shader->fieldC >> 8) & 0xFF) != 0) &&
+                i == ((shader->fieldC >> 8) & 0xFF))
             {
                 // xy the pixel position (x negated on back faces), zw the point sprite coordinate.
                 // The position is in guest pixels: the host targets are g_ResolutionScale times
@@ -2485,7 +2623,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     // Xenos starts a vertex shader with the vertex index (or a tessellated vertex's patch and
     // domain location) in r0 and r1.
     if (!isPixelShader)
+    {
         out += "\trenutVertexRegisters(iVertexId, iInstanceId, g_Tessellation, r0, r1);\n";
+        out += CONTROL_POINTS_PLACEHOLDER;
+    }
 #endif
 
     out += "\tint a0 = 0;\n";
@@ -2498,6 +2639,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     {
         // Export targets with no host output: point size and memexport address/data.
         out += "\tfloat4 oPts = 0.0;\n";
+        out += "\tfloat4 oUnused = 0.0;\n";  // dishonored-nx: exports to an unlisted interpolator
         out += "\tfloat4 eA = 0.0;\n";
         out += "\tfloat4 eM0 = 0.0;\n";
         out += "\tfloat4 eM1 = 0.0;\n";
@@ -2927,6 +3069,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     indent();
                     println("int aLSaved{} = aL;", loopDepth);
                     indent();
+#ifdef RENUT_RECOMP
+                    usedLoops.insert(uint32_t(cfInstr.loopStart.loopId));  // halo3-nx
+#endif
                     println("aL = i{}.y;", uint32_t(cfInstr.loopStart.loopId));
                     indent();
                     println("for (int loopIteration{0} = 0; loopIteration{0} < i{1}.x; loopIteration{0}++, aL += i{1}.z)",
@@ -2974,6 +3119,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 else
                 {
                     out += "\t\t\t++aL;\n";
+                #ifdef RENUT_RECOMP
+                    usedLoops.insert(uint32_t(cfInstr.loopEnd.loopId));  // halo3-nx
+                #endif
                     println("\t\t\tif (aL < i{}.x)", uint32_t(cfInstr.loopEnd.loopId));
                     out += "\t\t\t{\n";
                     println("\t\t\t\tpc = {};", uint32_t(cfInstr.loopEnd.address));
@@ -3181,10 +3329,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                         // passes through, unless the viewport transform is off: then it is in
                         // pixels (after what is left of the transform), mapped here to clip
                         // space over the whole render target, y down.
+                        // vivapinata-nx (from rr6-nx, vivapinata_user_clip_plane): the plane is in the guest's clip
+                        // space, so before anything below changes the position. All zero, as for a draw without a
+                        // plane, clips nothing.
+                        if (userClipPlane)
+                            out += "\toUserClip0 = dot(oPos, g_UserClipPlane);\n";
                         out += "\tif (g_ScreenSpace != 0)\n\t{\n";
                         out += "\t\tfloat2 pixel = oPos.xy * g_ScreenScale + g_ScreenOffset * oPos.w;\n";
                         out += "\t\toPos.xy = pixel * float2(2.0, -2.0) / g_ViewportSize + float2(-1.0, 1.0) * oPos.w;\n";
                         out += "\t}\n";
+                        // sasrt-nx (2026-10-20): a backwards depth range done in the shader (g_DepthRemap, shader_common.h): the
+                        // host viewport spans 0-1 and z * x + w * y is the guest's depth.
+                        out += "\tif (g_DepthRemap.x != 0.0)\n\t\toPos.z = oPos.z * g_DepthRemap.x + oPos.w * g_DepthRemap.y;\n";
                         // For point_sprite_gs: the exported point size (0 when the shader exports
                         // none: the render state's), negative for a killed vertex.
                         out += "\toPointSize = oPts.z != 0.0 ? -1.0 : oPts.x;\n";
@@ -3270,10 +3426,61 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 #endif
 
 #ifdef RENUT_RECOMP
+    // halo3-nx (2026-11-02): the device's loop constants a loop reads, and the registers above r31 a shader uses.
+    if (size_t at = out.find(LOOP_CONSTANTS_PLACEHOLDER); at != std::string::npos)
+    {
+        std::string declarations;
+        for (uint32_t loop : usedLoops)
+        {
+            if (!definedLoops.count(loop))
+                declarations += fmt::format("\tint4 i{0} = g_LoopConstant({0});\n", loop);
+        }
+        // Registers above the 32 declared below (Xenos has 128). Halo 3's largest shaders use r32 and r33.
+        for (uint32_t reg = 32; reg < 128; reg++)
+        {
+            const std::string name = fmt::format("r{}", reg);
+            for (size_t use = out.find(name); use != std::string::npos; use = out.find(name, use + 1))
+            {
+                const char before = use ? out[use - 1] : ' ';
+                const char after = use + name.size() < out.size() ? out[use + name.size()] : ' ';
+                if (!isalnum(uint8_t(before)) && before != '_' && !isalnum(uint8_t(after)) && after != '_')
+                {
+                    declarations += fmt::format("\tfloat4 {} = 0.0;\n", name);
+                    break;
+                }
+            }
+        }
+        out.replace(at, LOOP_CONSTANTS_PLACEHOLDER.size(), declarations);
+    }
+
+    // vivapinata-nx: see allLiterals. Each indexed literal array, up to the first register the shader does not define.
+    for (uint32_t base : indexedLiteralBases)
+    {
+        for (uint32_t reg = base; reg < 256; ++reg)
+        {
+            const auto literal = std::find_if(allLiterals.begin(), allLiterals.end(), [reg](const auto& l) { return l[0] == reg; });
+            if (literal == allLiterals.end())
+                break;
+            if (std::none_of(cbufLiterals.begin(), cbufLiterals.end(), [reg](const auto& l) { return l[0] == reg; }))
+                cbufLiterals.push_back(*literal);
+        }
+    }
     if (size_t at = out.find(KILL_OUTPUT_PLACEHOLDER); at != std::string::npos)
     {
         out.replace(at, KILL_OUTPUT_PLACEHOLDER.size(),
-            hasVertexKill ? "\n#ifndef __spirv__\n\t, out float oKill : SV_CullDistance0\n#endif\n" : "");
+            // renut-ultimate: the clip distance first, the cull distance last (the host geometry shaders declare only the first).
+            std::string(userClipPlane && !isPixelShader ? "\n\t, out float oUserClip0 : SV_ClipDistance0\n" : "") +
+            (hasVertexKill ? "\n#ifndef __spirv__\n\t, out float oKill : SV_CullDistance0\n#endif\n" : ""));
+    }
+    {
+        const std::string_view cubeHelper = hasCubeFetch ? "cube" : "cubeValues";
+        for (size_t at = out.find(CUBE_OP_PLACEHOLDER); at != std::string::npos; at = out.find(CUBE_OP_PLACEHOLDER, at))
+            out.replace(at, CUBE_OP_PLACEHOLDER.size(), cubeHelper);
+    }
+    if (size_t at = out.find(CONTROL_POINTS_PLACEHOLDER); at != std::string::npos)
+    {
+        out.replace(at, CONTROL_POINTS_PLACEHOLDER.size(), fetchesControlPoints
+            ? "\trenutControlPoints(g_Tessellation, g_VertexFetchSlot(g_Tessellation.w >> 8u), iInstanceId, r1);\n" : "");
     }
 
     // banjo-nx (2026-10-17): predicated blocks of register arithmetic as select() (banjo_pred_select.h). Off with

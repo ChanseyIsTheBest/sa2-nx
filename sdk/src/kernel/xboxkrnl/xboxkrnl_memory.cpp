@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
 #include <cstring>
 
 #include <rex/assert.h>
@@ -173,6 +174,12 @@ u32 NtAllocateVirtualMemory_entry(mapped_u32 base_addr_ptr, mapped_u32 region_si
   }
   if (!address) {
     // Failed - assume no memory available.
+    // Port 167 (from fnxf_xiii, its note of 2026-11-07): the first 16 failures logged (a load that never ends: out of
+    // guest memory?).
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 16)
+      REXKRNL_WARN("NtAllocateVirtualMemory failed: base {:#x} size {:#x} page {:#x} type {:#x}", adjusted_base,
+                   adjusted_size, page_size, uint32_t(alloc_type));
     return X_STATUS_NO_MEMORY;
   }
 
@@ -400,6 +407,11 @@ u32 MmAllocatePhysicalMemoryEx_entry(u32 flags, u32 region_size, u32 protect_bit
   if (!heap->AllocRange(heap_min_addr, heap_max_addr, adjusted_size, adjusted_alignment,
                         allocation_type, protect, top_down, &base_address)) {
     // Failed - assume no memory available.
+    // Port 167 (from fnxf_xiii, its note of 2026-11-07): the first 16 failures logged.
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 16)
+      REXKRNL_WARN("MmAllocatePhysicalMemoryEx failed: size {:#x}, range {:#x}-{:#x}, alignment {:#x}", uint32_t(region_size),
+                   heap_min_addr, heap_max_addr, adjusted_alignment);
     return 0;
   }
   REXKRNL_IMPORT_RESULT("MmAllocatePhysicalMemoryEx", "addr={:#x}", base_address);

@@ -44,6 +44,11 @@ class XamModule : public system::KernelModule {
   LoaderData loader_data_;
 };
 
+// ds3-nx (2026-10-24, sdk-patches/0014; port 57): a multi-disc title's own XamSwapDisc (xam_info.cpp): the handler
+// gets the guest call as it is (r3 the disc number, r4 the completion event) and answers in r3. nullptr: the stub
+// (success, nothing switched). Set it before the guest starts.
+void SetSwapDiscHandler(void (*handler)(PPCContext& ctx, uint8_t* base));
+
 }  // namespace xam
 }  // namespace kernel
 }  // namespace rex

@@ -4,6 +4,7 @@
  *          list management for the native renderer.
  */
 #include "renut_engine/gpu/backend/video.h"
+#include "renut_engine/gpu/host_batch.h"  // blur-nx (2026-11-18, the Renut host batch)
 
 #include <cstdio>
 #include <mutex>
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <system_error>
 #include <vector>
+#include <algorithm>  // blur-nx (2026-11-17, audit #4): std::max
 #include <atomic>
 #include <chrono>  // banjo-nx (2026-10-20): banjo_deko3d_latency_trim
 #include <string>
@@ -36,52 +38,93 @@
 #include "renut_engine/gpu/backend/video_internal.h"
 #include "renut_engine/gpu/banjo_renut_tuning.h"
 #include "renut_engine/gpu/banjo_renut_record.h"  // banjo-nx (package 28b): banjo_renut_record_worker
+#include "renut_engine/gpu/render/surfaces.h"  // banjo-nx (2026-10-28): NoteGpuFrameForDynamicResolution
 #include <rex/frame_latency.h>  // banjo-nx (2026-10-20): the latency probe's "input -> GPU done"
-#include <rex/cvar.h>  // sa2-nx (2026-10-20): sa2_renut_double_buffer
+#include <rex/cvar.h>  // sa2-nx (2026-10-20): pacman_renut_double_buffer
 #if defined(PLUME_DEKO3D)
 #include <plume_deko3d.h>  // banjo-nx (2026-10-20, banjo_deko3d_latency_trim): fence copies
 #endif
 
 #include "host_shaders/depth_resolve_ms_ps.spirv.h"
 #include "host_shaders/depth_resolve_ps.spirv.h"
+#include "host_shaders/depth_resolve_float_ps.spirv.h"  // sasrt-nx (2026-11-08)
 #include "host_shaders/present_ps.spirv.h"
+#include "host_shaders/present_lut_ps.spirv.h"  // vivapinata-nx (2026-11-12)
 #include "host_shaders/present_vs.spirv.h"
 #include "host_shaders/rectangle_list_gs.spirv.h"
 #include "host_shaders/point_sprite_gs.spirv.h"
 #include "host_shaders/stream_convert_cs.spirv.h"
+#include "host_shaders/fetch_copy_cs.spirv.h"  // sasrt-nx (2026-11-08)
+#include "host_shaders/texel_readback_cs.spirv.h"  // sasrt-nx (2026-11-08)
 #include "host_shaders/target_readback_cs.spirv.h"
 #include "host_shaders/texture_mip_ps.spirv.h"
 #include "host_shaders/resolve_copy_ps.spirv.h"
+#include "host_shaders/view_fp10_encode_ps.spirv.h"  // halo3-nx
+#include "host_shaders/sample_grid_resolve_ps.spirv.h"  // blur-nx (port 76)
+#include "host_shaders/edram_inherit_ps.spirv.h"  // blur-nx (port 76)
+#include "host_shaders/edram_inherit_src_ms_ps.spirv.h"  // blur-nx (port 76)
+#include "host_shaders/edram_inherit_dst_ms_ps.spirv.h"  // blur-nx (port 76)
+#include "host_shaders/edram_inherit_ms_ms_ps.spirv.h"  // blur-nx (port 76)
 #if defined(PLUME_DEKO3D)  // banjo-nx (2026-10-17): the deko3d back end's (tools/deko3d_host_shader.py)
 #include "host_shaders/depth_resolve_ms_ps.deko3d.h"
 #include "host_shaders/depth_resolve_ps.deko3d.h"
+#include "host_shaders/depth_resolve_float_ps.deko3d.h"  // sasrt-nx (2026-11-08)
 #include "host_shaders/present_ps.deko3d.h"
+#include "host_shaders/present_lut_ps.deko3d.h"  // vivapinata-nx (2026-11-12)
 #include "host_shaders/present_vs.deko3d.h"
 #include "host_shaders/rectangle_list_gs.deko3d.h"
 #include "host_shaders/point_sprite_gs.deko3d.h"
 #include "host_shaders/stream_convert_cs.deko3d.h"
+#include "host_shaders/fetch_copy_cs.deko3d.h"  // sasrt-nx (2026-11-08)
+#include "host_shaders/texel_readback_cs.deko3d.h"  // sasrt-nx (2026-11-08)
 #include "host_shaders/target_readback_cs.deko3d.h"
 #include "host_shaders/texture_mip_ps.deko3d.h"
 #include "host_shaders/resolve_copy_ps.deko3d.h"
+#include "host_shaders/view_fp10_encode_ps.deko3d.h"  // halo3-nx
+#include "host_shaders/sample_grid_resolve_ps.deko3d.h"  // blur-nx (port 76)
+#include "host_shaders/edram_inherit_ps.deko3d.h"  // blur-nx (port 76)
+#include "host_shaders/edram_inherit_src_ms_ps.deko3d.h"  // blur-nx (port 76)
+#include "host_shaders/edram_inherit_dst_ms_ps.deko3d.h"  // blur-nx (port 76)
+#include "host_shaders/edram_inherit_ms_ms_ps.deko3d.h"  // blur-nx (port 76)
 #endif
 #if defined(_WIN32)
 #include "host_shaders/depth_resolve_ms_ps.dxil.h"
 #include "host_shaders/depth_resolve_ps.dxil.h"
+#include "host_shaders/depth_resolve_float_ps.dxil.h"  // sasrt-nx (2026-11-08)
 #include "host_shaders/present_ps.dxil.h"
+#include "host_shaders/present_lut_ps.dxil.h"  // vivapinata-nx (2026-11-12)
 #include "host_shaders/present_vs.dxil.h"
 #include "host_shaders/rectangle_list_gs.dxil.h"
 #include "host_shaders/point_sprite_gs.dxil.h"
 #include "host_shaders/stream_convert_cs.dxil.h"
+#include "host_shaders/fetch_copy_cs.dxil.h"  // sasrt-nx (2026-11-08)
+#include "host_shaders/texel_readback_cs.dxil.h"  // sasrt-nx (2026-11-08)
 #include "host_shaders/target_readback_cs.dxil.h"
 #include "host_shaders/texture_mip_ps.dxil.h"
 #include "host_shaders/resolve_copy_ps.dxil.h"
+#include "host_shaders/view_fp10_encode_ps.dxil.h"  // halo3-nx
+#include "host_shaders/sample_grid_resolve_ps.dxil.h"  // blur-nx (port 76)
+#include "host_shaders/edram_inherit_ps.dxil.h"  // blur-nx (port 76)
+#include "host_shaders/edram_inherit_src_ms_ps.dxil.h"  // blur-nx (port 76)
+#include "host_shaders/edram_inherit_dst_ms_ps.dxil.h"  // blur-nx (port 76)
+#include "host_shaders/edram_inherit_ms_ms_ps.dxil.h"  // blur-nx (port 76)
 #endif
 
-REXCVAR_DEFINE_BOOL(sa2_renut_double_buffer, false, "SA2/Renderer",
+// sa2-nx (2026-10-20, sa2_renut_double_buffer). pacman-nx: on by default, the user's call (2026-11-03). renut-ultimate: off by
+// default, as in sa2-nx (a latency against stutter choice for each game's toml).
+// sasrt-nx (2026-11-11, port 80; its stutter hunt, run cache1: the race's three 280-350 ms frames were the render thread
+// waiting for the ring cleaner's range in progress, the cleaner at 0x3B on the system core kept off it by other work
+// there). A clean (dc cvac, plume Deko3DBuffer::unmap) can be repeated and run on two cores at once: the render thread
+// cleans that range itself instead of waiting for the thread to finish it (RingCleaner::Wait).
+REXCVAR_DEFINE_BOOL(sasrt_ring_cleaner_take_over, true, "Banjo/Enhancements",
+                    "From sasrt-nx: a submit that needs the range the ring cleaner thread is cleaning cleans it itself (a "
+                    "cache clean by address, repeatable) instead of waiting for the thread, which runs at the lowest "
+                    "priority on the system core and was kept off it for 280-350 ms at SASRT's race start")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(pacman_renut_double_buffer, false, "PacMan/Renderer",
                     "Renut's renderer: a swapchain of 2 images instead of 3 (input latency: a finished frame is shown at "
-                    "the next refresh instead of queueing behind one already waiting). Off by default: a frame that "
-                    "misses a refresh then waits a whole one, which hurts where frames are close to the budget (split "
-                    "screen). Takes effect at start")
+                    "the next refresh instead of queueing behind one already waiting). A frame that misses a refresh then "
+                    "waits a whole one. Takes effect at start")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace renut::gpu {
@@ -162,6 +205,8 @@ bool BuildSamplers(VideoState &s) {
   }
   s.sampler_set->setSampler(kLinearClampSamplerSlot, s.linear_clamp_sampler.get());
   s.sampler_set->setSampler(kPointClampSamplerSlot, s.point_clamp_sampler.get());
+  for (uint32_t slot = kPointClampSamplerSlot + 1; slot < kFirstDynamicSamplerSlot; ++slot)
+    s.sampler_set->setSampler(slot, s.linear_clamp_sampler.get());  // vivapinata-nx: an empty texture slot's word plus a variant
   return true;
 }
 
@@ -279,6 +324,15 @@ bool BuildPresentPipeline(VideoState &s) {
     return false;
   }
   s.present_pipeline->setName("renut present");
+  // vivapinata-nx (2026-11-12, vivapinata_present_lut): the scan-out with the gamma ramp as a 256 x 256 table
+  // (present_lut_ps.hlsl); optional: without it the scan-out is present_ps's.
+  s.present_lut_ps = CreateHostShader(s.device.get(), RENUT_HOST_SHADER(present_lut_ps), "present_lut_ps");
+  if (s.present_lut_ps) {
+    desc.pixelShader = s.present_lut_ps.get();
+    s.present_lut_pipeline = s.device->createGraphicsPipeline(desc);
+    if (s.present_lut_pipeline)
+      s.present_lut_pipeline->setName("renut present (gamma table)");
+  }
   return true;
 }
 
@@ -286,6 +340,21 @@ bool BuildPresentPipeline(VideoState &s) {
 bool BuildDepthResolvePipelines(VideoState &s) {
   // banjo-nx (2026-10-18): the colour resolves drawn on deko3d (DrawResolveCopy); optional.
   s.resolve_copy_ps = CreateHostShader(s.device.get(), RENUT_HOST_SHADER(resolve_copy_ps), "resolve_copy_ps");
+  // halo3-nx (2026-11-03): one EDRAM view read through another (SyncColorViewLocked).
+  s.view_fp10_encode_ps = CreateHostShader(s.device.get(), RENUT_HOST_SHADER(view_fp10_encode_ps), "view_fp10_encode_ps");
+  // blur-nx (2026-11-10, port 76; its key 216: blur_renut_sample_grid_resolve): a multisampled view resolved from its
+  // sample grid's 1x target. Optional: without it the view's own target is resolved.
+  s.sample_grid_resolve_ps =
+      CreateHostShader(s.device.get(), RENUT_HOST_SHADER(sample_grid_resolve_ps), "sample_grid_resolve_ps");
+  // blur-nx (2026-11-11, port 76; its key 220: blur_renut_edram_inherit): one EDRAM view written into another (1x /
+  // multisampled each side). Optional: without one that form takes nothing.
+  s.edram_inherit_ps = CreateHostShader(s.device.get(), RENUT_HOST_SHADER(edram_inherit_ps), "edram_inherit_ps");
+  s.edram_inherit_src_ms_ps =
+      CreateHostShader(s.device.get(), RENUT_HOST_SHADER(edram_inherit_src_ms_ps), "edram_inherit_src_ms_ps");
+  s.edram_inherit_dst_ms_ps =
+      CreateHostShader(s.device.get(), RENUT_HOST_SHADER(edram_inherit_dst_ms_ps), "edram_inherit_dst_ms_ps");
+  s.edram_inherit_ms_ms_ps =
+      CreateHostShader(s.device.get(), RENUT_HOST_SHADER(edram_inherit_ms_ms_ps), "edram_inherit_ms_ms_ps");
   s.depth_resolve_ps[0] =
       CreateHostShader(s.device.get(), RENUT_HOST_SHADER(depth_resolve_ps), "depth_resolve_ps");
   s.depth_resolve_ps[1] = CreateHostShader(s.device.get(), RENUT_HOST_SHADER(depth_resolve_ms_ps),
@@ -317,6 +386,17 @@ bool BuildDepthResolvePipelines(VideoState &s) {
     if (s.depth_resolve_float_pipeline[i])
       s.depth_resolve_float_pipeline[i]->setName(i ? "renut depth resolve, depth only (msaa)"
                                                    : "renut depth resolve, depth only");
+    // sasrt-nx (2026-11-08, sasrt_gpu_depth_resolve_float_ps): the same pipeline with the float-only shader.
+    if (i == 0) {
+      s.sasrt_depth_float_ps =
+          CreateHostShader(s.device.get(), RENUT_HOST_SHADER(depth_resolve_float_ps), "depth_resolve_float_ps");
+      if (s.sasrt_depth_float_ps) {
+        desc.pixelShader = s.sasrt_depth_float_ps.get();
+        s.sasrt_depth_float_pipeline = s.device->createGraphicsPipeline(desc);
+      }
+      if (s.sasrt_depth_float_pipeline)
+        s.sasrt_depth_float_pipeline->setName("sasrt depth resolve, the float alone");
+    }
   }
   return true;
 }
@@ -367,6 +447,37 @@ void BuildStreamConvertPipeline(VideoState &s) {
   s.stream_convert_pipeline->setName("renut stream convert");
 }
 
+// sasrt-nx (2026-11-08, sasrt_gpu_fetch_copy_compute): see shaders/host/fetch_copy_cs.hlsl.
+plume::RenderDescriptorSetBuilder FetchCopySetBuilder() {
+  plume::RenderDescriptorSetBuilder buffers;
+  buffers.begin();
+  buffers.addReadWriteByteAddressBuffer(0, kFetchCopyBuffers);  // u0, space0
+  buffers.end();
+  return buffers;
+}
+
+// Optional (deko3d only): without it the fetch data is copied by the copy engine, as before.
+void BuildFetchCopyPipeline(VideoState &s) {
+  if (!IsDeko3D())
+    return;
+  plume::RenderPipelineLayoutBuilder layout;
+  layout.begin(false, false);
+  layout.addDescriptorSet(FetchCopySetBuilder());
+  layout.addPushConstant(0, 1, sizeof(FetchCopyPush), plume::RenderShaderStageFlag::COMPUTE);
+  layout.end();
+  s.fetch_copy_layout = layout.create(s.device.get());
+  s.fetch_copy_cs = CreateHostShader(s.device.get(), RENUT_HOST_SHADER(fetch_copy_cs), "fetch_copy_cs");
+  if (s.fetch_copy_layout && s.fetch_copy_cs) {
+    s.fetch_copy_pipeline = s.device->createComputePipeline(
+        plume::RenderComputePipelineDesc(s.fetch_copy_layout.get(), s.fetch_copy_cs.get(), 64, 1, 1));
+  }
+  if (!s.fetch_copy_pipeline) {
+    RGPU_WARN("[sasrt] fetch copy pipeline creation failed: the copy engine copies the fetch data (as before)");
+    return;
+  }
+  s.fetch_copy_pipeline->setName("sasrt fetch copy");
+}
+
 // See shaders/host/target_readback_cs.hlsl.
 plume::RenderDescriptorSetBuilder TargetReadbackSetBuilder() {
   plume::RenderDescriptorSetBuilder buffers;
@@ -403,6 +514,17 @@ void BuildTargetReadbackPipeline(VideoState &s) {
     return;
   }
   s.target_readback_pipeline->setName("renut target readback");
+  // sasrt-nx (2026-11-08, sasrt_gpu_texel_readback_compute; deko3d only): the 1x1 float readback in the same layout.
+  if (IsDeko3D()) {
+    s.texel_readback_cs = CreateHostShader(s.device.get(), RENUT_HOST_SHADER(texel_readback_cs), "texel_readback_cs");
+    if (s.texel_readback_cs)
+      s.texel_readback_pipeline = s.device->createComputePipeline(plume::RenderComputePipelineDesc(
+          s.target_readback_layout.get(), s.texel_readback_cs.get(), 1, 1, 1));
+    if (s.texel_readback_pipeline)
+      s.texel_readback_pipeline->setName("sasrt texel readback");
+    else
+      RGPU_WARN("[sasrt] texel readback pipeline creation failed: the copy engine reads the 1x1 resolves back (as before)");
+  }
 }
 
 } // namespace
@@ -411,6 +533,10 @@ namespace detail {
 
 std::unique_ptr<plume::RenderDescriptorSet> CreateStreamConvertSet(VideoState &s) {
   return StreamConvertSetBuilder().create(s.device.get());
+}
+
+std::unique_ptr<plume::RenderDescriptorSet> CreateFetchCopySet(VideoState &s) {
+  return FetchCopySetBuilder().create(s.device.get());
 }
 
 std::unique_ptr<plume::RenderDescriptorSet> CreateTargetReadbackSet(VideoState &s) {
@@ -444,6 +570,29 @@ void DrainSlot(VideoState &s, uint32_t slot) {
   s.retired_framebuffers[slot].clear();
   s.retired_views[slot].clear();
   s.retired_textures[slot].clear();
+  // blur-nx (2026-11-17, audit #4, blur_renut_texture_pool): the slot's frame is done with its given-back images: into
+  // the pool (after the views above, which name them), the oldest dropped past kTexturePoolBytes or kTexturePoolCount.
+  if (!s.retired_pool[slot].empty()) {
+    constexpr uint64_t kTexturePoolBytes = 96ull << 20;
+    constexpr size_t kTexturePoolCount = 48;
+    for (VideoState::PooledTexture &p : s.retired_pool[slot]) {
+      s.texture_pool_bytes += p.bytes;
+      s.texture_pool.push_back(std::move(p));
+    }
+    s.retired_pool[slot].clear();
+    size_t drop = 0;
+    while (drop < s.texture_pool.size() &&
+           (s.texture_pool_bytes > kTexturePoolBytes || s.texture_pool.size() - drop > kTexturePoolCount)) {
+      s.texture_pool_bytes -= s.texture_pool[drop].bytes;
+      ++drop;
+    }
+    if (drop) {
+      s.texture_pool.erase(s.texture_pool.begin(), s.texture_pool.begin() + ptrdiff_t(drop));
+      s.texture_pool_dropped.fetch_add(drop, std::memory_order_relaxed);
+    }
+    s.texture_pool_kept.store(s.texture_pool.size(), std::memory_order_relaxed);
+    s.texture_pool_kept_bytes.store(s.texture_pool_bytes, std::memory_order_relaxed);
+  }
   s.retired_buffers[slot].clear();
   s.retired_sets[slot].clear();
   ReleaseCacheCopiesLocked(slot);
@@ -485,6 +634,16 @@ constexpr uint32_t kKickListsAFrame = 3;
 // banjo-nx (2026-10-20, banjo_deko3d_eager_kicks): smaller lists, more of them, each submitted at its own kick.
 constexpr uint32_t kEagerKickDraws = 100;
 static_assert(kKickListsAFrame <= VideoState::kKickLists);
+// Port 164 (from fnxf_xiii, its note of 2026-11-05; banjo_deko3d_progressive_submit): the piece was 200 draws, at most
+// 3 a frame; fnxf_xiii's gameplay frame had ~195 (up to ~400), so a frame almost never split and the GPU started it
+// only at the present (submit -> GPU done 17-18 of its 19 ms; a late Swap or a render-thread spike then missed the
+// refresh). Now a quarter of the previous frame's draws (40 at least), up to kKickLists pieces: the GPU works on the
+// frame while the game and the render thread still make the rest.
+constexpr uint32_t kPiecesAFrame = 4;
+constexpr uint32_t kPieceMinDraws = 40;
+uint32_t PieceDraws(const VideoState &s) {
+  return std::max(kPieceMinDraws, s.last_frame_draws / kPiecesAFrame);
+}
 
 class RingCleaner {
 public:
@@ -518,6 +677,16 @@ public:
       }
       if (working_ == 0 || working_ > ticket)
         return;
+      // sasrt-nx (2026-11-11, port 80, sasrt_ring_cleaner_take_over): the range in progress cleaned here too; every range
+      // up to 'ticket' is then clean (the queue's were taken above; a later job of the thread has a later ticket).
+      static const bool take_over = REXCVAR_GET(sasrt_ring_cleaner_take_over);
+      if (take_over) {
+        const UploadRing::Range r = working_range_;
+        lock.unlock();
+        Clean(r);
+        banjo::renut_gpu::CountKickSubmit(2);
+        return;
+      }
       render_thread::WaitScope wait;
       done_cv_.wait(lock, [&] { return working_ == 0 || working_ > ticket; });
     }
@@ -544,12 +713,29 @@ private:
 
   void Run() {
     banjo::renut_gpu::OnBackgroundThreadStart("ring cleaner");
+    // blur-nx (2026-11-18, the Renut host batch's #11, blur_renut_ring_cleaner_priority / A/B 233): above the game
+    // threads on the background core, so that the ranges are clean before a submit needs them (the race: the render
+    // thread cleaned 835 of 1,946 ranges a 10 s itself, the cleaner behind the game threads there). Set again when the
+    // A/B half changes it.
+    int priority = ::renut::gpu::host_batch::BackgroundPriority();
+    const auto follow = [&priority] {
+      const int want = ::renut::gpu::host_batch::On(::renut::gpu::host_batch::kCleanerPriority)
+                           ? ::renut::gpu::host_batch::CleanerPriority()
+                           : ::renut::gpu::host_batch::BackgroundPriority();
+      if (want != priority) {
+        ::renut::gpu::host_batch::SetThisThreadPriority(want);
+        priority = want;
+      }
+    };
+    follow();
     std::unique_lock lock(mutex_);
     for (;;) {
       cv_.wait(lock, [this] { return !queue_.empty(); });
+      follow();
       const Job job = queue_.front();
       queue_.pop_front();
       working_ = job.ticket;
+      working_range_ = job.range;  // port 80: a waiting submit may clean it too (sasrt_ring_cleaner_take_over)
       lock.unlock();
       Clean(job.range);
       banjo::renut_gpu::CountKickSubmit(1);
@@ -570,6 +756,7 @@ private:
   std::condition_variable cv_, done_cv_;
   std::deque<Job> queue_;
   uint64_t last_ticket_ = 0, working_ = 0;  // working_: the ticket of the range being cleaned, 0 for none
+  UploadRing::Range working_range_{};        // port 80: the range being cleaned (valid while working_ != 0)
   bool started_ = false;
 };
 
@@ -612,6 +799,7 @@ void CollectGpuTime(VideoState &s, uint32_t slot) {
       total += ns[2 * i + 1] - ns[2 * i];
   }
   frame_stats::OnGpuFrame(double(total) / 1e6);
+  NoteGpuFrameForDynamicResolution(double(total) / 1e6);  // banjo-nx (2026-10-28, GPU block)
 }
 
 } // namespace
@@ -843,6 +1031,8 @@ void SubmitAndAdvance(VideoState &s, plume::RenderCommandSemaphore *wait,
     // banjo-nx (2026-10-20, input latency): the guest Swap this frame ends, for the probe's "input -> GPU done".
     g_slot_swap[cur] = g_presenting_swap;
     g_gpu_done_noted[cur] = g_presenting_swap == 0;
+    s.last_frame_draws = s.frame_draws;  // port 164 (banjo_deko3d_progressive_submit)
+    s.frame_draws = 0;
 #if defined(PLUME_DEKO3D)
     g_trim.frame_end[cur] = plume::Deko3DCopyFence(s.fences[cur].get());
     FirstGpuWorkLocked(cur);
@@ -934,10 +1124,10 @@ bool Video::CreateHostDevice() {
   // One image beyond the frames in flight, so acquiring never waits on scanout.
   // sa2-nx (2026-10-20, sa2_renut_double_buffer): two images, so a finished frame is shown at the next refresh instead
   // of queueing behind one already waiting for it; a frame that misses a refresh then waits a whole one.
-  static const bool double_buffer = REXCVAR_GET(sa2_renut_double_buffer);
+  static const bool double_buffer = REXCVAR_GET(pacman_renut_double_buffer);
   const uint32_t images = double_buffer ? 2u : kFramesInFlight + 1;
   plume::RenderSwapChainDesc swap_desc(render_window, kSwapChainFormat, images, false, kFramesInFlight);
-  RGPU_INFO("Swapchain: {} images{}", images, double_buffer ? " (sa2_renut_double_buffer)" : "");
+  RGPU_INFO("Swapchain: {} images{}", images, double_buffer ? " (pacman_renut_double_buffer)" : "");
   s.swap_chain = s.queue->createSwapChain(swap_desc);
   // plume's Vulkan swapchain is created lazily by resize().
   if (s.swap_chain && IsVulkan())
@@ -963,6 +1153,7 @@ bool Video::CreateHostDevice() {
   }
   BuildRectangleListShader(s);
   BuildStreamConvertPipeline(s);
+  BuildFetchCopyPipeline(s);  // sasrt-nx (2026-11-08)
   BuildTargetReadbackPipeline(s);
   // Optional: without it, scaled resolve destinations keep one level.
   s.texture_mip_ps =
@@ -1037,6 +1228,7 @@ bool Video::EnsureCommandListLocked() {
 
 void Video::NoteDrawLocked() {
   ++State().list_draws;
+  ++State().frame_draws;  // port 164
 }
 
 void Video::NotePresentingSwap(uint64_t swap) {
@@ -1096,9 +1288,10 @@ void Video::KickLocked() {
   }
   // The open list ends here when it holds enough draws; the frame goes on in a kick list of the slot.
   const bool eager = banjo::renut_gpu::EagerKicksOn();
+  const bool progressive = !eager && banjo::renut_gpu::ProgressiveSubmitOn();  // port 164
   if (!banjo::renut_gpu::KickSubmitOn() ||
-      s.list_draws < (eager ? detail::kEagerKickDraws : detail::kKickSubmitDraws) ||
-      s.kick_lists_used[cur] >= (eager ? VideoState::kKickLists : detail::kKickListsAFrame))
+      s.list_draws < (eager ? detail::kEagerKickDraws : progressive ? detail::PieceDraws(s) : detail::kKickSubmitDraws) ||
+      s.kick_lists_used[cur] >= (eager || progressive ? VideoState::kKickLists : detail::kKickListsAFrame))
     return;
   std::unique_ptr<plume::RenderCommandList> &next = s.kick_lists[cur][s.kick_lists_used[cur]];
   if (!next) {
@@ -1195,6 +1388,79 @@ void Video::RetireLocked(std::unique_ptr<plume::RenderTexture> texture) {
     auto &s = State();
     s.retired_textures[s.frame].push_back(std::move(texture));
   }
+}
+
+// blur-nx (2026-11-17, audit #4, blur_renut_texture_pool).
+namespace {
+bool SamePoolDesc(const plume::RenderTextureDesc &a, const plume::RenderTextureDesc &b) {
+  return a.dimension == b.dimension && a.width == b.width && a.height == b.height && a.depth == b.depth &&
+         a.mipLevels == b.mipLevels && a.arraySize == b.arraySize && a.format == b.format &&
+         a.multisampling.sampleCount == b.multisampling.sampleCount && !a.multisampling.sampleLocationsEnabled &&
+         !b.multisampling.sampleLocationsEnabled && a.textureArrangement == b.textureArrangement &&
+         a.optimizedClearValue == nullptr && b.optimizedClearValue == nullptr && a.flags == b.flags &&
+         a.committed == b.committed;
+}
+uint64_t PoolBytes(const plume::RenderTextureDesc &d) {
+  // An estimate for the pool's cap: 8 bytes a texel at most, the levels' third more.
+  const uint64_t texels = uint64_t(d.width) * d.height * std::max(d.depth, 1u) * std::max(d.arraySize, 1u) *
+                          std::max<uint64_t>(uint64_t(d.multisampling.sampleCount), 1);
+  return texels * 8 * (d.mipLevels > 1 ? 4 : 3) / 3;
+}
+}  // namespace
+
+void Video::RetirePooledLocked(std::unique_ptr<plume::RenderTexture> texture, const plume::RenderTextureDesc &desc) {
+  if (!texture)
+    return;
+  auto &s = State();
+  s.retired_pool[s.frame].push_back({desc, std::move(texture), PoolBytes(desc)});
+}
+
+std::unique_ptr<plume::RenderTexture> Video::TakePooledLocked(const plume::RenderTextureDesc &desc) {
+  auto &s = State();
+  // Newest first: the image the same destination gave back a frame or two ago.
+  for (size_t i = s.texture_pool.size(); i-- > 0;) {
+    if (SamePoolDesc(s.texture_pool[i].desc, desc)) {
+      std::unique_ptr<plume::RenderTexture> t = std::move(s.texture_pool[i].texture);
+      s.texture_pool_bytes -= s.texture_pool[i].bytes;
+      s.texture_pool.erase(s.texture_pool.begin() + ptrdiff_t(i));
+      s.texture_pool_hits.fetch_add(1, std::memory_order_relaxed);
+      s.texture_pool_kept.store(s.texture_pool.size(), std::memory_order_relaxed);
+      s.texture_pool_kept_bytes.store(s.texture_pool_bytes, std::memory_order_relaxed);
+      return t;
+    }
+  }
+  s.texture_pool_misses.fetch_add(1, std::memory_order_relaxed);
+  return nullptr;
+}
+
+size_t Video::DropTexturePoolLocked() {
+  // renut-ultimate (2026-11-17, port 148): the pool holds up to 96 MB of images that Retire would have destroyed; with
+  // the heap or the GPU budget short they go before any cold texture does. The images of retired_pool, still in a frame
+  // in flight, join the pool at their DrainSlot and go at the next check.
+  auto &s = State();
+  const size_t n = s.texture_pool.size();
+  if (!n)
+    return 0;
+  s.texture_pool.clear();
+  s.texture_pool_bytes = 0;
+  s.texture_pool_dropped.fetch_add(n, std::memory_order_relaxed);
+  s.texture_pool_kept.store(0, std::memory_order_relaxed);
+  s.texture_pool_kept_bytes.store(0, std::memory_order_relaxed);
+  return n;
+}
+
+std::string Video::TexturePoolReportLocked() {
+  // (Called by the 10 s report on the game thread: only the atomics.)
+  auto &s = State();
+  const uint64_t hits = s.texture_pool_hits.exchange(0, std::memory_order_relaxed);
+  const uint64_t misses = s.texture_pool_misses.exchange(0, std::memory_order_relaxed);
+  const uint64_t dropped = s.texture_pool_dropped.exchange(0, std::memory_order_relaxed);
+  if (!hits && !misses)
+    return {};
+  return fmt::format("texture pool (blur_renut_texture_pool): {} images reused, {} made new, {} dropped; {} kept "
+                     "({:.1f} MB)",
+                     hits, misses, dropped, s.texture_pool_kept.load(std::memory_order_relaxed),
+                     double(s.texture_pool_kept_bytes.load(std::memory_order_relaxed)) / (1024.0 * 1024.0));
 }
 
 void Video::RetireLocked(std::unique_ptr<plume::RenderTextureView> view) {

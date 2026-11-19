@@ -12,11 +12,11 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
-#include <map>
 #include <string>
 
 #include <fmt/format.h>
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/image_info.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -28,7 +28,6 @@
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/system/kernel_module.h>
 #include <rex/system/kernel_state.h>
-#include <rex/system/static_modules.h>
 #include <rex/system/function_dispatcher.h>
 #include <chrono>
 #include <thread>
@@ -46,9 +45,44 @@
 #include <rex/system/xtimer.h>
 #include <rex/sys_counters.h>
 
-namespace rex::system {
+// blur-nx (2026-11-11): which notification listeners of the system area get the startup notifications
+// (KernelState::RegisterNotifyListener).
+REXCVAR_DEFINE_STRING(notify_startup_listeners, "first", "Kernel",
+                      "Which XNotify listeners of the system area get the startup notifications (XN_SYS_UI, "
+                      "SIGNINCHANGED, INPUTDEVICESCHANGED, INPUTDEVICECONFIGCHANGED): first = only the first made "
+                      "(Xenia's rule; a race when a game makes several on different threads: Blur's boot then waits "
+                      "forever under load), all = every one once when it is made, second = only the second (a test "
+                      "that reproduces the bad order)")
+    .allowed({"first", "all", "second"})
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
-constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
+
+// renut-ultimate (2026-11-16, port 143; tw2de_nx's kernel fixes, off by default: the user's word, "make sure its off by
+// default"; the speed-up, the deferred delay of 0 with the event reset it needs, ON: "port the speed ups as on by
+// default"). rex/ppc/function.h g_u64_args_whole.
+REXCVAR_DEFINE_BOOL(kernel_u64_args_whole, false, "Kernel",
+                    "tw2de_nx (exact): an export's 64-bit integer argument (u64) read whole, not only its low word "
+                    "(XamFormatDateString / XamFormatTimeString's FILETIME, XamNotifyCreateListener's mask, an XUID). "
+                    "false: the low word, as before");
+// tw2de_nx (2026-10-31): the overlapped's event reset as the deferred operation starts, as the console (and Windows) do.
+REXCVAR_DEFINE_BOOL(kernel_overlapped_reset_event, true, "Kernel",
+                    "tw2de_nx (exact): a deferred overlapped call (XamContentCreate, XamEnumerate, the XamShow* "
+                    "dialogs) resets the overlapped's event as it starts, as the console does: a signal left from an "
+                    "earlier operation on the same overlapped would end the caller's wait for this one at once, its "
+                    "result still IO_PENDING (FINAL FANTASY XIII's save list showed 41 of 51 saves). On by default "
+                    "with kernel_deferred_overlapped_delay_ms 0, which needs it. false: the event as it was, as before");
+// tw2de_nx (2026-10-30): Xenia's fixed 100 ms before every deferred overlapped call completes; 0 (no wait) by default.
+REXCVAR_DEFINE_INT32(kernel_deferred_overlapped_delay_ms, 0, "Kernel",
+                     "tw2de_nx: milliseconds a deferred overlapped call (XamContentCreate, XamEnumerate, the XamShow* "
+                     "dialogs) waits before it completes; 0 by default: completed as soon as the dispatch thread runs it "
+                     "(still asynchronous), with kernel_overlapped_reset_event on. 100 is Xenia's and the value before "
+                     "(a save list's load screen that opens 19 saves waited 1.9 s; each one's own work ~15 ms)");
+
+namespace rex::ppc {
+bool g_u64_args_whole = false;  // port 143: rex/ppc/function.h
+}  // namespace rex::ppc
+
+namespace rex::system {
 
 // This is a global object initialized with the XboxkrnlModule.
 // It references the current kernel state object that all kernel methods should
@@ -69,6 +103,7 @@ KernelState::KernelState(Runtime* emulator)
       dpc_list_(emulator->memory()) {
   function_dispatcher_ = emulator->function_dispatcher();
   file_system_ = emulator->file_system();
+  rex::ppc::g_u64_args_whole = REXCVAR_GET(kernel_u64_args_whole);  // port 143
 
   app_manager_ = std::make_unique<xam::AppManager>();
   user_profile_ = std::make_unique<xam::UserProfile>();
@@ -292,7 +327,7 @@ void KernelState::LoadAchievementsData() {
   const util::XdbfGameData db = title_xdbf();
   if (db.is_valid()) {
     const XLanguage language =
-        db.GetExistingLanguage(static_cast<XLanguage>(REXCVAR_GET(user_language)));
+        db.GetExistingLanguage(static_cast<XLanguage>(rex::system::EffectiveLanguage()));
     for (const auto& entry : db.GetAchievements()) {
       AchievementInfo info;
       info.id = entry.id;
@@ -750,6 +785,10 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
   // Wire recompiled code (if any) before publishing to user_modules_, so a
   // failure in this block leaves no half-loaded entry behind.
   auto recomp = FindRecompiledModule(path);
+  if (!recomp) {
+    // ds3-nx (2026-10-24, sdk-patches/0015; port 57)
+    REXSYS_WARN("LoadUserModule: no recompiled code registered for '{}' (its functions will not run)", path);
+  }
   bool wired_recomp = false;
   if (recomp && !recomp->shared_lib_name.empty()) {
     const std::string& lib_key = recomp->guest_path;
@@ -765,19 +804,15 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
     }
 
     rex::platform::DynamicLibrary library_local;
-    // A module linked into the executable (no dynamic loading, e.g. an NRO) registered its entry points.
-    const StaticModuleEntry* static_module = FindStaticModule(recomp->shared_lib_name.c_str());
-    if (!static_module && !library_local.Load(std::filesystem::path(recomp->shared_lib_name),
-                                              rex::platform::SymbolResolution::kImmediate)) {
+    if (!library_local.Load(std::filesystem::path(recomp->shared_lib_name),
+                            rex::platform::SymbolResolution::kImmediate)) {
       REXSYS_ERROR("Failed to load shared library for module '{}'", recomp->pe_name);
     } else {
+      auto register_func = reinterpret_cast<runtime::FunctionDispatcher::RegisterFn>(
+          library_local.GetRawSymbol("ReXModule_Register"));
       using GetImageInfoFn = const rex::PPCImageInfo* (*)();
-      auto register_func = static_module ? static_module->register_fn
-                                         : reinterpret_cast<runtime::FunctionDispatcher::RegisterFn>(
-                                               library_local.GetRawSymbol("ReXModule_Register"));
-      auto get_image_info = static_module ? static_module->get_image_info
-                                          : reinterpret_cast<GetImageInfoFn>(
-                                                library_local.GetRawSymbol("ReXModule_GetImageInfo"));
+      auto get_image_info =
+          reinterpret_cast<GetImageInfoFn>(library_local.GetRawSymbol("ReXModule_GetImageInfo"));
       if (!register_func) {
         REXSYS_ERROR("ReXModule_Register not found in '{}'", recomp->shared_lib_name);
       } else if (!get_image_info) {
@@ -929,6 +964,23 @@ std::optional<KernelState::RecompiledModuleInfo> KernelState::FindRecompiledModu
     if (info.guest_path == normalized)
       return info;
   }
+  // ds3-nx (2026-10-24, sdk-patches/0015; port 57): a title may remap game: to a device of its own (a title update
+  // folder, a disc), so the path the loader builds ("device/<name>/<file>") is not the one the manifest gave. Fall back
+  // to the file name when exactly one module has it.
+  auto file_name = [](std::string_view path) {
+    auto slash = path.find_last_of('/');
+    return slash == std::string_view::npos ? path : path.substr(slash + 1);
+  };
+  const KernelState::RecompiledModuleInfo* match = nullptr;
+  for (const auto& info : recompiled_modules_) {
+    if (file_name(info.guest_path) != file_name(normalized))
+      continue;
+    if (match)
+      return std::nullopt;
+    match = &info;
+  }
+  if (match)
+    return *match;
   return std::nullopt;
 }
 
@@ -1101,7 +1153,22 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
   // Games seem to expect a few notifications on startup, only for the first
   // listener.
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=resident+evil+5&start=375
-  if (!has_notified_startup_ && listener->mask() & 0x00000001) {
+  // blur-nx (2026-11-11): "the first" is a race when a game makes its system listeners on several threads. Blur makes
+  // two (mask 0x83 on one thread, at 5.6 s; mask 0x05 on another, at 12.4 s, in a PC run): the first gets the set and
+  // the game goes on to its save; under load (the PC busy, the guard's slow verify runs) the second thread can come
+  // first, the 0x83 listener never hears XN_SYS_SIGNINCHANGED and the boot's loading screen waits forever (4 of 8
+  // guard runs on 2026-11-11, before any XMA kick or save access). notify_startup_listeners: "first" as before, "all"
+  // (every listener of the system area gets the set once, when it is made), "second" (a test: only the second, which
+  // reproduces the bad order on demand).
+  if (!(listener->mask() & 0x00000001)) return;
+  static const std::string mode = REXCVAR_GET(notify_startup_listeners);
+  static uint32_t system_listeners = 0;  // counted under the global lock
+  ++system_listeners;
+  const bool give = mode == "all" ? true : mode == "second" ? system_listeners == 2 : !has_notified_startup_;
+  REXSYS_INFO("notification listener of the system area #{} (mask {:#x}): {} (notify_startup_listeners {})",
+              system_listeners, listener->mask(), give ? "given the startup notifications" : "no startup notifications",
+              mode);
+  if (give) {
     has_notified_startup_ = true;
     // XN_SYS_UI (on, off)
     listener->EnqueueNotification(0x00000009, 1);
@@ -1230,6 +1297,18 @@ void KernelState::CompleteOverlappedDeferredEx(
   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
   XOverlappedSetContext(ptr, XThread::GetCurrentThreadHandle());
+  // Port 143 (tw2de_nx, kernel_overlapped_reset_event): the event reset as the operation starts. FINAL FANTASY XIII's
+  // save list (XamEnumerate an item at a time, then XGetOverlappedResult with wait) read 997 as the end of the list
+  // when a signal from the item before was still set; the 100 ms delay hid it (every caller waited, and so consumed
+  // the event).
+  static const bool reset_event = REXCVAR_GET(kernel_overlapped_reset_event);
+  if (reset_event) {
+    if (X_HANDLE event_handle = XOverlappedGetEvent(ptr)) {
+      if (auto ev = object_table()->LookupObject<XEvent>(event_handle)) {
+        ev->Reset();
+      }
+    }
+  }
   auto global_lock = global_critical_region_.Acquire();
   dispatch_queue_.push_back(
       [this, completion_callback, overlapped_ptr, pre_callback, post_callback]() {
@@ -1237,9 +1316,12 @@ void KernelState::CompleteOverlappedDeferredEx(
         if (pre_callback) {
           pre_callback();
         }
-        REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr,
-                     kDeferredOverlappedDelayMillis);
-        rex::thread::Sleep(std::chrono::milliseconds(kDeferredOverlappedDelayMillis));
+        // Port 143: kernel_deferred_overlapped_delay_ms (100, Xenia's, by default).
+        static const int32_t delay_ms = REXCVAR_GET(kernel_deferred_overlapped_delay_ms);
+        if (delay_ms > 0) {
+          REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr, delay_ms);
+          rex::thread::Sleep(std::chrono::milliseconds(delay_ms));
+        }
         uint32_t extended_error, length;
         REXSYS_DEBUG("Deferred overlapped {:08X}: running completion", overlapped_ptr);
         auto result = completion_callback(extended_error, length);
@@ -1407,26 +1489,6 @@ const char* KernelState::GetOrCreateFiberName(uint32_t guest_addr, const char* t
   const char* ptr = buf.get();
   fiber_name_pool_.emplace(guest_addr, std::move(buf));
   return ptr;
-}
-
-}  // namespace rex::system
-
-namespace rex::system {
-namespace {
-std::map<std::string, StaticModuleEntry>& StaticModules() {
-  static std::map<std::string, StaticModuleEntry> modules;
-  return modules;
-}
-}  // namespace
-
-void RegisterStaticModule(const char* shared_lib_name, runtime::FunctionDispatcher::RegisterFn register_fn,
-                          const PPCImageInfo* (*get_image_info)()) {
-  StaticModules()[shared_lib_name] = StaticModuleEntry{register_fn, get_image_info};
-}
-
-const StaticModuleEntry* FindStaticModule(const char* shared_lib_name) {
-  const auto it = StaticModules().find(shared_lib_name);
-  return it == StaticModules().end() ? nullptr : &it->second;
 }
 
 }  // namespace rex::system

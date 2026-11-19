@@ -160,7 +160,7 @@ bool build_bctr(BuilderContext& ctx) {
             if (targetFn->sharesRegisters())
               ctx.emit_call_sharing_registers(fmt::format("{}(ctx, base);", targetFn->name()),
                                               false, "\t\t");
-            else if (ctx.keepsNonArgumentsInCtx(*targetFn))
+            else if (ctx.keepsNonArgumentsInCtx(*targetFn) && ctx.localizeNonArguments())
               ctx.emit_call_handing_non_arguments(fmt::format("{}(ctx, base);", targetFn->name()),
                                                   false, "\t\t");
             else

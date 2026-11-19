@@ -202,6 +202,11 @@ class WaitHandle {
   // This value is platform specific.
   virtual void* native_handle() const = 0;
 
+  // banjo-nx (2026-10-19, CPU proposal 21): the POSIX wait object behind this handle (threading_posix.cpp's
+  // PosixWaitHandle, a sibling base), so a wait finds it with one virtual call instead of a dynamic_cast (on the
+  // Switch's libstdc++ a walk of the class hierarchy comparing type names with strcmp). nullptr elsewhere.
+  virtual void* posix_wait_handle() { return nullptr; }
+
  protected:
   WaitHandle() = default;
 };

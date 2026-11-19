@@ -25,6 +25,11 @@
 REXCVAR_DEFINE_BOOL(vulkan_native_shader_features, false, "UI/Vulkan",
                     "Enable available capabilities for the experimental native shaders")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(vulkan_pipeline_executable_info, false, "UI/Vulkan",
+                    "Diagnostic: enable VK_KHR_pipeline_executable_properties when the driver has it, so a "
+                    "renderer can log the driver's statistics of its compiled shaders (registers, instructions, "
+                    "cycles). Changes no pipeline the renderer creates without asking for statistics")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
@@ -199,6 +204,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     // #456. Native renderer: dynamic blending and color write masks. Its three features are
     // enabled further down, only if the device provides them.
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_extended_dynamic_state3)
+    // #69. banjo-nx (package 25): the native renderer turns robustness off per pipeline (banjo_gpu_robustness_off).
+    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_pipeline_robustness)
+  }
+  if (get_physical_device_properties2_supported && REXCVAR_GET(vulkan_pipeline_executable_info)) {
+    // #270. Diagnostic: the driver's statistics of each compiled shader.
+    XE_UI_VULKAN_STRUCT_EXTENSION(KHR_pipeline_executable_properties)
   }
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
     // #414.
@@ -348,6 +359,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT>
       features_EXT_extended_dynamic_state3;
+  VulkanFeatures<VkPhysicalDevicePipelineRobustnessFeaturesEXT,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT>
+      features_EXT_pipeline_robustness;
+  // Diagnostic (vulkan_pipeline_executable_info).
+  VulkanFeatures<VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR,
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR>
+      features_KHR_pipeline_executable_properties;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -391,6 +409,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_EXT_extended_dynamic_state3) {
       features_EXT_extended_dynamic_state3.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_KHR_pipeline_executable_properties) {
+      features_KHR_pipeline_executable_properties.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_EXT_pipeline_robustness) {
+      features_EXT_pipeline_robustness.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -638,8 +662,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   XE_UI_VULKAN_ENUM_LIMIT(sampledImageDepthSampleCounts, SampleCountFlags)
   XE_UI_VULKAN_ENUM_LIMIT(sampledImageStencilSampleCounts, SampleCountFlags)
   XE_UI_VULKAN_LIMIT(standardSampleLocations)
-  XE_UI_VULKAN_LIMIT(lineWidthRange[0])
-  XE_UI_VULKAN_LIMIT(lineWidthRange[1])
   XE_UI_VULKAN_LIMIT(optimalBufferCopyOffsetAlignment)
   XE_UI_VULKAN_LIMIT(optimalBufferCopyRowPitchAlignment)
   XE_UI_VULKAN_LIMIT(nonCoherentAtomSize)
@@ -687,8 +709,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         XE_UI_VULKAN_FEATURE(samplerAnisotropy)
         XE_UI_VULKAN_FEATURE(fullDrawIndexUint32)
       }
-      // sa2-nx: guest lines keep their width relative to the image at a higher render resolution.
-      XE_UI_VULKAN_FEATURE(wideLines)
     }
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
@@ -777,6 +797,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE_2(features_EXT_extended_dynamic_state3, extendedDynamicState3ColorBlendEnable)
     XE_UI_VULKAN_FEATURE_2(features_EXT_extended_dynamic_state3, extendedDynamicState3ColorBlendEquation)
     XE_UI_VULKAN_FEATURE_2(features_EXT_extended_dynamic_state3, extendedDynamicState3ColorWriteMask)
+  }
+
+  if (device->extensions_.ext_EXT_pipeline_robustness) {
+    XE_UI_VULKAN_FEATURE_2(features_EXT_pipeline_robustness, pipelineRobustness)
+  }
+
+  if (device->extensions_.ext_KHR_pipeline_executable_properties) {
+    XE_UI_VULKAN_FEATURE_2(features_KHR_pipeline_executable_properties, pipelineExecutableInfo)
   }
 
 #undef XE_UI_VULKAN_LIMIT

@@ -53,6 +53,8 @@ void ReleaseCacheCopiesLocked(uint32_t slot);
 
 // A new descriptor set for stream_convert_cs (its buffers unset).
 std::unique_ptr<plume::RenderDescriptorSet> CreateStreamConvertSet(VideoState &s);
+// sasrt-nx (2026-11-08): a new descriptor set for fetch_copy_cs (its buffers unset).
+std::unique_ptr<plume::RenderDescriptorSet> CreateFetchCopySet(VideoState &s);
 // A new descriptor set for target_readback_cs's words buffer (unset).
 std::unique_ptr<plume::RenderDescriptorSet> CreateTargetReadbackSet(VideoState &s);
 // Right after the current list begins / before it ends: its GPU timestamps.

@@ -34,15 +34,11 @@ which hides them). Usage:
 Volatile mode (non_argument_as_local): the registers are r0, r2, r11, r12, f0, v32-v63 and the
 lwarx reservation (reserved_as_local).
   --volatile       code generated WITH the option: reads of the local of a function that does not share its
-                   registers (share_registers callees, non_argument_as_local_keep functions and the save/restore
-                   helpers read ctx.rN, which is not tracked)
+                   registers (share_registers callees read ctx.rN, which is not tracked)
   --volatile-ctx   code generated WITHOUT the option (ctx.rN spelling): every function that reads one of them
                    before writing it, i.e. every callee that takes an argument in r0/r11/r12/f0
   --kill-calls     (with either) forget the written set at every call: lists reads of a value the callee
                    would have to return in the register; the offending callee is shown after `<=`
-In volatile mode a store of an unwritten register counts as a read: these are argument registers, and
-__savegprlr_N storing the r12 its caller set up is exactly such a use. tools/non_argument_audit.py is the
-whole-program version (callee write sets, values passed through, the generated hand-overs).
 """
 import glob
 import re
@@ -53,8 +49,8 @@ REG = (r'r(?:1[4-9]|2[0-9]|3[01])|f(?:1[4-9]|2[0-9]|3[01])|'
 tok = re.compile(r'(?<![.\w])(' + REG + r')\b')
 # After tools/args_in_registers.py (or the codegen option args_in_registers) the body of a function that has direct
 # callers lives in `extern "C" ... __fast_sub_X(...) {`; the DEFINE_REX_FUNC of such a function is only a wrapper.
-# Named functions too (banjo-nx: 29 CRT __finally funclets named rex_LN* need share_registers, and the sub_-only
-# pattern never looked at them). The SDK's __save*/__rest* helpers are named as well: their reads are the point.
+# Every function, named ones too (rex_* from config/renut_funcs.toml: the CRT's SEH funclets such as rex_LN15_18 are
+# named; the sub_-only pattern missed them, banjo-nx 2026-10-07).
 fn_re = re.compile(r'^(?:DEFINE_REX_FUNC\(([A-Za-z_][A-Za-z0-9_]*)\)|extern "C" (?:uint64_t|void) __fast_(sub_[0-9A-F]+)\(.*\) \{)')
 lab_re = re.compile(r'^(loc_[0-9A-F]+):$')
 goto_re = re.compile(r'^goto (loc_[0-9A-F]+);$')
@@ -115,6 +111,13 @@ def uses_defs(s):
     if m and m.group(1) in idx:
         defs |= 1 << idx[m.group(1)]
         s2 = s2[len(m.group(1)):]
+    # banjo-nx (2026-10-29): fp_compares_modeless writes the field through a helper, rex::ppc::CompareAnyMode(cr6, a,
+    # b): a definition (2,220 of them in the title update's code read as reads made 450 false cr6 reports).
+    # blur-nx (2026-11-12): and tools/single_floats.py's REX_COMPARE_SINGLES(cr6, a, b) (two proven singles).
+    m = re.match(r'^(?:rex::ppc::CompareAnyMode|REX_COMPARE_SINGLES)\((cr[0-7]),', s2)
+    if m and m.group(1) in idx:
+        defs |= 1 << idx[m.group(1)]
+        s2 = s2[m.end():]
     ms = re.match(r'^simde_mm_store\w*\(\(?(?:simde__m128i?\*\))?(' + REG + r')\.\w+,(.*)$', s2)
     if ms:
         defs |= 1 << idx[ms.group(1)]
@@ -181,8 +184,8 @@ def build_cfg(body):
         if m:
             succ[i] = nxt + ([labels[m.group(1)]] if m.group(1) in labels else [])
             continue
-        if (s == 'return;' or s == 'return r3.u64;' or s.startswith('__builtin_trap()') or s.startswith('REX_FATAL(') or
-                'ppc_longjmp(' in s):
+        # ppc_longjmp: the guest's `bl longjmp` (setjmp_address/longjmp_address in the config), [[noreturn]]
+        if s == 'return;' or s == 'return r3.u64;' or s.startswith(('__builtin_trap()', 'REX_FATAL(', 'ppc_longjmp(')):
             succ[i] = []
             continue
         if s.startswith('switch ('):
@@ -270,15 +273,13 @@ def analyze(cfg, noreturn):
         u = ud[i][0] & ~IN[i]
         if u:
             # a plain store of the value to memory (a hand-written save, e.g. stvx v127 in a
-            # prologue) is harmless with locals; anything else uses the value. Every vector instruction is emitted as
-            # simde_mm_store*(<destination register>, ...), so only a simde store whose target is guest memory is a
-            # store (banjo-nx: the old startswith test took every vector read for one and hid v64-v77 globals).
-            ln = lines[i]
-            head = ln.split(',', 1)[0]
-            is_store = ln.startswith('REX_STORE_') or (
-                ln.startswith('simde_mm_store') and ('REX_RAW_ADDR(' in head or 'base +' in head))
-            # volatile mode: a stored argument register is a use (__savegprlr_N stores its caller's r12)
-            tgt = stores if is_store and not VOL else bad
+            # prologue) is harmless with locals; anything else uses the value
+            # (a simde_mm_store* into a REGISTER is how every vector instruction writes its result, and its
+            # operands are real reads: only a store to guest memory, REX_RAW_ADDR/base, is a save. Before
+            # banjo-nx 2026-10-07 every vector read was dropped here, which hid the WMV decoder's v64/v65.)
+            is_store = lines[i].startswith('REX_STORE_') or (lines[i].startswith('simde_mm_store') and
+                                                            ('REX_RAW_ADDR(' in lines[i] or '(base +' in lines[i]))
+            tgt = stores if is_store else bad
             if WHY:
                 lab = next((lines[j] for j in range(i, -1, -1) if lab_re.match(lines[j])), 'entry')
                 print('  why', lab, i, lines[i][:110], file=sys.stderr)

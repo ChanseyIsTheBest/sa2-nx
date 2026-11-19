@@ -14,9 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <string>
-#include <thread>
 
 #include <rex/cvar.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -34,21 +32,6 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
 #include <rex/ui/flags.h>
-
-REXCVAR_DEFINE_BOOL(vblank_per_swap, false, "GPU",
-                    "One guest vblank per frame the game swaps instead of one per 1/60 s: game logic that ticks per "
-                    "vblank no longer depends on the host speed (deterministic runs to compare renderers)");
-REXCVAR_DEFINE_INT32(vblank_per_swap_timeout_ms, 100, "GPU",
-                     "vblank_per_swap: a vblank anyway after this long without a swap (loading screens)")
-    .range(1, 10000);
-REXCVAR_DEFINE_INT32(diag_vdswap_delay_us, 0, "GPU",
-                     "Test only: VdSwap spins this long first (a slower game frame on a fast PC: the 60 -> 30 fall of "
-                     "fixed vsync, and sa2_vsync_relaxed, can be measured without the console)")
-    .range(0, 1000000);
-REXCVAR_DEFINE_INT32(vblank_per_swap_min_us, 16667, "GPU",
-                     "vblank_per_swap: at least this long between two vblanks (16667 = at most 60 frames a second, so "
-                     "a video recorder sees every frame; 0 = as fast as the host goes)")
-    .range(0, 1000000);
 
 namespace {
 // Display gamma type: 0 - linear, 1 - sRGB (CRT), 2 - BT.709 (HDTV), 3 - power
@@ -454,40 +437,6 @@ u32 VdRetrainEDRAM_entry(u32 unk0, u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 u
   return 0;
 }
 
-namespace {
-std::atomic<uint64_t> g_vd_swaps{0};
-}  // namespace
-
-uint64_t VdSwapCount() {
-  return g_vd_swaps.load(std::memory_order_acquire);
-}
-
-bool VblankPerSwap() {
-  return REXCVAR_GET(vblank_per_swap);
-}
-
-bool WaitSwapForVblank(uint64_t& last_swap, const std::atomic<bool>& running) {
-  // One vblank thread runs at a time (the emulated GPU's or a native renderer's).
-  static auto last_vblank = std::chrono::steady_clock::now();
-  const auto earliest = last_vblank + std::chrono::microseconds(REXCVAR_GET(vblank_per_swap_min_us));
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(REXCVAR_GET(vblank_per_swap_timeout_ms));
-  while (running.load(std::memory_order_acquire)) {
-    const auto now = std::chrono::steady_clock::now();
-    const uint64_t swaps = VdSwapCount();
-    if ((swaps != last_swap && now >= earliest) || now >= deadline) {
-      last_swap = swaps;
-      last_vblank = now;
-      return true;
-    }
-    if (swaps != last_swap && earliest - now > std::chrono::milliseconds(2))
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    else
-      std::this_thread::yield();
-  }
-  return false;
-}
-
 void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                   mapped_void fetch_ptr,       // frontbuffer Direct3D 9 texture header fetch
                   mapped_void unk2,            // system writeback ptr
@@ -496,12 +445,6 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
                   mapped_u32 frontbuffer_ptr,  // ptr to frontbuffer address
                   mapped_u32 texture_format_ptr, mapped_u32 color_space_ptr, mapped_u32 width,
                   mapped_u32 height) {
-  if (const int32_t delay = REXCVAR_GET(diag_vdswap_delay_us); delay > 0) [[unlikely]] {
-    // Busy, like the game's own work (a sleep would round to the host timer).
-    const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(delay);
-    while (std::chrono::steady_clock::now() < until) {
-    }
-  }
   // All of these parameters are REQUIRED.
   assert(buffer_ptr);
   assert(fetch_ptr);
@@ -575,7 +518,6 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
   for (uint32_t i = offset; i < 64; i++) {
     dwords[i] = xenos::MakePacketType2();
   }
-  g_vd_swaps.fetch_add(1, std::memory_order_release);
 }
 
 void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,

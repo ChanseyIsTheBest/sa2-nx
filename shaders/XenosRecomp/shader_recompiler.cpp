@@ -3,6 +3,11 @@
 #include <stdexcept>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>  // banjo-nx: banjoFlattenPredicated
+#include <cctype>
+#include <string_view>
+#include <unordered_set>
+#include <vector>
 
 // Opt-in diagnostic arithmetic contract, not complete Shader Model 3 numeric
 // emulation: existing zero/denormal/NaN rules are deliberately unchanged.
@@ -177,20 +182,6 @@ void ShaderRecompiler::printDstSwizzle01(uint32_t dstRegister, uint32_t dstSwizz
 
 static uint32_t banjoSlotLocation(uint32_t slot);  // banjo-nx, defined with classifyVertexFetches
 
-// sa2-nx: whether any destination component of a vertex fetch takes fetched data. Direct3D patches the swizzle of a
-// fetch whose element the vertex declaration lacks to constants only (0, 0, 0, 1); such a fetch reads nothing, and
-// printing it anyway gives "r1. = ....;", which does not compile.
-static bool dstSwizzleReadsFetch(uint32_t dstSwizzle)
-{
-    for (size_t i = 0; i < 4; i++)
-    {
-        const auto swizzle = getDestSwizzle(dstSwizzle, i);
-        if (swizzle >= FetchDestinationSwizzle::X && swizzle <= FetchDestinationSwizzle::W)
-            return true;
-    }
-    return false;
-}
-
 void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t address)
 {
     if (instr.isPredicated)
@@ -209,24 +200,18 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
             print("banjoVfetchIndex = int(floor(r{}.{}{})) * {};\n", instr.srcRegister,
                 SWIZZLES[instr.srcSwizzle & 0x3], instr.isIndexRounded ? " + 0.5" : "", uint32_t(instr.stride));
         }
-        if (dstSwizzleReadsFetch(instr.dstSwizzle))
-        {
-            indent();
-            print("r{}.", instr.dstRegister);
-            printDstSwizzle(instr.dstSwizzle, false);
+        indent();
+        print("r{}.", instr.dstRegister);
+        printDstSwizzle(instr.dstSwizzle, false);
+        // banjo-nx (2026-10-16): a 4-word float element at a multiple of 4 words (stride and offset both multiples of
+        // 4, the element index an integer): one 16-byte load where the renderer allows it (banjoVfetchAligned4).
+        if (uint32_t(instr.format) == 38 && uint32_t(instr.stride) % 4 == 0 && uint32_t(instr.offset) % 4 == 0)
+            print(" = banjoVfetchAligned4({}, banjoVfetchIndex + {}).", indexed->second, int32_t(instr.offset));
+        else
             print(" = banjoVfetch({}, banjoVfetchIndex + {}, {}, {}, {}, {}).", indexed->second, int32_t(instr.offset),
                 uint32_t(instr.format), uint32_t(instr.formatCompAll), uint32_t(instr.numFormatAll), int32_t(instr.expAdjust));
-            printDstSwizzle(instr.dstSwizzle, true);
-            out += ";\n";
-        }
-        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
-        closeIfWritesPredicate(markPredicate);
-        return;
-    }
-
-    if (!dstSwizzleReadsFetch(instr.dstSwizzle))
-    {
-        // sa2-nx: constants only (see dstSwizzleReadsFetch).
+        printDstSwizzle(instr.dstSwizzle, true);
+        out += ";\n";
         printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
         closeIfWritesPredicate(markPredicate);
         return;
@@ -422,6 +407,16 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     case TextureDimension::TextureCube:
         out += ", cubeMapData";
         break;
+    }
+
+    // banjo-nx (banjo_gpu_texture_signs_per_slot): whether this fetch constant may have packed signs (constant 61).
+    // By register, whatever the sampler's name. 1D fetches and weights apply no signs.
+    if (instr.opcode == FetchOpcode::TextureFetch && instr.dimension != TextureDimension::Texture1D)
+    {
+    #ifdef UNLEASHED_RECOMP
+        if (!bicubic)
+    #endif
+        print(", s{}_Signs", instr.constIndex);
     }
 
     out += ").";
@@ -651,22 +646,22 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     {
     case AluVectorOpcode::KillEq:
         indent();
-        println("clip(any({} == {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
+        println("clip(banjoSel(any({} == {}), -1, 1));", op(VECTOR_0), op(VECTOR_1));
         break;
     
     case AluVectorOpcode::KillGt:
         indent();
-        println("clip(any({} > {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
+        println("clip(banjoSel(any({} > {}), -1, 1));", op(VECTOR_0), op(VECTOR_1));
         break;
     
     case AluVectorOpcode::KillGe:
         indent();
-        println("clip(any({} >= {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
+        println("clip(banjoSel(any({} >= {}), -1, 1));", op(VECTOR_0), op(VECTOR_1));
         break;
     
     case AluVectorOpcode::KillNe:
         indent();
-        println("clip(any({} != {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
+        println("clip(banjoSel(any({} != {}), -1, 1));", op(VECTOR_0), op(VECTOR_1));
         break;
     }
 
@@ -721,12 +716,20 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             default:
             {
                 auto findResult = interpolators.find(instr.vectorDest);
-                // banjo-nx: export 63 (point size / edge flag / kill vertex) and the memory export registers
-                // 32..37 (eA, eM0..4; memexport is not emulated) have no interpolator: written to a dead local.
-                if (findResult == interpolators.end() && (instr.vectorDest == 63 ||
-                    (instr.vectorDest >= 32 && instr.vectorDest <= 37)))
+                // banjo-nx: export 63 = point size (x) / edge flag (y) / kill vertex (z): oPts, whose z kills the
+                // vertex at the end of the shader (Nuts & Bolts' grass removes blades with it where its density map is
+                // empty). The memory export registers 32..37 (eA, eM0..4; memexport is not emulated) have no
+                // interpolator: written to a dead local.
+                if (findResult == interpolators.end() && instr.vectorDest == 63)
                 {
-                    exportRegister = "oUnused";
+                    exportRegister = "oPts";
+                    break;
+                }
+                if (findResult == interpolators.end() && instr.vectorDest >= 32 && instr.vectorDest <= 37)
+                {
+                    // banjo-nx: memory export: eA (address) and eM0..4 (data), stored by banjoMemexportStore.
+                    static constexpr std::string_view kMemexportRegisters[] = {"eA", "eM0", "eM1", "eM2", "eM3", "eM4"};
+                    exportRegister = kMemexportRegisters[instr.vectorDest - 32];
                     break;
                 }
                 if (findResult == interpolators.end())
@@ -746,7 +749,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     if (instr.vectorOpcode >= AluVectorOpcode::SetpEqPush && instr.vectorOpcode <= AluVectorOpcode::SetpGePush)
     {
         indent();
-        print("p0 = {} == 0.0 && {} ", op(VECTOR_0), op(VECTOR_1));
+        // banjo-nx: and() / select() rather than && / ?: in what the translator writes: with HLSL 2021 a scalar && or
+        // ?: short-circuits, i.e. becomes a branch, and NAK keeps every branch (it flattens nothing). Same values.
+        print("p0 = banjoAnd({} == 0.0, {} ", op(VECTOR_0), op(VECTOR_1));
 
         switch (instr.vectorOpcode)
         {
@@ -764,7 +769,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             break;
         }
 
-        out += " 0.0;\n";
+        out += " 0.0);\n";
     }
     bool setsA0 = false;
     if (!(instr.vectorOpcode >= AluVectorOpcode::SetpEqPush && instr.vectorOpcode <= AluVectorOpcode::SetpGePush) &&
@@ -781,7 +786,9 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     }
 
     uint32_t vectorWriteMask = instr.vectorWriteMask;
-    if (instr.exportData)
+    // Port 175 (from rehatched-nx, its commit 58ad78b0): an export to a register with no name (not oC0-3 or oDepth)
+    // is a plain register write: its masks are not cut, and no '.x = ...' without a name is written.
+    if (instr.exportData && !exportRegister.empty())
         vectorWriteMask &= ~instr.scalarWriteMask;
 
     bool scalarSnapshotScope = false;
@@ -844,6 +851,15 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             println("{}float {} = {};", precisePosition ? "precise " : "",
                     scalarOperandOverrides[operand], expression);
         }
+    }
+
+    // banjo-nx: a new memory export address first stores the elements exported for the previous one.
+    if (exportRegister == "eA")
+    {
+        indent();
+        out += "banjoMemexportStore(eA, eM0, eM1, eM2, eM3, eM4, eMWritten);\n";
+        indent();
+        out += "eMWritten = 0u;\n";
     }
 
     if (vectorWriteMask != 0)
@@ -986,7 +1002,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         case AluVectorOpcode::SetpNePush:
         case AluVectorOpcode::SetpGtPush:
         case AluVectorOpcode::SetpGePush:
-            print("p0 ? 0.0 : {} + 1.0", op(VECTOR_0));
+            print("banjoSel0(p0, {} + 1.0)", op(VECTOR_0));
             break;
 
         case AluVectorOpcode::KillEq:
@@ -1138,21 +1154,25 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             print("exp2({})", op(SCALAR_0));
             break;
 
+        // banjo-nx (banjo_gpu_clamp_cbuf, package 25): the bounds are BANJO_FLT_LO / BANJO_FLT_HI (shader_common.h): two
+        // words of the shared block, a free constant-buffer operand of NAK's min / max on Maxwell, where the 32-bit
+        // immediates were moved into registers before every use. The same values: FLT_MIN / FLT_MAX in the old form.
+        // (Every variant is clamped, also the _IEEE ones the Xenos does not clamp: docs/shader-translator-ideas.md 31.)
         case AluScalarOpcode::Logc:
         case AluScalarOpcode::Log:
-            print("clamp(log2({}), FLT_MIN, FLT_MAX)", op(SCALAR_0));
+            print("clamp(log2({}), BANJO_FLT_LO, BANJO_FLT_HI)", op(SCALAR_0));
             break;
 
         case AluScalarOpcode::Rcpc:
         case AluScalarOpcode::Rcpf:
         case AluScalarOpcode::Rcp:
-            print("clamp(rcp({}), FLT_MIN, FLT_MAX)", op(SCALAR_0));
+            print("clamp(rcp({}), BANJO_FLT_LO, BANJO_FLT_HI)", op(SCALAR_0));
             break;
 
         case AluScalarOpcode::Rsqc:
         case AluScalarOpcode::Rsqf:
         case AluScalarOpcode::Rsq:
-            print("clamp(rsqrt({}), FLT_MIN, FLT_MAX)", op(SCALAR_0));
+            print("clamp(rsqrt({}), BANJO_FLT_LO, BANJO_FLT_HI)", op(SCALAR_0));
             break;
 
         case AluScalarOpcode::Subs:
@@ -1167,17 +1187,17 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         case AluScalarOpcode::SetpNe:
         case AluScalarOpcode::SetpGt:
         case AluScalarOpcode::SetpGe:
-            out += "p0 ? 0.0 : 1.0";
+            out += "banjoSel(p0, 0.0, 1.0)";
             break;
 
         case AluScalarOpcode::SetpInv:
             // Xenos: with src == 1 the counter goes back to 0 (Xenia's ucode.h, kSetpInv). Without that
             // case the counter stayed at 1 and later p0 blocks did not run.
-            print("p0 ? 0.0 : ({0} == 0.0 ? 1.0 : {0})", op(SCALAR_0));
+            print("banjoSel(p0, 0.0, banjoSel({0} == 0.0, 1.0, {0}))", op(SCALAR_0));
             break;
 
         case AluScalarOpcode::SetpPop:
-            print("p0 ? 0.0 : ({} - 1.0)", op(SCALAR_0));
+            print("banjoSel(p0, 0.0, {} - 1.0)", op(SCALAR_0));
             break;
 
         case AluScalarOpcode::SetpClr:
@@ -1185,7 +1205,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             break;
 
         case AluScalarOpcode::SetpRstr:
-            print("p0 ? 0.0 : {}", op(SCALAR_0));
+            print("banjoSel(p0, 0.0, {})", op(SCALAR_0));
             break;
 
         case AluScalarOpcode::KillsEq:
@@ -1255,7 +1275,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     }
 
     uint32_t scalarWriteMask = instr.scalarWriteMask;
-    if (instr.exportData)
+    if (instr.exportData && !exportRegister.empty())  // port 175
         scalarWriteMask &= ~instr.vectorWriteMask;
 
     if (scalarWriteMask != 0)
@@ -1280,7 +1300,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         out += " = ps;\n";
     }
 
-    if (instr.exportData)
+    if (instr.exportData && !exportRegister.empty())  // port 175
     {
         uint32_t zeroMask = instr.scalarDestRelative ? (0b1111 & ~(instr.vectorWriteMask | instr.scalarWriteMask)) : 0;
         uint32_t oneMask = instr.vectorWriteMask & instr.scalarWriteMask;
@@ -1299,12 +1319,17 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                 println("{}.{} = 1.0;", exportRegister, SWIZZLES[i]);
             }
         }
+        if (exportRegister.size() == 3 && exportRegister[0] == 'e' && exportRegister[1] == 'M')
+        {
+            indent();
+            println("eMWritten |= {}u;", 1u << uint32_t(exportRegister[2] - '0'));
+        }
     }
 
     if (instr.scalarOpcode >= AluScalarOpcode::KillsEq && instr.scalarOpcode <= AluScalarOpcode::KillsOne)
     {
         indent();
-        out += "clip(ps != 0.0 ? -1 : 1);\n";
+        out += "clip(banjoSel(ps != 0.0, -1, 1));\n";
     }
 
     if (scalarSnapshotScope)
@@ -1325,7 +1350,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 }
 
 // MASSEFFECT: the full vertex fetches of a microcode (instruction index, destination register), walking the
-// exec clauses of the control flow. Same walk as app/src/me/native/sa2_native_shaders.cpp
+// exec clauses of the control flow. Same walk as app/src/native/masseffect/masseffect_native_shaders.cpp
 // FetchesOfVertices: Direct3D's own vertex shaders are linked by fetch destination register.
 static std::vector<std::pair<uint32_t, uint32_t>> vertexFetchesByRegister(const std::vector<uint32_t>& w)
 {
@@ -1481,6 +1506,101 @@ static BanjoVertexFetchSplit classifyVertexFetches(const std::vector<uint32_t>& 
     }
     return split;
 }
+
+// banjo-nx: texture fetch constant registers sampled by a shader (TextureFetch and GetTextureWeights), ascending.
+// Vertex shaders take their texture descriptors from their own slots of the shared constants (bytes
+// 560 + slot * 24: 2D, 3D, cube, sampler, 1/width, 1/height), slot = position of the register in this list; the
+// native renderer fills them the same way (masseffect_native_shaders.cpp, FetchesOfTextures).
+static std::vector<uint32_t> banjoTextureFetchRegisters(const std::vector<uint32_t>& w)
+{
+    std::vector<uint32_t> registers;
+    uint32_t end = uint32_t(w.size() / 3);
+    for (uint32_t pair = 0; pair < end && pair * 3 + 2 < w.size(); pair++)
+    {
+        const uint64_t cf[2] = {
+            uint64_t(w[pair * 3]) | (uint64_t(w[pair * 3 + 1] & 0xFFFF) << 32),
+            uint64_t(w[pair * 3 + 1] >> 16) | (uint64_t(w[pair * 3 + 2]) << 16) };
+        for (uint64_t c : cf)
+        {
+            const uint32_t opcode = uint32_t(c >> 44) & 0xF;
+            if (!((opcode >= 1 && opcode <= 6) || opcode == 13 || opcode == 14))
+                continue;
+            const uint32_t address = uint32_t(c) & 0xFFF, count = uint32_t(c >> 12) & 0x7;
+            const uint32_t sequence = uint32_t(c >> 16) & 0xFFF;
+            if (address != 0)
+                end = std::min(end, address);
+            for (uint32_t i = 0; i < count; i++)
+            {
+                const uint32_t index = address + i;
+                if (!((sequence >> (i * 2)) & 0x1) || index * 3 + 2 >= w.size())
+                    continue;
+                const uint32_t d0 = w[index * 3], opcodeFetch = d0 & 0x1F;
+                if (opcodeFetch != 1 && opcodeFetch != 19)
+                    continue;
+                const uint32_t reg = (d0 >> 20) & 0x1F;
+                if (std::find(registers.begin(), registers.end(), reg) == registers.end())
+                    registers.push_back(reg);
+            }
+        }
+    }
+    std::sort(registers.begin(), registers.end());
+    return registers;
+}
+
+// banjo-nx: whether a vertex shader reads r1 before anything writes it: a patch domain shader (the tessellator gives it
+// the patch index in r1.x), the only kind that gets banjoTessDomain. Exec clauses in control-flow order; any fetch or
+// ALU write to r1 (any lane) counts as written, any ALU register operand or fetch source r1 as read.
+static bool banjoReadsR1First(const std::vector<uint32_t>& w)
+{
+    uint32_t end = uint32_t(w.size() / 3);
+    for (uint32_t pair = 0; pair < end && pair * 3 + 2 < w.size(); pair++)
+    {
+        const uint64_t cf[2] = {
+            uint64_t(w[pair * 3]) | (uint64_t(w[pair * 3 + 1] & 0xFFFF) << 32),
+            uint64_t(w[pair * 3 + 1] >> 16) | (uint64_t(w[pair * 3 + 2]) << 16) };
+        for (uint64_t c : cf)
+        {
+            const uint32_t opcode = uint32_t(c >> 44) & 0xF;
+            if (!((opcode >= 1 && opcode <= 6) || opcode == 13 || opcode == 14))
+                continue;
+            const uint32_t address = uint32_t(c) & 0xFFF, count = uint32_t(c >> 12) & 0x7;
+            const uint32_t sequence = uint32_t(c >> 16) & 0xFFF;
+            if (address != 0)
+                end = std::min(end, address);
+            for (uint32_t i = 0; i < count; i++)
+            {
+                const uint32_t index = address + i;
+                if (index * 3 + 2 >= w.size())
+                    continue;
+                const uint32_t w0 = w[index * 3], w2 = w[index * 3 + 2];
+                if ((sequence >> (i * 2)) & 0x1)
+                {
+                    if (((w0 >> 5) & 0x3F) == 1 && !((w0 >> 11) & 0x1))
+                        return true;  // fetch indexed by r1
+                    if (((w0 >> 12) & 0x3F) == 1 && !((w0 >> 18) & 0x1))
+                        return false;  // fetch into r1
+                }
+                else
+                {
+                    for (uint32_t k = 0; k < 3; k++)
+                        if (((w2 >> (29 + k)) & 0x1) && ((w2 >> (k * 8)) & 0x3F) == 1)
+                            return true;  // ALU operand r1 (unused operand fields count too: conservative)
+                    if (!((w0 >> 15) & 0x1) && (w0 & 0x3F) == 1 && !((w0 >> 6) & 0x1) && ((w0 >> 16) & 0xF))
+                        return false;  // vector result into r1
+                    if (!((w0 >> 15) & 0x1) && ((w0 >> 8) & 0x3F) == 1 && !((w0 >> 14) & 0x1) && ((w0 >> 20) & 0xF))
+                        return false;  // scalar result into r1
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static constexpr uint32_t BANJO_VS_TEXTURE_SLOTS = 4;
+static constexpr uint32_t BANJO_VS_TEXTURE_BYTES = 560;
+// banjo-nx: pixel shader texture registers 16 and 17 (the 2D slots of the shared block stop at 15; Nuts & Bolts' water
+// samples s16): two more slots of the same layout at shared bytes 736 + slot * 24.
+static constexpr uint32_t BANJO_PS_HIGH_TEXTURE_BYTES = 736;
 
 // banjo-nx: Vulkan location of input slot N of a register-linked vertex shader (TEXCOORDN). Slots 0..7 keep
 // USAGE_LOCATIONS' texcoord locations; 8..15 take the locations of the usages these shaders never declare.
@@ -1658,6 +1778,217 @@ static bool vertexIndexMayBeRead(const be<uint32_t>* code, uint32_t shaderSize,
     return true;  // reached the end of the control flow without a sure end: keep it
 }
 
+/*
+ * banjo-nx (banjo_gpu_pred_select, 2026-10-16): a vertex shader's predicated blocks without a branch.
+ *
+ * The Xenos predicates whole EXEC blocks (CondExecPred) and single instructions; the translator writes both as
+ * `if (p0) { ... }`. NVK flattens an if only when it holds at most 8 ALU operations and no load (nak_nir.c,
+ * nir_opt_peephole_select limit 8), so every bone of the skinning shaders stays a real branch (SSY/BRA/SYNC on
+ * Maxwell): its three bone-row loads are issued only once the previous bone's block is done, four memory latencies
+ * one after the other per vertex, and the level's skinned draws are small (about 2,000 vertices), too few warps to
+ * hide them.
+ *
+ * A block whose every statement is a plain assignment to a register (r0-r127, ps, p0, banjoVfetchIndex) of
+ * arithmetic on registers, static constants and indexed vertex fetches (banjoVfetch / banjoVfetchAligned4: clamped
+ * into their buffer, readable for any index) has no side effect and cannot fault, so it may run for every vertex:
+ * each register it writes is saved first and put back with select() where the predicate does not hold. The values
+ * are the ones the branch gives (the statements read what they read before; the condition is taken at the block's
+ * entry, as the `if` takes it). Left as they are: blocks with texture fetches, kills, outputs, memory exports,
+ * relative constant indexes (a0 / aL), nested control flow, or more than kBanjoFlatMaxStatements statements.
+ *
+ * Both forms stay in the module; SPEC_CONSTANT_PRED_BRANCHES (the key off, or its A/B) picks the old one when the
+ * pipeline is specialised.
+ *
+ * Pixel shaders (banjo_gpu_pred_select_ps, SPEC_CONSTANT_PRED_BRANCHES_PS, a key and an A/B of their own): the same,
+ * for blocks of at most kBanjoFlatMaxStatementsPs statements (a flattened block also runs for the warps a branch
+ * skipped whole, so only short ones). No derivative can be in one (none is on the list), so the derivatives of the
+ * later samples see the same values in every lane. The heavy material shaders keep 19-25 of their 37 branches
+ * (offline, unspecialised). tools/early_alpha.py reads the construct as the `if` it replaces.
+ */
+static constexpr size_t kBanjoFlatMaxStatements = 24;
+static constexpr size_t kBanjoFlatMaxStatementsPs = 12;
+
+static bool banjoFlatIdentifierAllowed(std::string_view id)
+{
+    if (id.size() >= 2 && id[0] == 'r' && std::all_of(id.begin() + 1, id.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        return true;
+    // banjo-nx (package 25): the shader's literal constants (float4 cN = asfloat(...), a local the translator never
+    // writes again): pure values like the registers. The in-place material shaders (ps_i...) keep their shadow taps'
+    // Poisson offsets there, so none of their light blocks was flattened before.
+    if (id.size() >= 2 && id[0] == 'c' && std::all_of(id.begin() + 1, id.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        return true;
+    static const std::unordered_set<std::string_view> allowed = {
+        "ps", "p0", "a0", "banjoVfetchIndex",
+        "dot", "saturate", "clamp", "rsqrt", "sqrt", "abs", "max", "min", "exp2", "log2", "floor", "frac", "ceil",
+        "trunc", "round", "sign", "isnan", "isinf", "mad", "lerp", "step", "sin", "cos", "exp", "log",
+        "int", "uint", "float", "float2", "float3", "float4", "bool", "bool2", "bool3", "bool4",
+        "select", "and", "or", "banjoSel", "banjoSel0", "banjoAnd", "banjoOr", "asfloat", "asuint", "asint",
+        "FLT_MIN", "FLT_MAX", "banjoVfetch", "banjoVfetchAligned4",
+        "BANJO_FLT_LO", "BANJO_FLT_HI",  // banjo_gpu_clamp_cbuf: FLT_MIN / FLT_MAX or two shared-block words
+        "MASSEFFECT_UBO", "g_UboVertex", "g_UboPixel", "vk", "RawBufferLoad", "g_PushConstants",
+        "VertexShaderConstants", "PixelShaderConstants",
+    };
+    return allowed.count(id) != 0;
+}
+
+// The written variable of `stmt` ("r12.xyz = ...;" gives "r12"), or empty when the statement is not one the
+// flattening may run unconditionally (see above).
+static std::string banjoFlatStatement(std::string_view stmt)
+{
+    if (stmt.size() < 6 || stmt.back() != ';')
+        return {};
+    const size_t eq = stmt.find(" = ");
+    if (eq == std::string_view::npos)
+        return {};
+    std::string_view lhs = stmt.substr(0, eq);
+    const std::string_view rhs = stmt.substr(eq + 3, stmt.size() - eq - 4);
+    const size_t dot = lhs.find('.');
+    std::string_view base = lhs.substr(0, dot);
+    if (dot != std::string_view::npos)
+    {
+        const std::string_view mask = lhs.substr(dot + 1);
+        if (mask.empty() || mask.size() > 4 || mask.find_first_not_of("xyzw") != std::string_view::npos)
+            return {};
+    }
+    const bool isRegister = base.size() >= 2 && base[0] == 'r' &&
+        std::all_of(base.begin() + 1, base.end(), [](char c) { return c >= '0' && c <= '9'; });
+    if (!isRegister && base != "ps" && base != "p0" && base != "banjoVfetchIndex")
+        return {};
+    if (!isRegister && dot != std::string_view::npos)
+        return {};
+    // The right side: identifiers from the list (a member after '.' is a swizzle or the UBO's array), static indexes
+    // only, and nothing that is not an expression character.
+    for (size_t i = 0; i < rhs.size();)
+    {
+        const char c = rhs[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_')
+        {
+            size_t j = i;
+            while (j < rhs.size() && (std::isalnum(uint8_t(rhs[j])) || rhs[j] == '_'))
+                ++j;
+            const std::string_view id = rhs.substr(i, j - i);
+            const bool member = i > 0 && rhs[i - 1] == '.';
+            if (member ? !(id == "v" || id == "VertexShaderConstants" || id == "PixelShaderConstants" ||
+                           id.find_first_not_of("xyzw") == std::string_view::npos)
+                       : !banjoFlatIdentifierAllowed(id))
+                return {};
+            i = j;
+        }
+        else if (c >= '0' && c <= '9')
+        {
+            while (i < rhs.size() && (std::isalnum(uint8_t(rhs[i])) || rhs[i] == '.'))
+                ++i;  // 12, 1.5, 0x10, 1e-05 (the exponent's sign is an operator character below)
+        }
+        else if (c == '[')
+        {
+            const size_t close = rhs.find(']', i);
+            if (close == std::string_view::npos || close == i + 1)
+                return {};
+            for (size_t k = i + 1; k < close; ++k)
+                if (rhs[k] < '0' || rhs[k] > '9')
+                    return {};  // a relative index: may be out of range where the predicate does not hold
+            i = close + 1;
+        }
+        else if (std::strchr(" +-*/<>=!&|?:(),.~^%", c) != nullptr)
+            ++i;
+        else
+            return {};
+    }
+    return std::string(base);
+}
+
+static void banjoFlattenPredicated(std::string& out, size_t from, bool pixel)
+{
+    const size_t maxStatements = pixel ? kBanjoFlatMaxStatementsPs : kBanjoFlatMaxStatements;
+    const char* const bit = pixel ? "SPEC_CONSTANT_PRED_BRANCHES_PS" : "SPEC_CONSTANT_PRED_BRANCHES";
+    const char* const what = pixel ? "pixel" : "vertex";
+    std::vector<std::string> lines;
+    for (size_t at = from; at <= out.size();)
+    {
+        size_t end = out.find('\n', at);
+        if (end == std::string::npos)
+            end = out.size();
+        lines.emplace_back(out, at, end - at);
+        at = end + 1;
+    }
+    std::string result;
+    result.reserve(out.size() - from + out.size() / 4);
+    for (size_t i = 0; i < lines.size(); ++i)
+    {
+        const std::string& line = lines[i];
+        const size_t tabs = line.find_first_not_of('\t');
+        const std::string_view head = tabs == std::string::npos ? std::string_view() : std::string_view(line).substr(tabs);
+        const bool negated = head == "if (!p0)";
+        size_t closeAt = 0;
+        std::vector<std::string> written;  // in first-write order
+        bool flatten = false;
+        if ((head == "if (p0)" || negated) && i + 1 < lines.size() && lines[i + 1] == line.substr(0, tabs) + "{")
+        {
+            const std::string inner(tabs + 1, '\t'), close = line.substr(0, tabs) + "}";
+            flatten = true;
+            size_t j = i + 2;
+            for (; j < lines.size() && lines[j] != close; ++j)
+            {
+                const std::string& body = lines[j];
+                if (body.compare(0, inner.size(), inner) != 0 || body.size() == inner.size() || body[inner.size()] == '\t')
+                {
+                    flatten = false;
+                    break;
+                }
+                const std::string var = banjoFlatStatement(std::string_view(body).substr(inner.size()));
+                if (var.empty())
+                {
+                    flatten = false;
+                    break;
+                }
+                if (std::find(written.begin(), written.end(), var) == written.end())
+                    written.push_back(var);
+            }
+            const size_t statements = j - (i + 2);
+            if (j >= lines.size() || statements == 0 || statements > maxStatements)
+                flatten = false;
+            closeAt = j;
+        }
+        if (!flatten)
+        {
+            result += line;
+            if (i + 1 < lines.size())
+                result += '\n';
+            continue;
+        }
+        const std::string t = line.substr(0, tabs);
+        const auto type = [](const std::string& var) {
+            return var == "ps" ? "float" : var == "p0" ? "bool" : var == "banjoVfetchIndex" ? "int" : "float4";
+        };
+        // One copy of the body. Key on (the bit clear): the condition is true once specialised, the if goes and the
+        // selects keep the results. The old form (bit set): `if (banjoPred)` as before, and inside it NIR replaces
+        // banjoPred with true (nir_opt_if), so the selects and the saved copies fold away.
+        result += t + "{\n";
+        result += fmt::format("{}\t// banjo_gpu_pred_select: runs for every {}, kept only where the predicate holds\n", t, what);
+        result += t + (negated ? "\tconst bool banjoPred = !p0;\n" : "\tconst bool banjoPred = p0;\n");
+        result += fmt::format("{}\t[branch] if (or(banjoPred, (g_SpecConstants() & {}) == 0))\n", t, bit);
+        result += t + "\t{\n";
+        for (const std::string& var : written)
+            result += fmt::format("{}\t\tconst {} banjoKeep_{} = {};\n", t, type(var), var, var);
+        for (size_t j = i + 2; j < closeAt; ++j)
+            result += "\t" + lines[j] + "\n";
+        for (const std::string& var : written)
+        {
+            if (std::string_view(type(var)) == "float4")
+                result += fmt::format("{}\t\t{} = select(bool4(banjoPred, banjoPred, banjoPred, banjoPred), {}, banjoKeep_{});\n",
+                    t, var, var, var);
+            else
+                result += fmt::format("{}\t\t{} = select(banjoPred, {}, banjoKeep_{});\n", t, var, var, var);
+        }
+        result += t + "\t}\n";
+        result += t + "}";
+        if (closeAt + 1 < lines.size())
+            result += '\n';
+        i = closeAt;
+    }
+    out.replace(from, out.size() - from, result);
+}
+
 void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include)
 {
     const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
@@ -1714,6 +2045,43 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     }
 
     out += "#ifdef __spirv__\n\n";
+
+    // banjo-nx: a vertex shader's texture registers read the vertex shader texture slots (see
+    // banjoTextureFetchRegisters); the pixel shader's slots 0..15 of the same block belong to the pixel shader.
+    std::vector<uint32_t> vsTextureRegisters;
+    bool banjoTessDomainShader = false;
+    if (!isPixelShader)
+    {
+        const auto* words = reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + codeMetadata->physicalOffset);
+        std::vector<uint32_t> microcode(codeMetadata->size / 4);
+        for (size_t i = 0; i < microcode.size(); i++)
+            microcode[i] = words[i];
+        vsTextureRegisters = banjoTextureFetchRegisters(microcode);
+        banjoTessDomainShader = banjoReadsR1First(microcode);
+        if (vsTextureRegisters.size() > BANJO_VS_TEXTURE_SLOTS)
+            throw std::runtime_error("more than 4 texture registers in a vertex shader");
+    }
+    const auto vsTextureSlot = [&](uint32_t reg) -> int32_t {
+        auto it = std::find(vsTextureRegisters.begin(), vsTextureRegisters.end(), reg);
+        return it == vsTextureRegisters.end() ? -1 : int32_t(it - vsTextureRegisters.begin());
+    };
+    const auto defineVsTexture = [&](const std::string_view name, uint32_t slot, uint32_t area = BANJO_VS_TEXTURE_BYTES) {
+        const uint32_t b = area + slot * 24;
+        for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+            println("#define {}_Texture{}DescriptorIndex (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT({}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {}))",
+                name, TEXTURE_DIMENSIONS[j], b + j * 4, b + j * 4);
+        println("#define {}_SamplerDescriptorIndex (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT({}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {}))",
+            name, b + 12, b + 12);
+        println("#define {}_InvSize (MASSEFFECT_UBO ? float2(MASSEFFECT_SHARED_FLOAT({}), MASSEFFECT_SHARED_FLOAT({})) : vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + {}))",
+            name, b + 16, b + 20, b + 16);
+    };
+    for (uint32_t reg : vsTextureRegisters)
+    {
+        char name[16];
+        std::snprintf(name, sizeof(name), "s%u", reg);
+        defineVsTexture(name, uint32_t(vsTextureSlot(reg)));
+        println("#define s{0}_Texture1DDescriptorIndex s{0}_Texture2DDescriptorIndex", reg);
+    }
 
 #ifdef UNLEASHED_RECOMP
     bool isMetaInstancer = false;
@@ -1783,6 +2151,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             char fallbackName[16];
             std::snprintf(fallbackName, sizeof(fallbackName), "s%u", registerIndex);
             const char* samplerName = reg == 0 ? constantName : fallbackName;
+            if (const int32_t vsSlot = vsTextureSlot(registerIndex); vsSlot >= 0)
+            {
+                // banjo-nx: a named vertex shader sampler (the sN names are already defined above).
+                if (reg == 0)
+                {
+                    defineVsTexture(samplerName, uint32_t(vsSlot));
+                    samplers.emplace(registerIndex, constantName);
+                }
+                continue;
+            }
             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
             {
                 println("#define {}_Texture{}DescriptorIndex (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT({}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {}))",
@@ -1813,6 +2191,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     // name, or a shader without a table); #ifndef skips the ones already defined.
     for (uint32_t reg = 0; reg < 32; reg++)
     {
+        if (isPixelShader && (reg == 16 || reg == 17))
+        {
+            println("#ifndef s{}_SamplerDescriptorIndex", reg);
+            char name[16];
+            std::snprintf(name, sizeof(name), "s%u", reg);
+            defineVsTexture(name, reg - 16, BANJO_PS_HIGH_TEXTURE_BYTES);
+            println("#define s{0}_Texture1DDescriptorIndex s{0}_Texture2DDescriptorIndex", reg);
+            println("#endif");
+            continue;
+        }
         println("#ifndef s{}_SamplerDescriptorIndex", reg);
         for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
             println("#define s{}_Texture{}DescriptorIndex (MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT({}) : vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {}))",
@@ -2017,8 +2405,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         out += precisePosition ? "\t[[vk::ext_decorate(18)]] out precise float4 oPos : SV_Position" : "\tout float4 oPos : SV_Position";
 
+        // banjo-nx (banjo_gpu_vs_outputs_unwritten, package 25): the outputs are banjo_o*; main writes locals named
+        // o* (declared with their defaults below) and each exit copies them (where the exit zeroed them before).
         for (auto& [usage, usageIndex] : INTERPOLATORS)
-            print(",\n\tout float4 o{0}{1} : {2}{1}", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+            print(",\n\tout float4 banjo_o{0}{1} : {2}{1}", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
     }
 
     out += ")\n";
@@ -2056,8 +2446,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             auto value = reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + definition->physicalOffset);
             for (uint16_t i = 0; i < (definition->count + 3) / 4; i++)
             {
-                println("\tfloat4 c{} = asfloat(uint4(0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}));",
-                    definition->registerIndex + i - (isPixelShader ? 256 : 0), value[0].get(), value[1].get(), value[2].get(), value[3].get());
+                // banjo-nx (banjo_gpu_literals_cbuf, package 26): a component NAK cannot encode as an immediate (any of
+                // the low 12 mantissa bits set: Maxwell's float immediates are 20 bits) is read from the constant
+                // register Direct3D loaded the definition into: a free constant-buffer operand instead of a move
+                // into a register before each use. The renderer compares those components with the register file
+                // at every draw and takes the old form (SPEC2_LITERALS_IMMEDIATE) when one differs.
+                uint32_t mask = 0;
+                for (uint32_t k = 0; k < 4; ++k)
+                    if (value[k].get() & 0xFFFu) mask |= 1u << k;
+                const uint32_t reg = definition->registerIndex + i - (isPixelShader ? 256 : 0);
+                if (mask && reg < 256)
+                    println("\tfloat4 c{} = BANJO_LITERAL_{}({}, 0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}, {});", reg,
+                        isPixelShader ? "PS" : "VS", reg, value[0].get(), value[1].get(), value[2].get(), value[3].get(), mask);
+                else
+                    println("\tfloat4 c{} = asfloat(uint4(0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}));",
+                        reg, value[0].get(), value[1].get(), value[2].get(), value[3].get());
 
                 value += 4;
             }
@@ -2093,17 +2496,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     bool printedRegisters[32]{};
 
-    // sa2-nx: interpolators are ALWAYS linked by hardware register, whatever the constant table says. The GPU knows
-    // no semantics: vertex shader export N reaches the pixel shader's interpolator N (Direct3D patches the export
-    // registers when it links a pair, and the microcode the ring loads is the linked one). Linking some shaders by
-    // semantic and others by register broke every mixed pair: a game vertex shader with no constants (an empty
-    // CTAB, so "register-linked") drawing SA2's warning/SEGA/Sonic Team screens with a semantic pixel shader that
-    // keeps COLOR0 in register 0 and TEXCOORD0 in register 1 got its texture coordinates from the colour (black).
-    const bool interpolatorsByRegister = true;
-
     // MASSEFFECT: register linking: export register N of the vertex shader is TEXCOORDN, read back by the
     // pixel shader's register N.
-    if (interpolatorsByRegister && !isPixelShader)
+    if (linkByRegister && !isPixelShader)
     {
         for (uint32_t i = 0; i < 16; i++)
             interpolators.emplace(i, fmt::format("oTexCoord{}", i));
@@ -2122,7 +2517,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         if (isPixelShader)
         {
             value = reinterpret_cast<const PixelShader*>(shader)->interpolators[i];
-            if (interpolatorsByRegister)
+            if (linkByRegister)
                 println("\tfloat4 r{0} = iTexCoord{0};", uint32_t(interpolator.reg));
             else
                 println("\tfloat4 r{} = i{}{};", uint32_t(interpolator.reg), USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex));
@@ -2132,7 +2527,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         {
             auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
             value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + vertexShader->vertexElementCount + i];
-            if (!interpolatorsByRegister)
+            if (!linkByRegister)
                 interpolators.emplace(i, fmt::format("o{}{}", USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex)));
         }
     }
@@ -2151,10 +2546,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             // UI pixel shader multiplies its alpha by r1.w while several paired vertex shaders
             // only export r0. Initializing every unused output to float4(0,0,0,0) made that UI
             // completely transparent.
-            if (interpolatorsByRegister)
-                println("\to{}{} = float4(0.0, 0.0, 0.0, 1.0);", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
+            if (linkByRegister)
+                println("\tfloat4 o{}{} = float4(0.0, 0.0, 0.0, 1.0);", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
             else
-                println("\to{}{} = 0.0;", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
+                println("\tfloat4 o{}{} = 0.0;", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
         }
 
         out += "\n";
@@ -2166,17 +2561,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         {
             if (precisePosition) print("\tprecise float4 r{} = ", i);
             else print("\tfloat4 r{} = ", i);
-            // sa2-nx: register linking, as the hardware does it: the pixel shader's register N is loaded with
-            // interpolator N whether or not the container declares it. A container rebuilt from a template around
-            // ring microcode (MASSEFFECT_SHADER_MISSING) carries the template's interpolator list, not the shader's:
-            // Direct3D's own Clear pixel shader (ps_ba62fb45, oC0 = r0) got an empty list, so r0 became the pixel
-            // position and every clear wrote (x, y, 0, 0) instead of the clear colour. A shader that declares no
-            // interpolator therefore reads them all; shaders that declare some keep their layout.
-            if (isPixelShader && interpolatorsByRegister && interpolatorCount == 0 && i < 16)
-            {
-                out += fmt::format("iTexCoord{};\n", i);
-            }
-            else if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
+            if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
             {
                 out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
             }
@@ -2209,11 +2594,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         }
     }
 
+    // banjo-nx: patch domain shaders take the domain location and patch index instead (banjoTessDomain).
+    if (!isPixelShader && banjoTessDomainShader)
+        out += "\tif (g_TessLevel != 0u) banjoTessDomain(iVertexId, r0, r1);\n";
     out += "\tint a0 = 0;\n";
     out += "\tint banjoNextA0 = 0;\n";
     out += "\tint aL = 0;\n";
     if (!isPixelShader)
-        out += "\tfloat4 oUnused = 0.0;\n";
+        out += "\tfloat4 oUnused = 0.0;\n\tfloat4 oPts = 0.0;\n"
+               "\tfloat4 eA = 0.0;\n\tfloat4 eM0 = 0.0;\n\tfloat4 eM1 = 0.0;\n\tfloat4 eM2 = 0.0;\n"
+               "\tfloat4 eM3 = 0.0;\n\tfloat4 eM4 = 0.0;\n\tuint eMWritten = 0u;\n";
     if (isPixelShader && (reinterpret_cast<const PixelShader*>(shader)->outputs & PIXEL_SHADER_OUTPUT_DEPTH))
         out += "\tfloat4 oDepth4 = 0.0;\n";
     if (!isPixelShader)
@@ -2858,9 +3248,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     out += '}';
                 #endif
                 #ifndef UNLEASHED_RECOMP
-                    // sa2-nx (sa2_gpu_blend_skip): a transparent pixel whose blend would leave the target exactly as it
-                    // was is discarded before the blend. The renderer sets these bits only for UNORM targets with no
-                    // depth or stencil write and a blend that keeps the destination; a NaN is never discarded.
+                    // sa2-nx (banjo_gpu_blend_skip / sa2_gpu_blend_skip): a transparent pixel whose blend would leave
+                    // the target exactly as it was is discarded before the blend. The renderer sets these bits only for
+                    // UNORM targets with no depth or stencil write and a blend that keeps the destination; a NaN is
+                    // never discarded.
                     specConstantsMask |= SPEC_CONSTANT_BLEND_SKIP_ALPHA | SPEC_CONSTANT_BLEND_SKIP_ZERO;
                     out += "\n";
                     indent();
@@ -2880,6 +3271,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                         out += "\toPos.xy = oPos.xy * g_NdcScale + g_NdcOffset * oPos.w;\n";
                         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
                     }
+                    // banjo-nx: kill vertex (export 63 z, see oPts): a NaN position discards its primitives, as in
+                    // Xenia (PA_CL_CLIP_CNTL VTX_KILL_OR semantics: any killed vertex removes the primitive).
+                    out += "\tif (oPts.z != 0.0) oPos = asfloat(uint4(0x7FC00000u, 0x7FC00000u, 0x7FC00000u, 0x7FC00000u));\n";
+                    out += "\tbanjoMemexportStore(eA, eM0, eM1, eM2, eM3, eM4, eMWritten);\n";
+                    // banjo-nx (masseffect_native_vs_pruned_outputs): an output the pipeline's pixel shader does not
+                    // read (constant 60; locations in INTERPOLATORS order) leaves nothing for the math that only fed
+                    // it, which goes when the pipeline is specialised. banjo_gpu_vs_outputs_unwritten (package 25):
+                    // such an output is not written at all, so the driver drops its store and attribute too; the old
+                    // form (SPEC2_OUTPUTS_WRITE_ZERO) writes 0 as before.
+                    for (size_t l = 0; l < std::size(INTERPOLATORS); ++l)
+                        println("\tif (BANJO_PS_READS({0})) banjo_o{1}{2} = o{1}{2}; else if (BANJO_OUTPUTS_WRITE_ZERO) banjo_o{1}{2} = 0.0;",
+                                l, USAGE_VARIABLES[uint32_t(INTERPOLATORS[l].first)], INTERPOLATORS[l].second);
                 }
 
                 if (simpleControlFlow || skipControlFlow)
@@ -2964,6 +3367,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     if (!isPixelShader && hasMtxProjection)
         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
+#endif
+
+#ifdef MASSEFFECT_RECOMP
+    // banjo-nx (banjo_gpu_pred_select, banjo_gpu_pred_select_ps): see banjoFlattenPredicated.
+    {
+        const size_t mainAt = out.rfind("void main(\n");
+        if (mainAt != std::string::npos)
+            banjoFlattenPredicated(out, mainAt, isPixelShader);
+    }
 #endif
 
     out += "}";

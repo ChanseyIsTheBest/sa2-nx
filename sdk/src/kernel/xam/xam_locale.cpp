@@ -17,13 +17,11 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
-#include <rex/system/xcontent.h>
 #include <rex/system/xenumerator.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
 REXCVAR_DEFINE_UINT32(user_country, 103, "Kernel", "User's country ID");
-REXCVAR_DECLARE(uint32_t, user_language);  // defined in xam_user.cpp
 
 // TODO(gibbed): put these forward decls in a header somewhere.
 
@@ -363,15 +361,6 @@ u32 XamGetLanguageFromOnlineLanguage_entry(u32 id) {
   return xeXamGetLanguageFromOnlineLanguage(static_cast<uint8_t>(id));
 }
 
-// sa2-nx: the same answer as XGetLanguage (user_language; was a stub returning 0).
-u32 XamGetLanguage_entry() {
-  const uint32_t language = REXCVAR_GET(user_language);
-  using rex::system::XLanguage;
-  return language > uint32_t(XLanguage::kInvalid) && language < uint32_t(XLanguage::kMaxLanguages)
-             ? language
-             : uint32_t(XLanguage::kEnglish);
-}
-
 u32 XamGetOnlineLanguageString_entry(u32 id, u32 buffer_length, mapped_wstring buffer) {
   if (buffer_length >= 0x80000000u) {
     return X_E_INVALIDARG;
@@ -417,7 +406,6 @@ REX_EXPORT(__imp__XamGetOnlineLanguageAndCountryString,
 REX_EXPORT(__imp__XamGetLocaleString, rex::kernel::xam::XamGetLocaleString_entry)
 REX_EXPORT(__imp__XamGetLocaleFromOnlineCountry,
            rex::kernel::xam::XamGetLocaleFromOnlineCountry_entry)
-REX_EXPORT(__imp__XamGetLanguage, rex::kernel::xam::XamGetLanguage_entry)
 REX_EXPORT(__imp__XamGetLanguageFromOnlineLanguage,
            rex::kernel::xam::XamGetLanguageFromOnlineLanguage_entry)
 REX_EXPORT(__imp__XamGetOnlineLanguageString, rex::kernel::xam::XamGetOnlineLanguageString_entry)
@@ -430,6 +418,7 @@ REX_EXPORT_STUB(__imp__XamFormatMessage);
 REX_EXPORT_STUB(__imp__XamFormatSystemDateString);
 REX_EXPORT_STUB(__imp__XamGetCountry);
 REX_EXPORT_STUB(__imp__XamGetCurrencyFormat);
+REX_EXPORT_STUB(__imp__XamGetLanguage);
 REX_EXPORT_STUB(__imp__XamGetLanguageLocaleFallbackString);
 REX_EXPORT_STUB(__imp__XamGetLanguageTypeface);
 REX_EXPORT_STUB(__imp__XamGetLanguageTypefacePatch);
