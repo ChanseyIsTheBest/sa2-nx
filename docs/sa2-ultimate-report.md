@@ -72,8 +72,9 @@ anywhere (the console decides; PC and emulator timings are not evidence).
 
 1. A console run of the package (your word): boot, menus, stages, Chao Garden, the two-player modes; send the logs
    of the `sa2_ab.toml` run (its CPU profile feeds the next batch of copies).
-2. PGO: the instrumented NRO (`app\out\switch-pgo-gen`), a console training session, `tools\pgo_merge.py`, then
-   `tools\build_switch_release.bat`.
+2. PGO: the instrumented NRO is built and packaged (`out\packages\2026-11-20_0534_pgo_generate`, 90 MB: PGO
+   generate, LTO with `-fipa-pta`, the copies in place); a console training session (its notes say what to play),
+   `tools\pgo_merge.py <pgo folder> pgo-inplace`, then `tools\build_switch_release.bat`.
 3. The installer (`out\handoffs\installer-needs.md`): the asset pack and the update zip, as 1.0.6's installer has.
 4. The remaining two-player-demo difference in the emulator; the stale stack word's reader.
 
