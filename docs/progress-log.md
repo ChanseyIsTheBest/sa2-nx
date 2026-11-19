@@ -61,3 +61,8 @@ and docs/sa2-near-exact.md.
   three keys from SA2's logs and the stereo check (sa2-ultimate-notes.md).
 - `tools\sa2_emu_ab.ps1`: the emulator A/B of the rebased NRO and 1.0.6's in the same SD folder, each with its own files.
 - `tools\deko3d_variant_cache.py --uam`.
+- The emulator against 1.0.6 (sa2-ultimate-notes.md, "The picture against 1.0.6 in the emulator"): the title
+  identical; the two-player demo drifted (player 2's run). Six Switch builds told the forms apart: the fused
+  multiply-add (`SASRT_VMX_FUSED_MADD`) makes it drift, CG-13 and the estimates do not. The user: the offending one off
+  in SA2's build, on in the base: `SASRT_VMX_FUSED_MADD` OFF in `app/CMakeLists.txt`. A smaller fixed difference
+  (grind sparks, an edge of a board) remains with every form off; its cause is open.

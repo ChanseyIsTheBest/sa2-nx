@@ -57,7 +57,12 @@ endif()
 # the copies see the same. An existing build folder keeps a cached OFF: cmake -DSASRT_VMX_FAST_ESTIMATES=ON
 # -DSASRT_VMX_FUSED_MADD=ON on it.
 option(SASRT_VMX_FAST_ESTIMATES "VMX vrsqrtefp / vrefp / vlogefp as AArch64 estimates (not bit-exact)" ON)
-option(SASRT_VMX_FUSED_MADD "VMX vmaddfp / vnmsubfp as one fused multiply-add (not bit-exact)" ON)
+# sa2-nx-ult (2026-11-19, the user's decision: off in SA2's build, on in the base): in the emulator the fused form made
+# player 2's run in SA2's two-player attract demo drift from sa2-nx 1.0.6's from about game frame 7780 (none of 1.0.6's
+# demo frames found identical; with it off, as many as with every float form off). The estimates did not make it drift
+# (fewer identical frames, none lost late in the demo) and stay on. docs/sa2-ultimate-notes.md, "The picture against
+# 1.0.6 in the emulator". An existing build folder keeps its cached value: cmake -DSASRT_VMX_FUSED_MADD=OFF on it.
+option(SASRT_VMX_FUSED_MADD "VMX vmaddfp / vnmsubfp as one fused multiply-add (not bit-exact; OFF for SA2)" OFF)
 if(SASRT_VMX_FAST_ESTIMATES)
     add_compile_definitions(REX_VMX_FAST_ESTIMATES)
 endif()

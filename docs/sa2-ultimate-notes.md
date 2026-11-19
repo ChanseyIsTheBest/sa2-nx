@@ -128,12 +128,25 @@ own GLSL package, compiled-shader cache and user folder), the attract sequence f
   | exact (all three off), four runs | 485-524 of 2,259 | 135 of 200 |
   | CG-13 alone | 484 of 2,259 | 135 of 200 |
   | the two VMX forms alone | 52 of 2,259 | 0 of 200 |
+  | CG-13 + the VMX estimates | 267 of 2,259 | 57 of 200 (no drift; more frames slightly different) |
+  | CG-13 + the fused multiply-add | 50 of 2,259 | 0 of 200 (drifts) |
 
   **The VMX pair (port 72) makes player 2's run drift; CG-13 changes nothing here** (its census's denormals in the demo
   leave every frame as the exact build has it). The exact runs also agree with each other in every block from game
   frame 6300 on: what still differs from 1.0.6 there is the same frames every run, so a fixed difference, not timing;
   only the demo's first 400 frames vary between runs. The user's decision (2026-11-19): the offending shortcut off in
-  SA2's own build, on in the base. Next: the pair split (`switch-est`, `switch-fma`, each with CG-13).
+  SA2's own build, on in the base. **The fused multiply-add (`SASRT_VMX_FUSED_MADD`) is the one:** off in SA2's
+  `app/CMakeLists.txt` (its default; the base's stays on). The estimates stay on: no drift, but fewer frames identical
+  to 1.0.6 (267 against 484); a decision for the user. CG-13 stays on.
+- **Still open:** with every float form off, the demo's frames from game frame 6300 on match 1.0.6 in the same
+  stretches every run and differ in the same others (grind sparks placed differently, a sliver at the edge of a
+  board): a fixed difference of the rebased Switch build, not shown by the PC build. Ruled out: the shader chain,
+  the base's renderer and CPU run-time enhancements, its fences and compare-and-swap barriers, 1.0.6's native
+  copies, the guest clock, a vblank interrupt, zero-initialised locals, the compile definitions (no game-relevant one
+  differs between the PC and the Switch builds; `-ffp-contract=off` in both; no simde accuracy shortcut in either
+  tree), the VMX exact forms (the same expressions as 1.0.6's) and the single-rounding `fmadds` (the same correctly
+  rounded `fmaf` on both platforms). Finding it needs a comparison of guest memory between the two NROs at a frame
+  that differs.
 
 ## Gameplay on the PC, verify mode (2026-11-19)
 
