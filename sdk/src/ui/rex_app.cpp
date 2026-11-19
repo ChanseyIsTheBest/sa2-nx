@@ -18,6 +18,7 @@
 #include <rex/ui/flags.h>
 #include <rex/kernel/crt/heap.h>
 #include <rex/filesystem.h>
+#include <rex/filesystem/devices/pack_device.h>  // sa2-nx-ult (2026-11-19): 1.0.6's asset cache
 #include <rex/logging/sink.h>
 #include <rex/logging.h>
 #include <rex/ui/overlay/achievement_toast.h>
@@ -267,7 +268,10 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
     return false;
   }
-  if (!std::filesystem::is_directory(paths.game_data_root)) {
+  // sa2-nx-ult (2026-11-19, sa2-nx 1.0.6's): the game data is the folder, or only its asset cache (<folder>.nxpack +
+  // .nxidx, see pack_device.h): on the Switch the folder is usually not on the card at all once the pack is there.
+  if (!std::filesystem::is_directory(paths.game_data_root) &&
+      !rex::filesystem::PackDevice::Exists(std::filesystem::absolute(paths.game_data_root))) {
     auto msg = fmt::format("--game_data_root does not exist: {}", paths.game_data_root.string());
     REXLOG_ERROR("{}", msg);
     rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);

@@ -65,6 +65,10 @@ input_rumble = false
 # The base's frame cap stays off: SA2 paces its own frames (sa2_renut_pacing.cpp).
 frame_cap = "Off"
 
+# The base's DLC installer hides Beautiful Katamari's unlock packs unless this is true; SA2 has none of them, so
+# nothing is hidden, as 1.0.6 (its own installer hid nothing).
+katamari_dlc_unlock_packs = true
+
 # Controllers: the Xbox layout by position, single Joy-Cons sideways with the stick turned (1.0.6).
 input_xbox_layout = true
 input_joycon_sideways = true

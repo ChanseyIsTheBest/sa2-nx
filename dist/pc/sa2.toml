@@ -14,3 +14,4 @@ banjo_renut_tags = false
 banjo_display_sync = true
 input_rumble = false
 frame_cap = "Off"
+katamari_dlc_unlock_packs = true

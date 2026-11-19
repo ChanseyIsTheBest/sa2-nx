@@ -37,3 +37,10 @@ and docs/sa2-near-exact.md.
   in the hot-function step.
 - D: was down to 1.7 GB (other sessions' builds): the lockstep frames (.rgba) LZX-compressed in place (1.6-2.1 : 1),
   nothing deleted; 2.7 GB free after.
+- 1.0.6's asset pack grafted (`pack_device`, `pack_storage_switch`, the `asset_pack` keys, `tools/build_asset_pack.py`):
+  1.0.6's installer puts only `game_root.nxpack` + `.nxidx` on the card, so the rebased NRO needs it to find the game.
+  PC check: the build mounted 1.0.6's own pack (the emulator's `sa2` folder, read-only: 3,709 files, 2.4 GB, in 7 ms)
+  and drew 750 of 750 of 1.0.6's frames identically.
+- The 2 MB code blocks' off switch reads `sa2.toml` (the base read `katamari.toml`), as 1.0.6.
+- `katamari_dlc_unlock_packs = true` in SA2's settings: the base's DLC installer otherwise hides Beautiful Katamari's
+  nine unlock packs by name (none of them SA2's); nothing hidden, as 1.0.6.

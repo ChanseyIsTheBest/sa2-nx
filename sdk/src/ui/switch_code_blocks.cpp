@@ -27,7 +27,7 @@
  * An emulator runs NROs without a loader, as CodeStatic memory, which can't be unmapped. There the code stays where it is
  * and the swap is tested on pages of its own instead.
  *
- * banjo_code_blocks = false in katamari.toml turns it off. The cvars aren't read yet, so this looks at the file itself; the
+ * banjo_code_blocks = false in sa2.toml turns it off (sa2-nx-ult, 2026-11-19: the app's toml, as 1.0.6; was katamari.toml). The cvars aren't read yet, so this looks at the file itself; the
  * cvar is in guest_memory_switch.cpp, so the key is known. The built-in defaults can't turn it off.
  */
 #if defined(__SWITCH__)
@@ -191,7 +191,7 @@ bool TurnedOffInToml() {
   const char* bar = strrchr(nro, '/');
   if (!bar) return false;
   char path[FS_MAX_PATH];
-  const int n = snprintf(path, sizeof(path), "%s%.*skatamari.toml", strchr(nro, ':') ? "" : "sdmc:",
+  const int n = snprintf(path, sizeof(path), "%s%.*ssa2.toml", strchr(nro, ':') ? "" : "sdmc:",
                          static_cast<int>(bar - nro + 1), nro);
   if (n <= 0 || static_cast<size_t>(n) >= sizeof(path)) return false;
   FILE* f = fopen(path, "r");
