@@ -93,8 +93,12 @@ own GLSL package, compiled-shader cache and user folder), the attract sequence f
 - **The three float forms off** (`app\out\switch-exact`: `BLUR_FPCR_ONE_MODE`, `SASRT_VMX_FAST_ESTIMATES`,
   `SASRT_VMX_FUSED_MADD` OFF): 572 of 2,300 of 1.0.6's frames identical, spread over the whole demo (late ones too:
   135 of 200 around game frame 7900), against none with them on. So they are what makes player 2's run drift; what
-  still differs frame to frame without drifting is the drawing on the Switch path (next: the same build with 1.0.6's
-  GLSL package beside it).
+  still differs frame to frame without drifting is small.
+- **The same build with 1.0.6's own GLSL package beside it** (read before the built-in one): the same picture, about
+  30 % of the frames identical. So not the shader chain. What differs in the others: a few of the grind sparks
+  placed elsewhere and a sliver along the edge of Shadow's board (a sub-pixel shift): positions computed on the CPU.
+  1.0.6's NRO runs native copies of hot functions that the rebased build does not have yet (`sa2_cpu_native_*`, among
+  them `njCalcPoint` and `njMultiMatrix`); next: 1.0.6 with its CPU enhancements off (`sa2_cpu_enhancements = false`).
 
 ## Gameplay on the PC, verify mode (2026-11-19)
 
