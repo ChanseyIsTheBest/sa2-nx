@@ -30,3 +30,10 @@ and docs/sa2-near-exact.md.
   `sa2_renut_gamma_entries`, sa2-ultimate-notes.md). With both: 400 of 400 and 750 of 750 of 1.0.6's frames identical
   (title, loading, 2P demo).
 - `tools/run_pc.ps1`: paths with spaces are quoted (Windows PowerShell's Start-Process split them).
+- Verify mode with gameplay (six runs on copies of the save): City Escape, the Dark story's opening cutscene and Iron
+  Gate, the Chao World lobby; 0 differences in every self-check (sa2-ultimate-notes.md, "Gameplay on the PC").
+- The base's Katamari hand natives (`banjo_hot_guest.cpp`, `katamari_hand_*` keys) are compiled in but reach nothing:
+  SA2's hot lists are empty, so no hook names their addresses. The start-up line still prints their keys ON; they go
+  in the hot-function step.
+- D: was down to 1.7 GB (other sessions' builds): the lockstep frames (.rgba) LZX-compressed in place (1.6-2.1 : 1),
+  nothing deleted; 2.7 GB free after.

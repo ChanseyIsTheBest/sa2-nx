@@ -73,6 +73,30 @@ compared by `tools/sa2_compare_frames.py --align` (2026-11-19).
   frames of game frames 6000-9000 (every 4th: the title, its fade, the loading, the 2P demo) all identical, in
   segments of one offset each.
 
+## Gameplay on the PC, verify mode (2026-11-19)
+
+Six runs of the rebased PC build with the base's verify keys (`banjo_cpu_verify`, the guard on every call), each on a
+fresh copy of the save (`out/pc_user_save`, the user's save with the Battle DLC: story progress, Chao Garden),
+scripted with the base's `input_script` (out/pc_runs/verify1-6, a capture every 15-20 s):
+
+| Run | Route | Reached |
+|---|---|---|
+| verify1 (300 s) | the save, 1P PLAY, STAGE SELECT, then random sticks | the stage map (City Escape, Wild Canyon, Chao World highlighted in turn) |
+| verify2 (300 s) | the stage map, A on City Escape, sticks from 75 s | City Escape played: the board section, the street, the park |
+| verify3 (170 s) | 1.0.6's story route (DARK story) | the opening cutscene with subtitles, then Iron Gate (Eggman's walker: a shooting stage) |
+| verify4 (170 s) | the stage map, UP, A | City Escape again (UP moves nowhere from it) |
+| verify5 (170 s) | the stage map, RIGHT, A | the Chao World lobby |
+| verify6 (170 s) | the stage map, LEFT, A | City Escape again |
+
+Every self-check said 0 differences in every run (verify2 alone: 162 million loads folded to constants, 139 million
+promoted indirect calls, 1.12 billion flush-mode checks, 837 million r1 checks, 1.4 million stack forwards); no
+"[hot] DIFFERENCE" line (there are no machine copies yet). The pictures look as 1.0.6's do. Not reached yet: a hunting
+stage (Wild Canyon is on the map; the d-pad route to it is still to find) and a Chao Garden itself (the lobby only).
+
+The base's `input_script` is not 1.0.6's: a hold is `@seconds` (1.0.6: `:seconds`) and the sticks are `LSUP`,
+`LSDOWN`, ... (1.0.6: `LY-`, `LX+`, ...). A test toml of 1.0.6 with an input_script needs its holds and sticks
+rewritten; players' tomls have none.
+
 ## Two code modules
 
 SA2 has two: `default.xex` and the stage DLL `gd/DLL/xbox 360/Data_DLL.xex` (160 functions; 31 MB, nearly all stage
