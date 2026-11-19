@@ -59,7 +59,7 @@ NRO on the Switch and registered statically (`rex/system/static_modules.h`).
 | `BLUR_NX_R1_ASSUME` | +3,427 functions assumed; 0 differences in 1.69 billion checked calls: **off** pending a console A/B |
 | `BANJO_GENERATED_NO_TRAPPING_MATH` | the base's CMake would put it on the 15 FPSCR-writing files: **off** |
 | `BLUR_LOCALIZE_ABI_TRUST`, `SASRT_HOT_LR_ELIDE` | off (the base's default); their censuses need a guard build with them on |
-| The stack-frame elisions | off; the reader of the uninitialised stack word: 189 candidate loads in 149 functions (`tools/sa2_stale_frame_reads.py`), not narrowed yet |
+| The stack-frame elisions | **1.0.6's tint found and fixed:** not a stale stack word the game reads but a real data store `tools/frame_traffic.py` took for a save (SA2's DXT1 decoder `sub_82833568`, frameless: an integer-to-float conversion through the stack); found by bisecting the generated files, then the functions. With the fixed tool all three elisions together: 750 of 750 of 1.0.6's frames identical. Off pending a console A/B |
 | The stereo check | SA2 ignores the speaker setting: the default stays |
 | The three keys from the log | `sasrt_gpu_skip_inert_draws`: 0 in every gameplay window (to set false once the console's log agrees); the other two need the console's log or do not apply |
 
@@ -76,12 +76,12 @@ anywhere (the console decides; PC and emulator timings are not evidence).
    generate, LTO with `-fipa-pta`, the copies in place); a console training session (its notes say what to play),
    `tools\pgo_merge.py <pgo folder> pgo-inplace`, then `tools\build_switch_release.bat`.
 3. The installer (`out\handoffs\installer-needs.md`): the asset pack and the update zip, as 1.0.6's installer has.
-4. The remaining two-player-demo difference in the emulator; the stale stack word's reader.
+4. The remaining two-player-demo difference in the emulator (grind sparks, a board's edge).
 
 ## Decisions for you
 
 - The VMX estimates: on (speed) or off (more frames identical to 1.0.6).
-- `BLUR_NX_R1_ASSUME`, `BLUR_NEAR_EXACT`: censuses clean; on only after a console A/B shows a gain.
+- `BLUR_NX_R1_ASSUME`, `BLUR_NEAR_EXACT`, and now the three stack-frame elisions (`BANJO_GEN_NV_SAVES_ELIDE`, `BANJO_GEN_LR_MOVES_ELIDE`, `BANJO_GEN_BACK_CHAIN_ELIDE`): censuses clean; on only after a console A/B shows a gain.
 - `sa2_renut_msaa` (1.0.6's MSAA of single-sample targets): not in the base; port it or leave it out.
 - `input_rumble`: off as 1.0.6, or the base's (the game's own vibration).
 - The base's SMAA: off as 1.0.6.
