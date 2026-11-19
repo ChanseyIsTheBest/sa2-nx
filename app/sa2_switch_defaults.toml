@@ -69,6 +69,11 @@ frame_cap = "Off"
 # nothing is hidden, as 1.0.6 (its own installer hid nothing).
 katamari_dlc_unlock_packs = true
 
+# Decided from SA2's own logs (the base's porting prompt, step 5): the GPU round's inert-draw skip found 0 draws to
+# skip in every 10 s window, gameplay included (the PC's City Escape run, the emulator's attract sequence: 91 windows),
+# so it is off and its checks cost nothing.
+sasrt_gpu_skip_inert_draws = false
+
 # Controllers: the Xbox layout by position, single Joy-Cons sideways with the stick turned (1.0.6).
 input_xbox_layout = true
 input_joycon_sideways = true

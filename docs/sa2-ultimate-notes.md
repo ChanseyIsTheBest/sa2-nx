@@ -220,10 +220,10 @@ stage (Wild Canyon is on the map; the d-pad route to it is still to find) and a 
 
 ## Decided from SA2's own logs (the base's porting prompt, step 5)
 
-- `sasrt_gpu_skip_inert_draws`: 0 in every 10 s window of the PC's City Escape run (verify2), gameplay included: false
-  for SA2 (to set in `sa2_switch_defaults.toml` once the emulator's log says the same; not edited during a build).
-- `ultimate_renut_replay_inherit_same`: the PC log has no "replays with the inherited words" line; the emulator's log
-  decides it.
+- `sasrt_gpu_skip_inert_draws`: 0 in every 10 s window of the PC's City Escape run (verify2), gameplay included, and in
+  the emulator's 91 windows of the attract sequence: **false in `sa2_switch_defaults.toml`** (2026-11-20).
+- `ultimate_renut_replay_inherit_same`: no "replays with the inherited words" line in the PC's or the emulator's logs
+  (SA2 runs without the base's tags): nothing to decide; the base's default stays.
 - `banjo_renut_tags_check`: nothing to decide, SA2 runs with `banjo_renut_tags = false` (no "recording from marks"
   line).
 - The stereo check (`audio_channel_census`, City Escape, 140 s each): with the default speaker configuration
