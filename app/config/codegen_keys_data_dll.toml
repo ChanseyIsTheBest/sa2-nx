@@ -1,0 +1,24 @@
+# sa2-nx on the ultimate base: the codegen keys of the stage DLL (gd/DLL/xbox 360/Data_DLL.xex), the same as the
+# main module's in app/renut_config.toml (keep the two equal by hand; sa2-nx 1.0.6 gave both modules one file,
+# codegen_flavor.toml). Root keys only: overrides_data_dll.toml holds the DLL's function entries.
+cr_as_local = true
+ctr_as_local = true
+xer_as_local = true
+reserved_as_local = true
+skip_msr = true
+dform_disp_split = true
+fctiwz_inline = true
+fcti_inline = true
+div_inline = true
+dcbt_prefetch = true
+rotate_word_shifts = true
+fp_compares_modeless = true
+fp_moves_modeless = true
+fp_mode_lookahead = true
+fp_mode_lookahead_past_branch = false
+fp_copy_pairs = true
+fp_copy_forwarding = true
+non_volatile_as_local = true
+elide_lr_stores = true
+non_argument_as_local = true
+non_argument_as_local_keep = [0x827F5144, 0x82801D90, 0x827EFE34, 0x88010BE4]

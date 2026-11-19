@@ -1,12 +1,30 @@
+# sa2-nx on the ultimate base: the code generator's manifest for Sonic Adventure 2 (Xbox Live Arcade, title 58411202,
+# default.xex 0.0.0.3; image base 0x82000000, entry point 0x82543108, image size 0x02560000).
+#
+# The internal project name stays the base's "renut" (generated/renut_*.h, renut_recomp.N.cpp, the renut and
+# renut_recomp targets, out/renut_image.bin), so the base's CMake, passes and scripts work as they are; the NRO, its
+# title and the SD folder are sa2-nx's (docs/ultimate-rebase-plan.md, "Decisions"). sa2-nx 1.0.6 called it "sa2".
+#
+# Your own game files: the extracted XBLA package in assets/game_root (tools/stfs_extract.py; in this worktree a
+# directory junction to the main checkout's). Nothing from the game is distributed with this project.
+
 [project]
 sdk_version = "0.10.0"
 name = "renut"
+game_root = "../assets/game_root"
 
 [entrypoint]
-file_path = "assets/default.xex"
+file_path = "../assets/game_root/default.xex"
 out_directory_path = "generated"
-includes = [
- "renut_config.toml"
-]
+includes = ["renut_config.toml"]
 
-
+# The 360 port's replacement for the GameCube REL overlays: one guest DLL with the stage code, which the game loads at
+# run time (XexLoadImage) from gd/DLL/xbox 360/. Without it the game stops at its entry point
+# ("Execute(88010308): function not in function table", sa2-nx's third boot, 2026-10-05). 160 functions, almost all
+# of its 31 MB is stage data. Its codegen keys are the main module's (config/codegen_keys_data_dll.toml, kept equal to
+# renut_config.toml's keys by hand).
+[[modules]]
+guest_path = "gd/DLL/xbox 360/Data_DLL.xex"
+file_path = "../assets/game_root/gd/DLL/xbox 360/Data_DLL.xex"
+out_directory_path = "generated/data_dll"
+includes = ["overrides_data_dll.toml", "config/codegen_keys_data_dll.toml"]
