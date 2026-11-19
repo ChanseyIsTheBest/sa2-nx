@@ -10188,7 +10188,7 @@ std::unordered_map<const void *, std::unordered_map<uint64_t, u32>> g_census_lef
 constexpr u32 kCensusFetchBegin = u32(offsetof(d3d::Device, m_Constants));
 constexpr u32 kCensusFloatBegin = kCensusFetchBegin + u32(offsetof(d3d::Constants, VertexShaderF));
 constexpr u32 kCensusTailBegin = kCensusFetchBegin + u32(offsetof(d3d::Constants, VertexShaderB));
-static_assert(kCensusTailBegin < 10880 && 11776 < d3d::kDeviceSnapshotSize);  // katamari-nx: a chunk boundary (backend/queued.cpp)
+static_assert(kCensusTailBegin < 11008 && 12224 < d3d::kDeviceSnapshotSize);  // sa2-nx-ult: SA2's private words (queued.cpp)  // katamari-nx: a chunk boundary (backend/queued.cpp)
 
 bool CensusCompared(u32 k) {  // g_census[k + 1] is frame N-(k+1)
   return g_census[0].frame != UINT64_MAX && g_census[k + 1].frame != UINT64_MAX &&
@@ -10242,8 +10242,8 @@ void CensusDraw(const u8 *device_state, const DrawCall &call, const Targets &tar
   CensusFrame &cur = g_census[0];
   // The state key.
   uint64_t state = XXH3_64bits(device_state + kCensusFetchBegin, kCensusFloatBegin - kCensusFetchBegin);
-  state = XXH3_64bits_withSeed(device_state + kCensusTailBegin, 10880 - kCensusTailBegin, state);
-  state = XXH3_64bits_withSeed(device_state + 11776, d3d::kDeviceSnapshotSize - 11776, state);  // katamari-nx: a chunk boundary (backend/queued.cpp)
+  state = XXH3_64bits_withSeed(device_state + kCensusTailBegin, 11008 - kCensusTailBegin, state);  // sa2-nx-ult: SA2's
+  state = XXH3_64bits_withSeed(device_state + 12224, d3d::kDeviceSnapshotSize - 12224, state);  // sa2-nx-ult: SA2's  // katamari-nx: a chunk boundary (backend/queued.cpp)
   const u32 call_words[6] = {call.primitive, call.start_index, call.start_vertex, call.count, u32(call.base_vertex),
                              u32(call.indexed) | u32(call.tessellation) << 1 | u32(call.up_vertices != nullptr) << 2 |
                                  u32(call.up_indices != nullptr) << 3};

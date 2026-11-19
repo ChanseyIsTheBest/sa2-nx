@@ -201,7 +201,7 @@ constexpr u32 kShaderMemoWays = 4;
 // banjo-nx (2026-10-28, per-draw night): 4,096 sets a kind (1,024): N&B makes a shader object per mesh (69-72 % of the
 // city's draws bind another address), more than the 4,096 entries a kind held; a miss is a registry lookup under its
 // lock. 512 KB of static memory, not the heap.
-constexpr u32 kShaderMemoSetBits = 12;
+constexpr u32 kShaderMemoSetBits = 12;  // the base's (a memo's size, not layout; sa2-nx 1.0.6 had 10)
 struct alignas(64) ShaderMemoSet {
   ShaderMemo way[kShaderMemoWays];
 };
@@ -970,9 +970,54 @@ void D3DVertexShader_Bind_hook(u32 shader_va, u32 declaration_va, mapped_u32 str
 
 } // namespace
 
-BANJO_RENUT_HOOK(sub_824D6120, D3DDevice_CreateVertexShader_hook);  // D3DDevice_CreateVertexShader  // katamari-nx: N&B sub_826377C0, signature 0.85 (next 0.55)
-BANJO_RENUT_HOOK(sub_824D6010, D3DDevice_CreatePixelShader_hook);  // D3DDevice_CreatePixelShader  // katamari-nx: N&B sub_826375D8, D3DDevice_CreatePixelShader: CreateVertexShader takes sub_824D6120 (0.85); this one's next best, 0.66
-BANJO_RENUT_HOOK(sub_824D4C50, D3DDevice_CreateVertexDeclaration_hook);  // D3DDevice_CreateVertexDeclaration  // katamari-nx: N&B sub_826379A0, signature 0.77 (next 0.47)
-BANJO_RENUT_UNHOOKED_HOOK(sub_8263FBD0, D3DVertexShader_Bind_hook);  // D3DVertexShader_Bind  // katamari-nx: not hooked (D3DVertexShader_Bind: no clear counterpart (sig 0.35/0.28))
-BANJO_RENUT_HOOK(sub_824D4838, XGRegisterVertexShader_hook);  // XGRegisterVertexShader  // katamari-nx: N&B sub_826376C8, signature 0.91 (next 0.32)
-BANJO_RENUT_UNHOOKED_HOOK(sub_826375A0, XGRegisterPixelShader_hook);  // XGRegisterPixelShader  // katamari-nx: not hooked (XGRegisterPixelShader: no counterpart (sig 0.26))
+// sa2-nx-ult (2026-11-19): Katamari's bindings went; SA2's, 1.0.6's block, follow.
+// ---------------------------------------------------------------------------
+// sa2-nx (2026-10-20): SA2's hooks (N&B's addresses in brackets)
+// ---------------------------------------------------------------------------
+// SA2's shader objects stay the game's: its D3DDevice_CreateVertexShader / CreatePixelShader (sub_8255E750 /
+// sub_8255E568) copy the container into the object and call XGRegisterVertexShader / XGRegisterPixelShader on it
+// (the same object layout as N&B's: the container at +0x368 / +0x28, the physical part's pointer at +0x20 / +0x18).
+// So the two XGRegister functions are the hooks: SA2's own code first, then the host side keyed by the container's
+// hash (RegisterGuestShader). The vertex declarations stay the game's too: the host side is kept per object.
+
+namespace {
+
+// The host side of a declaration the game's Direct3D made from pElements (D3DVERTEXELEMENT9[], up to D3DDECL_END:
+// Stream 0xFF), in order with the draws.
+void RegisterGuestDeclaration(u32 declaration_va, const GuestVertexElement *elements) {
+  auto declaration = std::make_shared<VertexDeclarationRecord>();
+  declaration->x360.resource.Common = u32(d3d::ResourceType::VertexDeclaration);
+  declaration->self_va = declaration_va;
+  for (u32 i = 0; i < 64 && u32(elements[i].Stream) != 0xFF && u32(elements[i].Type) != kDeclTypeUnused; ++i)
+    declaration->elements.push_back(elements[i]);
+  BuildDeclarationLayout(*declaration);
+  render_thread::Queue([declaration_va, declaration] {
+    ForgetVertexDeclarationLocked(declaration_va);
+    g_guest_declarations[declaration_va] = std::make_unique<VertexDeclarationRecord>(*declaration);
+  });
+}
+
+}  // namespace
+
+// void XGRegisterVertexShader(D3DVertexShader*, void *pPhysicalPart) [sub_8255E658; N&B 0x8264E7B8]
+BANJO_RENUT_HOOK_RAW(sub_8255E658) {
+  const u32 shader = ctx.r3.u32, physical = ctx.r4.u32;
+  __imp__sub_8255E658(ctx, base);
+  RegisterGuestShader(shader, physical, false);
+}
+
+// void XGRegisterPixelShader(D3DPixelShader*, void *pPhysicalPart) [sub_8255DBF8; N&B 0x8264E670]
+BANJO_RENUT_HOOK_RAW(sub_8255DBF8) {
+  const u32 shader = ctx.r3.u32, physical = ctx.r4.u32;
+  __imp__sub_8255DBF8(ctx, base);
+  RegisterGuestShader(shader, physical, true);
+}
+
+// D3DVertexDeclaration *D3DDevice_CreateVertexDeclaration(const D3DVERTEXELEMENT9*) [sub_8255E198; N&B 0x8264EA90]
+BANJO_RENUT_HOOK_RAW(sub_8255E198) {
+  const u32 elements_va = ctx.r3.u32;
+  __imp__sub_8255E198(ctx, base);
+  const u32 declaration = ctx.r3.u32;
+  if (const auto *elements = declaration ? GuestPtr<const GuestVertexElement>(elements_va) : nullptr)
+    RegisterGuestDeclaration(declaration, elements);
+}

@@ -51,7 +51,7 @@ namespace {
 constexpr u32 kE_OUTOFMEMORY = 0x8007000Eu;
 // D3DVIEWPORT9 {0, 0, 0xFFFF, 0xFFFF, 0.0, 1.0} in N&B's data (unk_82001744):
 // the whole surface.
-constexpr u32 kFullViewport = 0x820FAEB4;  // katamari-nx: 0x82001744->0x820FAEB4
+constexpr u32 kFullViewport = 0x820018DC;  // katamari-nx: 0x82001744->0x820FAEB4; sa2-nx: SA2's (1.0.6's draw.cpp), the base 0x820FAEB4
 // D3DRS_HIZWRITEENABLE's index in the render state table.
 constexpr u32 kRenderStateHiZWriteEnable = 97;
 
@@ -614,30 +614,85 @@ void D3DDevice_SetPixelShader_hook(u32 device, u32 shader) {
 
 } // namespace
 
-BANJO_RENUT_HOOK(sub_824D9D08, D3DDevice_DrawVertices_hook);  // D3DDevice_DrawVertices  // katamari-nx: N&B sub_821FB880, signature 0.90 (next 0.77)
-BANJO_RENUT_HOOK(sub_824DA0F0, D3DDevice_DrawIndexedVertices_hook);  // D3DDevice_DrawIndexedVertices  // katamari-nx: N&B sub_8263F358, signature 0.87 (next 0.78)
-BANJO_RENUT_HOOK(sub_824DA9C0, D3DDevice_DrawIndexedTessellatedVertices_hook);  // D3DDevice_DrawIndexedTessellatedVertices  // katamari-nx: N&B sub_821FF958, signature 0.86 (next 0.65)
-BANJO_RENUT_HOOK(sub_824D9758, D3DDevice_DrawVerticesUP_hook);  // D3DDevice_DrawVerticesUP  // katamari-nx: N&B sub_821FD698, D3DDevice_DrawVerticesUP: BeginVertices-style reserve, reads VerticesRingEnd +13428 (N&B +13444) and the flags +10940; sig 0.69/0.55
-BANJO_RENUT_UNHOOKED_HOOK(sub_8263F2B8, D3DDevice_DrawIndexedVerticesUP_hook);  // D3DDevice_DrawIndexedVerticesUP  // katamari-nx: not hooked (D3DDevice_DrawIndexedVerticesUP: no counterpart found (sig 0.32))
-BANJO_RENUT_HOOK(sub_824D92B8, D3DDevice_BeginVertices_hook);  // D3DDevice_BeginVertices  // katamari-nx: N&B sub_821FBD30, signature 0.87 (next 0.70)
-BANJO_RENUT_HOOK(sub_824F3248, D3DDevice_ClearF_hook);  // D3DDevice_ClearF  // katamari-nx: N&B sub_8224F110, D3DDevice_ClearF: sig 0.71/0.40; reads the targets +12432.. and tiling surfaces +12720.. as N&B +12448 / +12736
-BANJO_RENUT_HOOK(sub_824F3370, D3DDevice_Clear_hook);  // D3DDevice_Clear  // katamari-nx: N&B sub_8224F238, signature 0.84 (next 0.36)
-BANJO_RENUT_HOOK(sub_824F12B8, D3DDevice_Resolve_hook);  // D3DDevice_Resolve  // katamari-nx: N&B sub_821FC7A0, signature 0.78 (next 0.33)
-BANJO_RENUT_UNHOOKED_HOOK_SHARED(sub_82246798, D3DDevice_BeginTiling_hook);  // D3DDevice_BeginTiling: N&B's update form, see below
-BANJO_RENUT_UNHOOKED_HOOK(sub_821E17C0, D3DDevice_EndTiling_hook);  // D3DDevice_EndTiling: N&B's update form, see below
 // katamari-nx (2026-10-30): XDK 2.0.5632's BeginTiling (sub_824EFBC8: it stores the count at TileCount +0x31C4 and
 // the targets at TilingSurfaces +0x31B0, where the zones put N&B's fields; the game calls it at 0x8271E62C) and
 // EndTiling (sub_824F0150: sig 0.66/0.36, resolves through Resolve sub_824F12B8; called at 0x8272F2E0..0x8272F384),
 // with their full arguments read from the registers (the float argument takes r8's place: ClearStencil is r9).
-BANJO_RENUT_HOOK_RAW(sub_824EFBC8) {
-  BeginTilingImpl(ctx.r3.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, ctx.r4.u32, float(ctx.f1.f64), ctx.r9.u32);
+
+// sa2-nx-ult (2026-11-19): Katamari's bindings went; SA2's, 1.0.6's block, follow.
+// ---------------------------------------------------------------------------
+// sa2-nx (2026-10-20): SA2's hooks (N&B's addresses in brackets)
+// ---------------------------------------------------------------------------
+// The draws are Renut's at SA2's addresses (same signatures; sa2-nx's own hooks there, src/me/sa2_me_hooks.cpp and
+// src/me/sa2_d3d_api.cpp, hand over to these when Renut's renderer is chosen). SA2 does not tile, export, record
+// command buffers or draw tessellated, and its Present is left to its own code (its Resolve and Swap are hooked).
+//
+// Clear and Resolve: the host work is queued from the device as it is at the call (the same snapshot N&B's hooks
+// take), then SA2's own function does the device work N&B's hooks did natively (d3d_native.h is N&B's layout): its
+// packets go into the ring sink, its inline data into the scratch (device.cpp), its fences through the hooked
+// BlockOnFence and KickOff. SA2's Clear (sub_82563AB0) calls ClearF once per rect, and the game calls ClearF directly
+// too, so ClearF is the hook.
+
+namespace {
+
+void QueueHostClear(u32 device, u32 flags, const ClearRect *rect, const float color[4], float z, u32 stencil) {
+  if (IsRecordingCommandBuffer(device))
+    RecordClear(device, flags, rect, color, z, stencil);
+  else if (Active())
+    QueueClear(device, flags, rect, color, z, stencil);
 }
-BANJO_RENUT_HOOK_RAW(sub_824F0150) {
-  ctx.r3.u64 = EndTilingImpl(ctx.r3.u32, true, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32, float(ctx.f1.f64),
-                             ctx.r9.u32, ctx.r10.u32);
+
+void QueueHostResolve(u32 device, u32 flags, const ClearRect *rect, u32 dest_texture, i32 dest_x, i32 dest_y,
+                      u32 dest_level, u32 dest_slice, u32 color_va, float clear_z, u32 clear_stencil) {
+  float color[4] = {0, 0, 0, 0};
+  const bool has_color = color_va && ReadVector4(color_va, color);
+  if (IsRecordingCommandBuffer(device)) {
+    RecordResolve(device, flags, rect, dest_texture, dest_x, dest_y, dest_level, dest_slice,
+                  has_color ? color : nullptr, clear_z, clear_stencil);
+  } else if (Active()) {
+    QueueResolve(device, flags, rect, dest_texture, dest_x, dest_y, dest_level, dest_slice,
+                 has_color ? color : nullptr, clear_z, clear_stencil);
+  }
 }
-BANJO_RENUT_UNHOOKED_HOOK_SHARED(sub_82237FE8, D3DDevice_BeginExport_hook);  // D3DDevice_BeginExport  // katamari-nx: not hooked (D3DDevice_BeginExport: XDK 2.0.5632 has no memexport functions (as feedingfrenzy2-nx found for 6534))
-BANJO_RENUT_UNHOOKED_HOOK_SHARED(sub_82237D80, D3DDevice_EndExport_hook);  // D3DDevice_EndExport  // katamari-nx: not hooked (D3DDevice_EndExport: as above)
-BANJO_RENUT_HOOK(sub_824E9428, D3DDevice_Present_hook);  // D3DDevice_Present  // katamari-nx: N&B sub_826352B8, D3DDevice_Present: SynchronizeToPresentationInterval sub_824E89E8, Resolve sub_824F12B8, KickOff sub_824E0298, then Swap sub_824E8E90; sig 0.43/0.26
-BANJO_RENUT_HOOK(sub_824D4930, D3DDevice_SetVertexShader_hook);  // D3DDevice_SetVertexShader  // katamari-nx: N&B sub_821F90D8, signature 0.87 (next 0.75)
-BANJO_RENUT_HOOK(sub_824D4630, D3DDevice_SetPixelShader_hook);  // D3DDevice_SetPixelShader  // katamari-nx: N&B sub_821F58A8, signature 0.85 (next 0.73)
+
+}  // namespace
+
+BANJO_RENUT_HOOK(sub_82565C60, D3DDevice_DrawVertices_hook);  // D3DDevice_DrawVertices [0x8222C7A0]
+BANJO_RENUT_HOOK(sub_82566078, D3DDevice_DrawIndexedVertices_hook);  // D3DDevice_DrawIndexedVertices [0x826567C8]
+BANJO_RENUT_HOOK(sub_82565C18, D3DDevice_DrawVerticesUP_hook);  // D3DDevice_DrawVerticesUP [0x8222E520]
+BANJO_RENUT_HOOK(sub_82565758, D3DDevice_BeginVertices_hook);  // D3DDevice_BeginVertices [0x8222CC50]
+
+// void D3DDevice_ClearF(D3DDevice*, DWORD Flags, const D3DRECT *pRect, const D3DVECTOR4 *pColor, float Z,
+//     DWORD Stencil) [sub_82563978; N&B 0x822811A0]: Z in f1 (r7's slot), Stencil in r8.
+BANJO_RENUT_HOOK_RAW(sub_82563978) {
+  const u32 device = ctx.r3.u32, flags = ctx.r4.u32, rect_va = ctx.r5.u32, color_va = ctx.r6.u32;
+  ClearRect rect;
+  const bool has_rect = rect_va && ReadRect(rect_va, rect);
+  float color[4] = {0, 0, 0, 0};
+  if (color_va)
+    ReadVector4(color_va, color);
+  QueueHostClear(device, flags, has_rect ? &rect : nullptr, color, float(ctx.f1.f64), ctx.r8.u32);
+  __imp__sub_82563978(ctx, base);
+}
+
+// void D3DDevice_Resolve(D3DDevice*, DWORD Flags, const D3DRECT *pSourceRect, D3DBaseTexture *pDestTexture,
+//     const D3DPOINT *pDestPoint, UINT DestLevel, UINT DestSliceOrFace, const D3DVECTOR4 *pClearColor, float ClearZ,
+//     DWORD ClearStencil, const D3DRESOLVE_PARAMETERS *pParameters) [sub_825656F8; N&B 0x8222D6C8]: ClearZ in f1,
+// ClearStencil and pParameters in the caller's argument words at +92 and +100 (sub_825656F8 reads them there). Every
+// resolve of SA2 comes here: the game's, the Present's and Direct3D's own (sub_825645A0, the core, has no other
+// caller).
+BANJO_RENUT_HOOK_RAW(sub_825656F8) {
+  const u32 device = ctx.r3.u32, flags = ctx.r4.u32, rect_va = ctx.r5.u32, dest_texture = ctx.r6.u32;
+  const u32 point_va = ctx.r7.u32, dest_level = ctx.r8.u32, dest_slice = ctx.r9.u32, color_va = ctx.r10.u32;
+  const u32 clear_stencil = LoadU32(ctx.r1.u32 + 92);
+  ClearRect rect;
+  const bool has_rect = rect_va && ReadRect(rect_va, rect);
+  i32 dest_x = 0, dest_y = 0;
+  if (const auto *p = point_va ? GuestPtr<const be_u32>(point_va) : nullptr) {
+    dest_x = i32(u32(p[0]));
+    dest_y = i32(u32(p[1]));
+  }
+  QueueHostResolve(device, flags, has_rect ? &rect : nullptr, dest_texture, dest_x, dest_y, dest_level, dest_slice,
+                   color_va, float(ctx.f1.f64), clear_stencil);
+  __imp__sub_825656F8(ctx, base);
+}

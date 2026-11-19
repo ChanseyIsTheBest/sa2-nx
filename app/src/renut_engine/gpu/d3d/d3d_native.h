@@ -80,6 +80,8 @@ constexpr uint64_t TouchBits(u32 offset, u32 size) {
 // bool and integer constants and the register packets (0x2780-0x2A7F) and the private render state (0x2E00-0x2EFF; on
 // title update 3 0x2E04-0x2F07, its CDevice 4 bytes longer from 0x2AC0 and 8 from 0x2E30).
 constexpr uint64_t kStateTagChunks = TouchBits(0x2780, 0x300) | TouchBits(0x2DF4, 0x108);  // katamari-nx: 0x2E00->0x2DF4
+// sa2-nx-ult (2026-11-19): Katamari's, not moved: the tags (banjo_renut_tags) need marks from the state setters this
+// port leaves to SA2's own Direct3D, so they are off in SA2's settings and nothing reads this (docs/sa2-ultimate-notes.md).
 struct FetchTagTable {
   uint64_t chunks[32];
 };
@@ -289,36 +291,36 @@ constexpr u32 ModeControl = 0x2948;
 constexpr u32 BlendControl1 = 0x2958;
 constexpr u32 BlendControl2 = 0x295C;
 constexpr u32 BlendControl3 = 0x2960;
-constexpr u32 FenceCompletion = 0x2A90;    // -> the completed-fence word
-constexpr u32 FenceTag = 0x2A9C;           // the current fence
-constexpr u32 CommandBufferTagMask = 0x2AA0;  // Common bits a recorded buffer tracks
-constexpr u32 TilePredication = 0x2AB4;    // SetPredication / SetCommandBufferPredication args
-constexpr u32 RunPredication = 0x2AB8;
-constexpr u32 Flags = 0x2ABC;              // bytes 0x2ABC-0x2ABF, see below
-constexpr u32 Flags1 = 0x2ABD;
-constexpr u32 Flags2 = 0x2ABE;
-constexpr u32 Flags3 = 0x2ABF;
+constexpr u32 FenceCompletion = 11024;    // -> the completed-fence word; sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x2A90
+constexpr u32 FenceTag = 11036;           // the current fence; sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x2A9C
+constexpr u32 CommandBufferTagMask = 11040;  // Common bits a recorded buffer tracks; sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x2AA0
+constexpr u32 TilePredication = 11060;    // SetPredication / SetCommandBufferPredication args; sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x2AB4
+constexpr u32 RunPredication = 11064;  // sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x2AB8
+constexpr u32 Flags = 11068;              // bytes 0x2ABC-0x2ABF, see below; sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x2ABC
+constexpr u32 Flags1 = 11069;  // sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x2ABD
+constexpr u32 Flags2 = 11070;  // sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x2ABE
+constexpr u32 Flags3 = 11071;  // sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x2ABF
 // TU3: the fields from 0x2E30 to 0x3390 are 8 bytes further on.
-constexpr u32 ScissorRect = 0x317C;        // SetScissorRect's RECT (katamari-nx: 0x318C->0x317C)
-constexpr u32 IndexBuffer = 0x308C;  // katamari-nx: 0x309C->0x308C
-constexpr u32 RenderTargets = 0x3090;      // [4] (katamari-nx: 0x30A0->0x3090)
-constexpr u32 DepthStencil = 0x30A0;  // katamari-nx: 0x30B0->0x30A0
-constexpr u32 StreamSources = 0x30A4;      // [16] (katamari-nx: 0x30B4->0x30A4)
-constexpr u32 StreamStrides = 0x30E8;      // u8[16], stride / 4 (katamari-nx: 0x30F8->0x30E8)
-constexpr u32 Textures = 0x30F8;           // [26] (katamari-nx: 0x3108->0x30F8)
-constexpr u32 Predication = 0x319C;        // tile predication of the next draws, ~0 none (katamari-nx: 0x31AC->0x319C)
-constexpr u32 RunPredicationState = 0x31A0;  // katamari-nx: 0x31B0->0x31A0
-constexpr u32 PredicationSet = 0x31A4;     // 1 while SetPredication's mask is non-zero (katamari-nx: 0x31B4->0x31A4)
-constexpr u32 TilingSurfaces = 0x31B0;     // the 4 targets and depth BeginTiling bound (katamari-nx: 0x31C0->0x31B0)
-constexpr u32 TileCount = 0x31C4;  // katamari-nx: 0x31D4->0x31C4
-constexpr u32 TileRects = 0x31C8;          // D3DRECT[TileCount] (katamari-nx: 0x31D8->0x31C8)
-constexpr u32 TileOrigins = 0x32B8;        // per tile, x & ~31, y & ~31 (katamari-nx: 0x32C8->0x32B8)
-constexpr u32 TilingExtent = 0x3374;       // widest and tallest tile edge (katamari-nx: 0x3384->0x3374)
-constexpr u32 CommandBuffer = 0x34B4;      // the D3DCommandBuffer being recorded (katamari-nx: 0x34CC->0x34B4)
-constexpr u32 SideBuffer = 0x4140;  // katamari-nx: 0x4158->0x4140
-constexpr u32 AutoDepthStencil = 0x39D0;   // InitializePresentationParameters' surfaces (katamari-nx: 0x39E8->0x39D0)
-constexpr u32 AutoFrontBuffer = 0x39D4;  // katamari-nx: 0x39EC->0x39D4
-constexpr u32 AutoBackBuffer = 0x39D8;  // katamari-nx: 0x39F0->0x39D8
+constexpr u32 ScissorRect = 13052;        // SetScissorRect's RECT (katamari-nx: 0x318C->0x317C); sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x317C
+constexpr u32 IndexBuffer = 12812;  // katamari-nx: 0x309C->0x308C; sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x308C
+constexpr u32 RenderTargets = 12816;      // [4] (katamari-nx: 0x30A0->0x3090); sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x3090
+constexpr u32 DepthStencil = 12832;  // katamari-nx: 0x30B0->0x30A0; sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x30A0
+constexpr u32 StreamSources = 12836;      // [16] (katamari-nx: 0x30B4->0x30A4); sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x30A4
+constexpr u32 StreamStrides = 12904;      // u8[16], stride / 4 (katamari-nx: 0x30F8->0x30E8); sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x30E8
+constexpr u32 Textures = 12920;           // [26] (katamari-nx: 0x3108->0x30F8); sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x30F8
+constexpr u32 Predication = 13084;        // tile predication of the next draws, ~0 none (katamari-nx: 0x31AC->0x319C); sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x319C
+constexpr u32 RunPredicationState = 13088;  // katamari-nx: 0x31B0->0x31A0; sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x31A0
+constexpr u32 PredicationSet = 13092;     // 1 while SetPredication's mask is non-zero (katamari-nx: 0x31B4->0x31A4); sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x31A4
+constexpr u32 TilingSurfaces = 13104;     // the 4 targets and depth BeginTiling bound (katamari-nx: 0x31C0->0x31B0); sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x31B0
+constexpr u32 TileCount = 13124;  // katamari-nx: 0x31D4->0x31C4; sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x31C4
+constexpr u32 TileRects = 13128;          // D3DRECT[TileCount] (katamari-nx: 0x31D8->0x31C8); sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x31C8
+constexpr u32 TileOrigins = 13368;        // per tile, x & ~31, y & ~31 (katamari-nx: 0x32C8->0x32B8); sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x32B8
+constexpr u32 TilingExtent = 13556;       // widest and tallest tile edge (katamari-nx: 0x3384->0x3374); sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x3374
+constexpr u32 CommandBuffer = 13920;      // the D3DCommandBuffer being recorded (katamari-nx: 0x34CC->0x34B4); sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x34B4
+constexpr u32 SideBuffer = 17136;  // katamari-nx: 0x4158->0x4140; sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x4140
+constexpr u32 AutoDepthStencil = 15228;   // InitializePresentationParameters' surfaces (katamari-nx: 0x39E8->0x39D0); sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x39D0
+constexpr u32 AutoFrontBuffer = 15232;  // katamari-nx: 0x39EC->0x39D4; sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x39D4
+constexpr u32 AutoBackBuffer = 15236;  // katamari-nx: 0x39F0->0x39D8; sa2-nx: SA2's (1.0.6's d3d_native.h), the base 0x39D8
 }  // namespace off
 
 // Flags (0x2ABC) bits: 0x01 the draws that follow run in each tile's pass,

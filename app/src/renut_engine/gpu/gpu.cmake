@@ -255,13 +255,15 @@ function(renut_gpu_setup TARGET)
         ${RENUT_GPU_DIR}/d3d/hooks/draw.cpp
         ${RENUT_GPU_DIR}/d3d/hooks/resource.cpp
         ${RENUT_GPU_DIR}/d3d/hooks/shader.cpp
-        ${RENUT_GPU_DIR}/d3d/hooks/state.cpp
+        # sa2-nx (2026-10-20; sa2-nx-ult 2026-11-19): not d3d/hooks/state.cpp (the state setters natively, at
+        # Katamari's addresses in the base): SA2's own setters write the device the draws read.
         # Guest-side records, command buffers and callbacks.
         ${RENUT_GPU_DIR}/guest/callbacks.cpp
         ${RENUT_GPU_DIR}/guest/command_buffers.cpp
         ${RENUT_GPU_DIR}/guest/guest_records.cpp
-        ${RENUT_GPU_DIR}/guest/photo_capture.cpp
-        ${RENUT_GPU_DIR}/guest/widescreen.cpp
+        # sa2-nx: not guest/photo_capture.cpp and guest/widescreen.cpp (N&B's and Katamari's game code); SA2's screen
+        # size instead.
+        ${RENUT_GPU_DIR}/guest/sa2_screen.cpp
         # reNut's overlay and the SDK's menus.
         ${RENUT_GPU_DIR}/overlay/app_integration.cpp
         ${RENUT_GPU_DIR}/overlay/overlay_drawer.cpp

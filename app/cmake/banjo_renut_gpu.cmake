@@ -91,7 +91,10 @@ add_library(banjo_renut_gpu OBJECT
     "${CMAKE_SOURCE_DIR}/src/renut_engine/gpu/banjo_renut_record.cpp"
     # banjo-nx (2026-10-19, latency batch 3): the display's refresh for the frame limiter (it reads the presents' fences)
     "${CMAKE_SOURCE_DIR}/src/renut_engine/display_sync.cpp"
-    "${CMAKE_SOURCE_DIR}/src/renut_engine/perf/frame_stats.cpp")
+    "${CMAKE_SOURCE_DIR}/src/renut_engine/perf/frame_stats.cpp"
+    # sa2-nx (2026-10-20): the game's frames at its presentation interval (the console's vertical blank): SA2's game
+    # speed follows them (the Swap hook calls it).
+    "${CMAKE_SOURCE_DIR}/src/renut_engine/gpu/sa2_renut_pacing.cpp")
 target_include_directories(banjo_renut_gpu PRIVATE
     "${CMAKE_SOURCE_DIR}"
     "${CMAKE_SOURCE_DIR}/src"
