@@ -37,6 +37,15 @@ build, one flush mode for everything, would change). Three routes of 240 s each,
 | cg13_city | the stage map, City Escape played (sticks) | 23 | 1: the first (start-up) |
 | cg13_story | the Dark story: its opening cutscene, then Iron Gate | 23 | 1: the first (start-up) |
 | cg13_chao | the stage map, the Chao World lobby (sticks) | 23 | 1: the first (start-up) |
+| cg13_attract | no input, 200 s: the title and the attract sequence (the two-player City Escape demo) | 19 | **8**: the start-up and **7 of the two-player demo's windows (36-60 a second)** |
+
+
+**The two-player demo meets denormals.** Its windows count 36-60 FPU-mode stretches a second with a denormal operand or
+an underflow, at two game sites (the switch back on that ended the stretch): `sub_82140A90` (3,322, at a `vmulfp128`;
+a 4x4 matrix routine of vector permutes and products, the stretch that met the denormal is the scalar code before it)
+and `sub_821474F8` (413, at a `vsubfp128`). In the emulator the rebased NRO's two-player demo drifts from 1.0.6's
+(player 2's run, sa2-ultimate-notes.md), which 1.0.6 against itself does not: CG-13 is one of the three suspects
+there (with the VMX estimates and fused multiply-add of port 72). The test: a Switch build with the three off.
 
 About 17,000-18,000 flush-mode switches a second in SA2's game code (each an `msr fpcr` on the console that the
 Switch build leaves out). Gameplay, the cutscene, the menus and the lobby: 0 in every window.

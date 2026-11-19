@@ -73,6 +73,22 @@ compared by `tools/sa2_compare_frames.py --align` (2026-11-19).
   frames of game frames 6000-9000 (every 4th: the title, its fade, the loading, the 2P demo) all identical, in
   segments of one offset each.
 
+## The picture against 1.0.6 in the emulator (Ryujinx, 2026-11-19)
+
+The rebased NRO (`app\out\switch\renut.nro`, the everyday build) against 1.0.6's released NRO (bba67b6a, with its
+release shader package) in the sa2-ult data folder, one after the other (`tools\sa2_emu_ab.ps1`: each build with its
+own GLSL package, compiled-shader cache and user folder), the attract sequence from game frame 5600 / 6000:
+
+- **The title screen:** identical (201 consecutive frames and the fade into it; the rest is the title's own blinking
+  "Press START").
+- **The two-player demo:** the same moments (offset -5), player 1's half identical or nearly so throughout; speckles
+  along geometry edges in some frames (sub-pixel differences in vertex positions); and **player 2's run diverges** from
+  about game frame 7780: the camera, then Shadow's place on the course differ for the rest of the demo. On the PC the
+  whole demo matched 1.0.6 frame for frame, so the difference lives in what only the Switch build does: the base's
+  CG-13 (one flush mode), its VMX estimates and fused multiply-add (port 72, ON in the Switch build; the PC build's
+  defines change nothing on x86), the deko3d shader chain (the base's GLSL passes, uam), or the emulator's own timing.
+- Under way: 1.0.6 against itself in the emulator (the control), then the cause by builds with each form off.
+
 ## Gameplay on the PC, verify mode (2026-11-19)
 
 Six runs of the rebased PC build with the base's verify keys (`banjo_cpu_verify`, the guard on every call), each on a
