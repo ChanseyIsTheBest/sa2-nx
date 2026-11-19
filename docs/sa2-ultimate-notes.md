@@ -101,6 +101,27 @@ The guarded runs start slowly enough that the scripted presses miss the title, s
 intro cutscenes and the attract demos (the two-player City Escape race among them), not the menus' route; the same
 build without the verify options follows the route into City Escape and plays it (route_plain).
 
+The Switch build with the copies in place (`app\out\switch`, 58.6 MB): in the emulator its two-player demo is block
+for block what the build without them gives (273 against 268 of 1.0.6's 2,259 frames identical, the same blocks from
+game frame 6300 on; only the demo's first 400 frames vary between runs, as before).
+
+## The console package (2026-11-20)
+
+`tools\sa2_package_switch.ps1` makes `out\packages\<date>_<name>\`: `COPY_TO_SD_switch_sa2-nx\` (sa2.nro, the
+GLSL package, the DKSH cache, 1.0.6's default `sa2.toml`, `configs\sa2_play.toml` and `configs\sa2_ab.toml`: logs and
+the CPU sampler on), `sa2-nx.elf`, the source snapshot, the notes. The first, `2026-11-20_0453_rebase_test1`: the
+everyday build with the copies, its GLSL package beside it (a 1.0.6 card has 1.0.6's beside the NRO, which the NRO
+would read first), and a DKSH cache of 180 variants compiled by this tree's uam from the emulator's pipeline list
+(1,443 pipelines, the attract sequence only). Not run on the console.
+
+## PGO and LTO
+
+The base already uses sa2-nx's inliner limits for a profiled build (`max-inline-insns-auto` 64,
+`inline-unit-growth` 12); `-fipa-pta` is now on for SA2's LTO builds, as 1.0.6. The instrumented NRO
+(`-DBANJO_PGO=generate -DBANJO_SWITCH_LTO=ON`, copies in place: `app\out\switch-pgo-gen`) is the next step of the
+base's order, for a console training session when the user says; its streams are merged into `pgo-inplace\` with
+`tools\pgo_merge.py`, then `tools\build_switch_release.bat` makes the released form (PGO, LTO, no game shader inside).
+
 ## The picture against 1.0.6 in the emulator (Ryujinx, 2026-11-19)
 
 The rebased NRO (`app\out\switch\renut.nro`, the everyday build) against 1.0.6's released NRO (bba67b6a, with its
