@@ -197,6 +197,13 @@ own GLSL package, compiled-shader cache and user folder), the attract sequence f
   tree), the VMX exact forms (the same expressions as 1.0.6's) and the single-rounding `fmadds` (the same correctly
   rounded `fmaf` on both platforms). Finding it needs a comparison of guest memory between the two NROs at a frame
   that differs.
+- **Ruled out too (2026-11-20):** the code generation's float forms (a Switch build with the vperm form, the sign
+  operations, the single floats, the float loads and the single-rounding `fmadds` all back to their plain forms, on top
+  of the exact build: the same blocks), Renut's store-card proofs (`banjo_renut_store_cards = false`: the same), the
+  machine copies (the exact build of 2026-11-19 had none: the same). A hypothesis that fits everything: both NROs run
+  in Ryujinx as ARM code its JIT turns into x86, and the two builds' ARM code differs (the PC builds, compiled from the
+  same C++ for x86, are identical frame for frame); an ARM floating-point edge case the JIT does not reproduce exactly
+  (flush-to-zero, NaN handling) would show for the one build's instruction sequence only. Only the console tells.
 
 ## Gameplay on the PC, verify mode (2026-11-19)
 

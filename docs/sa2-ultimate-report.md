@@ -21,8 +21,11 @@ steps in [progress-log.md](progress-log.md).
 1.0.6 in the same stretches every run and differs in the same others: a few grind sparks placed elsewhere, a sliver
 at the edge of a board. Ruled out: the shaders (1.0.6's own GLSL package gives the same), the base's renderer and CPU
 run-time enhancements, its fences and compare-and-swap barriers, 1.0.6's native copies, the clock, a vblank
-interrupt, the zero-initialised locals, the compile definitions. The PC shows none of it. It breaks nothing. Next
-step to find it: compare guest memory of the two NROs at a frame that differs.
+interrupt, the zero-initialised locals, the compile definitions, the code generation's float forms, Renut's store
+cards, the machine copies. The PC shows none of it. It breaks nothing. Both NROs run in Ryujinx as ARM code that its
+JIT turns into x86, so an ARM floating-point edge case the JIT does not reproduce exactly could show for one build's
+code only; the console run tells whether it is there at all. Otherwise the next step is a comparison of guest memory of
+the two NROs at a frame that differs.
 
 ## The inventory's outcome
 
