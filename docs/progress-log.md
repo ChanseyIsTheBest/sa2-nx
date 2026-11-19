@@ -94,3 +94,13 @@ and docs/sa2-near-exact.md.
   are already sa2-nx's (64, 12).
 - `tools\sa2_stale_frame_reads.py`: 189 candidate loads (149 functions) for the read of a frame word never written;
   static, so candidates (the first one's use is on a path its earlier check rules out).
+- The Switch build with the copies in place: in the emulator block for block as without them. The console package
+  `rebase_test1` and the instrumented `pgo_generate` package (it boots in the emulator and writes its stream).
+- The installer's needs for SA2 (`out\handoffs\installer-needs.md`): the asset pack and the update zip.
+- The elision census: 1.0.6's tint is back with `BANJO_GEN_NV_SAVES_ELIDE` on this base; `SA2_DIAG_NV_ELIDE_FILES`
+  bisected the 129 files (file 116), then its 74 functions: SA2's DXT1 decoder `sub_82833568`, whose real
+  `std r31,-208(r1)` (read back by `lfd`) `tools\frame_traffic.py` took for a save. Fixed (5b78e9b1); with fresh
+  code (frame_traffic has no restore: the generator's record moved aside) all three elisions together give 750 of 750
+  of 1.0.6's frames. 1.0.6's "uninitialised stack word" was the tool. The fresh generation was also the determinism
+  check: 677 of 726 files identical to the previous run, the 49 others the fixed marks.
+- `sasrt_gpu_skip_inert_draws = false` in SA2's settings (0 in every gameplay window of the PC's and emulator's logs).
