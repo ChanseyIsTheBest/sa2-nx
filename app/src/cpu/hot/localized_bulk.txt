@@ -103,7 +103,6 @@
 8216CE58 0.06 % of the session, 6,002 calls, 146 instructions
 821BE438 0.06 % of the session, 154,556 calls, 161 instructions
 821AC6A0 0.06 % of the session, 398,083 calls, 315 instructions
-8254FCE8 0.06 % of the session, 584,122 calls, 207 instructions
 8251B790 0.06 % of the session, 9,681 calls, 67 instructions
 82149A78 0.06 % of the session, 658,112 calls, 44 instructions
 8217EBD8 0.06 % of the session, 20,511 calls, 261 instructions
@@ -140,7 +139,6 @@
 821BE7E8 0.03 % of the session, 596,724 calls, 58 instructions
 8251CAC8 0.03 % of the session, 100,747 calls, 208 instructions
 82915B18 0.03 % of the session, 362,555 calls, 46 instructions
-82519550 0.03 % of the session, 20,566 calls, 366 instructions
 821A8280 0.03 % of the session, 657,946 calls, 108 instructions
 821BA220 0.03 % of the session, 16,088 calls, 143 instructions
 8242E380 0.03 % of the session, 302 calls, 37 instructions
@@ -338,7 +336,6 @@
 8217DDF0 2 console samples, 66 instructions, 3 direct callees
 82917F88 2 console samples, 156 instructions, 3 direct callees
 828B6148 2 console samples, 52 instructions, 1 direct callees
-825645A0 2 console samples, 1110 instructions, 16 direct callees
 824DDDE0 2 console samples, 200 instructions, 9 direct callees
 82943838 2 console samples, 64 instructions, 3 direct callees
 82918DE8 2 console samples, 262 instructions, 1 direct callees
@@ -362,3 +359,9 @@
 8217A590 1 console samples, 136 instructions, 4 direct callees
 8292AA68 1 console samples, 296 instructions, 6 direct callees
 82936928 1 console samples, 242 instructions, 4 direct callees
+# sa2-nx-ult (2026-11-20): functions the app hooks, out of the copies (a second hook did not link).
+# out: 82519550 hooked by SA2's layer (sa2_controls.cpp, the OpenSA2 controls)
+# out: 8254FCE8 hooked by SA2's layer (sa2_renut_hooks.cpp, the window scissor's shadow)
+# out: 825645A0 named by Renut's draw hooks (renut_engine/gpu/d3d/hooks/draw.cpp)
+# out: 82565758 hooked by Renut (renut_engine/gpu/d3d/hooks/draw.cpp)
+# out: 82565C60 hooked by Renut (renut_engine/gpu/d3d/hooks/draw.cpp)

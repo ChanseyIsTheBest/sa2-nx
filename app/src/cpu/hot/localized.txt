@@ -53,12 +53,10 @@
 82139930 hot game function, one indirect call
 82834538 wrapper of 82832298 and 82833938
 821472E0 matrix routine: transpose, VMX matrix and memcpy calls
-82565758 Direct3D draw path (not hooked by the renderer)
 8213E040 hot game function, indirect calls
 82833568 DXT1 colour block to 16 RGBA float texels (reference of hot/n_dxt1_block.h)
 82832298 rescales 16 records of four floats: when the fourth is under a constant limit, the first three are scaled by limit/fourth (or set to the limit) (leaf; reference of hot/n_alpha_rescale.h)
 8214B320 fills one 20-byte record of a table at 0x83853480 from three table lookups indexed by r3 (leaf)
-82565C60 D3DDevice_DrawVertices: the draw's PM4 packets (the renderer's DrawVertices hook calls this copy)
 82556A60 D3D draw-time shader load, FlushState part (the renderer's shader-load hook calls this copy)
 82555E18 D3D: copies a block of state with memcpy into the command buffer
 8251D2A0 float routine with indirect calls (camera or object update)
@@ -94,3 +92,4 @@
 827EFEA0 C runtime memset (hand-written native, hand.txt)
 8255D990 Direct3D vertex shader float constants (hand-written native, hand.txt)
 8255D8B8 Direct3D pixel shader float constants (hand-written native, hand.txt)
+# sa2-nx-ult (2026-11-20): 1.0.6 also listed 82565758, 82565C60, which this tree hooks (Renut's draws): out (a second hook did not link).
