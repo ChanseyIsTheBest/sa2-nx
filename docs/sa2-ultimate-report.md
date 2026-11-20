@@ -16,9 +16,9 @@ in [progress-log.md](progress-log.md).
 | PC | the game read from 1.0.6's own `game_root.nxpack` | 750 of 750 identical |
 | PC, verify mode | City Escape played, the Dark story's cutscene and Iron Gate, the Chao World lobby, the attract demos; with and without the machine copies; after the first sync the title, menus, save load and intro | 0 differences in every self-check; the copies' guard: 0 differences in about 480 million compared calls |
 | PC, plain run after the syncs | the save, the stage map, City Escape | played (all scripted presses taken) |
-| Emulator (Ryujinx, deko3d) | the attract sequence against 1.0.6's released NRO | the title identical; the two-player demo plays the same moments, player 2's run no longer drifts since the fused multiply-add is off; a small fixed difference remains (below); after the first sync: as before (289 of 2,259 demo frames identical against 260, the same pattern); after the second: SYNC234_EMU |
+| Emulator (Ryujinx, deko3d) | the attract sequence against 1.0.6's released NRO | the title identical; the two-player demo plays the same moments, player 2's run no longer drifts since the fused multiply-add is off; a small fixed difference remains (below); after the first sync: as before (289 of 2,259 demo frames identical against 260, the same pattern); after the second: as before (263, the same pattern) |
 | Emulator | the Switch build with the 447 copies in place | block for block as without them |
-| Console | the packages in `out\packages` | **not run** (your word needed) |
+| Console | the packages in `out\packages`: `2026-11-20_1130_rebase_test3` (the current tree, ports 1-234; the everyday form) and the instrumented PGO package of the same tree | **not run** (your word needed) |
 
 **The remaining difference (open):** with every not-exact float form off, the two-player demo in the emulator matches
 1.0.6 in the same stretches every run and differs in the same others: a few grind sparks placed elsewhere, a sliver

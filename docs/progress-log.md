@@ -122,4 +122,7 @@ and docs/sa2-near-exact.md.
   identical to 1.0.6 against 260, the same pattern, no drift).
 - The base had moved on again (ports 223-234, banjo-nx's, by 09:24): taken (d4ab878c; two conflicts by hand). Port
   224 fixed the r1 / lr proofs' imports (they took banjo-nx master's older helper on this PC); the code generated
-  again from scratch is byte-identical to the previous generation. The PC: 1.0.6's 750 attract frames identical.
+  again from scratch is byte-identical to the previous generation. The PC: 1.0.6's 750 attract frames identical; a
+  verify run with 0 differences in every self-check. The Switch build in Ryujinx: the two-player demo block for block
+  as before the syncs. The console package `rebase_test3` (`out\packages\2026-11-20_1130_rebase_test3`), then the
+  instrumented PGO build of the same tree.

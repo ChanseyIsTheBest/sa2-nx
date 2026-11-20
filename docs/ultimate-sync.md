@@ -53,7 +53,10 @@ Ports 223-234 and SA2 (2026-11-20):
   DIFFERENCE or error line, 1.09 million stack forwards compared: 0 differences. A verify run (4 minutes: the title,
   the intro and the attract demos, every self-check on every use; `out/pc_runs/sync234_verify`): 0 differences in
   every check (1.18 billion flush-mode checks, 138 million folded loads, 134 million r1 checks, 7.5 million stack
-  forwards, 90.5 million guarded calls of 272 machine copies with 7 "differed once and not when repeated").
+  forwards, 90.5 million guarded calls of 272 machine copies with 7 "differed once and not when repeated"). The
+  emulator (11:26, `out\emu_runs\emu_sync234_attract`, the Switch build of 817afc76): 1.0.6's two-player demo 263 of
+  2,259 frames identical, block for block as before both syncs (260) and after the first (289): only the first
+  block, which varies between runs, and the last differ. Packaged: `out\packages\2026-11-20_1130_rebase_test3`.
 
 Ports 191-222 and SA2 (2026-11-20):
 
