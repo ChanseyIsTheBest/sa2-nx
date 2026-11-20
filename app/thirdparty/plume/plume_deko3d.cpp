@@ -150,6 +150,9 @@ namespace plume {
     // Deko3DSetDedicatedTargets.
     static Deko3DDevice *g_imageDevice = nullptr;
     static std::atomic<bool> g_dedicatedTargets{true};
+    // banjo-nx (2026-11-20, Deko3DHurryCompiles): threads waiting for a pipeline a background thread builds; while any
+    // does, the blocking compiles skip the compile rest (banjo_deko3d_background_compile_share).
+    static std::atomic<int> g_compileHurry{0};
     uint64_t Deko3DHeapFreeBytes() {  // plume_deko3d.h
         uint64_t heapFree = 0, processFree = 0;
         memoryFigures(heapFree, processFree);
@@ -2118,22 +2121,35 @@ namespace plume {
                 // compile counted): a compile waits out compileRestUntilNs unless a drawing thread waits for it; a
                 // cache read never waits (milliseconds). A new job wakes the wait, so a draw's compile or a read that
                 // arrives during a rest goes at once.
+                // 2026-11-20 (second build): the first such job anywhere in the queue, not only at its front: a compile
+                // the prebuild waits for is queued ahead of the background ones too, so a draw's compile could sit
+                // behind one during a rest (up to the 60 s cap). Such a job also goes ahead of a prebuild's compile
+                // when no rest is due (the prebuild is a background thread; the game waits for the draw).
+                std::vector<CompileJob *>::iterator pick;
                 for (;;) {
                     compileWake.wait(lock, [this] { return compileStop || !compileQueue.empty(); });
                     if (compileStop)
                         break;
-                    const CompileJob *front = compileQueue.front();
-                    const bool exempt = (front->async && front->cached) || (!front->async && front->drawWaits);
-                    const uint64_t now = armTicksToNs(armGetSystemTick());
-                    if (exempt || compileRestUntilNs <= now)
+                    // And while a drawing thread waits for a pipeline the prebuild builds (Deko3DHurryCompiles), the
+                    // prebuild's compiles too.
+                    const bool hurry = g_compileHurry.load(std::memory_order_relaxed) > 0;
+                    pick = std::find_if(compileQueue.begin(), compileQueue.end(), [hurry](const CompileJob *j) {
+                        return (j->async && j->cached) || (!j->async && (j->drawWaits || hurry));
+                    });
+                    if (pick != compileQueue.end())
                         break;
+                    const uint64_t now = armTicksToNs(armGetSystemTick());
+                    if (compileRestUntilNs <= now) {
+                        pick = compileQueue.begin();
+                        break;
+                    }
                     compileWake.wait_for(lock, std::chrono::nanoseconds(compileRestUntilNs - now));
                     g_deko3dStats.backgroundRestNs += armTicksToNs(armGetSystemTick()) - now;
                 }
                 if (compileStop)
                     break;
-                job = compileQueue.front();
-                compileQueue.erase(compileQueue.begin());
+                job = *pick;
+                compileQueue.erase(pick);
             }
             // banjo-nx (2026-10-23, asyncCacheReads): a variant the cache file holds, read here (the drawing thread
             // went on with the generic variant). No rest after it: it is a read, not a compile.
@@ -2615,6 +2631,15 @@ namespace plume {
     void Deko3DSetBackgroundThread(bool background) { t_backgroundThread = background; }
     void Deko3DSetDrawVariants(bool draw) { t_drawVariants = draw; }
     void Deko3DSetUrgentVariants(bool urgent) { t_urgentVariants = urgent; }
+    void Deko3DHurryCompiles(bool waiting) {
+        g_compileHurry.fetch_add(waiting ? 1 : -1, std::memory_order_relaxed);
+        if (waiting && g_imageDevice) {
+            // Under the lock: the uam thread looks at g_compileHurry and starts its wait with the lock held, so this
+            // wake is not lost between the two.
+            { std::lock_guard<std::mutex> lock(g_imageDevice->compileMutex); }
+            g_imageDevice->compileWake.notify_all();
+        }
+    }
 
     // At most this many background threads' requests wait at a time (each a few hundred bytes, but the uam thread does
     // about one a second on the console: a pipeline-list prebuild over a cache that lacks them would queue thousands).

@@ -1028,6 +1028,9 @@ namespace plume {
     void Deko3DSetDrawVariants(bool draw);
     // banjo-nx (2026-11-01): the pipeline this thread builds draws much slower with its generic variants: compile them now, here.
     void Deko3DSetUrgentVariants(bool urgent);
+    // banjo-nx (2026-11-20): this thread waits (true) or no longer waits (false) for a pipeline a background thread builds
+    // (Renut's render thread in TakePrebuilt): the blocking compiles skip the compile rest meanwhile. Calls in pairs.
+    void Deko3DHurryCompiles(bool waiting);
     // banjo-nx (2026-11-01): the shader's GLSL is unpacked by 'loader' when it is needed instead of being kept (see
     // Deko3DGlslSource). The loader must give the same text every time.
     void Deko3DShaderSetGlslLoader(RenderShader *shader, std::function<std::string()> loader);

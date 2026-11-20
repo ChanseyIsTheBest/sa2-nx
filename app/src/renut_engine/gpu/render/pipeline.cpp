@@ -1310,7 +1310,18 @@ plume::RenderPipeline *TakePrebuilt(const PipelineKey &key, uint64_t hash,
     claimed = true;
     return nullptr;
   }
+#if defined(PLUME_DEKO3D)
+  // banjo-nx (2026-11-20): the compile rest (banjo_deko3d_background_compile_share) is lifted while this thread waits
+  // (a worker's compile for an urgent pipeline might otherwise wait it out).
+  const bool hurry = job->stage != Job::Stage::Done;
+  if (hurry)
+    plume::Deko3DHurryCompiles(true);
+#endif
   g_prebuild.done.wait(lock, [job] { return job->stage == Job::Stage::Done; });
+#if defined(PLUME_DEKO3D)
+  if (hurry)
+    plume::Deko3DHurryCompiles(false);
+#endif
   out = std::move(job->pipeline);
   return out.get();
 }
@@ -1568,7 +1579,13 @@ void StopPipelinePrebuild() {
   std::unique_lock lock(g_prebuild.mutex);
   g_prebuild.stop = true;
   g_prebuild.work.notify_all();
+#if defined(PLUME_DEKO3D)
+  plume::Deko3DHurryCompiles(true);  // banjo-nx (2026-11-20): a worker's compile does not wait out the compile rest
+#endif
   g_prebuild.done.wait(lock, [] { return g_prebuild.workers == 0; });
+#if defined(PLUME_DEKO3D)
+  plume::Deko3DHurryCompiles(false);
+#endif
 }
 
 void PipelineShaderLoaded(const ShaderCacheEntry *entry) {
