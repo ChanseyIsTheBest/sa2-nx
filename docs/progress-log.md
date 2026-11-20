@@ -131,3 +131,10 @@ and docs/sa2-near-exact.md.
   it back if a run never finished: the PGO boot check's output was piped into `Select-Object -First 3`, which killed
   the script after its third line (the GLSL package line came first this time), before it collected the results and
   restored the SD's toml. Both done by hand (the SD's resting toml is 1.0.6's player toml, `out\emu_tomls\player_106.toml`).
+- Port 234's follow-up (a draw's shader compile no longer waits up to 60 s behind the compiler's rest) and port 235
+  (tools), 4e0bde24: the PC's 750 attract frames identical, the emulator's demo block for block as before (265; the
+  script's toml handling worked: the SD's toml back, no copy left). The packages made again with it:
+  `2026-11-20_1210_rebase_test4` and the instrumented one; `_1130_rebase_test3` and `_1159_pgo_generate2` (without
+  the follow-up), `_0453_rebase_test1` and `_0534_pgo_generate` (before the syncs) moved to `out\to_delete_20261120`
+  with today's other superseded files (4.9 GB: the diagnostic Switch build, the elision PC build, the run copies of
+  the save, the generation diffs).

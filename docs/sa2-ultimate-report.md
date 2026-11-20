@@ -1,7 +1,7 @@
 # Sonic Adventure 2 rebased on the ultimate base: the report
 
 sa2-nx 1.0.6 (main, baf523b8, untouched) rebased on renut_nx_ultimate_base 73b7b731 (ports 1-189) on 2026-11-19, then
-brought up to the base's 764410eb (ports 1-234) on 2026-11-20 with the base's sync tool. Branch `ultimate` (worktree
+brought up to the base's f70d05a4 (ports 1-235) on 2026-11-20 with the base's sync tool. Branch `ultimate` (worktree
 `D:\sonic adventure 2\sa2-nx-ult`, local only, not pushed); the state tested before the two syncs is the branch
 `ultimate-at-73b7b731`. The details and the evidence are in [sa2-ultimate-notes.md](sa2-ultimate-notes.md), the
 not-exact forms in [sa2-near-exact.md](sa2-near-exact.md), the inventory in
@@ -14,12 +14,12 @@ in [progress-log.md](progress-log.md).
 |---|---|---|
 | PC (Renut on Vulkan) | lockstep frames against 1.0.6's PC build, paired by content: the title, its fade, loading, the two-player attract demo | **identical**: 400 of 400 consecutive frames, 750 of 750 sampled over game frames 6000-9000 (after the gamma-rounding fix); 750 of 750 again after each sync |
 | PC | the game read from 1.0.6's own `game_root.nxpack` | 750 of 750 identical |
-| PC, verify mode | City Escape played, the Dark story's cutscene and Iron Gate, the Chao World lobby, the attract demos; with and without the machine copies; after the first sync the title, menus, save load and intro | 0 differences in every self-check; the copies' guard: 0 differences in about 480 million compared calls |
+| PC, verify mode | City Escape played, the Dark story's cutscene and Iron Gate, the Chao World lobby, the attract demos; with and without the machine copies; after the syncs the title, menus, save load, intro and attract demos | 0 differences in every self-check; the copies' guard: 0 differences in about 570 million compared calls |
 | PC, plain run after the syncs | the save, the stage map, City Escape | played (all scripted presses taken) |
-| Emulator (Ryujinx, deko3d) | the attract sequence against 1.0.6's released NRO | the title identical; the two-player demo plays the same moments, player 2's run no longer drifts since the fused multiply-add is off; a small fixed difference remains (below); after the first sync: as before (289 of 2,259 demo frames identical against 260, the same pattern); after the second: as before (263, the same pattern) |
+| Emulator (Ryujinx, deko3d) | the attract sequence against 1.0.6's released NRO | the title identical; the two-player demo plays the same moments, player 2's run no longer drifts since the fused multiply-add is off; a small fixed difference remains (below); after the first sync: as before (289 of 2,259 demo frames identical against 260, the same pattern); after the second: as before (263, the same pattern); after port 234's follow-up: as before (265) |
 | Emulator | the Switch build with the 447 copies in place | block for block as without them |
 | Emulator | the instrumented PGO build of the current tree | boots, runs the attract sequence, writes its stream (5.1 MB in 7 minutes), no error line |
-| Console | the packages in `out\packages`: `2026-11-20_1130_rebase_test3` (the current tree, ports 1-234; the everyday form) and `2026-11-20_1159_pgo_generate2` (the instrumented PGO build of the same tree; it replaces `_0534_pgo_generate`, built before the syncs) | **not run** (your word needed) |
+| Console | the packages in `out\packages`: `2026-11-20_1210_rebase_test4` (the current tree, ports 1-235; the everyday form) and the instrumented PGO build of the same tree (`pgo_generate3`; the earlier ones were built before the syncs or before port 234's follow-up). `2026-11-20_0844_rebase_test2` (before the syncs) is kept to compare | **not run** (your word needed) |
 
 **The remaining difference (open):** with every not-exact float form off, the two-player demo in the emulator matches
 1.0.6 in the same stretches every run and differs in the same others: a few grind sparks placed elsewhere, a sliver
@@ -34,9 +34,11 @@ Otherwise the next step is a comparison of guest memory of the two NROs at a fra
 
 ## The base's later ports (2026-11-20)
 
-The base took 45 more ports during the night. Both batches came in with `tools/ult_port_sync.py`
-([ultimate-sync.md](ultimate-sync.md)): ports 191-222 (73 files merged cleanly, one conflict, the hand port of the
-shader hooks) and 223-234 (two conflicts). One fix of SA2's own: port 213's new device field had Katamari's offset in
+The base took 45 more ports (191-235) during the night and the morning. They came in with `tools/ult_port_sync.py`
+([ultimate-sync.md](ultimate-sync.md)) in three batches: ports 191-222 (73 files merged cleanly, one conflict, the hand
+port of the shader hooks), 223-234 (two conflicts), and port 234's follow-up with port 235 (no conflict; the follow-up
+keeps a draw's shader compile from waiting up to 60 s behind the compiler's rest, which SA2 would meet on the console:
+its shader cache covers the attract sequence only, so the packages were made again with it). One fix of SA2's own: port 213's new device field had Katamari's offset in
 `render/draw.h` (its static_assert stopped the build): SA2's. The code generation changed in 24 files (port 199's
 stack forwarding: 46 forwards before, 43 after); port 224's fix of the r1 / link-register proofs' imports changed
 nothing in SA2's code. The Switch shader package is byte-identical. What reaches SA2 at run time, for the console
@@ -96,13 +98,13 @@ anywhere (the console decides; PC and emulator timings are not evidence).
 1. A console run of the newest package (your word): boot, menus, stages, Chao Garden, the two-player modes (connect
    the second controller after the menus too: port 220), saving; send the logs of the `sa2_ab.toml` run (its CPU
    profile feeds the next batch of copies).
-2. PGO: the instrumented package of the current tree (`out\packages\2026-11-20_1159_pgo_generate2`); a console
-   training session (its notes say what to play),
+2. PGO: the instrumented package of the current tree (`out\packages\<date>_pgo_generate3`); a console training
+   session (its notes say what to play),
    `tools\pgo_merge.py <pgo folder> pgo-inplace`, then `tools\build_switch_release.bat`.
 3. The installer (`out\handoffs\installer-needs.md`): the asset pack and the update zip, as 1.0.6's installer has.
 4. The remaining two-player-demo difference in the emulator (grind sparks, a board's edge), if the console shows it.
-5. Later base ports (port 235 was committed at 11:12, after this branch's last sync):
-   `tools/ult_port_sync.py --range 764410eb..<base commit>`, then the checks of [ultimate-sync.md](ultimate-sync.md).
+5. Later base ports: `tools/ult_port_sync.py --range f70d05a4..<base commit>`, then the checks of
+   [ultimate-sync.md](ultimate-sync.md).
 
 ## Decisions for you
 

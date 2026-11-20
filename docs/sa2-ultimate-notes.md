@@ -113,9 +113,10 @@ the CPU sampler on), `sa2-nx.elf`, the source snapshot, the notes. The first, `2
 everyday build with the copies, its GLSL package beside it (a 1.0.6 card has 1.0.6's beside the NRO, which the NRO
 would read first), and a DKSH cache of 180 variants compiled by this tree's uam from the emulator's pipeline list
 (1,443 pipelines, the attract sequence only). Not run on the console. Then `_0844_rebase_test2` (the tree of
-73b7b731 with `sasrt_gpu_skip_inert_draws` off) and, after the two syncs, `_1130_rebase_test3` (ports 1-234, the same
-GLSL package and DKSH cache: the shaders are byte-identical) and `_1159_pgo_generate2` (the instrumented build of the
-same tree; `_0534_pgo_generate` was built before the syncs). None run on the console.
+73b7b731 with `sasrt_gpu_skip_inert_draws` off) and, after the syncs, `_1210_rebase_test4` (ports 1-235, the same
+GLSL package and DKSH cache: the shaders are byte-identical) and the instrumented build of the same tree
+(`pgo_generate3`). The packages of 11:30 / 11:59 lacked port 234's follow-up, and those of 04:53 / 05:34 the syncs:
+moved to `out\to_delete_20261120`. None run on the console.
 
 ## PGO and LTO
 
@@ -124,8 +125,9 @@ The base already uses sa2-nx's inliner limits for a profiled build (`max-inline-
 (`-DBANJO_PGO=generate -DBANJO_SWITCH_LTO=ON`, copies in place: `app\out\switch-pgo-gen`) is the next step of the
 base's order, for a console training session when the user says; its streams are merged into `pgo-inplace\` with
 `tools\pgo_merge.py`, then `tools\build_switch_release.bat` makes the released form (PGO, LTO, no game shader inside).
-Its current package is `out\packages\2026-11-20_1159_pgo_generate2`: in Ryujinx it boots, runs the attract sequence
-and writes its stream (`out\emu_runs\emu_pgo_gen2_boot`, an emulator stream: not for a release profile).
+Its current package is `out\packages\<date>_pgo_generate3`; the same build without port 234's follow-up booted in
+Ryujinx, ran the attract sequence and wrote its stream (`out\emu_runs\emu_pgo_gen2_boot`, an emulator stream: not for
+a release profile).
 
 ## The picture against 1.0.6 in the emulator (Ryujinx, 2026-11-19)
 

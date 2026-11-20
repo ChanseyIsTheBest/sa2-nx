@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | The base | renut_nx_ultimate_base, branch `ultimate` (D:\renut-ultimate\base) |
-| The base commit this branch is at | **764410eb1e6f11b67885d9dc5c0538ec3560f54c** (2026-11-20 09:24, "Port 234"; ports 1-234); first taken at 73b7b7315be117d4c4a84f298dfa411e681c9b8a (2026-11-19 10:15, "docs: port 189"; ports 1-189) |
+| The base commit this branch is at | **f70d05a458ce1971c7ad65d72ac66c91b3b02e6d** (2026-11-20 11:17, "docs: port 234's row"; ports 1-235 with port 234's follow-up); first taken at 73b7b7315be117d4c4a84f298dfa411e681c9b8a (2026-11-19 10:15, "docs: port 189"; ports 1-189) |
 | How it was taken | the base's whole tree as one commit (e2099f33, "The ultimate base at 73b7b731"), byte for byte, then Katamari's layer out and SA2's layer on top (docs/ultimate-rebase-plan.md) |
 
 ## Taking the base's later ports
@@ -11,7 +11,7 @@
 The base's later ports come in with its sync tool (docs/building.md section 7), from the commit above:
 
 ```
-python tools/ult_port_sync.py --base D:\renut-ultimate\base --port "D:\sonic adventure 2\sa2-nx-ult" --range 764410eb..<base commit> --dry-run
+python tools/ult_port_sync.py --base D:\renut-ultimate\base --port "D:\sonic adventure 2\sa2-nx-ult" --range f70d05a4..<base commit> --dry-run
 ```
 
 then without `--dry-run`, the conflicts by hand, a build and the tests. After a sync, change the commit in the table
@@ -33,6 +33,7 @@ What the sync must leave to a hand port in this tree (SA2 keeps its own form of 
 | 2026-11-19 | 73b7b731 | the first rebase: ports 1-189 |
 | 2026-11-20 | 2f590c31 | ports 191-222 with `tools/ult_port_sync.py --range 73b7b731..2f590c31 --skip 190` (port 190 is sa2-nx's own FFmpeg files, already here): 73 files merged cleanly, 4 new, 1 conflict (`app/CMakeLists.txt`: SA2's sources and name with port 193's build stamp, `RENUT_GAME_NAME` "Sonic Adventure 2"), the hand port of `d3d/hooks/shader.cpp` (ports 196, 207: three-way merged into SA2's form without a conflict; the GetFunction hooks stay unbound, their key off, and SA2's containers are 0x11) |
 | 2026-11-20 | 764410eb | ports 223-234 (banjo-nx's, from its own rebase) with `--range 2f590c31..764410eb`: 28 files merged cleanly, 8 new tools, 2 conflicts (`app/CMakeLists.txt`: port 231's no-trapping-math condition in SA2's loop over both modules; `tools/deko3d_variant_cache.py`: SA2's `--uam` beside port 232's `--round-guess`); `tools/run_pc.ps1`'s argument quoting now port 225's (the same line sa2-nx-ult had added) |
+| 2026-11-20 | f70d05a4 | port 234's follow-up (banjo-nx's b830247a: a draw's shader compile no longer waits behind a prebuild's blocking compile during the compiler's rest, up to 60 s; `Deko3DHurryCompiles`) and port 235 (three analysis tools) with `--range 764410eb..f70d05a4`: 4 files merged cleanly, 2 new. SA2 compiles shaders at run time on the console (its DKSH cache covers the attract sequence only), so the packages of 11:30 / 11:59 were rebuilt with it. Checks: the PC's 750 attract frames identical, no DIFFERENCE line; the emulator's demo block for block as before (265 of 2,259); packages `2026-11-20_1210_rebase_test4` and the instrumented one of the same tree |
 
 Ports 223-234 and SA2 (2026-11-20):
 
