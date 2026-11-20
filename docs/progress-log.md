@@ -139,3 +139,4 @@ and docs/sa2-near-exact.md.
   with today's other superseded files (4.9 GB: the diagnostic Switch build, the elision PC build, the run copies of
   the save, the generation diffs).
 - The instrumented PGO build of 4e0bde24: boots in Ryujinx, writes its stream, no error line (the script ran to its end: the SD's toml back by itself). Packaged: `out\packages\2026-11-20_1234_pgo_generate3`.
+- Two more verify runs of the final PC build (4e0bde24) on the City Escape route: 0 differences in every self-check, the copies' guard 190 and 206 million calls with 0 differences; both routes missed presses around the title in verify mode and ended in the intro and attract demos, so the gameplay coverage after the syncs is the attract demos' (the plain run played City Escape).
