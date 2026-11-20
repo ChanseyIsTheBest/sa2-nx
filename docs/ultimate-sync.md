@@ -50,7 +50,10 @@ Ports 223-234 and SA2 (2026-11-20):
 - **The checks (2026-11-20):** the code generated again from scratch: all 726 files byte-identical to those of ports
   191-222 (the r1 / lr proofs with this tree's helpers prove what banjo-nx's older one did; `indirect_calls.py` found
   all 244 listed sites). The PC: 1.0.6's 750 attract frames all identical (`out/lockstep/sync234_attract1`), no
-  DIFFERENCE or error line, 1.09 million stack forwards compared: 0 differences.
+  DIFFERENCE or error line, 1.09 million stack forwards compared: 0 differences. A verify run (4 minutes: the title,
+  the intro and the attract demos, every self-check on every use; `out/pc_runs/sync234_verify`): 0 differences in
+  every check (1.18 billion flush-mode checks, 138 million folded loads, 134 million r1 checks, 7.5 million stack
+  forwards, 90.5 million guarded calls of 272 machine copies with 7 "differed once and not when repeated").
 
 Ports 191-222 and SA2 (2026-11-20):
 
