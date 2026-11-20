@@ -125,4 +125,9 @@ and docs/sa2-near-exact.md.
   again from scratch is byte-identical to the previous generation. The PC: 1.0.6's 750 attract frames identical; a
   verify run with 0 differences in every self-check. The Switch build in Ryujinx: the two-player demo block for block
   as before the syncs. The console package `rebase_test3` (`out\packages\2026-11-20_1130_rebase_test3`), then the
-  instrumented PGO build of the same tree.
+  instrumented PGO build of the same tree: it boots in Ryujinx and writes its stream; packaged as
+  `out\packages\2026-11-20_1159_pgo_generate2` (the 05:34 one was built before the syncs).
+- `tools\sa2_emu_ab.ps1` keeps the SD's own toml on disk during a run (`sa2.toml.before_emu_ab`) and the next run puts
+  it back if a run never finished: the PGO boot check's output was piped into `Select-Object -First 3`, which killed
+  the script after its third line (the GLSL package line came first this time), before it collected the results and
+  restored the SD's toml. Both done by hand (the SD's resting toml is 1.0.6's player toml, `out\emu_tomls\player_106.toml`).

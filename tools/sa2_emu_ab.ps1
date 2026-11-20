@@ -53,7 +53,16 @@ foreach ($item in @("deko3d_shaders.bin", "sa2")) {
     if (Test-Path $mine) { Move-Item $mine $live }
 }
 $sdToml = Join-Path $sd "sa2.toml"
+# 2026-11-20: the SD's own toml is kept on disk for the run (sa2.toml.before_emu_ab), not only in memory: a run whose
+# output was cut short (`| Select-Object -First N` kills this process once N lines are out) never reached the restore at
+# the end, and the SD kept the test toml. A copy left by such a run is put back first.
+$sdTomlKeep = Join-Path $sd "sa2.toml.before_emu_ab"
+if (Test-Path $sdTomlKeep) {
+    Write-Output "sa2.toml.before_emu_ab is there from a run that did not finish: the SD's toml put back from it"
+    Move-Item $sdTomlKeep $sdToml -Force
+}
 $sdTomlSaved = if (Test-Path $sdToml) { [System.IO.File]::ReadAllBytes($sdToml) } else { $null }
+if ($sdTomlSaved) { [System.IO.File]::WriteAllBytes($sdTomlKeep, $sdTomlSaved) }
 Copy-Item $Toml $sdToml -Force
 $captures = Join-Path $sd "captures"
 $logs = Join-Path $sd "logs"
@@ -94,4 +103,5 @@ foreach ($item in @("deko3d_shaders.bin", "sa2")) {
 }
 if (Test-Path $glsl) { Remove-Item $glsl -Force }
 if ($sdTomlSaved) { [System.IO.File]::WriteAllBytes($sdToml, $sdTomlSaved) } else { Remove-Item $sdToml -ErrorAction SilentlyContinue }
+Remove-Item $sdTomlKeep -ErrorAction SilentlyContinue
 Get-ChildItem $out -Recurse -File | Select-Object @{n = 'File'; e = { $_.FullName.Substring($out.Length + 1) } }, Length
