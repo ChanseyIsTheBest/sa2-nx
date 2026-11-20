@@ -1922,7 +1922,65 @@ namespace plume {
         return out;
     }
 
+    // banjo-nx (2026-11-01): the GLSL bytes alive (kept or unpacked) and the shader objects, for the memory report.
+    static std::atomic<uint64_t> g_glslBytes{0}, g_shaderObjects{0};
+
+    static std::shared_ptr<const std::string> countedText(std::string &&text) {
+        const uint64_t bytes = text.size();
+        g_glslBytes.fetch_add(bytes, std::memory_order_relaxed);
+        return std::shared_ptr<const std::string>(new std::string(std::move(text)), [bytes](const std::string *t) {
+            g_glslBytes.fetch_sub(bytes, std::memory_order_relaxed);
+            delete t;
+        });
+    }
+
+    // banjo-nx (2026-11-01): the last texts unpacked, held a little longer (a shader's pipelines are often made one after
+    // another: one unpack for them, not one each).
+    static constexpr uint32_t kRecentGlsl = 32;
+    static std::mutex g_recentGlslMutex;
+    static std::shared_ptr<const std::string> g_recentGlsl[kRecentGlsl];
+    static uint32_t g_recentGlslNext = 0;
+
+    std::shared_ptr<const std::string> Deko3DGlslSource::text() {
+        std::shared_ptr<const std::string> t;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (kept)
+                return kept;
+            t = unpacked.lock();
+            if (!t && loader) {
+                std::string unpackedText = loader();  // under the source's lock: one unpack of a shader at a time
+                if (!unpackedText.empty()) {
+                    t = countedText(std::move(unpackedText));
+                    unpacked = t;
+                }
+            }
+        }
+        if (t) {
+            std::lock_guard<std::mutex> lock(g_recentGlslMutex);
+            g_recentGlsl[g_recentGlslNext++ % kRecentGlsl] = t;
+        }
+        return t;
+    }
+
+    void Deko3DShaderSetGlslLoader(RenderShader *shader, std::function<std::string()> loader) {
+        auto *s = static_cast<Deko3DShader *>(shader);
+        if (s == nullptr || !s->glsl || !loader)
+            return;
+        std::lock_guard<std::mutex> lock(s->glsl->mutex);
+        s->glsl->unpacked = s->glsl->kept;  // alive while something still holds it
+        s->glsl->kept.reset();
+        s->glsl->loader = std::move(loader);
+    }
+
+    void Deko3DShaderMemory(uint64_t &shaders, uint64_t &glslBytes) {
+        shaders = g_shaderObjects.load(std::memory_order_relaxed);
+        glslBytes = g_glslBytes.load(std::memory_order_relaxed);
+    }
+
     struct Deko3DShaderImpl : Deko3DShader {
+        Deko3DShaderImpl() { g_shaderObjects.fetch_add(1, std::memory_order_relaxed); }  // banjo-nx (2026-11-01)
+        ~Deko3DShaderImpl() { g_shaderObjects.fetch_sub(1, std::memory_order_relaxed); }
         std::vector<SpecDefault> specDefaults;
         // Variants already looked up (spec values -> variant), so a pipeline does not hash the text again.
         std::mutex mutex;
@@ -1944,20 +2002,22 @@ namespace plume {
         shader->device = this;
         shader->stage = DkStage(header.stage);
         const char *glsl = static_cast<const char *>(data) + sizeof(header);
-        shader->glsl = std::make_shared<const std::string>(glsl, header.glslSize);
+        shader->glsl = std::make_shared<Deko3DGlslSource>();  // banjo-nx (2026-11-01): kept until a loader is set
+        shader->glsl->kept = countedText(std::string(glsl, header.glslSize));
+        const std::string &text = *shader->glsl->kept;
         if (header.dkshSize)
             shader->defaultDksh.assign(reinterpret_cast<const uint8_t *>(glsl) + header.glslSize,
                                        reinterpret_cast<const uint8_t *>(glsl) + header.glslSize + header.dkshSize);
-        shader->usage = parseUsage(*shader->glsl);
+        shader->usage = parseUsage(text);
         // banjo-nx (2026-10-27): a vertex shader whose text never names gl_VertexID cannot read it, in any variant (a
         // variant's defines only remove code): its draws may give their base vertex to the draw (Renut's whole-buffer
         // draws), the vertex index it does not read being the only thing that differs.
-        shader->usage.readsVertexId = shader->stage != DkStage_Vertex || shader->glsl->find("gl_VertexID") != std::string::npos;
+        shader->usage.readsVertexId = shader->stage != DkStage_Vertex || text.find("gl_VertexID") != std::string::npos;
         // vivapinata-nx (2026-11-03, tools/deko3d_glsl_opt.py vskill): a vertex shader with the kill's constant 914.
-        shader->usage.writesVertexKill = shader->stage == DkStage_Vertex && shader->glsl->find("SPIRV_CROSS_CONSTANT_ID_914") != std::string::npos;
+        shader->usage.writesVertexKill = shader->stage == DkStage_Vertex && text.find("SPIRV_CROSS_CONSTANT_ID_914") != std::string::npos;
         // blur-nx (2026-11-12): see Deko3DShaderUsage::writesClipDistance.
         shader->usage.writesClipDistance = (shader->stage != DkStage_Vertex && shader->stage != DkStage_Geometry) ||
-                                           shader->glsl->find("gl_ClipDistance") != std::string::npos;
+                                           text.find("gl_ClipDistance") != std::string::npos;
         // banjo-nx (2026-10-18): the varying locations it declares ("layout(location = N) in / out" lines).
         // katamari-nx (2026-11-01, rc10's black screen): an interpolation qualifier may come first ("layout(location = N)
         // centroid in", XenosRecomp's inputs the shader's header samples at the centroid); without it, those inputs were
@@ -1965,10 +2025,10 @@ namespace plume {
         {
             const char *key = "\nlayout(location = ";
             size_t p = 0;
-            while ((p = shader->glsl->find(key, p)) != std::string::npos) {
+            while ((p = text.find(key, p)) != std::string::npos) {
                 p += strlen(key);
                 char *end = nullptr;
-                const unsigned long loc = strtoul(shader->glsl->c_str() + p, &end, 10);
+                const unsigned long loc = strtoul(text.c_str() + p, &end, 10);
                 if (loc >= 32 || !end || strncmp(end, ") ", 2) != 0)
                     continue;
                 const char *q = end + 2;
@@ -1985,11 +2045,11 @@ namespace plume {
             }
         }
         {
-            const size_t z = shader->glsl->find("\n// banjo-vszero=0x");
+            const size_t z = text.find("\n// banjo-vszero=0x");
             if (z != std::string::npos)
-                shader->usage.zeroOutputMask = uint32_t(strtoul(shader->glsl->c_str() + z + 19, nullptr, 16));  // after "0x"
+                shader->usage.zeroOutputMask = uint32_t(strtoul(text.c_str() + z + 19, nullptr, 16));  // after "0x"
         }
-        shader->specDefaults = parseSpecDefaults(*shader->glsl);
+        shader->specDefaults = parseSpecDefaults(text);
         for (const SpecDefault &d : shader->specDefaults)
             shader->specIds.push_back(d.id);
         return shader;
@@ -2054,7 +2114,22 @@ namespace plume {
             CompileJob *job = nullptr;
             {
                 std::unique_lock<std::mutex> lock(compileMutex);
-                compileWake.wait(lock, [this] { return compileStop || !compileQueue.empty(); });
+                // banjo-nx (2026-11-20, the user: the compiler at most backgroundCompileShare % of its core, every
+                // compile counted): a compile waits out compileRestUntilNs unless a drawing thread waits for it; a
+                // cache read never waits (milliseconds). A new job wakes the wait, so a draw's compile or a read that
+                // arrives during a rest goes at once.
+                for (;;) {
+                    compileWake.wait(lock, [this] { return compileStop || !compileQueue.empty(); });
+                    if (compileStop)
+                        break;
+                    const CompileJob *front = compileQueue.front();
+                    const bool exempt = (front->async && front->cached) || (!front->async && front->drawWaits);
+                    const uint64_t now = armTicksToNs(armGetSystemTick());
+                    if (exempt || compileRestUntilNs <= now)
+                        break;
+                    compileWake.wait_for(lock, std::chrono::nanoseconds(compileRestUntilNs - now));
+                    g_deko3dStats.backgroundRestNs += armTicksToNs(armGetSystemTick()) - now;
+                }
                 if (compileStop)
                     break;
                 job = compileQueue.front();
@@ -2075,7 +2150,10 @@ namespace plume {
             }
             // banjo-nx (2026-10-21): a background job's text, made now from the shared one (one at a time).
             if (job->async) {
-                const std::string &glsl = *job->request.glsl;
+                // banjo-nx (2026-11-01): unpacked now (Deko3DGlslSource); none: an empty text, which fails to compile.
+                static const std::string noText;
+                const std::shared_ptr<const std::string> text = job->request.glsl ? job->request.glsl->text() : nullptr;
+                const std::string &glsl = text ? *text : noText;
                 const size_t nl = job->request.defines.empty() ? std::string::npos : glsl.find('\n');
                 if (nl == std::string::npos) {
                     job->ownSource = glsl;
@@ -2146,6 +2224,19 @@ namespace plume {
                 g_deko3dStats.fastCompiles++;
             g_deko3dStats.shaderCompileNs += armTicksToNs(armGetSystemTick()) - t0;
             g_deko3dStats.shaderCompiles++;
+            // banjo-nx (2026-11-20, the user: at most backgroundCompileShare % of the core for every compile): this
+            // compile's time, whoever waited for it, adds a rest in proportion (at most 60 s of rest outstanding); the
+            // next compile no drawing thread waits for starts after it (see the loop's top).
+            {
+                const int share = g_deko3dOptions.backgroundCompileShare;
+                if (share > 0 && share < 100) {
+                    const uint64_t now = armTicksToNs(armGetSystemTick());
+                    const uint64_t rest = (now - t0) * uint64_t(100 - share) / uint64_t(share);
+                    std::lock_guard<std::mutex> lock(compileMutex);
+                    compileRestUntilNs = std::min<uint64_t>(std::max<uint64_t>(compileRestUntilNs, now) + rest,
+                                                            now + uint64_t(60000000000ull));
+                }
+            }
             if (job->async) {
                 job->ownSource.clear();
                 job->ownSource.shrink_to_fit();
@@ -2154,21 +2245,9 @@ namespace plume {
                 job->ownLog = std::move(r.log);
                 finishAsync(job);
                 delete job;
-                // banjo-nx (2026-10-23): at most backgroundCompileShare % of the core for background compiles (the
-                // thread cannot go below the game's threads, see compileWorker): a rest in proportion to the compile,
-                // at most 30 s (2026-10-28: was 8 s, which held the share at 20 % or more for 2 s compiles), ended by a
-                // compile a thread waits for (those go ahead of the background ones).
-                const int share = g_deko3dOptions.backgroundCompileShare;
-                if (share > 0 && share < 100) {
-                    const uint64_t t1 = armTicksToNs(armGetSystemTick());
-                    const uint64_t rest = std::min<uint64_t>((t1 - t0) * uint64_t(100 - share) / uint64_t(share),
-                                                             30000000000ull);
-                    std::unique_lock<std::mutex> lock(compileMutex);
-                    compileWake.wait_for(lock, std::chrono::nanoseconds(rest), [this] {
-                        return compileStop || (!compileQueue.empty() && !compileQueue.front()->async);
-                    });
-                    g_deko3dStats.backgroundRestNs += armTicksToNs(armGetSystemTick()) - t1;
-                }
+                // banjo-nx (2026-10-23; 2026-11-20): the rest is taken at the loop's top (compileRestUntilNs), for
+                // every compile; before, only background compiles rested, and a compile the prebuild waited for ended
+                // the rest: 86 compiles in 10 minutes took 26 % of core 3 on the console.
                 continue;
             }
             {
@@ -2188,6 +2267,9 @@ namespace plume {
 
     // banjo-nx (2026-10-21): set on threads that do not draw (Deko3DSetBackgroundThread): the pipeline prebuild.
     static thread_local bool t_backgroundThread = false;
+    // banjo-nx (2026-10-31, Deko3DSetDrawVariants): the background thread builds a pipeline a draw is waiting for (it
+    // draws with the generic variants meanwhile): its variants are queued as a draw's.
+    static thread_local bool t_drawVariants = false;
     // banjo-nx (2026-11-01, Deko3DSetUrgentVariants): the pipeline this thread builds draws much slower with the generic
     // variant (banjo_gpu_fetch_spec): its variants compiled now, on this thread (a compile it waits for: ahead of the
     // background ones), not queued in the background.
@@ -2388,7 +2470,12 @@ namespace plume {
     bool g_deko3dProvisionalCount = true;
     void Deko3DSetProvisionalCount(bool on) { g_deko3dProvisionalCount = on; }
 
+    static std::atomic<uint64_t> g_graphicsPipelines{0};  // banjo-nx (2026-11-01)
+    uint64_t Deko3DPipelineCount() { return g_graphicsPipelines.load(std::memory_order_relaxed); }
+    Deko3DGraphicsPipeline::Deko3DGraphicsPipeline() { g_graphicsPipelines.fetch_add(1, std::memory_order_relaxed); }
+
     Deko3DGraphicsPipeline::~Deko3DGraphicsPipeline() {
+        g_graphicsPipelines.fetch_sub(1, std::memory_order_relaxed);
         if (provisional.load(std::memory_order_relaxed))
             g_deko3dProvisionalPipelines.fetch_sub(1, std::memory_order_relaxed);
     }
@@ -2526,6 +2613,7 @@ namespace plume {
     }
 
     void Deko3DSetBackgroundThread(bool background) { t_backgroundThread = background; }
+    void Deko3DSetDrawVariants(bool draw) { t_drawVariants = draw; }
     void Deko3DSetUrgentVariants(bool urgent) { t_urgentVariants = urgent; }
 
     // At most this many background threads' requests wait at a time (each a few hundred bytes, but the uam thread does
@@ -2571,6 +2659,35 @@ namespace plume {
         }
         compileWake.notify_one();
         return true;
+    }
+
+    // banjo-nx (2026-11-20, logMisses): a variant the draw got the generic one for, once per key, as the compile log's
+    // "run-time variant" line: its kind, the stage, the variant text's size, the base text's size and FNV-1a 64 (the GLSL
+    // file tools/deko3d_variant_cache.py --runtime-log matches it to) and its constants ("ID VALUEu;").
+    static void logMissedVariant(uint64_t key, uint32_t stage, const std::string &glsl, const std::string &defines,
+                                 size_t sourceSize) {
+        static std::mutex mutex;
+        static std::unordered_set<uint64_t> seen;
+        static constexpr size_t kCap = 60000;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (seen.size() >= kCap || !seen.insert(key).second)
+                return;
+        }
+        static const char *kDefine = "#define SPIRV_CROSS_CONSTANT_ID_";
+        std::string list;
+        size_t at = 0;
+        while ((at = defines.find(kDefine, at)) != std::string::npos) {
+            at += strlen(kDefine);
+            const size_t end = defines.find('\n', at);
+            list.append(defines, at, (end == std::string::npos ? defines.size() : end) - at);
+            list += ';';
+            if (end == std::string::npos)
+                break;
+            at = end + 1;
+        }
+        logf("uam: missed (generic meanwhile) run-time variant (stage %u, %zu bytes, base %zu bytes %016" PRIx64 "): %s",
+             stage, sourceSize, glsl.size(), fnv1a64(glsl.data(), glsl.size()), list.c_str());
     }
 
     const DkShader *Deko3DDevice::loadVariant(const Deko3DShader *base, const RenderSpecConstant *specConstants, uint32_t specConstantsCount,
@@ -2626,7 +2743,15 @@ namespace plume {
             return generic();
         // The variant's text: the GLSL with the constants defined after its first line (#version).
         std::string source;
-        const std::string &glsl = *shader->glsl;
+        // banjo-nx (2026-11-01): unpacked if need be (Deko3DGlslSource), held until the key and any compile are made.
+        const std::shared_ptr<const std::string> glslText = shader->glsl->text();
+        if (!glslText) {
+            static std::atomic<uint32_t> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+                logf("loadVariant: the GLSL of %s could not be unpacked: no variant", shader->name.c_str());
+            return nullptr;
+        }
+        const std::string &glsl = *glslText;
         const size_t nl = glsl.find('\n');
         if (defines.empty() || nl == std::string::npos) {
             source = glsl;
@@ -2669,7 +2794,7 @@ namespace plume {
                     pending->defines = defines;
                     pending->stage = shader->stage;
                     pending->name = shader->name;
-                    queueAsync(*pending, t_backgroundThread, true);
+                    queueAsync(*pending, t_backgroundThread && !t_drawVariants, true);
                     g_deko3dStats.variantFallbacks++;
                     return fallback;
                 }
@@ -2687,7 +2812,9 @@ namespace plume {
                 pending->defines = defines;
                 pending->stage = shader->stage;
                 pending->name = shader->name;
-                queueAsync(*pending, t_backgroundThread);  // no room: the draw that needs it queues it (refresh)
+                queueAsync(*pending, t_backgroundThread && !t_drawVariants);  // no room: the draw that needs it queues it (refresh)
+                if (g_deko3dOptions.logMisses)  // banjo-nx (2026-11-20)
+                    logMissedVariant(key, uint32_t(shader->stage), glsl, defines, source.size());
                 return generic();
             }
             if (!have && noCompile)

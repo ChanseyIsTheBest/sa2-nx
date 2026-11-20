@@ -235,12 +235,27 @@ namespace plume {
         bool writesClipDistance = true;
     };
 
+    // banjo-nx (2026-11-01, the console's out-of-memory crash): a shader's GLSL, unpacked when it is needed. Every shader
+    // object kept its whole text (35 KB on average, 161 MB for the whole package) for as long as it lived, and the game
+    // loads more shaders in every area. With a loader (Deko3DShaderSetGlslLoader: the text unpacked again from the
+    // package in memory), the text lives only while a lookup or a compile uses it, plus the last few used
+    // (Deko3DGlslSource::text). Without one it is kept, as before.
+    struct Deko3DGlslSource {
+        std::mutex mutex;
+        std::shared_ptr<const std::string> kept;     // no loader: the text, for good
+        std::weak_ptr<const std::string> unpacked;   // with a loader: the text while something holds it
+        std::function<std::string()> loader;  // the text again; empty when it cannot
+        // The text (nullptr if the loader fails).
+        std::shared_ptr<const std::string> text();
+    };
+
     struct Deko3DShader : RenderShader {
         Deko3DDevice *device = nullptr;
         DkStage stage = DkStage_Vertex;
         // banjo-nx (2026-10-21): shared, so a background compile (and a pipeline waiting for one) holds the text without
-        // a copy, also after the shader object is gone (Renut's prebuild workers destroy theirs).
-        std::shared_ptr<const std::string> glsl;
+        // a copy, also after the shader object is gone (Renut's prebuild workers destroy theirs). 2026-11-01: the source
+        // (Deko3DGlslSource), not the text itself.
+        std::shared_ptr<Deko3DGlslSource> glsl;
         std::vector<uint8_t> defaultDksh;
         Deko3DShaderUsage usage;
         // Specialization constant ids the GLSL defines (SPIRV_CROSS_CONSTANT_ID_n), so a variant key holds only those.
@@ -320,7 +335,7 @@ namespace plume {
     // shared text, the defines plume inserts after its first line, the stage and the shader's name (for the log).
     struct Deko3DVariantRequest {
         uint64_t key = 0;
-        std::shared_ptr<const std::string> glsl;
+        std::shared_ptr<Deko3DGlslSource> glsl;  // banjo-nx (2026-11-01): the source; the uam thread unpacks the text
         std::string defines;
         DkStage stage = DkStage_Vertex;
         std::string name;
@@ -346,6 +361,7 @@ namespace plume {
         bool dynamicStencilReference = false;
         bool dynamicDepthBias = false;
         std::atomic<bool> provisional{false};  // (see pending, below; counted in g_deko3dProvisionalPipelines)
+        Deko3DGraphicsPipeline();   // banjo-nx (2026-11-01): counted (Deko3DPipelineCount)
         ~Deko3DGraphicsPipeline();  // banjo-nx (2026-10-28): a provisional pipeline that goes leaves the count
         DkPrimitive primitive = DkPrimitive_Triangles;
         uint32_t stageMask = 0;
@@ -779,6 +795,10 @@ namespace plume {
             std::string ownLog;
         };
         std::vector<CompileJob *> compileQueue;
+        // banjo-nx (2026-11-20, the user: the shader compiler at most backgroundCompileShare % of its core): the time
+        // until which the uam thread rests; every compile adds its time x (100 - share) / share, and only a compile a
+        // drawing thread waits for (or a cache read) starts before it.
+        uint64_t compileRestUntilNs = 0;
         // banjo-nx (2026-10-18): the uam thread's handle, the priorities of the threads waiting for a compile, and the
         // priority last set (applyCompilePriority).
         uint32_t compileThreadHandle = 0;
@@ -1002,8 +1022,19 @@ namespace plume {
     // banjo-nx (2026-10-21, asyncVariants): this thread does not draw (Renut's pipeline prebuild workers): the variants it
     // asks for are compiled after the draws' ones, and only so many wait at a time (the rest when a draw needs them).
     void Deko3DSetBackgroundThread(bool background);
+    // banjo-nx (2026-10-31): on such a thread, the pipeline it builds next is one a draw waits for (Renut's specialised
+    // pipelines; the draw goes on with the generic one): its variants are queued as a draw's (ahead of the background
+    // ones). Set before the build, cleared after it.
+    void Deko3DSetDrawVariants(bool draw);
     // banjo-nx (2026-11-01): the pipeline this thread builds draws much slower with its generic variants: compile them now, here.
     void Deko3DSetUrgentVariants(bool urgent);
+    // banjo-nx (2026-11-01): the shader's GLSL is unpacked by 'loader' when it is needed instead of being kept (see
+    // Deko3DGlslSource). The loader must give the same text every time.
+    void Deko3DShaderSetGlslLoader(RenderShader *shader, std::function<std::string()> loader);
+    // banjo-nx (2026-11-01): shader objects alive, and the GLSL bytes kept or unpacked now (for the memory report).
+    void Deko3DShaderMemory(uint64_t &shaders, uint64_t &glslBytes);
+    // banjo-nx (2026-11-01): graphics pipeline objects alive (for the memory report).
+    uint64_t Deko3DPipelineCount();
     // banjo-nx (2026-10-28, the console's OOM): called when a memory block's storage cannot be had from the heap, before
     // asking again (any thread; it must not take the application's renderer lock): the application's spares go back.
     void Deko3DSetMemoryPressureCallback(void (*callback)());
@@ -1137,6 +1168,10 @@ namespace plume {
         // uam's banjo-nx codegen passes (uam_api.h setBanjoFlags): 1 PRMT byte moves, 2 storage buffer offsets in the
         // load, 4 shift distribution, 8 + 16 the input interpolation cache where it pays.
         unsigned uamFlags = 447;
+        // banjo-nx (2026-11-20): every variant a draw got the generic one for (not loaded, not in the cache file) logged
+        // once, as the compile log's "run-time variant" lines (tools/deko3d_variant_cache.py --runtime-log reads both):
+        // the variants a DKSH cache made from pipeline lists still lacks. A diagnostic: off by default.
+        bool logMisses = false;
         // The uam thread's core (-1: any) and priority (Horizon: a higher number is a lower priority; 0: unchanged).
         // A thread that waits for a compile lends its priority to the uam thread while it waits.
         int compileCore = -1;

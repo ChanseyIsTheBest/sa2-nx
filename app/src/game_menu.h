@@ -115,4 +115,19 @@ class GameMenuDialog : public rex::ui::ImGuiDialog {
   float row_height_ = 0.0f;
 };
 
+// banjo-nx (2026-11-19, the user: "the menu ... to have all the current items in the toml exposed to the user from
+// 1.0.2"; a handoff for the base): a game's own rows on the Settings tab. The hook gets the rows as the base makes them
+// (each time they are made: the menu's language may have changed), the menu's language row (game_menu_text.h:
+// 0 English ... 11 Chinese (Traditional)) and the player's file's name, and may change, add, remove or reorder rows.
+// Set once, before the menu is first drawn (the app's OnCreateDialogs). None set: the base's rows.
+using GameMenuRowsHook = void (*)(std::vector<GameMenuDialog::Setting>& settings, int language_row,
+                                  const std::string& file);
+void SetGameMenuRows(GameMenuRowsHook hook);
+// The menu's own text (game_menu_text.h's MenuText ids: On, Off, System ...) in the menu's language.
+const char* GameMenuText(int id);
+// The Settings tab's rows as the menu makes them in a language row (game hook included), for a check without the UI.
+std::vector<GameMenuDialog::Setting> GameMenuSettingsRows(int language_row, const std::string& file);
+// The value the menu shows for a row's key now (as the row's choices' raw values are written).
+std::string GameMenuCurrentRaw(const GameMenuDialog::Setting& s);
+
 }  // namespace blur

@@ -1247,8 +1247,10 @@ REXCVAR_DEFINE_BOOL(blur_renut_diag_stage_census, false, "Banjo/Diagnostics",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 namespace renut::gpu::census {
 Acc g_acc[kStageCount];
-bool On() {
-  static const bool on = REXCVAR_GET(blur_renut_diag_stage_census);
+std::atomic<int> g_on{-1};
+bool OnSlow() {
+  const bool on = REXCVAR_GET(blur_renut_diag_stage_census);
+  g_on.store(on ? 1 : 0, std::memory_order_relaxed);
   return on;
 }
 std::string Report(double seconds) {

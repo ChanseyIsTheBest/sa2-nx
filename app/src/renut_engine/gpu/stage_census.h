@@ -40,7 +40,15 @@ enum Stage : uint32_t {
   kStageCount
 };
 
-bool On();  // blur_renut_diag_stage_census (banjo_renut_tuning.cpp), read once
+// blur_renut_diag_stage_census (banjo_renut_tuning.cpp), read once. banjo-nx (2026-11-20, the rebase; a handoff): inline,
+// a relaxed load of the cached value: the out-of-line call with its function-local static's guard ran in every Scope
+// of the draw path (19 of them) with the key off, 1.7 % of N&B's render thread on the console (its title loop).
+extern std::atomic<int> g_on;  // -1: not read yet
+bool OnSlow();
+inline bool On() {
+  const int on = g_on.load(std::memory_order_relaxed);
+  return on >= 0 ? on != 0 : OnSlow();
+}
 
 struct Acc {
   std::atomic<uint64_t> ticks{0};

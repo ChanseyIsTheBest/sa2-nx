@@ -39,6 +39,26 @@ import re
 import sys
 
 FUNC = re.compile(r'^DEFINE_REX_FUNC\((sub_([0-9A-F]{8}))\) \{$')
+# banjo-nx (2026-11-19, the rebase on the ultimate base; handed to the base): every function, named ones too
+# (a config's names: appMainDraw, rex_XInputGetKeystroke ...), by its address in *_init.cpp's table. Before, a named
+# function's sites counted as the previous sub_ function's, so a list keyed that way moved to other sites whenever the
+# generator laid the files out differently (banjo-nx on the base: 19 of 298 sites not found).
+ANY_FUNC = re.compile(r'^DEFINE_REX_FUNC\((\w+)\) \{$')
+INIT_ENTRY = re.compile(r'^\s*\{ 0x([0-9A-F]{8}), (\w+) \},\s*$')
+
+
+def function_addresses(gen):
+    """name -> address (8 hex digits) of every function in the generated tree's *_init.cpp table."""
+    names = {}
+    for f in os.listdir(gen):
+        if f.endswith('_init.cpp'):
+            for line in open(os.path.join(gen, f), encoding='utf-8'):
+                m = INIT_ENTRY.match(line)
+                if m:
+                    names.setdefault(m.group(2), m.group(1))
+    return names
+
+
 PLAIN = re.compile(r'^\tREX_CALL_INDIRECT_FUNC\(((?:ctx\.)?ctr\.u32)\);$')
 SITE = re.compile(r'^\tREX_CALL_INDIRECT_FUNC_AT\(0x[0-9A-F]{8}, \d+, ((?:ctx\.)?ctr\.u32)\);$')
 PROMOTED = re.compile(r'^\tif \(REX_PROMOTED_IS\(((?:ctx\.)?ctr\.u32), 0x[0-9A-F]{8}u\)\) \[\[likely\]\] \{ '
@@ -138,6 +158,7 @@ def main():
                 promote[(line[0].upper(), int(line[1]))] = [t.upper() for t in line[2:5]]
     texts = {}
     defined = set()
+    addresses = function_addresses(a.gen)
     for f in files:
         texts[f] = open(os.path.join(a.gen, f), encoding='utf-8').read().split('\n')
         for line in texts[f]:
@@ -153,9 +174,11 @@ def main():
         ordinal = 0
         targets = set()
         for i, line in enumerate(lines):
-            m = FUNC.match(line)
+            m = ANY_FUNC.match(line)
             if m:
-                function, ordinal = m.group(2), 0
+                name = m.group(1)
+                function = name[4:] if FUNC.match(line) else addresses.get(name)
+                ordinal = 0
                 continue
             if function is None or not (line.startswith('\tREX_CALL_INDIRECT_') or line.startswith('\tif (REX_PROMOTED_IS(')):
                 continue

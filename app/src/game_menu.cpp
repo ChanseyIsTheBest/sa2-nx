@@ -64,6 +64,10 @@ int BlurFrameCapNow();
 
 namespace blur {
 
+// banjo-nx (2026-11-19): a game's own Settings rows (game_menu.h, SetGameMenuRows).
+static GameMenuRowsHook g_game_rows = nullptr;
+void SetGameMenuRows(GameMenuRowsHook hook) { g_game_rows = hook; }
+
 namespace {
 
 // ---- Fonts ----------------------------------------------------------------------------------------------------------
@@ -432,6 +436,8 @@ std::vector<Setting> MakeSettings(const std::string& file) {
       opacity.push_back(C(std::to_string(p) + " %", std::to_string(p), std::to_string(p)));
     add(T_MENUOPACITY, "menu_background_opacity", false, std::move(opacity), 8, Tr(H_MENUOPACITY));  // 80 %
   }
+  if (g_game_rows)  // banjo-nx (2026-11-19): the game's own rows (game_menu.h)
+    g_game_rows(s, g_lang, file);
   return s;
 }
 
@@ -526,6 +532,16 @@ std::string TabName(int i) {
 }
 
 }  // namespace
+
+const char* GameMenuText(int id) { return Tr(id); }  // banjo-nx (2026-11-19): game_menu.h
+std::vector<GameMenuDialog::Setting> GameMenuSettingsRows(int language_row, const std::string& file) {
+  const int saved = g_lang;
+  g_lang = language_row >= 0 && language_row < kMenuLanguages ? language_row : 0;
+  std::vector<GameMenuDialog::Setting> rows = MakeSettings(file);
+  g_lang = saved;
+  return rows;
+}
+std::string GameMenuCurrentRaw(const GameMenuDialog::Setting& s) { return CurrentRaw(s); }
 
 // ---- Fonts ----------------------------------------------------------------------------------------------------------
 

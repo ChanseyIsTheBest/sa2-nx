@@ -38,6 +38,12 @@ REXCVAR_DEFINE_BOOL(banjo_deko3d_log_writer, true, "Banjo/Enhancements",
                     "line written and flushed where it is said, as before")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 // Port 161 (from fnxf_xiii, its note of 2026-10-30): plume_deko3d.h beforeBufferCopy.
+// banjo-nx (2026-11-20, the rebase's console runs: 20,000 stages on the generic variant): plume's logMisses.
+REXCVAR_DEFINE_BOOL(banjo_deko3d_log_misses, false, "Banjo/Diagnostics",
+                    "deko3d renderer: every shader variant a draw got the generic one for (neither loaded nor in "
+                    "deko3d_shaders.bin) is logged once to deko3d.log as a \"run-time variant\" line, for "
+                    "tools/deko3d_variant_cache.py --runtime-log: the variants a cache made from the pipeline lists lacks")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(banjo_deko3d_copy_run_barriers, true, "Banjo/Enhancements",
                     "deko3d: no barrier between back-to-back buffer copies once a full one has run (the copy engine "
                     "runs them one at a time; each full barrier is 2 GPU submission entries). false: a barrier before "
@@ -422,61 +428,88 @@ bool InstalledShaderTable(std::vector<ShaderCacheEntry> &entries, std::vector<Sh
 
 #if defined(PLUME_DEKO3D)
 
-std::unique_ptr<plume::RenderShader> CreateGameShader(plume::RenderDevice *device, uint64_t hash) {
-  // The installer's package first (made from the player's files), then the NRO's own.
+// banjo-nx (2026-11-01): a shader's GLSL from the package that has it, the installer's first (empty: in neither, or it did
+// not unpack). in_memory: that package is in memory (unpacking it again later reads no card).
+static std::string UnpackGlsl(uint64_t hash, uint32_t &stage, bool &in_memory) {
   InstalledPackage &f = OpenInstalled();
   Package &p = Open();
   const PackageEntry *installed = Find(f, hash);
   const PackageEntry *e = installed ? installed : Find(p, hash);
-  if (!e || !device) {
+  in_memory = false;
+  if (!e) {
     static int logged = 0;
     if ((f.ok || p.ok) && logged++ < 16)
       REXLOG_ERROR("[deko3d] shader {:016X} is in no GLSL package", hash);
-    return nullptr;
+    return {};
   }
-  std::vector<uint8_t> blob(sizeof(plume::Deko3DShaderBlob) + e->size);
-  plume::Deko3DShaderBlob header;
-  header.stage = e->stage;
-  header.glslSize = e->size;
-  header.dkshSize = 0;
-  std::memcpy(blob.data(), &header, sizeof(header));
+  stage = e->stage;
+  std::string text(e->size, '\0');
   if (installed && f.ddict) {
     // banjo-nx (2026-10-23): from memory (a package with a dictionary).
     std::lock_guard<std::mutex> lock(f.mutex);
-    const size_t n = ZSTD_decompress_usingDDict(f.dctx, blob.data() + sizeof(header), e->size, f.data.data() + e->offset,
+    const size_t n = ZSTD_decompress_usingDDict(f.dctx, text.data(), e->size, f.data.data() + e->offset,
                                                 e->compressedSize, f.ddict);
     if (ZSTD_isError(n) || n != e->size) {
       REXLOG_ERROR("[deko3d] shader {:016X}: the installed GLSL did not unpack ({})", hash,
                    ZSTD_isError(n) ? ZSTD_getErrorName(n) : "short");
-      return nullptr;
+      return {};
     }
+    in_memory = true;
   } else if (installed) {
     std::lock_guard<std::mutex> lock(f.mutex);
     std::vector<uint8_t> frame(e->compressedSize);
     const bool read = std::fseek(f.file, long(f.data_offset + e->offset), SEEK_SET) == 0 &&
                       std::fread(frame.data(), 1, frame.size(), f.file) == frame.size();
-    const size_t n = read ? ZSTD_decompressDCtx(f.dctx, blob.data() + sizeof(header), e->size, frame.data(), frame.size())
-                          : 0;
+    const size_t n = read ? ZSTD_decompressDCtx(f.dctx, text.data(), e->size, frame.data(), frame.size()) : 0;
     if (!read || ZSTD_isError(n) || n != e->size) {
       REXLOG_ERROR("[deko3d] shader {:016X}: the installed GLSL did not read ({})", hash,
                    !read ? "card" : ZSTD_isError(n) ? ZSTD_getErrorName(n) : "short");
-      return nullptr;
+      return {};
     }
   } else {
     std::lock_guard<std::mutex> lock(p.mutex);
-    const size_t n = p.dict ? ZSTD_decompress_usingDDict(p.dctx, blob.data() + sizeof(header), e->size,
-                                                         p.data + e->offset, e->compressedSize, p.dict)
-                            : ZSTD_decompressDCtx(p.dctx, blob.data() + sizeof(header), e->size, p.data + e->offset,
-                                                  e->compressedSize);
+    const size_t n = p.dict ? ZSTD_decompress_usingDDict(p.dctx, text.data(), e->size, p.data + e->offset,
+                                                         e->compressedSize, p.dict)
+                            : ZSTD_decompressDCtx(p.dctx, text.data(), e->size, p.data + e->offset, e->compressedSize);
     if (ZSTD_isError(n) || n != e->size) {
       REXLOG_ERROR("[deko3d] shader {:016X}: the GLSL did not unpack ({})", hash,
                    ZSTD_isError(n) ? ZSTD_getErrorName(n) : "short");
-      return nullptr;
+      return {};
+    }
+    in_memory = true;
+  }
+  return text;
+}
+
+std::unique_ptr<plume::RenderShader> CreateGameShader(plume::RenderDevice *device, uint64_t hash) {
+  // The installer's package first (made from the player's files), then the NRO's own.
+  if (!device)
+    return nullptr;
+  uint32_t stage = 0;
+  bool in_memory = false;
+  const std::string glsl = UnpackGlsl(hash, stage, in_memory);
+  if (glsl.empty())
+    return nullptr;
+  std::vector<uint8_t> blob(sizeof(plume::Deko3DShaderBlob) + glsl.size());
+  plume::Deko3DShaderBlob header;
+  header.stage = stage;
+  header.glslSize = uint32_t(glsl.size());
+  header.dkshSize = 0;
+  std::memcpy(blob.data(), &header, sizeof(header));
+  std::memcpy(blob.data() + sizeof(header), glsl.data(), glsl.size());
+  auto shader = device->createShader(blob.data(), blob.size(), "main", plume::RenderShaderFormat::DEKO3D);
+  if (shader) {
+    shader->setName(fmt::format("{}_{:016X}", stage == 4 ? "ps" : "vs", hash));
+    // banjo-nx (2026-11-01, the console's out-of-memory crash): the text is not kept with the shader; plume unpacks it
+    // again when a new variant needs it (plume::Deko3DGlslSource). A package read from the card keeps it, as before.
+    if (in_memory) {
+      plume::Deko3DShaderSetGlslLoader(shader.get(), [hash] {
+        uint32_t st = 0;
+        bool mem = false;
+        return UnpackGlsl(hash, st, mem);
+      });
     }
   }
-  auto shader = device->createShader(blob.data(), blob.size(), "main", plume::RenderShaderFormat::DEKO3D);
-  if (shader)
-    shader->setName(fmt::format("{}_{:016X}", e->stage == 4 ? "ps" : "vs", hash));
   return shader;
 }
 
@@ -590,6 +623,7 @@ void InstallShaderCache() {
   options.stripRestart = Deko3DStripRestartOn();
   options.vsOutputs = Deko3DVsOutputsOn();
   options.uamFlags = Deko3DUamFlags();
+  options.logMisses = REXCVAR_GET(banjo_deko3d_log_misses);  // banjo-nx (2026-11-20)
   options.mergeBarriers = Deko3DBarrierMergeOn();  // banjo-nx (2026-10-19, GPU)
   options.leanBarriers = Deko3DBarrierLeanOn();
   options.copyRunBarriers = REXCVAR_GET(banjo_deko3d_copy_run_barriers);  // port 161 (from fnxf_xiii)

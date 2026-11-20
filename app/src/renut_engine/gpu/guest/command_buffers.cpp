@@ -4224,7 +4224,13 @@ bool SameButPredication(const std::vector<u8> &a, const std::vector<u8> &b, u32 
   };
   // Ascending: TilePredication and RunPredication (SetCommandBufferPredication's), then the device's predication and
   // run predication state.
-  constexpr u32 kSkipped[4] = {0x2A30, 0x2A34, d3d::kDeviceOffsetPredication, d3d::kDeviceOffsetPredication + 4};
+  // banjo-nx (2026-11-19, its rebase on the base): the XDK's own offsets (d3d_native.h). Port 87 wrote
+  // vivapinata-nx's 0x2A30 / 0x2A34, which are other fields at N&B's and Katamari's XDKs (TilePredication 0x2AB4).
+  constexpr u32 kSkipped[4] = {native::off::TilePredication, native::off::RunPredication, d3d::kDeviceOffsetPredication,
+                               d3d::kDeviceOffsetPredication + 4};
+  static_assert(native::off::TilePredication < native::off::RunPredication &&
+                    native::off::RunPredication < d3d::kDeviceOffsetPredication,
+                "kSkipped ascending");
   for (const u32 skip : kSkipped) {
     if (skip + 4 > a.size())
       break;
@@ -4281,8 +4287,11 @@ bool TilesOnce(u32 device_va, const u8 *device, u32 command_buffer_va, const std
   if (banjo::renut_gpu::g_ab_off.load(std::memory_order_relaxed) == 86)
     return false;
   // Tiling (BeginTiling sets Flags 0x20 until EndTiling) with two tiles or more.
-  const u32 tiles = *reinterpret_cast<const be_u32 *>(device + 0x30B8);  // native::off::TileCount
-  if (!(device[0x2A38] & 0x20) || tiles < 2 || tiles > 16)  // native::off::Flags
+  // banjo-nx (2026-11-19, its rebase on the base): native::off's TileCount and Flags (the byte BeginTiling sets 0x20
+  // in, hooks/draw.cpp), not port 87's vivapinata-nx offsets 0x30B8 / 0x2A38, other fields at this XDK (its Flags is
+  // TilePredication + 8, as here).
+  const u32 tiles = *reinterpret_cast<const be_u32 *>(device + native::off::TileCount);
+  if (!(device[native::off::Flags] & 0x20) || tiles < 2 || tiles > 16)
     return false;
   const u32 predication = Predication(run->running.data());
   const int tile = OneTile(predication, tiles);

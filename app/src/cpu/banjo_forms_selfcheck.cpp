@@ -102,6 +102,15 @@ void Conversions(Tally& t) {
     int64_t fctid, fctiw, fctidz;
   };
   const double nan = std::numeric_limits<double>::quiet_NaN();
+  // banjo-nx (2026-11-19, the rebase; a handoff): with blur-nx's near-exact #2 (REX_NX_FCTI_NO_NAN, N&B's cleared set,
+  // docs/banjo-near-exact.md) a NaN converts to 0 by design (AArch64's fcvtzs, no NaN test): that is the expected
+  // result then, so the check still proves the form instead of reporting the switch at every start (and writing
+  // banjo_selfcheck_failed.txt next to the program).
+#if defined(REX_NX_FCTI_NO_NAN)
+  constexpr bool kNanToZero = true;
+#else
+  constexpr bool kNanToZero = false;
+#endif
   const Case cases[] = {
       {0.5, 0, 0, 0},
       {1.5, 2, 2, 1},
@@ -117,7 +126,7 @@ void Conversions(Tally& t) {
       {-1e10, -10000000000ll, INT32_MIN, -10000000000ll},
       {9223372036854775808.0, INT64_MAX, INT32_MAX, INT64_MAX},
       {-1e19, INT64_MIN, INT32_MIN, INT64_MIN},
-      {nan, INT64_MIN, int64_t(0x80000000u), INT64_MIN},
+      {nan, kNanToZero ? 0 : INT64_MIN, kNanToZero ? 0 : int64_t(0x80000000u), kNanToZero ? 0 : INT64_MIN},
   };
   for (const Case& c : cases) {
     const double v = Opaque(c.v);
@@ -128,7 +137,7 @@ void Conversions(Tally& t) {
     // fctiwz (the first round's): truncation with the same saturation and NaN image.
     int64_t z;
     if (std::isnan(c.v)) {
-      z = int64_t(0x80000000u);
+      z = kNanToZero ? 0 : int64_t(0x80000000u);
     } else if (c.v >= 2147483647.0) {
       z = INT32_MAX;
     } else if (c.v <= -2147483648.0) {

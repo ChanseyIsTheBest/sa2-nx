@@ -65,7 +65,28 @@ SCRATCH_V = V(0) | sum(V(n) for n in range(32, 64))
 # continues; the service traps (types 20, 26) read r3 / r4 for their debug string. Was ALL (leaf_dead_stores.py's
 # rule), which made every function with a divide-by-zero check read every register. SASRT_REG_LIVENESS_TRAP_ALL=1: ALL.
 TRAP_USE = (R(3) | R(4)) if os.environ.get('SASRT_REG_LIVENESS_TRAP_ALL', '0') != '1' else ALL
-INDIRECT_USE = ALL & ~SCRATCH_V
+
+
+# banjo-nx (2026-11-19, the rebase on the ultimate base; a handoff): a game whose tools/cc_entry_census.py finds a
+# pointer-reached function reading a scratch vector register on entry lists that register in
+# app/config/scratch_vectors_read_on_entry.txt (a register per line, `#` comments with the function and why): it then
+# stays live at every indirect call (an indirect call may reach that function), so the machine copies hand it over as
+# the generated code does. Exact; a store more at each such site. N&B: v0, sub_82402910 (a message handler that stores
+# v0 at +2784 on a path that does not load it first). A missing file: the convention as before.
+def _entry_read_scratch():
+    path = os.path.join(ROOT, 'app', 'config', 'scratch_vectors_read_on_entry.txt')
+    m = 0
+    if os.path.exists(path):
+        for line in open(path, encoding='utf-8'):
+            word = line.split('#')[0].strip()
+            if re.fullmatch(r'v\d+', word) and int(word[1:]) < 128:
+                m |= V(int(word[1:]))
+    return m & SCRATCH_V
+
+
+ENTRY_READ_V = _entry_read_scratch()
+INDIRECT_SCRATCH_V = SCRATCH_V & ~ENTRY_READ_V  # scratch vectors an indirect call's target never reads on entry
+INDIRECT_USE = ALL & ~INDIRECT_SCRATCH_V
 # sasrt-nx (2026-11-12, stage 1b): calls through an app or SDK hook (a C++ replacement of the guest function) and calls
 # of kernel imports / named functions follow the same convention: they read their arguments, never the scratch vector
 # registers. SASRT_REG_LIVENESS_HOOKS_ABI=0: everything live at them, as leaf_dead_stores.py.
@@ -530,7 +551,7 @@ def main():
         rows = []
         for i, out_a, out_t in ind:
             n_ind += 1
-            skip = SCRATCH_V & ~(out_a | (live_out.get(addr, ALL) & out_t))
+            skip = INDIRECT_SCRATCH_V & ~(out_a | (live_out.get(addr, ALL) & out_t))
             if skip:
                 rows.append([i, '%x' % skip])
                 skipped['iv'] += bin(skip).count('1')

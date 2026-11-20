@@ -25,6 +25,13 @@ import reg_liveness as rl  # noqa: E402
 
 GEN = sys.argv[sys.argv.index('--gen') + 1] if '--gen' in sys.argv else os.path.join(ROOT, 'app', 'generated')
 NOREAD = re.compile(r'^(vspltis[bhw]|vspltis[bhw]128|lvlx|lvlx128|lvrx|lvrx128)$')
+# banjo-nx (2026-11-19, the rebase; a handoff): more forms the generated code writes whole without reading the
+# destination (checked in N&B's tree: REX_VUPKD3D_*, simde unpack / shift / convert / estimate stores of the sources
+# only), where reg_liveness.defuse counts the destination as read; they count only when the destination is not also a
+# source. And the float estimates defuse does not know (it answers "everything"): they read their one source.
+NODEST = re.compile(r'^(vupkd3d128|vmrghw|vmrglw|vmrghw128|vmrglw128|vsraw|vsrw|vslw|vctsxs|vctuxs|vcfsx|vcfux|'
+                    r'vexptefp|vlogefp|vrefp|vrsqrtefp|vexptefp128|vlogefp128|vrefp128|vrsqrtefp128)$')
+FLOAT_EST = re.compile(r'^(fres|frsqrte)$')
 SELF = re.compile(r'^(vxor|vxor128|vsubuwm|vsububm|vsubuhm|vandc|vandc128)$')
 
 rl._ns['MID_ASM_HOOKS'] = lds.load_mid_asm_hooks(GEN)
@@ -35,6 +42,17 @@ bodies = dcd.all_functions(GEN, named)
 def du(c):
     mn = c.group(1).rstrip('.')
     ops = [o.strip() for o in c.group(2).split(',')]
+    if mn.startswith('('):
+        return 0, 0  # banjo-nx: a post-codegen tool's note in the comments, "(tools/vec_lvlx_splat.py: ...)", no instruction
+    if FLOAT_EST.match(mn) and len(ops) == 2:
+        return rl.regs(ops[0]), rl.regs(ops[1])
+    if NODEST.match(mn) and ops and ops[0] not in ops[1:]:
+        try:
+            d, u = rl.defuse(c.group(1), c.group(2))
+        except Exception:
+            return 0, rl.ALL
+        dv = rl.regs(ops[0])
+        return d | dv, u & ~dv
     try:
         d, u = rl.defuse(c.group(1), c.group(2))
     except Exception:
@@ -44,6 +62,10 @@ def du(c):
         return d | dv, u & ~dv
     if SELF.match(mn) and len(ops) == 3 and ops[1] == ops[2]:
         return d | rl.regs(ops[0]), u & ~rl.regs(ops[1])
+    # banjo-nx (2026-11-19): `subfe rD,rX,rX` is ~rX + rX + CA = CA - 1: the carry's value only, not rX's (N&B: 96 such
+    # reads after indirect calls).
+    if mn in ('subfe', 'subfeo') and len(ops) == 3 and ops[1] == ops[2]:
+        return d, u & ~rl.regs(ops[1])
     # `mr rX,rX` / `or rX,rX,rX` (the compiler's no-op markers): the register keeps its value whatever it is.
     if mn in ('mr', 'or') and ops and all(o == ops[0] for o in ops):
         return d, u & ~rl.regs(ops[0])

@@ -34,7 +34,9 @@ import os
 import re
 import sys
 
-sys.path.insert(0, 'D:/Banjo kazooie port/banjo-nx/tools')
+# banjo-nx (2026-11-19, the rebase; a handoff): this folder's tools, not banjo-nx's (the line named
+# 'D:/Banjo kazooie port/banjo-nx/tools', which on this PC put banjo-nx's older leaf_dead_stores.py first).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import leaf_dead_stores as lds  # noqa: E402
 import dead_ctx_defs as dcd  # noqa: E402
 

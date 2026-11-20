@@ -376,11 +376,17 @@ if(BANJO_GENERATED_MATH_FLAGS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     foreach(_sa2_game renut_recomp renut_Data_DLL)  # sa2-nx-ult: both modules
         if(TARGET ${_sa2_game})
             target_compile_options(${_sa2_game} PRIVATE -fno-math-errno)
-            if(BANJO_GENERATED_NO_TRAPPING_MATH)
+            # banjo-nx (2026-11-19, the rebase; blur-nx's BLUR_NO_TRAPPING_MATH form, 2026-11-16, CG-26; base port 231):
+            # only with BLUR_FPCR_ONE_MODE (no flush-mode switches left in game code), and the files that write the
+            # guest FPSCR keep -ftrapping-math (tools/fp_env_files.py's list, below the round definitions).
+            if(BANJO_GENERATED_NO_TRAPPING_MATH AND BLUR_FPCR_ONE_MODE)
                 target_compile_options(${_sa2_game} PRIVATE -fno-trapping-math)
             endif()
         endif()
     endforeach()
+endif()
+if(BANJO_GENERATED_NO_TRAPPING_MATH AND NOT BLUR_FPCR_ONE_MODE)
+    message(WARNING "banjo: BANJO_GENERATED_NO_TRAPPING_MATH needs BLUR_FPCR_ONE_MODE (the flush-mode switches); left off")
 endif()
 
 # The localized native copies (src/cpu/banjo_hot_guest.cpp includes generated/hot) are game code compiled in the app:
@@ -405,6 +411,10 @@ set(BANJO_HOT_SOURCES src/cpu/banjo_hot_guest.cpp
 )
 if(BANJO_GENERATED_MATH_FLAGS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set_property(SOURCE ${BANJO_HOT_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -fno-math-errno)
+    # banjo-nx (2026-11-19; blur-nx's form): the copies as the game code (the guard compares them with it).
+    if(BANJO_GENERATED_NO_TRAPPING_MATH AND BLUR_FPCR_ONE_MODE)
+        set_property(SOURCE ${BANJO_HOT_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -fno-trapping-math)
+    endif()
 endif()
 if(NOT REXGLUE_PLATFORM_SWITCH)
     set_property(SOURCE ${BANJO_HOT_SOURCES} APPEND PROPERTY COMPILE_DEFINITIONS REX_DIET_CENSUS_ON)
@@ -736,6 +746,31 @@ foreach(_banjo_target renut_recomp renut renut_Data_DLL)  # sa2-nx-ult: the stag
     endif()
 endforeach()
 message(STATUS "banjo: sa2-nx's CPU rounds: definitions '${_banjo_round_definitions}'")
+
+# banjo-nx (2026-11-19, the rebase; blur-nx's form, 2026-11-16): with BANJO_GENERATED_NO_TRAPPING_MATH, the files that
+# write the guest FPSCR (mtfsf and kin: the rounding mode) back to -ftrapping-math, tools/fp_env_files.py's list (a
+# source's option comes after its target's on the command line, so it wins): GCC would otherwise move a float
+# operation across the mode write. Without the list (no post-codegen run yet) the switch stays off.
+if(BANJO_GENERATED_NO_TRAPPING_MATH AND BLUR_FPCR_ONE_MODE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set(_banjo_fp_env_list "${CMAKE_CURRENT_SOURCE_DIR}/generated/fp_env_files.txt")
+    if(EXISTS "${_banjo_fp_env_list}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_banjo_fp_env_list}")
+        file(STRINGS "${_banjo_fp_env_list}" _banjo_fp_env_files)
+        foreach(_banjo_f ${_banjo_fp_env_files})
+            set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/${_banjo_f}" APPEND PROPERTY COMPILE_OPTIONS
+                         -ftrapping-math)
+        endforeach()
+        list(LENGTH _banjo_fp_env_files _banjo_fp_env_count)
+        message(STATUS "banjo: -fno-trapping-math, but ${_banjo_fp_env_count} FPSCR-writing files keep -ftrapping-math")
+    else()
+        message(WARNING "banjo: ${_banjo_fp_env_list} is missing (tools/post_codegen.py writes it): the game code "
+                "keeps -ftrapping-math")
+        if(TARGET renut_recomp)
+            target_compile_options(renut_recomp PRIVATE -ftrapping-math)
+        endif()
+        set_property(SOURCE ${BANJO_HOT_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -ftrapping-math)
+    endif()
+endif()
 
 # banjo-nx (2026-10-21, the user's request): link-time and profile-guided optimisation of the Switch build, from
 # sa2-nx (its app/CMakeLists.txt and docs/enhancements.md, "Link-time optimisation of a recompiled program"). Both OFF

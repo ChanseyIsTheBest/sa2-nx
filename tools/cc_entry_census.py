@@ -98,4 +98,11 @@ print('call sites with a volatile vector register read right after: %d' % after_
 print('  by register:', after.most_common(24))
 print('pointer-reached functions %d; vector registers read on entry:' % len(ptr), ptr_entry.most_common(30))
 bad = {r: (k, examples[r]) for r, k in ptr_entry.items() if r == 'v0' or 32 <= int(r[1:]) <= 63}
+# banjo-nx (2026-11-19): a register listed in app/config/scratch_vectors_read_on_entry.txt stays live at indirect calls
+# (tools/reg_liveness.py ENTRY_READ_V), so it is no longer a problem; it is still named.
+listed = {r for r in bad if rl.ENTRY_READ_V >> (64 + int(r[1:])) & 1}
+if listed:
+    print('  listed in app/config/scratch_vectors_read_on_entry.txt (kept live at indirect calls):',
+          {r: bad[r] for r in sorted(listed)})
+bad = {r: v for r, v in bad.items() if r not in listed}
 print('pointer-reached functions reading v0 or v32-v63 on entry (must be none):', bad or 'none')

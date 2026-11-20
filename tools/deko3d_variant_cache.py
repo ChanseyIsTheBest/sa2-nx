@@ -224,6 +224,21 @@ ALPHA_GUESS = (8, 7, 5)
 GPR_CAP_PS = {'364C9BF8579CE602', 'F646B7A8A3A7218B', '92D1F7E40EBB8E86', '9041AFF62011FC58'}
 
 
+def round_vs_specs(prefix, specs):
+    """banjo-nx (2026-11-20, --round-guess): a vertex shader's variant from a list record made before the GPU rounds as
+    the draws key it now: the memory fetches' byte-order words 937 / 939 (render/draw.cpp SasrtSpecWordsOf) at the two
+    values N&B's console and Ryujinx runs asked for (0x200000 / 0x800 for its vertex buffers, 0x80000000 for both), and
+    the vertex epilogue word 932 at 7 beside --sasrt-guess's 5. A shader that declares none of them keeps one variant."""
+    for s in specs:
+        yield s
+        if ROUND_GUESS and prefix == 'vs' and 937 not in s:
+            for b937, b939 in ((0x200000, 0x800), (0x80000000, 0x80000000)):
+                g = {**s, 937: b937, 939: b939}
+                yield g
+                if g.get(932) == 5:
+                    yield {**g, 932: 7}
+
+
 def sasrt_guess(hashes, spec):
     """sasrt-nx (2026-11-08, --sasrt-guess): a listed pipeline (from a list made before the third round's key words) as a
     race draw keys it now: the vertex epilogue's word 5 (constant 932: no screen-space draw, no depth remap, both items
@@ -273,6 +288,8 @@ def read_list(path, blend_skip_on, alpha_guess=ALPHA_GUESS):
         no_clip = vs != 0 and not (reserved & 8)
         per_instance, rect_list, point_sprite = struct.unpack_from('<III', data, at + OFF_PER_INSTANCE)
         depth_control, stencil_ref_mask = struct.unpack_from('<II', data, at + OFF_DEPTH_CONTROL)
+        fetch_types = struct.unpack_from('<4I', data, at + OFF_FETCH_TYPES) if version >= 5 else (0, 0, 0, 0)
+        tess_kind = struct.unpack_from('<I', data, at + OFF_TESS_KIND)[0] if version >= 5 else 0
         at += size
         tail = {FLAG_TESS: per_instance, FLAG_GS: rect_list | point_sprite,
                 FLAG_DEPTH_WRITES: depth_writes(depth_control, stencil_ref_mask)}
@@ -376,11 +393,32 @@ def read_list(path, blend_skip_on, alpha_guess=ALPHA_GUESS):
         if plain and vs_mask and (plain | vs_mask) != plain:
             for s in made:
                 out.append((hashes, {**s, 926: plain | vs_mask}))
+        # banjo-nx (2026-11-20, --round-guess; the console's misses): a list record made before the GPU rounds has none
+        # of their run-time words, and the draws ask for them: the fetch conversion words (950 + r) and the 3D exponent
+        # words (958 + r, 966 + r) of each pixel-shader fetch r < 8 (render/draw.cpp SasrtSpecWordsOf), and bit 31 of
+        # 926 (sasrt_gpu_one_x: 1x targets, scale code 0). For a plain fetch (its bit in 926) those words are exactly
+        # 0x8000 and 0x80 (no gamma, signs or exponent: what makes it plain), so for each 926 guess the variant with
+        # them, and the same with bit 31. The shader's own declarations drop the words it does not have.
+        if ROUND_GUESS and ps and not any(950 <= k <= 973 for k in spec):
+            masks = {m for m in (guess_mask, guess_mask | vs_mask if guess_mask else 0, plain,
+                                 plain | vs_mask if plain else 0) if m}
+            for m in masks:
+                words = {}
+                for r in range(8):
+                    if m >> r & 1:
+                        words[950 + r] = 0x8000
+                        words[958 + r] = 0x80
+                        words[966 + r] = 0x80
+                for s in made:
+                    out.append((hashes, {**s, **words, 926: m & 0x7FFFFFFF}))
+                    out.append((hashes, {**s, **words, 926: (m & 0x7FFFFFFF) | 0x80000000}))
     return out
 
 
 # port 44: pixel shader hash -> textureFetchMask & 0x7FFFFFFF, from the NRO's shader table (--plain-guess).
 PLAIN_GUESS = {}
+# banjo-nx (2026-11-20): --round-guess (the GPU rounds' run-time words for lists made before them).
+ROUND_GUESS = False
 
 
 def load_plain_guess(table):
@@ -450,6 +488,9 @@ def main():
     ap.add_argument('--round-ab', action='store_true',
                     help='vivapinata-nx (2026-11-12): also every pixel variant with constant 975 = 0, the shader '
                          "round's A/B off half (vivapinata_shader_round, A/B 150)")
+    ap.add_argument('--round-guess', action='store_true',
+                    help="banjo-nx (2026-11-20): for lists made before the GPU rounds, each guessed plain-fetch variant also "
+                         "with the rounds' run-time words of its plain fetches (950/958/966 + r) and with 926's bit 31")
     ap.add_argument('--sasrt-guess', action='store_true',
                     help='sasrt-nx (2026-11-08): each listed pipeline also with the third round\'s guessable key words '
                          '(constant 932 = 5, the register cap of the listed pixel shaders): lists made before them')
@@ -469,6 +510,8 @@ def main():
                     help="a console's renut log: the run-time variants it names (base size and hash) are added")
     a = ap.parse_args()
     UAM = a.uam
+    global ROUND_GUESS
+    ROUND_GUESS = a.round_guess
 
     glsl_cache = {}
     signature = {}  # name -> 'size:mtime_ns' of the GLSL file (the key memo below is by it)
@@ -556,7 +599,7 @@ def main():
                 continue
             sspec = stage_spec(prefix, spec, vs_shader[0] if vs_shader else None,
                                ps_shader[0] if ps_shader else None, not no_ps)
-            for sspec in config_specs(prefix, shader[1], sspec):
+            for sspec in round_vs_specs(prefix, config_specs(prefix, shader[1], sspec)):
                 defines = variant_defines(shader[1], sspec)
                 if (prefix, h, defines) in seen:
                     continue

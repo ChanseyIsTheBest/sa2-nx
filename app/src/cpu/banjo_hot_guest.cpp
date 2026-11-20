@@ -145,6 +145,11 @@ REXCVAR_DEFINE_BOOL(banjo_hot_poison_dead, false, "Banjo/Enhancements",
                     "not compare (dead after the return by LiveOut: tools/reg_liveness.py, leaf_dead_stores.py) with "
                     "garbage, so a wrong LiveOut shows. Diagnostic only; costs a test per call")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(banjo_hot_bulk_lines, false, "Banjo/Diagnostics",
+                    "Verify runs (2026-11-19): about once a minute the guard's report also has a line per reached bulk "
+                    "copy ('[hot] bulk reached <name> on|off: N compared, M not comparable'), to see which copies of a "
+                    "new list a run reached")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(banjo_hot_count, false, "Banjo/Enhancements",
                     "Measurement (PC): every native copy runs in its counting form and logs/hot_counts.txt gets how "
                     "often each block of statements ran, for tools/hot_arm_compare.py. No guard while it is on")
@@ -1212,6 +1217,9 @@ void Report() {
   // One line per hook that was reached, so each fits the log's line and a tool reads one function per line.
   uint64_t compared = 0, not_comparable = 0, differences = 0, not_repeated = 0, prefix_equal = 0, prefix_differ = 0;
   uint32_t reached = 0, on = 0, direct = 0, bulk_total = 0, bulk_reached = 0, bulk_on = 0;
+  // banjo_hot_bulk_lines: every 6th report (about once a minute), so a long run's log stays small.
+  static uint32_t report_number = 0;
+  const bool bulk_lines = REXCVAR_GET(banjo_hot_bulk_lines) && (report_number++ % 6) == 0;
   for (Hook* h = g_hooks; h; h = h->next) {
     const uint8_t state = h->state.load(std::memory_order_relaxed);
     bulk_total += h->bulk;
@@ -1233,6 +1241,12 @@ void Report() {
       if (d)
         REXLOG_INFO("[hot] {} (bulk) off after {} difference(s); {} calls compared before", h->name, d,
                     h->compared.load(std::memory_order_relaxed));
+      // banjo-nx (2026-11-19, the rebase; a handoff): banjo_hot_bulk_lines, a line per reached bulk copy, so a verify
+      // run shows which copies of a new list the guard reached (the guide: verified only with the counts showing it).
+      else if (bulk_lines)
+        REXLOG_INFO("[hot] bulk reached {} {}: {} compared, {} not comparable", h->name,
+                    state == kOn || state == kDirect ? "on" : "off", h->compared.load(std::memory_order_relaxed),
+                    h->not_comparable.load(std::memory_order_relaxed));
       continue;
     }
     const uint64_t c = h->compared.load(std::memory_order_relaxed);
