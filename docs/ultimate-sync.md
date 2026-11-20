@@ -42,4 +42,17 @@ Ports 191-222 and SA2 (2026-11-20):
   game opened its sign-in screen as a guest (SA2 imports `XamShowSigninUI`; no log shows it opened: a console check in
   the two-player menus); port 203's shared save descriptors (`filesystem_shared_handles`, on) on the Switch; port 195's
   message boxes at twice the size; port 206's shortcuts on release.
-- **The checks:** the PC frames against 1.0.6 (the lockstep), a verify run, the Switch build in the emulator.
+- **A port-213 fix:** its new device field (the device's own vertex declaration, which SetFVF rewrites in place) came
+  with Katamari's offset 0x2F98 in `draw.h`; its static_assert stopped the build: SA2's 0x3118 (4ea0837b).
+- **The code generated again** (the generator's record moved aside, `app/renut_config.toml` touched): 24 of 726 files
+  changed. Port 199: 46 stack forwards in 35 functions before, 43 in 26 after (the forwards past a call gone, a few new
+  after a branch). Port 200: nothing in SA2. Port 191's `tools/built_ptr_scan.py`: 0 candidates in both modules.
+- **The PC checks (2026-11-20):** 1.0.6's 750 attract frames all identical (`out/lockstep/sync_attract1`, game frames
+  5800-9400 hash-only, aligned by content), no DIFFERENCE or error line, 1.09 million stack forwards compared with the
+  real load: 0 differences. A verify run (5 minutes, every self-check on every use): 0 differences in every check (1.16
+  billion flush-mode checks, 125 million folded loads, 109 million r1 checks, 7.5 million stack forwards, 61.8 million
+  guarded calls of the machine copies with 5 "differed once and not when repeated", as every run before the sync: 4-10).
+  Its scripted presses were missed while the save loaded (the guarded run is slow; known), so it showed the title and
+  the intro; a plain run on the same route played City Escape (`out/pc_runs/sync_route`, all ten presses taken).
+- **The Switch shader package** made again with the merged translator (ports 194, 207, 209): all four files
+  byte-identical to the package before.

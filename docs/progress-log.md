@@ -115,3 +115,7 @@ and docs/sa2-near-exact.md.
   `draw.cpp` stopped the build: SA2's 0x3118 (draw.cpp's `kDeviceDeclarationOffset`, 1.0.6's layout).
 - Stack forwarding ruled out for the emulator's remaining demo difference (sa2-ultimate-notes.md): the PC checks every
   forward against the real load (0 differences in every log), the Switch runs the same forwards.
+- The code generated again after the sync (24 of 726 files changed: port 199's stack forwards, 46 -> 43) and the PC
+  build: 1.0.6's 750 attract frames identical; a verify run with 0 differences in every self-check; City Escape played
+  on the plain route; port 191's built-address scan 0 in both modules; the Switch shader package byte-identical
+  (docs/ultimate-sync.md).
