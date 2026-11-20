@@ -19,7 +19,7 @@ in [progress-log.md](progress-log.md).
 | Emulator (Ryujinx, deko3d) | the attract sequence against 1.0.6's released NRO | the title identical; the two-player demo plays the same moments, player 2's run no longer drifts since the fused multiply-add is off; a small fixed difference remains (below); after the first sync: as before (289 of 2,259 demo frames identical against 260, the same pattern); after the second: as before (263, the same pattern); after port 234's follow-up: as before (265) |
 | Emulator | the Switch build with the 447 copies in place | block for block as without them |
 | Emulator | the instrumented PGO build of the current tree | boots, runs the attract sequence, writes its stream (5.1 MB in 7 minutes), no error line |
-| Console | the packages in `out\packages`: `2026-11-20_1210_rebase_test4` (the current tree, ports 1-235; the everyday form) and the instrumented PGO build of the same tree (`pgo_generate3`; the earlier ones were built before the syncs or before port 234's follow-up). `2026-11-20_0844_rebase_test2` (before the syncs) is kept to compare | **not run** (your word needed) |
+| Console | the packages in `out\packages`: `2026-11-20_1210_rebase_test4` (the current tree, ports 1-235; the everyday form) and the instrumented PGO build of the same tree (`2026-11-20_1234_pgo_generate3`; the earlier ones were built before the syncs or before port 234's follow-up). `2026-11-20_0844_rebase_test2` (before the syncs) is kept to compare | **not run** (your word needed) |
 
 **The remaining difference (open):** with every not-exact float form off, the two-player demo in the emulator matches
 1.0.6 in the same stretches every run and differs in the same others: a few grind sparks placed elsewhere, a sliver
@@ -98,7 +98,7 @@ anywhere (the console decides; PC and emulator timings are not evidence).
 1. A console run of the newest package (your word): boot, menus, stages, Chao Garden, the two-player modes (connect
    the second controller after the menus too: port 220), saving; send the logs of the `sa2_ab.toml` run (its CPU
    profile feeds the next batch of copies).
-2. PGO: the instrumented package of the current tree (`out\packages\<date>_pgo_generate3`); a console training
+2. PGO: the instrumented package of the current tree (`out\packages\2026-11-20_1234_pgo_generate3`); a console training
    session (its notes say what to play),
    `tools\pgo_merge.py <pgo folder> pgo-inplace`, then `tools\build_switch_release.bat`.
 3. The installer (`out\handoffs\installer-needs.md`): the asset pack and the update zip, as 1.0.6's installer has.

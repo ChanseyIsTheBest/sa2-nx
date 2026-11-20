@@ -138,3 +138,4 @@ and docs/sa2-near-exact.md.
   the follow-up), `_0453_rebase_test1` and `_0534_pgo_generate` (before the syncs) moved to `out\to_delete_20261120`
   with today's other superseded files (4.9 GB: the diagnostic Switch build, the elision PC build, the run copies of
   the save, the generation diffs).
+- The instrumented PGO build of 4e0bde24: boots in Ryujinx, writes its stream, no error line (the script ran to its end: the SD's toml back by itself). Packaged: `out\packages\2026-11-20_1234_pgo_generate3`.
