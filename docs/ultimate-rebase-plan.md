@@ -3,7 +3,8 @@
 Written 2026-11-19, before any code moved; sorted into the three lists below the same day (the user's word through the
 base's session: a full rebase, grafting only what SA2 needs). The rebase starts from sa2-nx 1.0.6 (main, baf523b) and
 the ultimate base (D:\renut-ultimate\base, branch `ultimate`, commit 73b7b731, ports 1-189). The base's working tree had
-979 files that differ from that commit only in line endings, so the commit is what is taken.
+979 files that differ from that commit only in line endings, so the commit is what is taken. The base's later ports
+(191-234, to 764410eb) came in on 2026-11-20 with its sync tool: docs/ultimate-sync.md.
 
 ## The method: a full rebase
 
