@@ -47,6 +47,10 @@ Ports 223-234 and SA2 (2026-11-20):
   console's `sa2_ab.toml` turn logging on, so their profiles stay); port 226's `banjo_hot_bulk_lines` (off); port 227's game-menu hook (SA2 sets
   none); ports 228, 229, 232, 234 change deko3d's shader handling (GLSL unpacked when needed, a draw's pipelines ahead of
   the background list, the cache tool's `--round-guess`, the compile share count).
+- **The checks (2026-11-20):** the code generated again from scratch: all 726 files byte-identical to those of ports
+  191-222 (the r1 / lr proofs with this tree's helpers prove what banjo-nx's older one did; `indirect_calls.py` found
+  all 244 listed sites). The PC: 1.0.6's 750 attract frames all identical (`out/lockstep/sync234_attract1`), no
+  DIFFERENCE or error line, 1.09 million stack forwards compared: 0 differences.
 
 Ports 191-222 and SA2 (2026-11-20):
 
@@ -73,3 +77,8 @@ Ports 191-222 and SA2 (2026-11-20):
   the intro; a plain run on the same route played City Escape (`out/pc_runs/sync_route`, all ten presses taken).
 - **The Switch shader package** made again with the merged translator (ports 194, 207, 209): all four files
   byte-identical to the package before.
+- **The emulator (Ryujinx, 10:35):** the Switch build of ports 191-222 (`app\out\switch`, 4ea0837b) through the
+  attract sequence (`out\emu_runs\emu_sync222_attract`): 1.0.6's two-player demo 289 of 2,259 frames identical against
+  the pre-sync build's 260 (`emu_ult_head1_attract`), the same pattern block by block (the first 400 frames vary
+  between runs), the late blocks as high: no drift. sasrt's Ryujinx ran beside it from 10:40 (frame content is
+  compared, not timing).

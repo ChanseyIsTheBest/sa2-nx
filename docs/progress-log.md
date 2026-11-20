@@ -118,4 +118,8 @@ and docs/sa2-near-exact.md.
 - The code generated again after the sync (24 of 726 files changed: port 199's stack forwards, 46 -> 43) and the PC
   build: 1.0.6's 750 attract frames identical; a verify run with 0 differences in every self-check; City Escape played
   on the plain route; port 191's built-address scan 0 in both modules; the Switch shader package byte-identical
-  (docs/ultimate-sync.md).
+  (docs/ultimate-sync.md). Its Switch build in Ryujinx: the two-player demo as before the sync (289 of 2,259 frames
+  identical to 1.0.6 against 260, the same pattern, no drift).
+- The base had moved on again (ports 223-234, banjo-nx's, by 09:24): taken (d4ab878c; two conflicts by hand). Port
+  224 fixed the r1 / lr proofs' imports (they took banjo-nx master's older helper on this PC); the code generated
+  again from scratch is byte-identical to the previous generation. The PC: 1.0.6's 750 attract frames identical.
