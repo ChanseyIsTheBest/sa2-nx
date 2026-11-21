@@ -55,6 +55,8 @@ class PackEntry : public Entry {
   // sa2-nx-ult (2026-11-21): the pack holds NAME.hevc (rex/filesystem/sfd_hevc.h, a Sofdec movie as H.265) for this
   // entry NAME: its stored bytes are stored_size() at data_offset(); the entry's size is the movie's.
   bool sfd_hevc() const { return sfd_hevc_; }
+  // The same for NAME.adxo (rex/filesystem/adx_opus.h, ADX streams as Opus).
+  bool adx_opus() const { return adx_opus_; }
   uint64_t stored_size() const { return stored_size_; }
 
  private:
@@ -62,6 +64,7 @@ class PackEntry : public Entry {
   PackDevice* pack_ = nullptr;
   uint64_t data_offset_ = 0;
   bool sfd_hevc_ = false;
+  bool adx_opus_ = false;
   uint64_t stored_size_ = 0;
 };
 

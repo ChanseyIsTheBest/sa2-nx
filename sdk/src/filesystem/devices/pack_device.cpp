@@ -19,6 +19,7 @@
 #include <unordered_map>
 
 #include <rex/filesystem.h>
+#include <rex/filesystem/adx_opus.h>  // sa2-nx-ult (2026-11-21): NAME.adxo entries
 #include <rex/filesystem/sfd_hevc.h>  // sa2-nx-ult (2026-11-21): NAME.hevc entries
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -254,12 +255,14 @@ X_STATUS PackEntry::Open(uint32_t desired_access, File** out_file) {
     REXFS_ERROR("Attempting to open {} for write access on the read-only asset pack", path());
     return X_STATUS_ACCESS_DENIED;
   }
-  if (sfd_hevc_) {  // sa2-nx-ult (2026-11-21): the movie made from the stored NAME.hevc
+  if (sfd_hevc_ || adx_opus_) {  // sa2-nx-ult (2026-11-21): the file made from the stored NAME.hevc / NAME.adxo
     PackStorage* storage = pack_->storage();
-    const std::filesystem::path name = rex::to_path(std::string(path()) + std::string(kSfdHevcSuffix));
-    auto handle = OpenSfdHevcFrom(std::make_unique<PackRangeHandle>(storage, data_offset_, stored_size_, name),
-                                  std::make_unique<PackRangeHandle>(storage, data_offset_, stored_size_, name),
-                                  stored_size_);  // logs why when it is not a valid .hevc movie
+    const std::filesystem::path name =
+        rex::to_path(std::string(path()) + std::string(sfd_hevc_ ? kSfdHevcSuffix : kAdxOpusSuffix));
+    auto first = std::make_unique<PackRangeHandle>(storage, data_offset_, stored_size_, name);
+    auto second = std::make_unique<PackRangeHandle>(storage, data_offset_, stored_size_, name);
+    auto handle = sfd_hevc_ ? OpenSfdHevcFrom(std::move(first), std::move(second), stored_size_)
+                            : OpenAdxOpusFrom(std::move(first), std::move(second), stored_size_);  // logs why not
     if (!handle) return X_STATUS_NO_SUCH_FILE;
     *out_file = new PackHandleFile(desired_access, this, std::move(handle));
     return X_STATUS_SUCCESS;
@@ -367,28 +370,34 @@ bool PackDevice::Initialize() {
   };
   // sa2-nx-ult (2026-11-21): a NAME.hevc (a Sofdec movie as H.265, rex/filesystem/sfd_hevc.h) answers for NAME, with
   // the movie's size from its header; a plain NAME in the same pack wins (and the .hevc stays an ordinary file).
+  // The same for NAME.adxo (ADX streams as Opus, rex/filesystem/adx_opus.h).
   std::unordered_map<std::string, bool> plain_names;
   for (const DiskEntry& disk : index.entries) {
     const std::string path(index.paths.data() + disk.path_offset, disk.path_length);
-    if (!HasSfdHevcSuffix(path)) plain_names.emplace(rex::string::utf8_lower_ascii(path), true);
+    if (!HasSfdHevcSuffix(path) && !HasAdxOpusSuffix(path))
+      plain_names.emplace(rex::string::utf8_lower_ascii(path), true);
   }
-  size_t movies = 0;
+  size_t movies = 0, sounds = 0;
   for (const DiskEntry& disk : index.entries) {
     std::string path(index.paths.data() + disk.path_offset, disk.path_length);
-    bool sfd_hevc = false;
+    bool sfd_hevc = false, adx_opus = false;
     uint64_t movie_size = 0;
-    if (HasSfdHevcSuffix(path)) {
-      const std::string plain = path.substr(0, path.size() - kSfdHevcSuffix.size());
+    const bool is_hevc = HasSfdHevcSuffix(path), is_adxo = HasAdxOpusSuffix(path);
+    if (is_hevc || is_adxo) {
+      const std::string plain =
+          path.substr(0, path.size() - (is_hevc ? kSfdHevcSuffix.size() : kAdxOpusSuffix.size()));
       uint8_t header[kSfdHevcHeaderBytes];
+      static_assert(kSfdHevcHeaderBytes >= kAdxOpusHeaderBytes);
       if (plain_names.count(rex::string::utf8_lower_ascii(plain))) {
         REXFS_WARN("[pack] {} and {} are both in the pack: the plain file is used", plain, path);
       } else if (disk.size >= sizeof(header) && storage_->ReadAt(disk.offset, header, sizeof(header)) &&
-                 SfdHevcSizeFromHeader(header, sizeof(header), &movie_size)) {
-        sfd_hevc = true;
+                 (is_hevc ? SfdHevcSizeFromHeader(header, sizeof(header), &movie_size)
+                          : AdxOpusSizeFromHeader(header, sizeof(header), &movie_size))) {
+        (is_hevc ? sfd_hevc : adx_opus) = true;
         path = plain;
-        ++movies;
+        ++(is_hevc ? movies : sounds);
       } else {
-        REXFS_WARN("[pack] {} is not a valid .hevc movie: left as it is", path);
+        REXFS_WARN("[pack] {} is not a valid {} file: left as it is", path, is_hevc ? ".hevc" : ".adxo");
       }
     }
     PackEntry* parent = root_entry_.get();
@@ -405,11 +414,13 @@ bool PackDevice::Initialize() {
     PackEntry* file = make(parent, path.substr(start_part), false);
     file->data_offset_ = disk.offset;
     file->sfd_hevc_ = sfd_hevc;
+    file->adx_opus_ = adx_opus;
     file->stored_size_ = disk.size;
-    file->size_ = size_t(sfd_hevc ? movie_size : disk.size);
+    file->size_ = size_t(sfd_hevc || adx_opus ? movie_size : disk.size);
     file->allocation_size_ = rex::round_up(file->size_, size_t(bytes_per_sector()));
   }
-  if (movies) REXFS_INFO("[pack] {} movies stored as H.265 (NAME.hevc)", movies);
+  if (movies || sounds)
+    REXFS_INFO("[pack] {} movies stored as H.265 (NAME.hevc), {} sound files as Opus (NAME.adxo)", movies, sounds);
   entry_count_ = index.entries.size();
   REXFS_INFO("[pack] mounted '{}' at {}: {} files, {} directories, {:.1f} MB in {:.1f} ms",
              rex::path_to_utf8(PackPath(folder_)), mount_path(), entry_count_, directories.size() - 1,

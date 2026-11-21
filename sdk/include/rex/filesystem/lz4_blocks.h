@@ -6,11 +6,17 @@
  * the game's NAME, with NAME's size (HostPathEntry::Create); opening it wraps the host handle in one that decompresses
  * the blocks a read covers (OpenLz4Blocks). A plain NAME next to it wins: the .lz4b is then left as an ordinary file.
  *
+ * rr6-nx (2026-11-11, the user's hybrid): version 2 holds ZXC blocks (ZXC 0.15, sdk/thirdparty/zxc): the installer
+ * packs the RRM archives as LZ4 HC 9 in 256 KB blocks (what loads read: LZ4 1.10.0's decoder, ~590 MB/s on the console)
+ * and every other game file (the videos, music and packs, read while they play) as ZXC 7 in 512 KB blocks (smaller;
+ * ~200 MB/s). The console runs of 2026-11-11 (docs/progress-log.md) measured both.
+ *
  * The format, little-endian:
- *   header, 32 bytes:  "RXLZ4BLK", u32 version (1), u32 block size, u64 size of the file it holds, u32 block count,
- *                      u32 0
- *   the blocks:        each block's LZ4 block-format data back to back; a block whose stored size equals its own
- *                      length is stored as it is (peggle2-nx's HD pack rule)
+ *   header, 32 bytes:  "RXLZ4BLK", u32 version (1: LZ4 blocks; 2: ZXC blocks), u32 block size, u64 size of the file it
+ *                      holds, u32 block count, u32 0
+ *   the blocks:        each block's LZ4 block-format data (version 1) or zxc_compress_block output (version 2) back to
+ *                      back; a block whose stored size equals its own length is stored as it is (peggle2-nx's HD pack
+ *                      rule)
  *   the index:         u32 per block, its stored size
  *   footer, 16 bytes:  u64 offset of the index, "RXLZ4END"
  * Every block is 'block size' long but the last. The footer lets the page write the file as a stream.
@@ -37,8 +43,5 @@ bool ReadLz4BlocksSize(const std::filesystem::path& path, uint64_t* out_size);
 
 // A handle that reads the file `packed` holds, or nullptr when `packed` is not a valid .lz4b file (logged).
 std::unique_ptr<FileHandle> OpenLz4Blocks(std::unique_ptr<FileHandle> packed);
-
-// LZ4 block format, every read and write checked (peggle2-nx's Lz4Decode). Returns the bytes written or -1.
-int64_t Lz4BlockDecode(const uint8_t* in, size_t in_size, uint8_t* out, size_t out_size);
 
 }  // namespace rex::filesystem

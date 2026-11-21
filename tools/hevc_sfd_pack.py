@@ -116,12 +116,16 @@ def pictures(es):
                 gops += 1
     if cur and cur['slice0'] is not None and cur['end'] is None:
         cur['end'] = len(es)
-    out = [(q['slice0'], q['end'], q['base'] + q['tref']) for q in pics]
-    if any(s is None for s, _, _ in out):
+    if any(q['slice0'] is None for q in pics):
         raise SystemExit('a picture without slices')
-    disp = sorted(x[2] for x in out)
-    if disp != list(range(len(out))):
-        raise SystemExit('the display indices are not 0..N-1 (an unexpected GOP structure)')
+    # sa2-nx-ult (2026-11-21): a picture's display index is its rank among the display times (GOP base + temporal
+    # reference): three of SA2's movies (e015bmv, e015mva, gerald35) end on a GOP whose last temporal references skip
+    # numbers (209 -> 211), and the decoder still gives every coded picture, in display order.
+    times = [q['base'] + q['tref'] for q in pics]
+    if len(set(times)) != len(times):
+        raise SystemExit('two pictures with the same display time (an unexpected GOP structure)')
+    rank = {t: i for i, t in enumerate(sorted(times))}
+    out = [(q['slice0'], q['end'], rank[t]) for q, t in zip(pics, times)]
     return out, gops
 
 

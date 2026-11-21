@@ -1,8 +1,12 @@
-// rr6-nx (2026-11-10): host test of the .lz4b reader (sdk/src/filesystem/lz4_blocks.cpp, unchanged) against the file
+// rr6-nx (2026-11-10): host test of the .lz4b reader (sdk/src/filesystem/lz4_blocks.cpp) against the file
 // it holds: the whole file read in 1 MB pieces, then random reads (parts of blocks, runs of whole blocks, past the
 // end), every byte compared. The SDK's logging and file handles are replaced by tools/test_stubs (stdio).
-//   PATH=/c/devkitPro/msys2/clang64/bin:$PATH clang++ -std=c++20 -O2 -Itools/test_stubs -Isdk/include \
-//     tools/test_lz4_blocks.cpp sdk/src/filesystem/lz4_blocks.cpp -o out/test_lz4_blocks.exe
+// 2026-11-11: both versions (1: LZ4, 2: ZXC), the codecs from sdk/thirdparty built as C:
+//   PATH=/c/devkitPro/msys2/clang64/bin:$PATH clang++ -O2 -DZXC_STATIC_DEFINE -DZXC_ONLY_DEFAULT \
+//     -DZXC_FUNCTION_SUFFIX=_default -Itools/test_stubs -Isdk/include -Isdk/thirdparty/lz4 \
+//     -Isdk/thirdparty/zxc/include -Isdk/thirdparty/zxc/src/lib -Isdk/thirdparty/zxc/src/lib/vendors \
+//     -x c sdk/thirdparty/lz4/lz4.c sdk/thirdparty/zxc/src/lib/zxc_{common,pivco_tables,dict,dispatch,pstream,seekable,compress,decompress,huffman}.c \
+//     -x c++ tools/test_lz4_blocks.cpp sdk/src/filesystem/lz4_blocks.cpp -o out/test_lz4_blocks.exe
 //   out/test_lz4_blocks.exe <file.lz4b> <original> [random reads]
 #include <chrono>
 #include <cstdio>

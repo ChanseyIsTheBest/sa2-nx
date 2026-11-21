@@ -49,6 +49,11 @@ inline constexpr std::string_view kSfdHevcSuffix = ".hevc";
 inline constexpr uint32_t kSfdHevcTagBytes = 10;
 
 bool HasSfdHevcSuffix(std::string_view name);
+// sa2-nx-ult (2026-11-21, the user: "we want to be able to run ZXC compressed H265 videos"; rr6-nx's of the same day):
+// NAME.hevc.lz4b, a NAME.hevc packed as LZ4 / ZXC blocks (rex/filesystem/lz4_blocks.h; the installer packs the movies
+// with ZXC: their SFD bytes compress, the H.265 frames do not), stands for the game's NAME as NAME.hevc does.
+inline constexpr std::string_view kPackedSfdHevcSuffix = ".hevc.lz4b";
+bool HasPackedSfdHevcSuffix(std::string_view name);
 // The size of the movie a NAME.hevc stands for, from its header. False if it is not one.
 bool ReadSfdHevcSize(const std::filesystem::path& path, uint64_t* out_size);
 // A handle that reads the movie `packed` stands for, or nullptr when it is not a valid NAME.hevc (logged). While it is

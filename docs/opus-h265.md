@@ -31,6 +31,18 @@ item of a six-item submenu whose other items are `advsng_5.adx` (shown after 5 h
 update" (`CodecPack02`, `CodecPackLoaderRoot`, `XamIsOptionalMediaUpdateInstalled`, `XamShowOptionalMediaUpdateRequiredUI`,
 both stubs in the SDK), so 1.0.6 never shows them. Playing them is new work (a host decoder in the codec pack's place).
 
+## The user's orders (2026-11-21)
+
+- "rencode all the videos to h.265 please and all the audio to opus in a web installer like culdcept"
+- "also want you to copy culdcept saga web installer for encoding audio and video please and compressing files with
+  ZXC and L4Z"; "there's also ridge racer 6 web installer if its useful" (its SFD writer: `lib/sfdh.js`,
+  `wasm/src/mpeg1`)
+
+So the new package is culdcept-nx-installer's: loose game files in `game_root/`, the big ones packed as `NAME.lz4b`
+(LZ4 or ZXC blocks, the base's and rr6-nx's reader: culdcept-nx's commit 90206e0a, taken here), the movies as
+`NAME.hevc`, the sound as `NAME.adxo`, both left uncompressed (as Culdcept's). 1.0.6's `game_root.nxpack` stays
+readable (the pack device knows `.hevc` and `.adxo` entries too).
+
 ## Plan
 
 1. **The Sofdec movies (31)**: rr6-nx's path. NAME.hevc (`rex/filesystem/sfd_hevc.h`, "RXSFDH01") shows the game the
@@ -70,6 +82,24 @@ both stubs in the SDK), so 1.0.6 never shows them. Playing them is new work (a h
   Mono: `sub_828CCD28(in, n, out, &hist, c1, c2, &key, ...)`; stereo: `sub_828CD3E0` -> `sub_828CCE80` /
   `sub_828CD168`. A block whose scale has its high bit set ends the stream (the decoders return early).
 - All 157 music files: version 3 (one v4), flags 0 (no encryption).
+- The decoders' formula (from their PPC): scale = ((field ^ key) & 0x1FFF) + 1 (key 0 here), sample = nibble * scale +
+  ((c1 * s1 + c2 * s2) >> 12), clamped; high nibble first. FFmpeg's adpcm_adx uses the field without the + 1: the two
+  decodes agree to 49.6 dB on title.adx; `tools/adx_opus_lib.mjs` decodes as the game does.
+
+## The audio: NAME.adxo (2026-11-21)
+
+`sdk/include/rex/filesystem/adx_opus.h` has the format: rr6-nx's segment layout (stored bytes, zeros, and runs of ADX
+blocks whose bytes are made as tags), a stream table, each stream's Opus packets (20 ms, 48 kHz, its channels). The
+console makes the game's file with every block a tag (stream id, block index, channel); the hook on the decode step
+(`app/src/sa2_adx_opus.cpp`, `sub_828C2948`) writes each tagged block's 32 samples from `AdxOpusBlockSamples` (the
+SDK: libopus, the 48 kHz window kept a second back, a seek decodes from 4 packets before, a zero-phase Kaiser sinc
+down to the stream's rate) and ends the step at the first block that is not one (an end marker), as the game's does.
+
+`tools/adx_opus_pack.mjs` (with `tools/adx_opus_lib.mjs`, the part the installer shares) makes them on a PC with
+FFmpeg's libopus: music 128 kbit/s stereo, mono 40. Checks: every byte outside the blocks as it was, every tag right;
+the Opus decoded back and resampled is at lag 0 against the game's decode (title.adx: SNR below 3 kHz 19.9 dB; Opus
+is perceptual: its full-band waveform SNR is 15-20 dB at any rate, so that number is not the measure). title.adx
+0.75 -> 0.33 MB. The resampler's round trip alone (32 -> 48 -> 32 kHz): lag 0, 38 dB (the band above 15.5 kHz).
 
 ## Log
 
@@ -80,3 +110,17 @@ both stubs in the SDK), so 1.0.6 never shows them. Playing them is new work (a h
   PC (out/pc_runs/hevc_pc2): `op360us.sfd.hevc` opened (1,273 H.265 frames), every slice tagged and skipped, every
   frame given to the game carries its tag (the PC has no H.265 decoder: grey pictures, seen blended over the opening).
   `hevc_sfd_pack.py --check` on SA2's movies: e0401_m 5.5 -> 2.9 MB (PSNR mean 52.6 dB), op360us 3.0 -> 1.3 MB.
+- 2026-11-21: all 31 movies convert (`hevc_sfd_pack.py`: a picture's display index is now its rank among the display
+  times: e015bmv, e015mva and gerald35 end on a GOP whose temporal references skip numbers; the installer's
+  `lib/sfdh.js` the same). 15 movies have B pictures (all eleven 640x480 cutscenes): the hook's Y plane (mpv+5000)
+  is confirmed for I and P pictures only; B is the next check. With nvenc: 425 -> 185 MB.
+- 2026-11-21 (the user: "we want to be able to run ZXC compressed H265 videos"): NAME.hevc.lz4b (rr6-nx's of the same
+  day): the movie's .hevc packed as ZXC blocks; `sfd_hevc.cpp` reads it through OpenLz4Blocks (both handles), the
+  host folder's lookup takes it for NAME. The ZXC reader is culdcept-nx's commit 90206e0a (rr6-nx's reader, LZ4
+  1.10.0, ZXC 0.15.0), applied here. `out/zxcb_pack.exe` (tools/zxcb_pack.cpp, built with devkitPro's clang64; run
+  it with that folder on PATH): the 31 movies 184.6 -> 157.9 MB (14.4 % smaller). PC (out/pc_runs/zxchevc_pc1):
+  op360us.sfd.hevc.lz4b opened (1,273 frames), tagged frames shown.
+- 2026-11-21: the audio: `NAME.adxo` (format, reader `adx_opus.cpp`, hook `sa2_adx_opus.cpp`, tools). PC
+  (out/pc_runs/hevc_adxo_pc1, 63 music files as .adxo): btl_opng, btl_hb, btl_pc opened, every decode step taken
+  from the .adxo (0.005-0.1 ms a step), the game runs on; the PC has no libopus, so silence there (the Switch links
+  devkitPro's). All music converted so far at lag 0.

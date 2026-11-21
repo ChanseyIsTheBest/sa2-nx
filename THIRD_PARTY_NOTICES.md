@@ -50,6 +50,9 @@ Libraries used by the SDK, the NRO and the code generator, in `sdk/thirdparty`, 
 | [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) | MIT |
 | [fmt](https://github.com/fmtlib/fmt), [spdlog](https://github.com/gabime/spdlog) | MIT |
 | [xxHash](https://github.com/Cyan4973/xxHash) | BSD-2-Clause |
+| [LZ4](https://github.com/lz4/lz4) 1.10.0 by Yann Collet (`lib/lz4.c`: the decoder of the game files the installer packs with LZ4; from rr6-nx, through culdcept-nx) | BSD-2-Clause |
+| [ZXC](https://github.com/hellobertrand/zxc) 0.15.0 by Bertrand Lebonnois (the decoder of the game files the installer packs with ZXC; from rr6-nx, through culdcept-nx), with [rapidhash](https://github.com/Nicoshev/rapidhash) by Nicolas De Carli | BSD-3-Clause; MIT |
+| [FFmpeg](https://ffmpeg.org) 7.1 as devkitPro's `switch-ffmpeg` builds it, with averne's nvtegra backend (in `tools/switch/nxvideo`, culdcept-nx's, linked into the Switch build: the H.265 movies' decoder on the Switch's NVDEC, and its software decoder) | GPL (built with `--enable-gpl`); LGPL-2.1-or-later sources |
 | [SIMDe](https://github.com/simd-everywhere/simde) | MIT |
 | [toml++](https://github.com/marzer/tomlplusplus) | MIT |
 | [o1heap](https://github.com/pavel-kirienko/o1heap) | MIT |

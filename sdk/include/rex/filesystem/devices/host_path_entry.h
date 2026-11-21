@@ -38,8 +38,11 @@ class HostPathEntry : public Entry {
   // sa2-nx-ult (2026-11-21, rr6-nx's): host_path_ is a NAME.hevc (rex/filesystem/sfd_hevc.h: a Sofdec movie whose
   // pictures are H.265), shown as NAME with that file's size; opened through OpenSfdHevc, never mapped or written.
   bool sfd_hevc() const { return sfd_hevc_; }
-  // Either: the guest's file is made from the host's one (read only, not mapped, its size the one it stands for).
-  bool packed() const { return lz4_blocks_ || sfd_hevc_; }
+  // sa2-nx-ult (2026-11-21): host_path_ is a NAME.adxo (rex/filesystem/adx_opus.h: a file of ADX streams whose sound
+  // is Opus), shown as NAME with that file's size; opened through OpenAdxOpus, never mapped or written.
+  bool adx_opus() const { return adx_opus_; }
+  // Any of them: the guest's file is made from the host's one (read only, not mapped, its size the one it stands for).
+  bool packed() const { return lz4_blocks_ || sfd_hevc_ || adx_opus_; }
 
   /*
    * "All the children of this directory are already known."
@@ -94,6 +97,7 @@ class HostPathEntry : public Entry {
   bool children_complete_ = false;
   bool lz4_blocks_ = false;
   bool sfd_hevc_ = false;
+  bool adx_opus_ = false;
 };
 
 }  // namespace rex::filesystem

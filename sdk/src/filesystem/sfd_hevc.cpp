@@ -12,6 +12,7 @@
 #include <mutex>
 
 #include <rex/filesystem.h>
+#include <rex/filesystem/lz4_blocks.h>  // NAME.hevc.lz4b (sa2-nx-ult, rr6-nx's, 2026-11-21)
 #include <rex/logging.h>
 #include <rex/string.h>
 
@@ -206,8 +207,33 @@ bool HasSfdHevcSuffix(std::string_view name) {
   return true;
 }
 
+
+// sa2-nx-ult (2026-11-21, the user: "we want to be able to run ZXC compressed H265 videos"; rr6-nx's Unpacked of the
+// same day): NAME.hevc.lz4b (kPackedSfdHevcSuffix) is a NAME.hevc packed as LZ4 / ZXC blocks (rex/filesystem/
+// lz4_blocks.h): the movie it holds is read through OpenLz4Blocks; any other handle as it is.
+static bool IsPacked(const std::filesystem::path& path) {
+  return HasLz4BlocksSuffix(rex::path_to_utf8(path.filename()));
+}
+static std::unique_ptr<FileHandle> Unpacked(std::unique_ptr<FileHandle> f) {
+  if (!f || !IsPacked(f->path())) return f;
+  return OpenLz4Blocks(std::move(f));  // logs why when it is not a valid .lz4b file
+}
+// The size of the .hevc movie at `path`: the file's own, or the one an .lz4b file holds.
+static bool UnpackedSize(const std::filesystem::path& path, uint64_t* out_size) {
+  if (IsPacked(path)) return ReadLz4BlocksSize(path, out_size);
+  FileInfo info;
+  if (!GetInfo(path, &info)) return false;
+  *out_size = info.total_size;
+  return true;
+}
+
+bool HasPackedSfdHevcSuffix(std::string_view name) {
+  if (!HasLz4BlocksSuffix(name)) return false;
+  return HasSfdHevcSuffix(name.substr(0, name.size() - kLz4BlocksSuffix.size()));
+}
+
 bool ReadSfdHevcSize(const std::filesystem::path& path, uint64_t* out_size) {
-  auto f = FileHandle::OpenExisting(path, FileAccess::kFileReadData);
+  auto f = Unpacked(FileHandle::OpenExisting(path, FileAccess::kFileReadData));  // NAME.hevc.lz4b too
   if (!f) return false;
   uint8_t h[kHeaderSize];
   Header header;
@@ -226,13 +252,14 @@ bool SfdHevcSizeFromHeader(const uint8_t* h, size_t length, uint64_t* out_size) 
 std::unique_ptr<FileHandle> OpenSfdHevc(std::unique_ptr<FileHandle> packed) {
   if (!packed) return nullptr;
   const std::filesystem::path path = packed->path();
-  FileInfo info;
-  if (!GetInfo(path, &info) || info.total_size < kHeaderSize) {
+  uint64_t size = 0;
+  if (!UnpackedSize(path, &size) || size < kHeaderSize) {
     LogBad(path, "too short to be a .hevc movie");
     return nullptr;
   }
-  return OpenSfdHevcFrom(std::move(packed), FileHandle::OpenExisting(path, FileAccess::kFileReadData),
-                         info.total_size);
+  // NAME.hevc.lz4b: both handles (the game's reads and the movie's frame reads) through the block reader
+  return OpenSfdHevcFrom(Unpacked(std::move(packed)),
+                         Unpacked(FileHandle::OpenExisting(path, FileAccess::kFileReadData)), size);
 }
 
 std::unique_ptr<FileHandle> OpenSfdHevcFrom(std::unique_ptr<FileHandle> packed, std::unique_ptr<FileHandle> frames,

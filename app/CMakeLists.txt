@@ -215,6 +215,8 @@ set(RENUT_SOURCES
     src/sa2_capture.cpp
     # sa2-nx-ult (2026-11-21): the Sofdec movies from H.265 (docs/opus-h265.md; rr6-nx's way).
     src/sa2_hevc_movies.cpp
+    # sa2-nx-ult (2026-11-21): the ADX sound from Opus (NAME.adxo, rex/filesystem/adx_opus.h).
+    src/sa2_adx_opus.cpp
     src/game_menu.cpp  # blur-nx (2026-11-18): the game menu (A+B+X+Y+L+R on the Switch, F8 on the PC)
     src/blur_small_alloc.cpp  # blur-nx (2026-11-17, #220; port 151): small C++ allocations per thread (Switch; 32 MB)
     # katamari-nx (2026-10-31): DLC packages in the "dlc" folder next to the NRO installed at start (reNut upstream's).

@@ -20,6 +20,7 @@
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/lz4_blocks.h>  // rr6-nx (2026-11-10)
+#include <rex/filesystem/adx_opus.h>    // sa2-nx-ult (2026-11-21)
 #include <rex/filesystem/sfd_hevc.h>    // sa2-nx-ult (2026-11-21, rr6-nx's)
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -41,7 +42,8 @@ std::atomic<uint64_t> g_inputs_in_tree{0};
 // re-encoded one (NAME.hevc) first, then NAME itself, then NAME.lz4b. Entry::GetChild takes the first child whose
 // name matches, so a directory's children are kept in this order.
 int AnswerRank(const std::string& name) {
-  if (HasSfdHevcSuffix(name)) return 0;
+  // and NAME.adxo, and NAME.hevc.lz4b (a movie packed as ZXC blocks) (sa2-nx-ult, 2026-11-21)
+  if (HasSfdHevcSuffix(name) || HasPackedSfdHevcSuffix(name) || HasAdxOpusSuffix(name)) return 0;
   if (HasLz4BlocksSuffix(name)) return 2;
   return 1;
 }
@@ -202,7 +204,8 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
       auto found_path = exact_path;
       bool found = false;
       for (const std::string_view suffix :
-           {rex::filesystem::kSfdHevcSuffix, std::string_view(), rex::filesystem::kLz4BlocksSuffix}) {
+           {rex::filesystem::kSfdHevcSuffix, rex::filesystem::kPackedSfdHevcSuffix, rex::filesystem::kAdxOpusSuffix,
+            std::string_view(), rex::filesystem::kLz4BlocksSuffix}) {
         found_path = exact_path;
         found_path += std::string(suffix);
         if ((found = rex::filesystem::GetInfo(found_path, &exact_info))) {
@@ -232,10 +235,14 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
       });  // sa2-nx-ult (2026-11-21, rr6-nx's): the first match is the one that answers
       auto match = std::find_if(child_infos.begin(), child_infos.end(), [&](const auto& info) {
         std::string name = rex::path_to_utf8(info.name);
-        if (rex::filesystem::HasLz4BlocksSuffix(name)) {  // rr6-nx: NAME.lz4b answers for NAME
+        if (rex::filesystem::HasPackedSfdHevcSuffix(name)) {  // sa2-nx-ult (2026-11-21): NAME.hevc.lz4b
+          name.resize(name.size() - rex::filesystem::kPackedSfdHevcSuffix.size());
+        } else if (rex::filesystem::HasLz4BlocksSuffix(name)) {  // rr6-nx: NAME.lz4b answers for NAME
           name.resize(name.size() - rex::filesystem::kLz4BlocksSuffix.size());
         } else if (rex::filesystem::HasSfdHevcSuffix(name)) {  // sa2-nx-ult (2026-11-21): and NAME.hevc
           name.resize(name.size() - rex::filesystem::kSfdHevcSuffix.size());
+        } else if (rex::filesystem::HasAdxOpusSuffix(name)) {  // and NAME.adxo
+          name.resize(name.size() - rex::filesystem::kAdxOpusSuffix.size());
         }
         return rex::string::utf8_equal_case(name, part);
       });

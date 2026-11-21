@@ -17,6 +17,7 @@
 #include <rex/filesystem/device.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/lz4_blocks.h>
+#include <rex/filesystem/adx_opus.h>  // sa2-nx-ult (2026-11-21)
 #include <rex/filesystem/sfd_hevc.h>  // sa2-nx-ult (2026-11-21)
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -157,7 +158,8 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
    */
   bool lz4_blocks = false;
   uint64_t lz4_size = 0;
-  if (file_info.type == rex::filesystem::FileInfo::Type::kFile && HasLz4BlocksSuffix(name)) {
+  if (file_info.type == rex::filesystem::FileInfo::Type::kFile && HasLz4BlocksSuffix(name) &&
+      !HasPackedSfdHevcSuffix(name)) {  // sa2-nx-ult: NAME.hevc.lz4b is a movie (below)
     std::filesystem::path plain = full_path;
     plain.replace_extension();
     rex::filesystem::FileInfo plain_info;
@@ -171,27 +173,48 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
       REXFS_WARN("{} is not a valid .lz4b file: left as it is", rex::path_to_utf8(full_path));
     }
   }
-  // sa2-nx-ult (2026-11-21, rr6-nx's): NAME.hevc (rex/filesystem/sfd_hevc.h, a movie as H.265) the same way.
+  // sa2-nx-ult (2026-11-21, rr6-nx's): NAME.hevc (rex/filesystem/sfd_hevc.h, a movie as H.265) the same way, and
+  // NAME.hevc.lz4b (the same movie packed as ZXC blocks; the user: "we want to be able to run ZXC compressed H265
+  // videos").
   bool sfd_hevc = false;
-  if (file_info.type == rex::filesystem::FileInfo::Type::kFile && HasSfdHevcSuffix(name)) {
+  const bool packed_hevc = HasPackedSfdHevcSuffix(name);
+  if (file_info.type == rex::filesystem::FileInfo::Type::kFile && (HasSfdHevcSuffix(name) || packed_hevc)) {
     std::filesystem::path plain = full_path;
     plain.replace_extension();
+    if (packed_hevc) plain.replace_extension();
     rex::filesystem::FileInfo plain_info;
     if (rex::filesystem::GetInfo(plain, &plain_info)) {
       REXFS_WARN("{} and {} are both in the game folder: the plain file is used (delete one of them)",
                  rex::path_to_utf8(plain), rex::path_to_utf8(full_path));
     } else if (ReadSfdHevcSize(full_path, &lz4_size)) {
       sfd_hevc = true;
-      name.resize(name.size() - kSfdHevcSuffix.size());
+      name.resize(name.size() - (packed_hevc ? kPackedSfdHevcSuffix.size() : kSfdHevcSuffix.size()));
     } else {
       REXFS_WARN("{} is not a valid .hevc movie: left as it is", rex::path_to_utf8(full_path));
+    }
+  }
+  // sa2-nx-ult (2026-11-21): NAME.adxo (rex/filesystem/adx_opus.h, ADX streams as Opus) the same way.
+  bool adx_opus = false;
+  if (file_info.type == rex::filesystem::FileInfo::Type::kFile && HasAdxOpusSuffix(name)) {
+    std::filesystem::path plain = full_path;
+    plain.replace_extension();
+    rex::filesystem::FileInfo plain_info;
+    if (rex::filesystem::GetInfo(plain, &plain_info)) {
+      REXFS_WARN("{} and {} are both in the game folder: the plain file is used (delete one of them)",
+                 rex::path_to_utf8(plain), rex::path_to_utf8(full_path));
+    } else if (ReadAdxOpusSize(full_path, &lz4_size)) {
+      adx_opus = true;
+      name.resize(name.size() - kAdxOpusSuffix.size());
+    } else {
+      REXFS_WARN("{} is not a valid .adxo file: left as it is", rex::path_to_utf8(full_path));
     }
   }
   auto path = rex::string::utf8_join_guest_paths(parent->path(), name);
   auto entry = new HostPathEntry(device, parent, path, full_path);
   entry->lz4_blocks_ = lz4_blocks;
   entry->sfd_hevc_ = sfd_hevc;
-  if (lz4_blocks || sfd_hevc) {
+  entry->adx_opus_ = adx_opus;
+  if (lz4_blocks || sfd_hevc || adx_opus) {
     file_info.total_size = size_t(lz4_size);
   }
 
@@ -281,6 +304,11 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
     }
   } else if (sfd_hevc_) {
     file_handle = OpenSfdHevc(std::move(file_handle));  // logs why when it is not a valid .hevc movie
+    if (!file_handle) {
+      return X_STATUS_NO_SUCH_FILE;
+    }
+  } else if (adx_opus_) {
+    file_handle = OpenAdxOpus(std::move(file_handle));  // logs why when it is not a valid .adxo file
     if (!file_handle) {
       return X_STATUS_NO_SUCH_FILE;
     }
@@ -387,6 +415,12 @@ void HostPathEntry::update() {
     } else if (sfd_hevc_) {  // sa2-nx-ult (2026-11-21): and a .hevc movie
       uint64_t size = 0;
       if (!ReadSfdHevcSize(host_path_, &size)) {
+        return;
+      }
+      file_info.total_size = size_t(size);
+    } else if (adx_opus_) {  // and an .adxo
+      uint64_t size = 0;
+      if (!ReadAdxOpusSize(host_path_, &size)) {
         return;
       }
       file_info.total_size = size_t(size);
