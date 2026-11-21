@@ -136,3 +136,15 @@ is perceptual: its full-band waveform SNR is 15-20 dB at any rate, so that numbe
   error. **The B pictures:** +4992..+5000 is a B picture's backward reference, its own planes are +5008..+5016
   (the log's B slices), so the hook tagged the reference (wrong index shown) and left the B picture untagged; fixed
   (kPictureY 5016), with a [hevc] warning for a frame shown without a tag while a movie plays.
+- 2026-11-22: out/emu_runs/emu_bfix: the logo movie with the fix, 0 frames shown without a tag.
+- 2026-11-22 (the user: "just LZ4 compress everything besides the ZXC compress the H.265 videos"): measured with the
+  installer's own packers: the game files the installer packs, 932 MB -> 502 MB with LZ4 HC (the .pak archives 363.5
+  -> 60 MB), 486 MB with ZXC; so LZ4 for them, ZXC for the H.265 movies only.
+- 2026-11-22, **the installer end to end** (sa2-nx-ult-installer, branch `sa2`, 7822ee5): its release is the
+  release-shaders NRO of 120d675d (`app/out/switch-relshaders`, no PGO / LTO). Node (test/full_node.mjs): 47 s, 103
+  shaders (97 the port's GLSL byte for byte, 6 with other temporaries' numbers, as 1.0.6's installer). The browser
+  (test/browser.html in the pane's Chromium 156, the PC's H.265 encoder): 517 s, the zip 1,222 MB from the game's
+  2,400 MB (the 33 movies 1,063 -> 399 MB, the music 365 -> 164 MB, the rest 932 -> 502 MB); check_zip: every entry
+  and game file right. The emulator on that zip as a player gets it (out/emu_runs/emu_installer1: the release NRO, the
+  page's deko3d_glsl.bin, its game_root): the GLSL package's 103 shaders loaded, title.adx played from the page's
+  Opus, the logo movie shown from the page's H.265 (ZXC) to picture 329 of 335, 0 untagged frames, 0 errors.
