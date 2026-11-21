@@ -18,8 +18,10 @@
 //                                sub_828F7780 into mpv+5084). Reached only through mpv+5084: hooked, they take every
 //                                slice. Their first byte is the one with the slice header's last bits (bit offset 6
 //                                for the 6 bits of quantiser and extra_bit_slice), so a tag is at that byte + 1.
-//   mpv+4992 / +4996 / +5000     the picture being decoded: its Cb, Cr and Y planes (+4976..4984 the one before; the
-//                                frame buffer mwPlyGetCurFrm hands out is the Y plane's address). The layout is
+//   mpv+5008 / +5012 / +5016     the picture being decoded: its Cb, Cr and Y planes (+4992..+5000 the backward
+//                                reference, +4976..+4984 the forward one; for an I or P picture +4992..+5000 is the
+//                                picture itself, for a B one not: the emulator's e0401_m showed it). The frame buffer
+//                                mwPlyGetCurFrm hands out is the Y plane's address. The layout is
 //                                rr6-nx's SofdecPlanes: Y pitch the width rounded to 16 then 128, Cb at Y + pitch *
 //                                rows (16-rounded), Cr after Cb at half the 16-rounded width rounded to 128.
 //   sub_828E06F8(ply, frm)       MWSFD's mwPlyGetCurFrm: frm (168 bytes) filled by sub_828E01B0, +0 the buffer, +12 / +16
@@ -91,7 +93,11 @@ namespace {
 constexpr uint32_t kChunk = 5288;      // mpv+5288: the slice decoder's chunk (address, +4 length)
 constexpr uint32_t kMbNow = 5204;      // mpv+5204: the last macroblock done
 constexpr uint32_t kMbLast = 5216;     // mpv+5216: the picture's last macroblock
-constexpr uint32_t kPictureY = 5000;   // mpv+5000: the picture being decoded, its Y plane
+// mpv+5016: the picture being decoded, its Y plane (+5008 / +5012 its Cb / Cr). 2026-11-21, the emulator's e0401_m (B
+// pictures): +4992..+5000 is the backward reference (the last I or P picture), the same as +5008..+5016 for an I or P
+// picture but not for a B one, whose own planes are +5008..+5016 (and +5040..+5048). The first form wrote a B
+// picture's tag into its reference: that reference then showed the B picture's index and the B picture no tag.
+constexpr uint32_t kPictureY = 5016;
 // A tag whose display index could not be read: the frame after the last one shown (rr6-nx's).
 constexpr uint32_t kIndexUnknown = 0x1FFFFF;
 
@@ -458,7 +464,19 @@ REX_HOOK_RAW(sub_828E06F8) {
   }
   if (!on) return;
   uint32_t id, index;
-  if (!rex::filesystem::ParseSfdHevcTag(Host(base, buf), &id, &index)) return;
+  if (!rex::filesystem::ParseSfdHevcTag(Host(base, buf), &id, &index)) {
+    // A frame without a tag while slices of an H.265 movie are being skipped (the last second): a picture whose tag
+    // went elsewhere (the B pictures' planes, 2026-11-21). Counted and named in the log, a few times.
+    static std::atomic<uint64_t> last_tagged{0}, untagged{0};
+    const uint64_t now = g_tagged_slices.load(std::memory_order_relaxed);
+    if (now && now != last_tagged.exchange(now, std::memory_order_relaxed)) {
+      const uint64_t n = untagged.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 4 || n % 1000 == 0)
+        REXLOG_WARN("[hevc] a frame without a tag while an H.265 movie plays ({} so far): buffer {:08X} {}x{}", n, buf,
+                    Ld32(base, frm + 12), Ld32(base, frm + 16));
+    }
+    return;
+  }
   const uint32_t w = Ld32(base, frm + 12), h = Ld32(base, frm + 16);
   if (!w || !h || w > 4096 || h > 4096) return;
   const Planes pl = SofdecPlanes(buf, w, h);

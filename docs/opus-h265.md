@@ -86,6 +86,11 @@ readable (the pack device knows `.hevc` and `.adxo` entries too).
   ((c1 * s1 + c2 * s2) >> 12), clamped; high nibble first. FFmpeg's adpcm_adx uses the field without the + 1: the two
   decodes agree to 49.6 dB on title.adx; `tools/adx_opus_lib.mjs` decodes as the game does.
 
+**The voices are not ADX (2026-11-21):** the clips of `gd/event_adx.afs` and `gd/event_adx_e.afs` have the ADX
+signature but encoding 0x10: CRI **AHX** (an MPEG-1 Layer II variant; the game's "AHX Decoder" strings), about
+63 kbit/s mono 22.05 kHz. The first inventory (and rr6-nx's handoff) read only the signature. The ADX hook does not see
+them; Opus for them (about half their 146 MB at 32 kbit/s) needs a hook on the AHX decoder: a separate step.
+
 ## The audio: NAME.adxo (2026-11-21)
 
 `sdk/include/rex/filesystem/adx_opus.h` has the format: rr6-nx's segment layout (stored bytes, zeros, and runs of ADX
@@ -124,3 +129,10 @@ is perceptual: its full-band waveform SNR is 15-20 dB at any rate, so that numbe
   (out/pc_runs/hevc_adxo_pc1, 63 music files as .adxo): btl_opng, btl_hb, btl_pc opened, every decode step taken
   from the .adxo (0.005-0.1 ms a step), the game runs on; the PC has no libopus, so silence there (the Switch links
   devkitPro's). All music converted so far at lag 0.
+- 2026-11-21, the emulator (out/emu_runs/emu_av2, 16 min of the attract with the 31 movies as .hevc.lz4b and 125
+  music files as .adxo; nxvideo's software decoder): e0401_m (the logo movie at every start of the attract loop,
+  640x480 with B pictures) opened from its ZXC file three times and shown from H.265; btl_hb, m_space, btl_pc, c_wall
+  played from Opus (10,186 packets, loops seeking, 0.7-4 ms a decode step in the emulator, no step left to ADX). No
+  error. **The B pictures:** +4992..+5000 is a B picture's backward reference, its own planes are +5008..+5016
+  (the log's B slices), so the hook tagged the reference (wrong index shown) and left the B picture untagged; fixed
+  (kPictureY 5016), with a [hevc] warning for a frame shown without a tag while a movie plays.
