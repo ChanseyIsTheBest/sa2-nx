@@ -20,6 +20,7 @@ add_library(rexfilesystem OBJECT
     devices/stfs_container_entry.cpp
     devices/stfs_container_file.cpp
     lz4_blocks.cpp
+    sfd_hevc.cpp  # sa2-nx-ult (2026-11-21, from rr6-nx): NAME.hevc, a Sofdec movie as H.265 (docs/opus-h265.md)
 )
 add_library(rex::filesystem ALIAS rexfilesystem)
 

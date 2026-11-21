@@ -19,9 +19,11 @@
 #include <unordered_map>
 
 #include <rex/filesystem.h>
+#include <rex/filesystem/sfd_hevc.h>  // sa2-nx-ult (2026-11-21): NAME.hevc entries
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/string.h>
+#include <rex/string/utf8.h>
 
 namespace rex::filesystem {
 
@@ -191,6 +193,59 @@ std::unique_ptr<PackStorage> PackStorage::Open(const std::filesystem::path& path
 // ---------------------------------------------------------------------------------------------------------------
 // Entry and file
 
+namespace {
+
+// sa2-nx-ult (2026-11-21): a range of the pack as a FileHandle (positional reads; PackStorage is thread safe), for the
+// readers of re-encoded entries (rex/filesystem/sfd_hevc.h).
+class PackRangeHandle final : public FileHandle {
+ public:
+  PackRangeHandle(PackStorage* storage, uint64_t offset, uint64_t size, const std::filesystem::path& name)
+      : FileHandle(name), storage_(storage), offset_(offset), size_(size) {}
+  bool Read(size_t file_offset, void* buffer, size_t buffer_length, size_t* out_bytes_read) override {
+    *out_bytes_read = 0;
+    if (file_offset >= size_) return buffer_length == 0;
+    const size_t n = size_t(std::min<uint64_t>(buffer_length, size_ - file_offset));
+    if (!storage_->ReadAt(offset_ + file_offset, buffer, n)) return false;
+    *out_bytes_read = n;
+    return n == buffer_length;
+  }
+  bool Write(size_t, const void*, size_t, size_t* out_bytes_written) override {
+    *out_bytes_written = 0;
+    return false;
+  }
+  bool SetLength(size_t) override { return false; }
+  void Flush() override {}
+
+ private:
+  PackStorage* storage_;
+  uint64_t offset_, size_;
+};
+
+// A file read through a FileHandle (the movie a NAME.hevc entry stands for).
+class PackHandleFile final : public File {
+ public:
+  PackHandleFile(uint32_t file_access, Entry* entry, std::unique_ptr<FileHandle> handle)
+      : File(file_access, entry), handle_(std::move(handle)) {}
+  void Destroy() override { delete this; }
+  X_STATUS ReadSync(std::span<uint8_t> buffer, size_t byte_offset, size_t* out_bytes_read) override {
+    *out_bytes_read = 0;
+    const size_t size = entry()->size();
+    if (byte_offset >= size) return X_STATUS_END_OF_FILE;
+    const size_t n = std::min(buffer.size(), size - byte_offset);
+    size_t got = 0;
+    if (!handle_->Read(byte_offset, buffer.data(), n, &got)) return X_STATUS_UNSUCCESSFUL;
+    *out_bytes_read = got;
+    return X_STATUS_SUCCESS;
+  }
+  X_STATUS WriteSync(std::span<const uint8_t>, size_t, size_t*) override { return X_STATUS_ACCESS_DENIED; }
+  X_STATUS SetLength(size_t) override { return X_STATUS_ACCESS_DENIED; }
+
+ private:
+  std::unique_ptr<FileHandle> handle_;
+};
+
+}  // namespace
+
 PackEntry::PackEntry(Device* device, Entry* parent, const std::string_view path) : Entry(device, parent, path) {}
 PackEntry::~PackEntry() = default;
 
@@ -198,6 +253,16 @@ X_STATUS PackEntry::Open(uint32_t desired_access, File** out_file) {
   if (desired_access & (FileAccess::kFileWriteData | FileAccess::kFileAppendData)) {
     REXFS_ERROR("Attempting to open {} for write access on the read-only asset pack", path());
     return X_STATUS_ACCESS_DENIED;
+  }
+  if (sfd_hevc_) {  // sa2-nx-ult (2026-11-21): the movie made from the stored NAME.hevc
+    PackStorage* storage = pack_->storage();
+    const std::filesystem::path name = rex::to_path(std::string(path()) + std::string(kSfdHevcSuffix));
+    auto handle = OpenSfdHevcFrom(std::make_unique<PackRangeHandle>(storage, data_offset_, stored_size_, name),
+                                  std::make_unique<PackRangeHandle>(storage, data_offset_, stored_size_, name),
+                                  stored_size_);  // logs why when it is not a valid .hevc movie
+    if (!handle) return X_STATUS_NO_SUCH_FILE;
+    *out_file = new PackHandleFile(desired_access, this, std::move(handle));
+    return X_STATUS_SUCCESS;
   }
   // A folder opens too (games open directories to enumerate them); reads on it are rejected in ReadSync.
   *out_file = new PackFile(desired_access, this);
@@ -300,8 +365,32 @@ bool PackDevice::Initialize() {
     parent->children_.push_back(std::unique_ptr<Entry>(entry));
     return entry;
   };
+  // sa2-nx-ult (2026-11-21): a NAME.hevc (a Sofdec movie as H.265, rex/filesystem/sfd_hevc.h) answers for NAME, with
+  // the movie's size from its header; a plain NAME in the same pack wins (and the .hevc stays an ordinary file).
+  std::unordered_map<std::string, bool> plain_names;
   for (const DiskEntry& disk : index.entries) {
     const std::string path(index.paths.data() + disk.path_offset, disk.path_length);
+    if (!HasSfdHevcSuffix(path)) plain_names.emplace(rex::string::utf8_lower_ascii(path), true);
+  }
+  size_t movies = 0;
+  for (const DiskEntry& disk : index.entries) {
+    std::string path(index.paths.data() + disk.path_offset, disk.path_length);
+    bool sfd_hevc = false;
+    uint64_t movie_size = 0;
+    if (HasSfdHevcSuffix(path)) {
+      const std::string plain = path.substr(0, path.size() - kSfdHevcSuffix.size());
+      uint8_t header[kSfdHevcHeaderBytes];
+      if (plain_names.count(rex::string::utf8_lower_ascii(plain))) {
+        REXFS_WARN("[pack] {} and {} are both in the pack: the plain file is used", plain, path);
+      } else if (disk.size >= sizeof(header) && storage_->ReadAt(disk.offset, header, sizeof(header)) &&
+                 SfdHevcSizeFromHeader(header, sizeof(header), &movie_size)) {
+        sfd_hevc = true;
+        path = plain;
+        ++movies;
+      } else {
+        REXFS_WARN("[pack] {} is not a valid .hevc movie: left as it is", path);
+      }
+    }
     PackEntry* parent = root_entry_.get();
     size_t start_part = 0;
     for (size_t slash = path.find('/'); slash != std::string::npos; slash = path.find('/', start_part)) {
@@ -315,9 +404,12 @@ bool PackDevice::Initialize() {
     }
     PackEntry* file = make(parent, path.substr(start_part), false);
     file->data_offset_ = disk.offset;
-    file->size_ = size_t(disk.size);
-    file->allocation_size_ = rex::round_up(size_t(disk.size), size_t(bytes_per_sector()));
+    file->sfd_hevc_ = sfd_hevc;
+    file->stored_size_ = disk.size;
+    file->size_ = size_t(sfd_hevc ? movie_size : disk.size);
+    file->allocation_size_ = rex::round_up(file->size_, size_t(bytes_per_sector()));
   }
+  if (movies) REXFS_INFO("[pack] {} movies stored as H.265 (NAME.hevc)", movies);
   entry_count_ = index.entries.size();
   REXFS_INFO("[pack] mounted '{}' at {}: {} files, {} directories, {:.1f} MB in {:.1f} ms",
              rex::path_to_utf8(PackPath(folder_)), mount_path(), entry_count_, directories.size() - 1,

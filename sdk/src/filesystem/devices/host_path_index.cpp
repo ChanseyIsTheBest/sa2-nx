@@ -134,7 +134,9 @@ bool ListLight(const std::string& path, std::vector<LightEntry>* output) {
 namespace {
 
 constexpr char kMagic[8] = {'R', 'X', 'V', 'F', 'S', 'I', 'D', 'X'};
-constexpr uint32_t kVersion = 1;
+// 2: sa2-nx-ult (2026-11-21, rr6-nx's), children in host_path_device.cpp's AnswerRank order (an index of 1 may hold
+// NAME.lz4b before NAME.hevc).
+constexpr uint32_t kVersion = 2;
 constexpr size_t kHeader = 8 + 4 + 4 + 8 + 8 + 8;
 // Sanity limits for parsing a damaged file: nothing in a game folder comes close.
 constexpr uint32_t kMaxName = 4096;

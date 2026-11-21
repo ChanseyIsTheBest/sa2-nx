@@ -20,6 +20,7 @@
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/lz4_blocks.h>  // rr6-nx (2026-11-10)
+#include <rex/filesystem/sfd_hevc.h>    // sa2-nx-ult (2026-11-21, rr6-nx's)
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/string/utf8.h>
@@ -35,6 +36,15 @@ std::atomic<uint64_t> g_misses_in_dry{0};
 std::atomic<uint64_t> g_stats_in_sd{0};
 std::atomic<uint64_t> g_swept_in_sd{0};
 std::atomic<uint64_t> g_inputs_in_tree{0};
+
+// sa2-nx-ult (2026-11-21, rr6-nx's AnswerRank): which of several files answering for the same game name wins: a
+// re-encoded one (NAME.hevc) first, then NAME itself, then NAME.lz4b. Entry::GetChild takes the first child whose
+// name matches, so a directory's children are kept in this order.
+int AnswerRank(const std::string& name) {
+  if (HasSfdHevcSuffix(name)) return 0;
+  if (HasLz4BlocksSuffix(name)) return 2;
+  return 1;
+}
 }  // namespace
 
 StatsPaths ReadStatsPaths() {
@@ -187,12 +197,17 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
       const auto exact_path = current_entry->host_path() / rex::to_path(part);
       rex::filesystem::FileInfo exact_info;
       g_stats_in_sd.fetch_add(1, std::memory_order_relaxed);
-      // rr6-nx (2026-11-10): or the game's file packed as NAME.lz4b (rex/filesystem/lz4_blocks.h)
+      // In AnswerRank's order (sa2-nx-ult 2026-11-21, rr6-nx's): NAME.hevc (rex/filesystem/sfd_hevc.h, a movie as
+      // H.265), NAME, then NAME.lz4b (rr6-nx 2026-11-10, rex/filesystem/lz4_blocks.h, the game's file packed).
       auto found_path = exact_path;
-      bool found = rex::filesystem::GetInfo(exact_path, &exact_info);
-      if (!found) {
-        found_path += std::string(rex::filesystem::kLz4BlocksSuffix);
-        found = rex::filesystem::GetInfo(found_path, &exact_info);
+      bool found = false;
+      for (const std::string_view suffix :
+           {rex::filesystem::kSfdHevcSuffix, std::string_view(), rex::filesystem::kLz4BlocksSuffix}) {
+        found_path = exact_path;
+        found_path += std::string(suffix);
+        if ((found = rex::filesystem::GetInfo(found_path, &exact_info))) {
+          break;
+        }
       }
       if (found) {
         auto* exact_child = HostPathEntry::Create(this, current_entry, found_path, exact_info);
@@ -212,10 +227,15 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
        */
       g_swept_in_sd.fetch_add(1, std::memory_order_relaxed);
       auto child_infos = rex::filesystem::ListFiles(current_entry->host_path());
+      std::stable_sort(child_infos.begin(), child_infos.end(), [](const auto& a, const auto& b) {
+        return AnswerRank(rex::path_to_utf8(a.name)) < AnswerRank(rex::path_to_utf8(b.name));
+      });  // sa2-nx-ult (2026-11-21, rr6-nx's): the first match is the one that answers
       auto match = std::find_if(child_infos.begin(), child_infos.end(), [&](const auto& info) {
         std::string name = rex::path_to_utf8(info.name);
         if (rex::filesystem::HasLz4BlocksSuffix(name)) {  // rr6-nx: NAME.lz4b answers for NAME
           name.resize(name.size() - rex::filesystem::kLz4BlocksSuffix.size());
+        } else if (rex::filesystem::HasSfdHevcSuffix(name)) {  // sa2-nx-ult (2026-11-21): and NAME.hevc
+          name.resize(name.size() - rex::filesystem::kSfdHevcSuffix.size());
         }
         return rex::string::utf8_equal_case(name, part);
       });
@@ -240,6 +260,11 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
 
 void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
   auto child_infos = rex::filesystem::ListFiles(parent_entry->host_path());
+  // sa2-nx-ult (2026-11-21, rr6-nx's): children in AnswerRank's order, so Entry::GetChild finds a re-encoded file
+  // before NAME.lz4b of the same game name (the VFS index keeps this order).
+  std::stable_sort(child_infos.begin(), child_infos.end(), [](const auto& a, const auto& b) {
+    return AnswerRank(rex::path_to_utf8(a.name)) < AnswerRank(rex::path_to_utf8(b.name));
+  });
   for (auto& child_info : child_infos) {
     auto child = HostPathEntry::Create(this, parent_entry,
                                        parent_entry->host_path() / child_info.name, child_info);

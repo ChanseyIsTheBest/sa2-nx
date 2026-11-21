@@ -17,6 +17,7 @@
 #include <rex/filesystem/device.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/lz4_blocks.h>
+#include <rex/filesystem/sfd_hevc.h>  // sa2-nx-ult (2026-11-21)
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory/mapped_memory.h>
@@ -170,10 +171,27 @@ HostPathEntry* HostPathEntry::Create(Device* device, Entry* parent,
       REXFS_WARN("{} is not a valid .lz4b file: left as it is", rex::path_to_utf8(full_path));
     }
   }
+  // sa2-nx-ult (2026-11-21, rr6-nx's): NAME.hevc (rex/filesystem/sfd_hevc.h, a movie as H.265) the same way.
+  bool sfd_hevc = false;
+  if (file_info.type == rex::filesystem::FileInfo::Type::kFile && HasSfdHevcSuffix(name)) {
+    std::filesystem::path plain = full_path;
+    plain.replace_extension();
+    rex::filesystem::FileInfo plain_info;
+    if (rex::filesystem::GetInfo(plain, &plain_info)) {
+      REXFS_WARN("{} and {} are both in the game folder: the plain file is used (delete one of them)",
+                 rex::path_to_utf8(plain), rex::path_to_utf8(full_path));
+    } else if (ReadSfdHevcSize(full_path, &lz4_size)) {
+      sfd_hevc = true;
+      name.resize(name.size() - kSfdHevcSuffix.size());
+    } else {
+      REXFS_WARN("{} is not a valid .hevc movie: left as it is", rex::path_to_utf8(full_path));
+    }
+  }
   auto path = rex::string::utf8_join_guest_paths(parent->path(), name);
   auto entry = new HostPathEntry(device, parent, path, full_path);
   entry->lz4_blocks_ = lz4_blocks;
-  if (lz4_blocks) {
+  entry->sfd_hevc_ = sfd_hevc;
+  if (lz4_blocks || sfd_hevc) {
     file_info.total_size = size_t(lz4_size);
   }
 
@@ -218,8 +236,8 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
     return X_STATUS_SUCCESS;
   }
 
-  // rr6-nx (2026-11-10): an .lz4b file is read only.
-  if (lz4_blocks_ && (desired_access & (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
+  // rr6-nx (2026-11-10): an .lz4b file is read only (sa2-nx-ult 2026-11-21: and a .hevc movie).
+  if (packed() && (desired_access & (FileAccess::kGenericWrite | FileAccess::kFileWriteData |
                                         FileAccess::kFileAppendData | FileAccess::kGenericAll))) {
     return X_STATUS_ACCESS_DENIED;
   }
@@ -261,6 +279,11 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
     if (!file_handle) {
       return X_STATUS_NO_SUCH_FILE;
     }
+  } else if (sfd_hevc_) {
+    file_handle = OpenSfdHevc(std::move(file_handle));  // logs why when it is not a valid .hevc movie
+    if (!file_handle) {
+      return X_STATUS_NO_SUCH_FILE;
+    }
   }
   *out_file = new HostPathFile(desired_access, this, std::move(file_handle));
   return X_STATUS_SUCCESS;
@@ -268,7 +291,7 @@ X_STATUS HostPathEntry::Open(uint32_t desired_access, File** out_file) {
 
 std::unique_ptr<memory::MappedMemory> HostPathEntry::OpenMapped(memory::MappedMemory::Mode mode,
                                                                 size_t offset, size_t length) {
-  if (lz4_blocks_) {
+  if (packed()) {
     return nullptr;  // rr6-nx: the host file is the packed one
   }
   return memory::MappedMemory::Open(host_path_, mode, offset, length);
@@ -358,6 +381,12 @@ void HostPathEntry::update() {
     if (lz4_blocks_) {  // rr6-nx: the size of the file it holds
       uint64_t size = 0;
       if (!ReadLz4BlocksSize(host_path_, &size)) {
+        return;
+      }
+      file_info.total_size = size_t(size);
+    } else if (sfd_hevc_) {  // sa2-nx-ult (2026-11-21): and a .hevc movie
+      uint64_t size = 0;
+      if (!ReadSfdHevcSize(host_path_, &size)) {
         return;
       }
       file_info.total_size = size_t(size);

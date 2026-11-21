@@ -52,11 +52,17 @@ class PackEntry : public Entry {
 
   uint64_t data_offset() const { return data_offset_; }
   PackDevice* pack() const { return pack_; }
+  // sa2-nx-ult (2026-11-21): the pack holds NAME.hevc (rex/filesystem/sfd_hevc.h, a Sofdec movie as H.265) for this
+  // entry NAME: its stored bytes are stored_size() at data_offset(); the entry's size is the movie's.
+  bool sfd_hevc() const { return sfd_hevc_; }
+  uint64_t stored_size() const { return stored_size_; }
 
  private:
   friend class PackDevice;
   PackDevice* pack_ = nullptr;
   uint64_t data_offset_ = 0;
+  bool sfd_hevc_ = false;
+  uint64_t stored_size_ = 0;
 };
 
 class PackFile : public File {
