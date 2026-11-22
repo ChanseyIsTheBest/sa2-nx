@@ -178,3 +178,10 @@ is perceptual: its full-band waveform SNR is 15-20 dB at any rate, so that numbe
   had no WMV3 (config.h now includes config_masseffect_wmv3.h). Scripted menus on the PC need `--headless=true` (the
   autosave message box); START on the file select toggles its WARNING dialog, B closes it and does nothing on the file
   select (the emulator route: STARTs across the title's window, then B, B, A, LEFT, A).
+- 2026-11-22, the emulator (Ryujinx, the installer's H.265 interview, `sa2_hevc_nvdec = false`; the save copy as
+  sa2.ult on the SD; route out/emu_tomls/ult_interview.toml): played, nxvideo's software decoder, 0 failed pictures,
+  WMA Pro sound; first starved (emu_interview_hevc2: the decode thread 100 % of a core, the game 60 fps, the sound dry),
+  then with 7e174bb7 in time (emu_interview_hevc3: 195 s of sound in about 200 s, the pictures within 1.5 s, about 8 a
+  second, the rest passed over to keyframes). Files left out (emu_interview_absent1): back to the menu in 0.5 s. A
+  route press lost in an emulator stall: input_script presses now start at the first poll that sees them (08ce9e9e).
+  Not run: the console (NVDEC), the natural end of the 6-minute file (only skips so far).
