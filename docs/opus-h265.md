@@ -148,3 +148,8 @@ is perceptual: its full-band waveform SNR is 15-20 dB at any rate, so that numbe
   and game file right. The emulator on that zip as a player gets it (out/emu_runs/emu_installer1: the release NRO, the
   page's deko3d_glsl.bin, its game_root): the GLSL package's 103 shaders loaded, title.adx played from the page's
   Opus, the logo movie shown from the page's H.265 (ZXC) to picture 329 of 335, 0 untagged frames, 0 errors.
+- 2026-11-22 (the user: "an option in the file not to include the wmv interview videos to save space"): installer
+  4dea4ad, game.json `"leave_out"` (a box on the page, ticked by default: the port does not play the interviews). Note
+  the units: the zip above is 1,222,462,113 bytes, 1,166 MB in the 2,400 MB's units (MiB). Browser test with
+  `?leave_out=interviews`: 970,480,872 bytes (926 MB) in 260 s (517 s with them); check_zip OK. Not checked: what the
+  game does when the interviews' menu item is chosen with the files absent (1.0.6 never played them either).
