@@ -217,6 +217,8 @@ set(RENUT_SOURCES
     src/sa2_hevc_movies.cpp
     # sa2-nx-ult (2026-11-21): the ADX sound from Opus (NAME.adxo, rex/filesystem/adx_opus.h).
     src/sa2_adx_opus.cpp
+    # sa2-nx-ult (2026-11-22): BONUS VIDEO's interviews played by the port in place of XMedia2 (docs/opus-h265.md).
+    src/sa2_interviews.cpp
     src/game_menu.cpp  # blur-nx (2026-11-18): the game menu (A+B+X+Y+L+R on the Switch, F8 on the PC)
     src/blur_small_alloc.cpp  # blur-nx (2026-11-17, #220; port 151): small C++ allocations per thread (Switch; 32 MB)
     # katamari-nx (2026-10-31): DLC packages in the "dlc" folder next to the NRO installed at start (reNut upstream's).
@@ -1005,6 +1007,12 @@ foreach(_dep imgui xxhash renderdoc)
             $<TARGET_PROPERTY:${_dep},INTERFACE_INCLUDE_DIRECTORIES>)
     endif()
 endforeach()
+
+# sa2-nx-ult (2026-11-22, culdcept-nx's line): src/sa2_interviews.cpp calls the SDK's FFmpeg itself (WMV3 and WMA Pro;
+# on the PC its own copy beside the runtime DLL's, which keeps XMA's).
+if(TARGET libavcodec)
+    target_link_libraries(renut PRIVATE libavcodec libavutil)
+endif()
 
 # sa2-nx-ult (2026-11-21, the user: the movies re-encoded to H.265, as culdcept-nx does; this block is rr6-nx's):
 # nxvideo (tools/switch/nxvideo, culdcept-nx's), the H.265 decoder on the Switch's NVDEC: devkitPro's switch-ffmpeg 7.1

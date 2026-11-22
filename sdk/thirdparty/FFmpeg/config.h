@@ -30,3 +30,7 @@
 #else
 #error "no config"
 #endif
+/* sa2-nx-ult (2026-11-22): the fork addition config_masseffect_wmv3.h says config.h includes it after each platform's
+ * header, and its sources are built (thirdparty/CMakeLists.txt), but this file did not: CONFIG_WMV3_DECODER stayed 0
+ * and FFmpeg had no WMV3 decoder (src/sa2_interviews.cpp plays the original interviews with it). */
+#include "config_masseffect_wmv3.h"

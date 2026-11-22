@@ -125,7 +125,10 @@ void FreePhysical(u32 va) {
 
 // The GPU format table (word_82005200): per D3D format low 6 bits, bits per
 // pixel in the low byte, flags in the high one.
-constexpr u32 kFormatTable = 0x820052F8;  // katamari-nx: 0x82005200->0x820FA9D0; sa2-nx: SA2's (1.0.6's resource.cpp), the base 0x820FA9D0
+// sa2-nx-ult (2026-11-22): SA2's table is at 0x820013C8 (8_8_8_8's entry 0x3020: 32 bits; found by its bits per pixel,
+// 1 1 8 16 16 16 32 32 8 8 16); 1.0.6's 0x820052F8 holds other data (8_8_8_8 0x1200: 0 bits), unnoticed because SA2's
+// resources are made by its own D3D: MakeTextureForHost (the interviews) is the first native creation SA2 runs.
+constexpr u32 kFormatTable = 0x820013C8;  // katamari-nx: 0x82005200->0x820FA9D0; sa2-nx 1.0.6: 0x820052F8 (wrong)
 
 u16 FormatTableEntry(u32 format) {
   const auto *table = GuestPtr<const be_u16>(kFormatTable);
@@ -1710,6 +1713,23 @@ namespace renut::gpu::native {
 
 u32 AddRefResource(u32 resource) {
   return AddRef(resource);
+}
+
+// sa2-nx-ult (2026-11-22): a 2D texture of one level made as D3DDevice_CreateTexture makes one, for native code (the
+// interviews' pictures, src/sa2_interviews.cpp), in a zeroed header of 0x34 bytes the caller owns (SA2 never makes the
+// records heap AllocHeader takes from: its resources are its own D3D's): the data's address, or 0.
+u32 MakeTextureForHost(u32 header, u32 width, u32 height, u32 format) {
+  u32 base_size = 0, mip_size = 0;
+  SetTextureHeader(3, width, height, 1, 1, 0, format, 2, 0, 0, 0, header, base_size, mip_size);
+  const u32 base = AllocPhysical(base_size, 0x8C800000u | (3u << 28));  // usage 0, as D3DDevice_CreateTexture
+  if (!base) {
+    RGPU_ERROR("MakeTextureForHost: header {:08X} {}x{} format {:08X}: base size {}, mip size {}, no memory", header,
+               width, height, format, base_size, mip_size);
+    return 0;
+  }
+  auto *t = GuestPtr<be_u32>(header);
+  t[8] = (u32(t[8]) & 0xFFFu) | (base & ~0xFFFu);
+  return base;
 }
 
 } // namespace renut::gpu::native
