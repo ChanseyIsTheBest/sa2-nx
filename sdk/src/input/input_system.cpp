@@ -279,6 +279,10 @@ struct ScriptedPress {
   // katamari-nx (2026-11-01): a stick pushed all the way (axis 0-3: left x, left y, right x, right y).
   int axis = -1;
   int16_t value = 0;
+  // sa2-nx-ult (2026-11-22): the first poll at or after `at` (-1: none yet); the press lasts `hold` from there. In an
+  // emulator the game thread stalls past a press's window (Ryujinx, 626 ms frames in SA2's menus): a route's DOWN was
+  // never seen and the cursor stopped one item short. Now a late poll only makes the press late.
+  mutable double started = -1.0;
 };
 std::vector<ScriptedPress> ParseInputScript(const std::string& text);
 const std::vector<ScriptedPress>& InputScript() {
@@ -394,7 +398,9 @@ uint16_t ScriptedButtons(const std::vector<ScriptedPress>& script = InputScript(
   const double now = ScriptSeconds();
   uint16_t buttons = 0;
   for (const ScriptedPress& press : script) {
-    if (press.axis < 0 && now >= press.at && now < press.at + press.hold) {
+    if (press.axis < 0 && now >= press.at && press.started < 0)
+      press.started = now;
+    if (press.axis < 0 && press.started >= 0 && now < press.started + press.hold) {
       buttons |= press.buttons;
       static double logged = -1.0;
       if (logged != press.at) {
@@ -410,7 +416,9 @@ bool ScriptedStickPushes(X_INPUT_GAMEPAD& pad, const std::vector<ScriptedPress>&
   const double now = ScriptSeconds();
   bool any = false;
   for (const ScriptedPress& press : script) {
-    if (press.axis < 0 || now < press.at || now >= press.at + press.hold) continue;
+    if (press.axis >= 0 && now >= press.at && press.started < 0)
+      press.started = now;  // sa2-nx-ult (2026-11-22): from the first poll that sees it, as the buttons
+    if (press.axis < 0 || press.started < 0 || now >= press.started + press.hold) continue;
     switch (press.axis) {
       case 0: pad.thumb_lx = press.value; break;
       case 1: pad.thumb_ly = press.value; break;
