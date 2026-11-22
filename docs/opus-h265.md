@@ -23,13 +23,29 @@ The game's CRI libraries (strings in `out/renut_image.bin`): ADXT/XBOX360 11.35,
 
 ## The interviews
 
-`sub_82121768` picks `interview_jp.wmv` (0x820E8C30) or `interview.wmv` (0x820E8C44) by a language byte and starts the
-game's player (`sub_82121A00`, `sub_82120D68`; Microsoft's XMedia2 library at 0x8257xxxx). It is called from the main
-menu's state machine (`sub_823D2838`, 24 states; the screen `sub_823D0C68`, sub-state 26 -> main state 22): the first
-item of a six-item submenu whose other items are `advsng_5.adx` (shown after 5 hours of play time, 1,080,000 frames),
-`advsng_1.adx`, two more screens and back. SA2's own code has no WMV decoder: XMedia2 loads the 360's "optional media
-update" (`CodecPack02`, `CodecPackLoaderRoot`, `XamIsOptionalMediaUpdateInstalled`, `XamShowOptionalMediaUpdateRequiredUI`,
-both stubs in the SDK), so 1.0.6 never shows them. Playing them is new work (a host decoder in the codec pack's place).
+**BONUS VIDEO** in HELP & OPTIONS (EXTRA, BONUS VIDEO, HOW TO PLAY, CONTROLS, SETTINGS, CREDITS). The item is dimmed
+and skipped until 5 hours of play: the menu (`sub_823D0C68`) compares the play time at 0x83BEFC2C with 1,080,000
+frames; in the save that is the u32 at 0x2870 of `savedata.bin` (the block from 0x2844, whose first word is its
+checksum: the byte sum of everything after it; 0x286C holds the same value and is not the one read). (`advsng_5.adx` is
+HOW TO PLAY's music, not the 5-hour item's, as this section said before.) `sub_82121768` picks `interview_jp.wmv`
+(0x820E8C30) or `interview.wmv` (0x820E8C44) by a language byte and starts SA2's player (`sub_82120D68`) on Microsoft's
+XMedia2 (0x8256xxxx-0x825Dxxxx). SA2's own code has no WMV or WMA decoder: XMedia2 takes them from the 360's "optional
+media update" (`CodecPack02`, `CodecPackLoaderRoot`).
+
+**1.0.6 (and this branch before 5e0e8d41) stops when the item is chosen**, files present or not (2026-11-22, PC, a copy
+of the save with 5 h): XMedia2's setup (`sub_8256F830`) treats the SDK's bare stub `XamGetDashBackstackData`'s r3 (its
+own argument, a guest address, so a negative HRESULT) as a failure and keeps it in 0x82989138; the player's creation
+(`sub_82571408`) then writes a null player and returns that failure, and SA2 never checks: it calls the null player's
+method 11 (`[census] indirect call to 00000000 from sub_82120D68 (site 00000002)`, then the SDK's FATAL). 1.0.6 has the
+same stub; not run on 1.0.6 itself.
+
+**The port plays them now** (`app/src/sa2_interviews.cpp`, from 5e0e8d41; its header has the whole map of SA2's
+interview code): XMedia2's entry points hooked, a player of our own in guest memory whose methods are XMedia2 functions
+nothing calls any more; the ASF read here; H.265 (the installer's) or WMV3 (the original) by nxvideo on the Switch
+(`sa2_hevc_nvdec`: NVDEC, or software in an emulator) or WMV3 by the SDK's FFmpeg on the PC (pictures skipped while
+behind: its WMV3 has no assembly and one thread); 1280x720 ARGB in three linear textures that SA2's own code draws, its
+subtitles over them; WMA Pro by the SDK's FFmpeg through an audio render client of its own, the video's clock. B skips
+(SA2's own check); a file that does not open ends at once (back to the menu).
 
 ## The user's orders (2026-11-21)
 
@@ -153,3 +169,12 @@ is perceptual: its full-band waveform SNR is 15-20 dB at any rate, so that numbe
   the units: the zip above is 1,222,462,113 bytes, 1,166 MB in the 2,400 MB's units (MiB). Browser test with
   `?leave_out=interviews`: 970,480,872 bytes (926 MB) in 260 s (517 s with them); check_zip OK. Not checked: what the
   game does when the interviews' menu item is chosen with the files absent (1.0.6 never played them either).
+- 2026-11-22 (the user: "Try editing save to unlock interviews and test on pc snd emulstor and see what code path
+  happens", then "Why does it crash in xmedia", then "Yeah lets do 2"): the save's play time (0x2870, checksum at
+  0x2844; out/save_copies, the copy in out/pc_user_interview) unlocks BONUS VIDEO; the crash traced (above) with
+  `--banjo_diag_indirect_census`; the native player (5e0e8d41). PC runs out/pc_runs/interview_native7-8, interview_skip1,
+  interview_replay1: the interview shown (colours and orientation right), sound in time, B back to the menu, played
+  again. Found on the way: the renderer's format table address was wrong for SA2 (now 0x820013C8) and the SDK's FFmpeg
+  had no WMV3 (config.h now includes config_masseffect_wmv3.h). Scripted menus on the PC need `--headless=true` (the
+  autosave message box); START on the file select toggles its WARNING dialog, B closes it and does nothing on the file
+  select (the emulator route: STARTs across the title's window, then B, B, A, LEFT, A).
