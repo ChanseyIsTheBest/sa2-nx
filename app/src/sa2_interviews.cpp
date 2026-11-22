@@ -225,6 +225,7 @@ struct Player {
 
   // counts for the log
   uint64_t video_objects = 0, audio_objects = 0, video_decoded = 0, video_failed = 0, audio_frames = 0;
+  uint64_t video_skipped = 0;  // pictures passed over to catch up with the sound (nxvideo)
   std::chrono::steady_clock::time_point last_log{};
   std::string video_kind;
 };
@@ -871,8 +872,59 @@ void WorkerMain() {
   std::vector<Object> objects;
   uint64_t next_packet = 0;
   const size_t audio_target = size_t(info.audio.rate ? info.audio.rate : 48000) * 2;  // two seconds
+  auto read_packet = [&] {  // the next packet's objects: video kept compressed, sound decoded at once
+    if (next_packet >= info.packets ||
+        !r.Read(info.data_offset + next_packet * info.packet_size, packet.data(), packet.size())) {
+      DecodeVideo(pl, vd, nullptr);
+      pl.eof = true;
+      return;
+    }
+    ++next_packet;
+    objects.clear();
+    ParsePacket(packet.data(), info.packet_size, parts, objects);
+    for (Object& o : objects) {
+      if (o.stream == info.video.number) {
+        ++pl.video_objects;
+        std::lock_guard lock(pl.mutex);
+        pl.video_in.push_back(std::move(o));
+      } else if (pl.has_audio && o.stream == info.audio.number) {
+        ++pl.audio_objects;
+        DecodeAudio(pl, ad, o);
+      }
+    }
+  };
+  auto levels = [&](size_t& audio_have, size_t& video_waiting) {
+    std::lock_guard lock(pl.mutex);
+    audio_have = pl.ring_count;
+    video_waiting = pl.video_in.size();
+  };
   while (!pl.quit) {
     bool progress = false;
+    size_t audio_have, video_waiting;
+    // the sound first: a slow picture decoder must not starve the clock (2026-11-22, Ryujinx: nxvideo's software H.265
+    // at 1080p took most of a second a picture, the reading waited behind it and the sound ran dry, 0.0 s buffered)
+    for (int n = 0; n < 64 && !pl.eof && pl.has_audio; ++n) {
+      levels(audio_have, video_waiting);
+      if (audio_have >= audio_target / 2 || video_waiting > 900)
+        break;
+      read_packet();
+      progress = true;
+    }
+    // nxvideo far behind the sound (no frame skipping of its own): on to the next keyframe
+    if (vd.nxv_used || vd.hevc) {
+      const int64_t newest = pl.newest_decoded.load();
+      if (newest >= 0 && pl.clock_now.load() - newest > 1000) {
+        std::lock_guard lock(pl.mutex);
+        size_t k = 1;
+        while (k < pl.video_in.size() && !pl.video_in[k].key)
+          ++k;
+        if (k < pl.video_in.size()) {
+          pl.video_skipped += k;
+          pl.newest_decoded = int64_t(pl.video_in[k].pts) - int64_t(info.preroll_ms);
+          pl.video_in.erase(pl.video_in.begin(), pl.video_in.begin() + std::ptrdiff_t(k));
+        }
+      }
+    }
     // a picture, when there is room for one
     Object* next = nullptr;
     {
@@ -890,32 +942,9 @@ void WorkerMain() {
       progress = true;
     }
     // more of the file, while the sound is short or no picture waits
-    size_t audio_have, video_waiting;
-    {
-      std::lock_guard lock(pl.mutex);
-      audio_have = pl.ring_count;
-      video_waiting = pl.video_in.size();
-    }
+    levels(audio_have, video_waiting);
     if (!pl.eof && ((pl.has_audio && audio_have < audio_target) || video_waiting < 4)) {
-      if (next_packet >= info.packets || !r.Read(info.data_offset + next_packet * info.packet_size, packet.data(),
-                                                 packet.size())) {
-        DecodeVideo(pl, vd, nullptr);
-        pl.eof = true;
-      } else {
-        ++next_packet;
-        objects.clear();
-        ParsePacket(packet.data(), info.packet_size, parts, objects);
-        for (Object& o : objects) {
-          if (o.stream == info.video.number) {
-            ++pl.video_objects;
-            std::lock_guard lock(pl.mutex);
-            pl.video_in.push_back(std::move(o));
-          } else if (pl.has_audio && o.stream == info.audio.number) {
-            ++pl.audio_objects;
-            DecodeAudio(pl, ad, o);
-          }
-        }
-      }
+      read_packet();
       progress = true;
     }
     if (!progress) {
@@ -994,10 +1023,10 @@ uint32_t ShowFrame(uint8_t* base) {
       std::chrono::steady_clock::now() - pl.last_log > std::chrono::seconds(10)) {
     pl.last_log = std::chrono::steady_clock::now();
     std::lock_guard lock(pl.mutex);
-    REXLOG_INFO("[interview] {:.1f} s: {} pictures shown (the last {} ms), {} decoded of {} read ({} failed), {} "
-                "waiting; sound {:.1f} s played, {:.1f} s buffered",
+    REXLOG_INFO("[interview] {:.1f} s: {} pictures shown (the last {} ms), {} decoded of {} read ({} failed, {} skipped), "
+                "{} waiting; sound {:.1f} s played, {:.1f} s buffered",
                 now / 1000.0, pl.frames_shown, pl.shown_pts, pl.video_decoded, pl.video_objects, pl.video_failed,
-                pl.video_in.size(), double(pl.samples_played.load()) / (pl.info.audio.rate ? pl.info.audio.rate : 48000),
+                pl.video_skipped, pl.video_in.size(), double(pl.samples_played.load()) / (pl.info.audio.rate ? pl.info.audio.rate : 48000),
                 double(pl.ring_count) / (pl.info.audio.rate ? pl.info.audio.rate : 48000));
   }
   return pl.texture_shown;
@@ -1057,7 +1086,7 @@ void ResetPlayer() {
   pl.clock_ms = 0;
   pl.clock_now = 0;
   pl.newest_decoded = -1;
-  pl.video_objects = pl.audio_objects = pl.video_decoded = pl.video_failed = pl.audio_frames = 0;
+  pl.video_objects = pl.audio_objects = pl.video_decoded = pl.video_failed = pl.audio_frames = pl.video_skipped = 0;
   pl.video_kind.clear();
 }
 
