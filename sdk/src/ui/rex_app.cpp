@@ -359,7 +359,11 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
     std::string host_tail{tail};
     std::replace(host_tail.begin(), host_tail.end(), '\\', '/');
     auto xex_host = paths.game_data_root / host_tail;
-    if (!std::filesystem::is_regular_file(xex_host)) {
+    // Through the mounted file system, not the host folder: with the asset cache the XEX is inside the pack.
+    // (sa2-nx 1.0.6's line, lost in the rebase on the ultimate base; restored 2026-11-24: the console's start with
+    // only game_root.nxpack on the card ended here, "Entrypoint XEX not found", and went back to the menu.)
+    if (!std::filesystem::is_regular_file(xex_host) &&
+        !(runtime_->file_system() && runtime_->file_system()->ResolvePath(xex_image))) {
       auto msg = fmt::format("Entrypoint XEX not found: {}", xex_host.string());
       REXLOG_ERROR("{}", msg);
       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
