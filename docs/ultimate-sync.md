@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | The base | renut_nx_ultimate_base, branch `ultimate` (D:\renut-ultimate\base) |
-| The base commit this branch is at | **9da84f9b87ab91c25aa0e9510188d3c605e08f6e** (2026-11-23 11:16, "docs: port 263 (sasrt_gpu_seed_cpu_direct off)"; ports 1-263); before it f70d05a4 (2026-11-20, ports 1-235; branch `ultimate-at-f70d05a4`); first taken at 73b7b7315be117d4c4a84f298dfa411e681c9b8a (2026-11-19 10:15, "docs: port 189"; ports 1-189) |
+| The base commit this branch is at | **5a35671b** (2026-11-23 17:11, "docs: port 264 (the VFS index's two sizes)"; ports 1-264); before it 9da84f9b (2026-11-23, ports 1-263; branch `ultimate-at-9da84f9b`), f70d05a4 (2026-11-20, ports 1-235; branch `ultimate-at-f70d05a4`); first taken at 73b7b7315be117d4c4a84f298dfa411e681c9b8a (2026-11-19 10:15, "docs: port 189"; ports 1-189) |
 | How it was taken | the base's whole tree as one commit (e2099f33, "The ultimate base at 73b7b731"), byte for byte, then Katamari's layer out and SA2's layer on top (docs/ultimate-rebase-plan.md) |
 
 ## Taking the base's later ports
@@ -11,7 +11,7 @@
 The base's later ports come in with its sync tool (docs/building.md section 7), from the commit above:
 
 ```
-python tools/ult_port_sync.py --base D:\renut-ultimate\base --port "D:\sonic adventure 2\sa2-nx-ult" --range 9da84f9b..<base commit> --dry-run
+python tools/ult_port_sync.py --base D:\renut-ultimate\base --port "D:\sonic adventure 2\sa2-nx-ult" --range 5a35671b..<base commit> --dry-run
 ```
 
 then without `--dry-run`, the conflicts by hand, a build and the tests. After a sync, change the commit in the table
@@ -35,6 +35,19 @@ What the sync must leave to a hand port in this tree (SA2 keeps its own form of 
 | 2026-11-20 | 764410eb | ports 223-234 (banjo-nx's, from its own rebase) with `--range 2f590c31..764410eb`: 28 files merged cleanly, 8 new tools, 2 conflicts (`app/CMakeLists.txt`: port 231's no-trapping-math condition in SA2's loop over both modules; `tools/deko3d_variant_cache.py`: SA2's `--uam` beside port 232's `--round-guess`); `tools/run_pc.ps1`'s argument quoting now port 225's (the same line sa2-nx-ult had added) |
 | 2026-11-20 | f70d05a4 | port 234's follow-up (banjo-nx's b830247a: a draw's shader compile no longer waits behind a prebuild's blocking compile during the compiler's rest, up to 60 s; `Deko3DHurryCompiles`) and port 235 (three analysis tools) with `--range 764410eb..f70d05a4`: 4 files merged cleanly, 2 new. SA2 compiles shaders at run time on the console (its DKSH cache covers the attract sequence only), so the packages of 11:30 / 11:59 were rebuilt with it. Checks: the PC's 750 attract frames identical, no DIFFERENCE line; the emulator's demo block for block as before (265 of 2,259); packages `2026-11-20_1210_rebase_test4` and the instrumented one of the same tree |
 | 2026-11-23 | 9da84f9b | ports 236-263 (banjo-nx's render-thread rounds and command stage, sasrt-nx's rounds 2-4 and handoff base_1122, rr6-nx's dynamic resolution switches, the Cave ports' GPU boost fix) in five steps (`--range f70d05a4..b73aea69`, then `..7754b5a6`, `..5b67c75b`, `..818f3b09` and `..9da84f9b`; the dry run's conflicts in 236-258 were knock-on ones: each step merged cleanly), every other file merged cleanly; ports 252 and 254 change only Katamari's tomls and tools; port 259 (the smaller game files in the SDK: the same rr6-nx / culdcept-nx files this tree had taken on 2026-11-21) with 10 conflicts, files both sides had added: the base's `opus_decoder.*` and `host_path_index.cpp`, SA2's `sfd_hevc.*` (the base's plus the pack device's readers), the base's `host_path_entry.*`, `host_path_device.cpp` and `src/filesystem/CMakeLists.txt` with SA2's NAME.adxo and pack device sources, the base's nxvideo library (`RENUT_NXVIDEO`, in place of SA2's `SA2_NXVIDEO` copy of the same object) |
+| 2026-11-24 | 5a35671b | port 264 (the VFS index keeps a stand-in's SD size: culdcept-nx's two-size index, version 4) with `--range 9da84f9b..5a35671b`: `host_path_index.cpp` merged cleanly; 2 conflicts in `host_path_entry.h/.cpp`, SA2's NAME.adxo beside the port's fields: its check now on a scan only, as the others', and NAME.adxo is index kind 32 (`kIndexAdxOpus`; the reader takes kinds up to 63, `kIndexKindsAll`) |
+
+Port 264 and SA2 (2026-11-24):
+
+- **Why it matters here:** the installer's SA2 folder is all stand-ins (3,519 .lz4b, 31 .hevc.lz4b, 157 .adxo), so
+  with the index of versions 1-2 every start scanned every file again (headers read).
+- **The checks:** the PC on the installer's folder (`out/pc_runs/index264_pc1`, `_pc2`): the old index rejected
+  ("another version"), 3,881 entries scanned in 40.7 s and the index written; the second start 3,881 entries from
+  the index in 49.8 ms, title.adx again an .adxo (as Opus). Ryujinx on the same folder (`emu_index264_1`, `_2`,
+  `out/emu_tomls/ult_index.toml`): the scan 204.7 s, the index written (361 ms); the next start 788 ms from the
+  index; both played the music from Opus (title, btl_opng, btl_hb, m_space, T9_SONIC) and the logo movie from
+  H.265 (op360us.sfd.hevc), 0 errors. The PC's 750 attract frames of 1.0.6 identical (`out/lockstep/port264_attract1`).
+  Packaged: `out\packages\2026-11-24_port264` (NRO 02c4b933), copied to the console over FTP (MD5 checked).
 
 Ports 236-263 and SA2 (2026-11-23):
 
