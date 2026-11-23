@@ -27,6 +27,9 @@ renut_gpu_profile = 0.0
 banjo_renut_render_height_handheld = 720
 banjo_renut_render_height_docked = 1080
 banjo_renut_display_height_docked = 1080
+# Fixed in both modes, as 1.0.6: the base's port 255 turned docked dynamic resolution on by default (972p-1080p, the
+# user's order to rr6-nx); SA2 keeps 1.0.6's picture by default (handheld stays the base's default, off).
+banjo_renut_dynamic_resolution_docked = false
 # The game's own 8-bit post buffers, as on the Xbox 360 (1.0.6; the base's "High" changes the picture).
 renut_post_process_precision = "Game"
 # The game's own sample counts (msaa_level 4: the base only lowers a count, so 4 changes nothing). SA2 makes its render
