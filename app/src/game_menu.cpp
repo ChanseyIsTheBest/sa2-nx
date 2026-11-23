@@ -412,7 +412,16 @@ std::vector<Setting> MakeSettings(const std::string& file) {
   // (banjo_renut_smaa = false in app/sa2_switch_defaults.toml: it would do nothing until SA2's composite shader is
   // listed), so the row was an option that changed nothing.
   // add(T_SMAA, "banjo_renut_smaa", false, on_off(), 0, Tr(H_SMAA));
-  add(T_MSAA, "msaa_level", false, {C(Tr(C_OFF), "1", "1"), C("2x", "2", "2"), C("4x", "4", "4")}, 0, Tr(H_MSAA));
+  // sa2-nx-ult (2026-11-24, the user: "MSAA doesn't appear to be working", "SA2 used to support MSAA before the
+  // rebase"): SA2's MSAA row sets sa2-nx 1.0.6's sa2_renut_msaa (the game's single-sample targets multisampled:
+  // surfaces.cpp BuildTarget), read at start, so it takes effect at the next start. The base's msaa_level only lowers
+  // the samples of the targets a game makes with MSAA; SA2 makes none (its 4x fast Clear aliases stay at 4, its
+  // default), so that row changed nothing.
+  // add(T_MSAA, "msaa_level", false, {C(Tr(C_OFF), "1", "1"), C("2x", "2", "2"), C("4x", "4", "4")}, 0, Tr(H_MSAA));
+  add(T_MSAA, "sa2_renut_msaa", true,
+      {C(Tr(C_OFF), "0", "0"), C("2x", "2", "2"), C("4x", "4", "4"), C("8x", "8", "8")}, 0,
+      "Smoother edges on the game's 3D image (2x, 4x or 8x samples). Each step costs GPU and CPU time and can lower the "
+      "frame rate. Takes effect at the next start.");
   // blur-nx (2026-11-18, the user: "make 4 core mode an option ... on by default and a warning that it is highly
   // reccomended to be left on").
   add(T_FOURCORE, "four_core_mode", true, on_off(), 0, Tr(H_FOURCORE));

@@ -37,6 +37,9 @@
 #include <threading_switch.h>  // sasrt-nx (2026-11-09; port 58): RexSwitchReleaseSpareStacks (the governor)
 #endif
 
+// sa2-nx-ult (2026-11-24): 1.0.6's MSAA of the game's single-sample targets (app/src/sa2_keys.cpp; BuildTarget below).
+REXCVAR_DECLARE(int32_t, sa2_renut_msaa);
+
 // renut-ultimate (2026-11-16, port 145; tw2de_nx's of 2026-10-22, ON at the user's word: "port the speed ups as on by default").
 // Port 174 (from rehatched-nx): see CapturedHeaderVa. Accuracy, so off by default; a game that re-points headers turns it
 // on in its toml, with banjo_renut_chain_reuse and banjo_deko3d_scanout_handover off (both read the live header:
@@ -311,6 +314,25 @@ bool BuildTarget(HostSurface &surface, const d3d::SurfaceDesc &desc, uint32_t mi
   if (const uint32_t want = g_msaa_latched ? g_msaa_latched : banjo::renut_gpu::MsaaLevel();
       uint32_t(surface.samples) > want)
     surface.samples = want == 2 ? plume::RenderSampleCount::COUNT_2 : plume::RenderSampleCount::COUNT_1;
+  // sa2-nx-ult (2026-11-24, the user: "SA2 used to support MSAA before the rebase"): sa2-nx 1.0.6's sa2_renut_msaa
+  // (its surfaces.cpp of 2026-10-20, the user's "MSAA for the final build"; off by default since 1.0.3.1). SA2 makes
+  // every render target single-sample, so msaa_level (above) has nothing to act on; this gives the game's
+  // single-sample targets 2, 4 or 8 samples on the host, and the game's resolves downsample them (the resolve paths
+  // go by the host target's samples). Its 4x surfaces (Direct3D's fast Clear aliases) stay as above. After the
+  // lowering, so msaa_level never takes the raised count back; 0 (the default) changes nothing.
+  if (SampleCount(surface.info_word) == plume::RenderSampleCount::COUNT_1) {
+    static const plume::RenderSampleCounts forced = [] {
+      const int32_t n = REXCVAR_GET(sa2_renut_msaa);
+      const auto c = n >= 8   ? plume::RenderSampleCounts(plume::RenderSampleCount::COUNT_8)
+                     : n >= 4 ? plume::RenderSampleCounts(plume::RenderSampleCount::COUNT_4)
+                     : n >= 2 ? plume::RenderSampleCounts(plume::RenderSampleCount::COUNT_2)
+                              : plume::RenderSampleCounts(plume::RenderSampleCount::COUNT_1);
+      if (c != plume::RenderSampleCount::COUNT_1)
+        RGPU_INFO("[sa2] MSAA {}x on the game's single-sample render targets (sa2_renut_msaa)", u32(c));
+      return c;
+    }();
+    surface.samples = forced;
+  }
   if (surface.depth) {
     surface.format = DepthTargetFormat(surface.format_word);  // banjo-nx (2026-10-19, banjo_deko3d_depth24)
     if (banjo::renut_gpu::Depth24On()) {
