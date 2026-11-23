@@ -14,6 +14,14 @@
  *                    ('/'-separated, relative to the folder).
  *   Checksums are 64-bit FNV-1a: the index one covers the entries and the paths, the data one every file byte.
  * tools/build_asset_pack.py writes the same files on a PC; PackDevice::Build writes them on the console.
+ *
+ * sa2-nx-ult (2026-11-24, the user: the web installer to build game_root.nxpack and .nxidx): version 3, the same but
+ * for a 32-byte DiskEntry (version 2's 24 bytes and a u64 guest size: the size the game sees). It holds the web
+ * installer's stand-ins as they are: NAME.lz4b (LZ4 / ZXC blocks, rex/filesystem/lz4_blocks.h) for NAME,
+ * NAME.hevc.lz4b and NAME.hevc (a movie as H.265) and NAME.adxo (ADX as Opus) for NAME, each with NAME's size in the
+ * index, so a mount reads no stand-in's header. Version 2 (1.0.6's installer and Build before) still loads: its
+ * .hevc / .adxo entries take their size from their headers, and a version-2 pack holding .lz4b entries is not used.
+ * The web installer (sa2-nx-ult-installer lib/nxpack.js) and PackDevice::Build write version 3.
  */
 
 #pragma once
@@ -57,6 +65,9 @@ class PackEntry : public Entry {
   bool sfd_hevc() const { return sfd_hevc_; }
   // The same for NAME.adxo (rex/filesystem/adx_opus.h, ADX streams as Opus).
   bool adx_opus() const { return adx_opus_; }
+  // sa2-nx-ult (2026-11-24): the stored bytes are NAME.lz4b (LZ4 / ZXC blocks) of NAME, or with sfd_hevc() of
+  // NAME.hevc (NAME.hevc.lz4b); read through OpenLz4Blocks.
+  bool lz4_blocks() const { return lz4_blocks_; }
   uint64_t stored_size() const { return stored_size_; }
 
  private:
@@ -65,6 +76,7 @@ class PackEntry : public Entry {
   uint64_t data_offset_ = 0;
   bool sfd_hevc_ = false;
   bool adx_opus_ = false;
+  bool lz4_blocks_ = false;
   uint64_t stored_size_ = 0;
 };
 

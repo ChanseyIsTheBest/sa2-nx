@@ -43,5 +43,8 @@ bool ReadLz4BlocksSize(const std::filesystem::path& path, uint64_t* out_size);
 
 // A handle that reads the file `packed` holds, or nullptr when `packed` is not a valid .lz4b file (logged).
 std::unique_ptr<FileHandle> OpenLz4Blocks(std::unique_ptr<FileHandle> packed);
+// sa2-nx-ult (2026-11-24): the same for a handle that is not a host file of its own (an entry of the asset pack,
+// rex/filesystem/devices/pack_device.h): its size is given, not taken from the host path.
+std::unique_ptr<FileHandle> OpenLz4Blocks(std::unique_ptr<FileHandle> packed, uint64_t packed_size);
 
 }  // namespace rex::filesystem

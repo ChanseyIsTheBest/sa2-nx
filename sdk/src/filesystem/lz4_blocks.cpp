@@ -316,9 +316,22 @@ bool ReadLz4BlocksSize(const std::filesystem::path& path, uint64_t* out_size) {
 
 std::unique_ptr<FileHandle> OpenLz4Blocks(std::unique_ptr<FileHandle> packed) {
   if (!packed) return nullptr;
-  const std::filesystem::path path = packed->path();
   FileInfo info;
-  if (!GetInfo(path, &info) || info.total_size < kHeaderSize + kFooterSize) {
+  if (!GetInfo(packed->path(), &info)) {
+    LogBad(packed->path(), "too short to be an .lz4b file");
+    return nullptr;
+  }
+  return OpenLz4Blocks(std::move(packed), info.total_size);
+}
+
+// sa2-nx-ult (2026-11-24): the size given (an asset pack's entry has no host file of its own).
+std::unique_ptr<FileHandle> OpenLz4Blocks(std::unique_ptr<FileHandle> packed, uint64_t packed_size) {
+  if (!packed) return nullptr;
+  const std::filesystem::path path = packed->path();
+  struct {
+    uint64_t total_size;
+  } info{packed_size};
+  if (info.total_size < kHeaderSize + kFooterSize) {
     LogBad(path, "too short to be an .lz4b file");
     return nullptr;
   }

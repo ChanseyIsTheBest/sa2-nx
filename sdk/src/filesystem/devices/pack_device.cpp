@@ -33,20 +33,69 @@ namespace rex::filesystem {
 
 namespace {
 
-constexpr uint32_t kPackVersion = 2;
+// sa2-nx-ult (2026-11-24): version 3 (pack_device.h), what Build and the web installer write; 2 still loads.
+constexpr uint32_t kPackVersion = 3;
+constexpr uint32_t kPackVersionOld = 2;
 constexpr uint32_t kMaxEntries = 100000;
 constexpr uint64_t kMaxPathsSize = 64ull << 20;
 constexpr size_t kCacheSize = 64 * 1024;       // asset_pack.c PACK_CACHE_SIZE
 constexpr size_t kChunk = 1 << 20;             // big reads go in 1 MB pieces, so other readers interleave
 constexpr uint64_t kFnvBasis = 1469598103934665603ULL;
 
-// sa2-nx-ult (2026-11-24): the web installer's stand-ins that a pack cannot serve: NAME.lz4b (and NAME.hevc.lz4b),
-// NAME.opcm, NAME.xmo, NAME.xmop (the host path device reads them; a pack only knows NAME.hevc and NAME.adxo). The
-// first boot used to pack such a folder file for file, and the game then found none of its files (the console's
-// crash of 2026-11-24 at boot: 3,550 .lz4b entries in game_root.nxpack). Since base port 264 the folder itself starts
-// fast from its VFS index, so a folder with any of them is never packed, and a pack holding any is not used.
-bool UnservedStandIn(std::string_view path) {
-  return HasLz4BlocksSuffix(path) || HasOpusPcmSuffix(path) || HasXmoSuffix(path) || HasXmopSuffix(path);
+// sa2-nx-ult (2026-11-24): the stand-ins a pack does not serve: NAME.opcm, NAME.xmo, NAME.xmop, packed as .lz4b or
+// not (the host path device reads them; SA2 has none). A folder holding any is never packed, and a pack holding any
+// is not used (the folder is mounted). Before version 3 NAME.lz4b was one of them: the first boot packed the web
+// installer's folder file for file, and the game then found none of its files (the console's crash of 2026-11-24 at
+// boot: 3,550 .lz4b entries in a version-2 game_root.nxpack); such a pack is still not used (Initialize).
+bool NeverInPack(std::string_view path) {
+  if (HasLz4BlocksSuffix(path)) path.remove_suffix(kLz4BlocksSuffix.size());
+  return HasOpusPcmSuffix(path) || HasXmoSuffix(path) || HasXmopSuffix(path);
+}
+
+// What an entry of the pack stands for: NAME.lz4b, NAME.hevc[.lz4b] or NAME.adxo[.lz4b] for NAME (`plain`).
+struct StandIn {
+  bool lz4 = false, hevc = false, adxo = false;
+  std::string plain;  // the guest's name (the path without the suffixes); the path itself for a plain file
+  bool any() const { return lz4 || hevc || adxo; }
+};
+StandIn StandInOf(std::string_view path) {
+  StandIn s;
+  std::string_view n = path;
+  if (HasLz4BlocksSuffix(n)) {
+    s.lz4 = true;
+    n.remove_suffix(kLz4BlocksSuffix.size());
+  }
+  if (HasSfdHevcSuffix(n)) {
+    s.hevc = true;
+    n.remove_suffix(kSfdHevcSuffix.size());
+  } else if (HasAdxOpusSuffix(n)) {
+    s.adxo = true;
+    n.remove_suffix(kAdxOpusSuffix.size());
+  }
+  s.plain = std::string(n);
+  return s;
+}
+
+// The size of the file an .lz4b holds, from its 32-byte header ("RXLZ4BLK", version, block size, u64 size).
+bool Lz4BlocksSizeFromHeader(const uint8_t* h, uint64_t* out_size) {
+  if (std::memcmp(h, "RXLZ4BLK", 8) != 0) return false;
+  std::memcpy(out_size, h + 16, sizeof(*out_size));
+  return true;
+}
+
+// Build: the size the game sees of a host file that is a stand-in (StandInOf), from its header (through
+// OpenLz4Blocks for NAME.hevc.lz4b / NAME.adxo.lz4b). False if it is not a valid one.
+bool GuestSizeOf(const std::filesystem::path& source, const StandIn& s, uint64_t* out_size) {
+  if (!s.hevc && !s.adxo) return ReadLz4BlocksSize(source, out_size);  // a plain NAME.lz4b
+  auto handle = FileHandle::OpenExisting(source, FileAccess::kFileReadData);
+  if (handle && s.lz4) handle = OpenLz4Blocks(std::move(handle));
+  if (!handle) return false;
+  uint8_t header[kSfdHevcHeaderBytes];
+  static_assert(kSfdHevcHeaderBytes >= kAdxOpusHeaderBytes);
+  const size_t want = s.hevc ? kSfdHevcHeaderBytes : kAdxOpusHeaderBytes;
+  size_t got = 0;
+  if (!handle->Read(0, header, want, &got) || got != want) return false;
+  return s.hevc ? SfdHevcSizeFromHeader(header, want, out_size) : AdxOpusSizeFromHeader(header, want, out_size);
 }
 
 struct PackHeader {
@@ -73,9 +122,18 @@ struct DiskEntry {
   uint32_t path_offset;
   uint32_t path_length;
 };
+// sa2-nx-ult (2026-11-24): version 3's entry, version 2's and the size the game sees.
+struct DiskEntry3 {
+  uint64_t offset;
+  uint64_t size;
+  uint32_t path_offset;
+  uint32_t path_length;
+  uint64_t guest_size;
+};
 static_assert(sizeof(PackHeader) == 40, "asset_pack.c PackHeader layout");
 static_assert(sizeof(IndexHeader) == 56, "asset_pack.c IndexHeader layout");
 static_assert(sizeof(DiskEntry) == 24, "asset_pack.c DiskEntry layout");
+static_assert(sizeof(DiskEntry3) == 32, "version 3's DiskEntry layout");
 
 uint64_t Fnv(uint64_t hash, const void* data, size_t size) {
   const auto* bytes = static_cast<const uint8_t*>(data);
@@ -137,6 +195,7 @@ struct LoadedIndex {
   IndexHeader header{};
   std::vector<DiskEntry> entries;
   std::vector<char> paths;
+  std::vector<uint64_t> guest_sizes;  // sa2-nx-ult: version 3's, one per entry (empty for version 2)
 };
 
 // asset_pack.c load_pair: the pack header and the index must come from one run of the packer, the index checksum
@@ -157,7 +216,8 @@ bool LoadIndex(const std::filesystem::path& pack_path, const std::filesystem::pa
   if (!f) return *error = "the asset index cannot be opened", false;
   IndexHeader& h = out->header;
   bool ok = pack_read && std::fread(&h, sizeof(h), 1, f) == 1 && !std::memcmp(pack.magic, "SSNXPAK1", 8) &&
-            !std::memcmp(h.magic, "SSNXIDX1", 8) && pack.version == kPackVersion && h.version == kPackVersion &&
+            !std::memcmp(h.magic, "SSNXIDX1", 8) &&
+            (pack.version == kPackVersion || pack.version == kPackVersionOld) && h.version == pack.version &&
             pack.pack_id == h.pack_id && pack.file_size == pack_size && pack.data_checksum == h.data_checksum &&
             h.pack_size == pack_size && h.count && h.count <= kMaxEntries && h.paths_size &&
             h.paths_size <= kMaxPathsSize;
@@ -165,20 +225,34 @@ bool LoadIndex(const std::filesystem::path& pack_path, const std::filesystem::pa
     std::fclose(f);
     return *error = "the asset pack header is invalid", false;
   }
-  const uint64_t entries_size = uint64_t(h.count) * sizeof(DiskEntry);
+  const bool v3 = h.version == kPackVersion;  // sa2-nx-ult (2026-11-24): 32-byte entries with the guest's size
+  const size_t entry_bytes = v3 ? sizeof(DiskEntry3) : sizeof(DiskEntry);
+  const uint64_t entries_size = uint64_t(h.count) * entry_bytes;
   if (sizeof(IndexHeader) + entries_size + h.paths_size != index_size) {
     std::fclose(f);
     return *error = "the asset index size is invalid", false;
   }
-  out->entries.resize(h.count);
+  std::vector<uint8_t> raw(static_cast<size_t>(entries_size));
   out->paths.resize(size_t(h.paths_size));
-  ok = std::fread(out->entries.data(), 1, size_t(entries_size), f) == entries_size &&
+  ok = std::fread(raw.data(), 1, raw.size(), f) == raw.size() &&
        std::fread(out->paths.data(), 1, out->paths.size(), f) == out->paths.size();
   std::fclose(f);
   if (!ok) return *error = "the asset index cannot be read", false;
-  uint64_t checksum = Fnv(kFnvBasis, out->entries.data(), size_t(entries_size));
+  uint64_t checksum = Fnv(kFnvBasis, raw.data(), raw.size());
   checksum = Fnv(checksum, out->paths.data(), out->paths.size());
   if (checksum != h.checksum) return *error = "the asset index checksum is invalid", false;
+  out->entries.resize(h.count);
+  if (v3) {
+    out->guest_sizes.resize(h.count);
+    for (uint32_t i = 0; i < h.count; ++i) {
+      DiskEntry3 e3;
+      std::memcpy(&e3, raw.data() + size_t(i) * sizeof(DiskEntry3), sizeof(e3));
+      out->entries[i] = {e3.offset, e3.size, e3.path_offset, e3.path_length};
+      out->guest_sizes[i] = e3.guest_size;
+    }
+  } else {
+    std::memcpy(out->entries.data(), raw.data(), raw.size());
+  }
   for (uint32_t i = 0; i < h.count; ++i) {
     const DiskEntry& e = out->entries[i];
     const uint64_t path_end = uint64_t(e.path_offset) + e.path_length + 1;
@@ -267,14 +341,39 @@ X_STATUS PackEntry::Open(uint32_t desired_access, File** out_file) {
     REXFS_ERROR("Attempting to open {} for write access on the read-only asset pack", path());
     return X_STATUS_ACCESS_DENIED;
   }
-  if (sfd_hevc_ || adx_opus_) {  // sa2-nx-ult (2026-11-21): the file made from the stored NAME.hevc / NAME.adxo
+  if (sfd_hevc_ || adx_opus_ || lz4_blocks_) {
+    // sa2-nx-ult (2026-11-21): the file made from the stored NAME.hevc / NAME.adxo; (2026-11-24) and from a stored
+    // NAME.lz4b (LZ4 / ZXC blocks) of NAME, of NAME.hevc or of NAME.adxo, through OpenLz4Blocks.
     PackStorage* storage = pack_->storage();
-    const std::filesystem::path name =
-        rex::to_path(std::string(path()) + std::string(sfd_hevc_ ? kSfdHevcSuffix : kAdxOpusSuffix));
-    auto first = std::make_unique<PackRangeHandle>(storage, data_offset_, stored_size_, name);
-    auto second = std::make_unique<PackRangeHandle>(storage, data_offset_, stored_size_, name);
-    auto handle = sfd_hevc_ ? OpenSfdHevcFrom(std::move(first), std::move(second), stored_size_)
-                            : OpenAdxOpusFrom(std::move(first), std::move(second), stored_size_);  // logs why not
+    std::string stored_name(path());
+    if (sfd_hevc_) stored_name += kSfdHevcSuffix;
+    if (adx_opus_) stored_name += kAdxOpusSuffix;
+    if (lz4_blocks_) stored_name += kLz4BlocksSuffix;
+    const std::filesystem::path name = rex::to_path(stored_name);
+    const auto range = [&]() -> std::unique_ptr<FileHandle> {
+      auto handle = std::make_unique<PackRangeHandle>(storage, data_offset_, stored_size_, name);
+      if (!lz4_blocks_) return handle;
+      return OpenLz4Blocks(std::move(handle), stored_size_);  // nullptr (logged) when not an .lz4b
+    };
+    std::unique_ptr<FileHandle> handle;
+    if (sfd_hevc_ || adx_opus_) {
+      // the stand-in's own size (the NAME.hevc / NAME.adxo bytes): the .lz4b's content size when it is packed
+      uint64_t inner_size = stored_size_;
+      uint8_t header[32];
+      if (lz4_blocks_ && !(stored_size_ >= sizeof(header) && storage->ReadAt(data_offset_, header, sizeof(header)) &&
+                           Lz4BlocksSizeFromHeader(header, &inner_size))) {
+        REXFS_ERROR("[pack] {}: not a valid .lz4b", stored_name);
+        return X_STATUS_NO_SUCH_FILE;
+      }
+      auto first = range();
+      auto second = range();
+      if (first && second) {
+        handle = sfd_hevc_ ? OpenSfdHevcFrom(std::move(first), std::move(second), inner_size)
+                           : OpenAdxOpusFrom(std::move(first), std::move(second), inner_size);  // logs why not
+      }
+    } else {
+      handle = range();
+    }
     if (!handle) return X_STATUS_NO_SUCH_FILE;
     *out_file = new PackHandleFile(desired_access, this, std::move(handle));
     return X_STATUS_SUCCESS;
@@ -356,20 +455,22 @@ bool PackDevice::Initialize() {
     REXFS_ERROR("[pack] {}: {}", rex::path_to_utf8(PackPath(folder_)), error);
     return false;
   }
-  // sa2-nx-ult (2026-11-24): a pack made from the web installer's folder (UnservedStandIn) is not used: the game
-  // folder is mounted instead (Runtime::SetupVfs).
+  // sa2-nx-ult (2026-11-24): a pack holding stand-ins it does not serve (NeverInPack), or a version-2 pack holding
+  // NAME.lz4b (made by an earlier build's first boot from the web installer's folder: no guest sizes) is not used:
+  // the game folder is mounted instead (Runtime::SetupVfs).
   {
+    const bool v3 = !index.guest_sizes.empty();
     size_t unserved = 0;
     std::string first;
     for (const DiskEntry& disk : index.entries) {
       const std::string_view path(index.paths.data() + disk.path_offset, disk.path_length);
-      if (UnservedStandIn(path) && unserved++ == 0) first = std::string(path);
+      if ((NeverInPack(path) || (!v3 && HasLz4BlocksSuffix(path))) && unserved++ == 0) first = std::string(path);
     }
     if (unserved) {
-      REXFS_WARN("[pack] {} holds compressed files a pack cannot serve ({} of them, the first {}: made by an earlier "
-                 "build from the web installer's game folder): not used, the game folder is read instead. The "
-                 ".nxpack and .nxidx can be deleted.",
-                 rex::path_to_utf8(PackPath(folder_)), unserved, first);
+      REXFS_WARN("[pack] {} holds compressed files this pack cannot serve ({} of them, the first {}{}): not used, the "
+                 "game folder is read instead. The .nxpack and .nxidx can be deleted.",
+                 rex::path_to_utf8(PackPath(folder_)), unserved, first,
+                 v3 ? "" : "; a version-2 pack made by an earlier build from the web installer's game folder");
       return false;
     }
   }
@@ -399,34 +500,39 @@ bool PackDevice::Initialize() {
   };
   // sa2-nx-ult (2026-11-21): a NAME.hevc (a Sofdec movie as H.265, rex/filesystem/sfd_hevc.h) answers for NAME, with
   // the movie's size from its header; a plain NAME in the same pack wins (and the .hevc stays an ordinary file).
-  // The same for NAME.adxo (ADX streams as Opus, rex/filesystem/adx_opus.h).
+  // The same for NAME.adxo (ADX streams as Opus, rex/filesystem/adx_opus.h). (2026-11-24) And NAME.lz4b, NAME.hevc.lz4b
+  // (version 3 only): in version 3 every stand-in's size is the index's guest size, so no header is read here.
   std::unordered_map<std::string, bool> plain_names;
   for (const DiskEntry& disk : index.entries) {
     const std::string path(index.paths.data() + disk.path_offset, disk.path_length);
-    if (!HasSfdHevcSuffix(path) && !HasAdxOpusSuffix(path))
-      plain_names.emplace(rex::string::utf8_lower_ascii(path), true);
+    if (!StandInOf(path).any()) plain_names.emplace(rex::string::utf8_lower_ascii(path), true);
   }
-  size_t movies = 0, sounds = 0;
-  for (const DiskEntry& disk : index.entries) {
+  size_t movies = 0, sounds = 0, packed = 0;
+  for (size_t i = 0; i < index.entries.size(); ++i) {
+    const DiskEntry& disk = index.entries[i];
     std::string path(index.paths.data() + disk.path_offset, disk.path_length);
-    bool sfd_hevc = false, adx_opus = false;
+    bool sfd_hevc = false, adx_opus = false, lz4_blocks = false;
     uint64_t movie_size = 0;
-    const bool is_hevc = HasSfdHevcSuffix(path), is_adxo = HasAdxOpusSuffix(path);
-    if (is_hevc || is_adxo) {
-      const std::string plain =
-          path.substr(0, path.size() - (is_hevc ? kSfdHevcSuffix.size() : kAdxOpusSuffix.size()));
+    const StandIn s = StandInOf(path);
+    if (s.any()) {
       uint8_t header[kSfdHevcHeaderBytes];
       static_assert(kSfdHevcHeaderBytes >= kAdxOpusHeaderBytes);
-      if (plain_names.count(rex::string::utf8_lower_ascii(plain))) {
-        REXFS_WARN("[pack] {} and {} are both in the pack: the plain file is used", plain, path);
-      } else if (disk.size >= sizeof(header) && storage_->ReadAt(disk.offset, header, sizeof(header)) &&
-                 (is_hevc ? SfdHevcSizeFromHeader(header, sizeof(header), &movie_size)
-                          : AdxOpusSizeFromHeader(header, sizeof(header), &movie_size))) {
-        (is_hevc ? sfd_hevc : adx_opus) = true;
-        path = plain;
-        ++(is_hevc ? movies : sounds);
+      if (plain_names.count(rex::string::utf8_lower_ascii(s.plain))) {
+        REXFS_WARN("[pack] {} and {} are both in the pack: the plain file is used", s.plain, path);
+      } else if (!index.guest_sizes.empty() ||
+                 (disk.size >= sizeof(header) && storage_->ReadAt(disk.offset, header, sizeof(header)) &&
+                  (s.hevc ? SfdHevcSizeFromHeader(header, sizeof(header), &movie_size)
+                          : AdxOpusSizeFromHeader(header, sizeof(header), &movie_size)))) {
+        if (!index.guest_sizes.empty()) movie_size = index.guest_sizes[i];
+        sfd_hevc = s.hevc;
+        adx_opus = s.adxo;
+        lz4_blocks = s.lz4;
+        path = s.plain;
+        if (s.hevc) ++movies;
+        if (s.adxo) ++sounds;
+        if (s.lz4) ++packed;
       } else {
-        REXFS_WARN("[pack] {} is not a valid {} file: left as it is", path, is_hevc ? ".hevc" : ".adxo");
+        REXFS_WARN("[pack] {} is not a valid {} file: left as it is", path, s.hevc ? ".hevc" : ".adxo");
       }
     }
     PackEntry* parent = root_entry_.get();
@@ -444,12 +550,15 @@ bool PackDevice::Initialize() {
     file->data_offset_ = disk.offset;
     file->sfd_hevc_ = sfd_hevc;
     file->adx_opus_ = adx_opus;
+    file->lz4_blocks_ = lz4_blocks;
     file->stored_size_ = disk.size;
-    file->size_ = size_t(sfd_hevc || adx_opus ? movie_size : disk.size);
+    file->size_ = size_t(sfd_hevc || adx_opus || lz4_blocks ? movie_size : disk.size);
     file->allocation_size_ = rex::round_up(file->size_, size_t(bytes_per_sector()));
   }
-  if (movies || sounds)
-    REXFS_INFO("[pack] {} movies stored as H.265 (NAME.hevc), {} sound files as Opus (NAME.adxo)", movies, sounds);
+  if (movies || sounds || packed)
+    REXFS_INFO("[pack] version {}: {} movies stored as H.265 (NAME.hevc), {} sound files as Opus (NAME.adxo), {} "
+               "files as LZ4 / ZXC blocks (NAME.lz4b)",
+               index.header.version, movies, sounds, packed);
   entry_count_ = index.entries.size();
   REXFS_INFO("[pack] mounted '{}' at {}: {} files, {} directories, {:.1f} MB in {:.1f} ms",
              rex::path_to_utf8(PackPath(folder_)), mount_path(), entry_count_, directories.size() - 1,
@@ -477,6 +586,7 @@ bool PackDevice::Build(const std::filesystem::path& folder, std::string* error,
     std::string path;
     std::filesystem::path source;
     uint64_t size = 0, offset = 0;
+    uint64_t guest_size = 0;  // sa2-nx-ult (2026-11-24): version 3's (a stand-in's NAME size; else `size`)
   };
   std::vector<Item> items;
   std::error_code ec;
@@ -491,10 +601,17 @@ bool PackDevice::Build(const std::filesystem::path& folder, std::string* error,
     if (ec || !ValidRelative(item.path.c_str(), item.path.size())) {
       return *error = "the game folder cannot be enumerated (" + item.path + ")", false;
     }
-    if (UnservedStandIn(item.path)) {  // sa2-nx-ult (2026-11-24): the web installer's folder is read as it is
-      return *error = "the game folder holds the web installer's compressed files (the first: " + item.path +
+    if (NeverInPack(item.path)) {  // sa2-nx-ult (2026-11-24): the folder is read as it is (pack_device.h)
+      return *error = "the game folder holds stand-ins a pack does not serve (the first: " + item.path +
                       "), which the folder serves with its VFS index",
              false;
+    }
+    // sa2-nx-ult (2026-11-24): a stand-in (the web installer's NAME.lz4b, NAME.hevc[.lz4b], NAME.adxo) goes in as it
+    // is, with NAME's size in the version-3 index
+    item.guest_size = item.size;
+    const StandIn s = StandInOf(item.path);
+    if (s.any() && !GuestSizeOf(item.source, s, &item.guest_size)) {
+      return *error = "the game folder holds a stand-in that is not valid: " + item.path, false;
     }
     items.push_back(std::move(item));
   }
@@ -590,11 +707,12 @@ bool PackDevice::Build(const std::filesystem::path& folder, std::string* error,
   const bool header_ok = rex::filesystem::Seek(out, 0, SEEK_SET) && std::fwrite(&header, sizeof(header), 1, out) == 1;
   if (std::fclose(out) != 0 || !header_ok) return fail("the asset pack cannot be finalized");
 
-  std::vector<DiskEntry> entries(items.size());
+  std::vector<DiskEntry3> entries(items.size());  // sa2-nx-ult (2026-11-24): version 3
   std::vector<char> paths;
   paths.reserve(size_t(paths_size));
   for (size_t i = 0; i < items.size(); ++i) {
-    entries[i] = {items[i].offset, items[i].size, uint32_t(paths.size()), uint32_t(items[i].path.size())};
+    entries[i] = {items[i].offset, items[i].size, uint32_t(paths.size()), uint32_t(items[i].path.size()),
+                  items[i].guest_size};
     paths.insert(paths.end(), items[i].path.begin(), items[i].path.end());
     paths.push_back(0);
   }
@@ -605,11 +723,11 @@ bool PackDevice::Build(const std::filesystem::path& folder, std::string* error,
   index.pack_id = pack_id;
   index.pack_size = pack_size;
   index.paths_size = paths.size();
-  index.checksum = Fnv(Fnv(kFnvBasis, entries.data(), entries.size() * sizeof(DiskEntry)), paths.data(), paths.size());
+  index.checksum = Fnv(Fnv(kFnvBasis, entries.data(), entries.size() * sizeof(DiskEntry3)), paths.data(), paths.size());
   index.data_checksum = data_checksum;
   out = rex::filesystem::OpenFile(temp_index, "wb");
   const bool index_ok = out && std::fwrite(&index, sizeof(index), 1, out) == 1 &&
-                        std::fwrite(entries.data(), sizeof(DiskEntry), entries.size(), out) == entries.size() &&
+                        std::fwrite(entries.data(), sizeof(DiskEntry3), entries.size(), out) == entries.size() &&
                         std::fwrite(paths.data(), 1, paths.size(), out) == paths.size();
   if (!out || std::fclose(out) != 0 || !index_ok) return fail("the asset index cannot be written");
 
