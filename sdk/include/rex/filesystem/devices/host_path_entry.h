@@ -35,14 +35,22 @@ class HostPathEntry : public Entry {
   // rr6-nx (2026-11-10): host_path_ is an LZ4 block file (NAME.lz4b, rex/filesystem/lz4_blocks.h) shown as NAME with
   // the size of the file it holds; opened through OpenLz4Blocks, never mapped or written.
   bool lz4_blocks() const { return lz4_blocks_; }
-  // sa2-nx-ult (2026-11-21, rr6-nx's): host_path_ is a NAME.hevc (rex/filesystem/sfd_hevc.h: a Sofdec movie whose
-  // pictures are H.265), shown as NAME with that file's size; opened through OpenSfdHevc, never mapped or written.
+  // culdcept-nx (2026-11-20) / sasrt-nx (2026-11-21): host_path_ is a NAME.xmo (an XMA file whose frames are Opus)
+  // or a NAME.xmop / NAME.xmop.lz4b (a Wwise package whose XMA2 sounds are Opus; rex/filesystem/xmo.h), shown as NAME
+  // with that file's size; opened through OpenXmo / OpenXmop, never mapped or written.
+  bool xmo() const { return xmo_; }
+  bool xmop() const { return xmop_; }
+  // rr6-nx (2026-11-21): host_path_ is a NAME.opcm (rex/filesystem/opus_pcm.h: a file whose PCM samples are Opus),
+  // shown as NAME with that file's size; opened through OpenOpusPcm, never mapped or written.
+  bool opus_pcm() const { return opus_pcm_; }
+  // rr6-nx (2026-11-21): host_path_ is a NAME.hevc (rex/filesystem/sfd_hevc.h: a Sofdec movie whose pictures are
+  // H.265), shown as NAME with that file's size; opened through OpenSfdHevc, never mapped or written.
   bool sfd_hevc() const { return sfd_hevc_; }
   // sa2-nx-ult (2026-11-21): host_path_ is a NAME.adxo (rex/filesystem/adx_opus.h: a file of ADX streams whose sound
   // is Opus), shown as NAME with that file's size; opened through OpenAdxOpus, never mapped or written.
   bool adx_opus() const { return adx_opus_; }
   // Any of them: the guest's file is made from the host's one (read only, not mapped, its size the one it stands for).
-  bool packed() const { return lz4_blocks_ || sfd_hevc_ || adx_opus_; }
+  bool packed() const { return lz4_blocks_ || xmo_ || xmop_ || opus_pcm_ || sfd_hevc_ || adx_opus_; }
 
   /*
    * "All the children of this directory are already known."
@@ -96,8 +104,11 @@ class HostPathEntry : public Entry {
   std::filesystem::path host_path_;
   bool children_complete_ = false;
   bool lz4_blocks_ = false;
+  bool xmo_ = false;
+  bool xmop_ = false;
+  bool opus_pcm_ = false;
   bool sfd_hevc_ = false;
-  bool adx_opus_ = false;
+  bool adx_opus_ = false;  // sa2-nx-ult
 };
 
 }  // namespace rex::filesystem

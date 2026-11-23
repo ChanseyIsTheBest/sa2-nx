@@ -369,6 +369,14 @@ class XmaContext {
   AVFrame* chain_frame_ = nullptr;
   std::array<uint8_t, kBytesPerFrameChannel * 2> chain_raw_;
 
+  // culdcept-nx (2026-11-20, the user: the game's audio in Opus): a frame of a NAME.xmo (rex/filesystem/xmo.h: its
+  // packet has a tag) gets its 512 samples from the sound's Opus stream instead of FFmpeg (xma_context.cpp). `packet` is
+  // the frame's packet and `frame_offset` its first bit in it. -1: not such a frame (decode it as XMA); 1: raw_frame_
+  // holds its samples (silence when they could not be had).
+  struct XmoState;
+  XmoState* xmo_ = nullptr;
+  int DecodeXmoFrame(const uint8_t* packet, uint32_t frame_offset, bool stereo);
+
 };
 
 }  // namespace rex::audio

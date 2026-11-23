@@ -1,10 +1,8 @@
 /**
- * sa2-nx-ult (2026-11-21): rr6-nx's file, for NAME.adxo (rex/filesystem/adx_opus.h).
- *
  * rr6-nx (2026-11-21): the Opus decoder for NAME.opcm (rex/filesystem/opus_pcm.h), as culdcept-nx's
  * sdk/src/audio/xmo_opus.h (credit culdcept-nx). libopus: devkitPro's portlibs build, linked in, on the Switch; on a
  * PC the system's or one next to the executable (libopus-0.dll / opus.dll, libopus.so.0, libopus.0.dylib), loaded on
- * first use. Without it an .adxo's sound plays as silence (warned once).
+ * first use. Without it an .opcm's samples read as silence (warned once).
  */
 #pragma once
 

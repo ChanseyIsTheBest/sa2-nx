@@ -1,6 +1,4 @@
 /**
- * sa2-nx-ult (2026-11-21): rr6-nx's file, for NAME.adxo.
- *
  * rr6-nx (2026-11-21): opus_decoder.h; culdcept-nx's sdk/src/audio/xmo_opus.cpp with its names (credit culdcept-nx).
  */
 #include "opus_decoder.h"
@@ -28,7 +26,7 @@ Decoder* Create(int channels) {
   int error = 0;
   OpusDecoder* d = opus_decoder_create(48000, channels, &error);
   if (!d) {
-    REXFS_ERROR("[adxo] opus_decoder_create failed: {}", error);
+    REXFS_ERROR("[opcm] opus_decoder_create failed: {}", error);
     return nullptr;
   }
   return new Decoder{d};
@@ -81,7 +79,7 @@ const Api& GetApi() {
       api.ok = api.create && api.destroy && api.ctl && api.decode_float;
     }
     if (!api.ok)
-      REXFS_WARN("[adxo] libopus was not found ({}): the sound of .adxo files plays as silence", names[0]);
+      REXFS_WARN("[opcm] libopus was not found ({}): the music in .opcm files reads as silence", names[0]);
   });
   return api;
 }
@@ -97,7 +95,7 @@ Decoder* Create(int channels) {
   int error = 0;
   void* d = api.create(48000, channels, &error);
   if (!d) {
-    REXFS_ERROR("[adxo] opus_decoder_create failed: {}", error);
+    REXFS_ERROR("[opcm] opus_decoder_create failed: {}", error);
     return nullptr;
   }
   return new Decoder{d};

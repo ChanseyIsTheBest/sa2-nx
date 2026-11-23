@@ -52,7 +52,7 @@
 #include <thread>
 #include <vector>
 
-#if SA2_NXVIDEO
+#if RENUT_NXVIDEO
 #include <switch.h>  // svcGetThreadPriority / svcSetThreadPriority (sa2_hevc_decode_priority), threadCreate
 
 #include "nxvideo.h"
@@ -223,7 +223,7 @@ Planes SofdecPlanes(uint32_t buf, uint32_t w, uint32_t h) {
   return p;
 }
 
-#if SA2_NXVIDEO
+#if RENUT_NXVIDEO
 // rr6-nx (2026-11-21): the frames a movie will ask for next are read by a thread of their own, kAhead of them ahead of
 // the decoder; the game's thread reads a frame itself only when the read-ahead has not got it yet.
 constexpr int64_t kAhead = 45;  // 1.5 s at 30 frames a second
@@ -480,7 +480,7 @@ REX_HOOK_RAW(sub_828E06F8) {
   const uint32_t w = Ld32(base, frm + 12), h = Ld32(base, frm + 16);
   if (!w || !h || w > 4096 || h > 4096) return;
   const Planes pl = SofdecPlanes(buf, w, h);
-#if SA2_NXVIDEO
+#if RENUT_NXVIDEO
   std::lock_guard<std::mutex> lock(g_mutex);
   auto it = g_decoders.find(id);
   if (it == g_decoders.end()) {

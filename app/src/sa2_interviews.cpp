@@ -65,7 +65,7 @@ extern "C" {
 #include <libavutil/mem.h>
 }
 
-#if SA2_NXVIDEO
+#if RENUT_NXVIDEO
 #include <switch.h>
 
 #include "nxvideo.h"
@@ -573,12 +573,12 @@ struct VideoDecoder {
   AVFrame* frame = nullptr;
   AVPacket* packet = nullptr;
   std::deque<int64_t> pending;  // pts of frames sent and not out yet (sorted on the way out)
-#if SA2_NXVIDEO
+#if RENUT_NXVIDEO
   NxvDecoder* nxv = nullptr;
   NxvPicture pic{};
 #endif
   ~VideoDecoder() {
-#if SA2_NXVIDEO
+#if RENUT_NXVIDEO
     if (nxv)
       nxv_close(nxv);
 #endif
@@ -631,7 +631,7 @@ void OpenVideo(Player& pl, VideoDecoder& vd, const Object& first) {
   vd.hevc = LooksHevc(first.data);
   const AsfStream& s = pl.info.video;
   if (vd.hevc) {
-#if SA2_NXVIDEO
+#if RENUT_NXVIDEO
     char why[160] = {};
     vd.nxv = nxv_open(NXV_HEVC, nullptr, 0, int(s.width), int(s.height), REXCVAR_GET(sa2_hevc_nvdec) ? 1 : 0, why,
                       sizeof(why));
@@ -642,7 +642,7 @@ void OpenVideo(Player& pl, VideoDecoder& vd, const Object& first) {
 #endif
     return;
   }
-#if SA2_NXVIDEO
+#if RENUT_NXVIDEO
   // WMV3 on the Switch: nxvideo too (NVDEC decodes VC-1; culdcept-nx's culdcept_movie_nvdec 2), its software decoder
   // with sa2_hevc_nvdec off (an emulator)
   {
@@ -703,7 +703,7 @@ void DecodeVideo(Player& pl, VideoDecoder& vd, const Object* o) {  // o null: dr
   if (vd.hevc || vd.nxv_used) {
     if (!o)
       return;
-#if SA2_NXVIDEO
+#if RENUT_NXVIDEO
     if (vd.broken || !vd.nxv)
       return;
     vd.pending.push_back(pts);
@@ -845,7 +845,7 @@ void DecodeAudio(Player& pl, AudioDecoder& ad, const Object& o) {
 // The worker: reads the file, keeps up to kDecodedMax pictures decoded ahead and about two seconds of sound.
 void WorkerMain() {
   Player& pl = g_player;
-#if SA2_NXVIDEO
+#if RENUT_NXVIDEO
   svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2C);
 #endif
   Reader r;

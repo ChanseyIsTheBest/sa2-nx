@@ -19,9 +19,11 @@
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
-#include <rex/filesystem/lz4_blocks.h>  // rr6-nx (2026-11-10)
 #include <rex/filesystem/adx_opus.h>    // sa2-nx-ult (2026-11-21)
-#include <rex/filesystem/sfd_hevc.h>    // sa2-nx-ult (2026-11-21, rr6-nx's)
+#include <rex/filesystem/lz4_blocks.h>  // rr6-nx (2026-11-10)
+#include <rex/filesystem/opus_pcm.h>    // rr6-nx (2026-11-21)
+#include <rex/filesystem/sfd_hevc.h>    // rr6-nx (2026-11-21)
+#include <rex/filesystem/xmo.h>         // culdcept-nx / sasrt-nx (2026-11-21)
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/string/utf8.h>
@@ -38,14 +40,20 @@ std::atomic<uint64_t> g_stats_in_sd{0};
 std::atomic<uint64_t> g_swept_in_sd{0};
 std::atomic<uint64_t> g_inputs_in_tree{0};
 
-// sa2-nx-ult (2026-11-21, rr6-nx's AnswerRank): which of several files answering for the same game name wins: a
-// re-encoded one (NAME.hevc) first, then NAME itself, then NAME.lz4b. Entry::GetChild takes the first child whose
-// name matches, so a directory's children are kept in this order.
+// rr6-nx (2026-11-21): which of several files answering for the same game name wins: a re-encoded one
+// (NAME.opcm, NAME.hevc, NAME.xmo, NAME.xmop, packed or not) first, then NAME itself, then NAME.lz4b. A newer
+// install unzipped over an older one leaves the older NAME.lz4b beside the new NAME.hevc; the new one must be what
+// the game reads. Entry::GetChild takes the first child whose name matches, so a directory's children are kept in
+// this order.
 int AnswerRank(const std::string& name) {
-  // and NAME.adxo, and NAME.hevc.lz4b (a movie packed as ZXC blocks) (sa2-nx-ult, 2026-11-21)
-  if (HasSfdHevcSuffix(name) || HasPackedSfdHevcSuffix(name) || HasAdxOpusSuffix(name)) return 0;
-  if (HasLz4BlocksSuffix(name)) return 2;
-  return 1;
+  std::string_view n = name;
+  const bool packed = HasLz4BlocksSuffix(n);
+  if (packed) n.remove_suffix(kLz4BlocksSuffix.size());
+  if (HasOpusPcmSuffix(n) || HasXmoSuffix(n) || HasXmopSuffix(n) || HasSfdHevcSuffix(n) ||
+      HasAdxOpusSuffix(n)) {  // sa2-nx-ult (2026-11-21): and NAME.adxo
+    return 0;  // and NAME.hevc.lz4b, NAME.xmop.lz4b
+  }
+  return packed ? 2 : 1;
 }
 }  // namespace
 
@@ -199,12 +207,16 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
       const auto exact_path = current_entry->host_path() / rex::to_path(part);
       rex::filesystem::FileInfo exact_info;
       g_stats_in_sd.fetch_add(1, std::memory_order_relaxed);
-      // In AnswerRank's order (sa2-nx-ult 2026-11-21, rr6-nx's): NAME.hevc (rex/filesystem/sfd_hevc.h, a movie as
-      // H.265), NAME, then NAME.lz4b (rr6-nx 2026-11-10, rex/filesystem/lz4_blocks.h, the game's file packed).
+      // rr6-nx (2026-11-21): in AnswerRank's order: NAME.opcm (rex/filesystem/opus_pcm.h, the music as Opus),
+      // NAME.hevc (rex/filesystem/sfd_hevc.h, a movie as H.265), NAME.xmo / NAME.xmop (rex/filesystem/xmo.h, XMA as
+      // Opus; sasrt-nx), each of those two also packed as .lz4b, NAME, then NAME.lz4b (2026-11-10,
+      // rex/filesystem/lz4_blocks.h, the game's file packed).
       auto found_path = exact_path;
       bool found = false;
       for (const std::string_view suffix :
-           {rex::filesystem::kSfdHevcSuffix, rex::filesystem::kPackedSfdHevcSuffix, rex::filesystem::kAdxOpusSuffix,
+           {rex::filesystem::kOpusPcmSuffix, rex::filesystem::kSfdHevcSuffix, rex::filesystem::kPackedSfdHevcSuffix,
+            rex::filesystem::kXmopSuffix, std::string_view(".xmop.lz4b"), rex::filesystem::kXmoSuffix,
+            rex::filesystem::kAdxOpusSuffix,  // sa2-nx-ult (2026-11-21): NAME.adxo, ADX streams as Opus
             std::string_view(), rex::filesystem::kLz4BlocksSuffix}) {
         found_path = exact_path;
         found_path += std::string(suffix);
@@ -232,16 +244,21 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
       auto child_infos = rex::filesystem::ListFiles(current_entry->host_path());
       std::stable_sort(child_infos.begin(), child_infos.end(), [](const auto& a, const auto& b) {
         return AnswerRank(rex::path_to_utf8(a.name)) < AnswerRank(rex::path_to_utf8(b.name));
-      });  // sa2-nx-ult (2026-11-21, rr6-nx's): the first match is the one that answers
+      });  // rr6-nx (2026-11-21): the first match is the one that answers
       auto match = std::find_if(child_infos.begin(), child_infos.end(), [&](const auto& info) {
         std::string name = rex::path_to_utf8(info.name);
-        if (rex::filesystem::HasPackedSfdHevcSuffix(name)) {  // sa2-nx-ult (2026-11-21): NAME.hevc.lz4b
-          name.resize(name.size() - rex::filesystem::kPackedSfdHevcSuffix.size());
-        } else if (rex::filesystem::HasLz4BlocksSuffix(name)) {  // rr6-nx: NAME.lz4b answers for NAME
+        if (rex::filesystem::HasLz4BlocksSuffix(name)) {  // rr6-nx: NAME.lz4b answers for NAME
           name.resize(name.size() - rex::filesystem::kLz4BlocksSuffix.size());
-        } else if (rex::filesystem::HasSfdHevcSuffix(name)) {  // sa2-nx-ult (2026-11-21): and NAME.hevc
+        }
+        if (rex::filesystem::HasOpusPcmSuffix(name)) {  // rr6-nx (2026-11-21): and NAME.opcm
+          name.resize(name.size() - rex::filesystem::kOpusPcmSuffix.size());
+        } else if (rex::filesystem::HasXmoSuffix(name)) {  // culdcept-nx: and NAME.xmo
+          name.resize(name.size() - rex::filesystem::kXmoSuffix.size());
+        } else if (rex::filesystem::HasXmopSuffix(name)) {  // sasrt-nx: and NAME.xmop[.lz4b]
+          name.resize(name.size() - rex::filesystem::kXmopSuffix.size());
+        } else if (rex::filesystem::HasSfdHevcSuffix(name)) {  // rr6-nx (2026-11-21): and NAME.hevc[.lz4b]
           name.resize(name.size() - rex::filesystem::kSfdHevcSuffix.size());
-        } else if (rex::filesystem::HasAdxOpusSuffix(name)) {  // and NAME.adxo
+        } else if (rex::filesystem::HasAdxOpusSuffix(name)) {  // sa2-nx-ult (2026-11-21): and NAME.adxo
           name.resize(name.size() - rex::filesystem::kAdxOpusSuffix.size());
         }
         return rex::string::utf8_equal_case(name, part);
@@ -267,8 +284,8 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
 
 void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
   auto child_infos = rex::filesystem::ListFiles(parent_entry->host_path());
-  // sa2-nx-ult (2026-11-21, rr6-nx's): children in AnswerRank's order, so Entry::GetChild finds a re-encoded file
-  // before NAME.lz4b of the same game name (the VFS index keeps this order).
+  // rr6-nx (2026-11-21): children in AnswerRank's order, so Entry::GetChild finds a re-encoded file before
+  // NAME.lz4b of the same game name (the VFS index keeps this order).
   std::stable_sort(child_infos.begin(), child_infos.end(), [](const auto& a, const auto& b) {
     return AnswerRank(rex::path_to_utf8(a.name)) < AnswerRank(rex::path_to_utf8(b.name));
   });

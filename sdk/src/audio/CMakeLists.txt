@@ -7,6 +7,7 @@ add_library(rexaudio OBJECT
     audio_system.cpp
     downmix.cpp
     xma_context.cpp
+    xmo_opus.cpp  # culdcept-nx (2026-11-20): Opus for NAME.xmo / NAME.xmop frames (base port 259)
     xma_decoder.cpp
     xma_register_file.cpp
     # NOP backend (always available)
@@ -46,3 +47,6 @@ target_link_libraries(rexaudio
 if(NOT REXGLUE_PLATFORM_SWITCH)
     target_link_libraries(rexaudio PUBLIC SDL3::SDL3)
 endif()
+
+# Base port 259: xmo_opus.cpp's libopus (src/filesystem's rexopus: linked in on the Switch, loaded at run time on a PC).
+target_link_libraries(rexaudio PUBLIC rexopus)

@@ -1024,15 +1024,17 @@ if(TARGET libavcodec)
     target_link_libraries(renut PRIVATE libavcodec libavutil)
 endif()
 
-# sa2-nx-ult (2026-11-21, the user: the movies re-encoded to H.265, as culdcept-nx does; this block is rr6-nx's):
-# nxvideo (tools/switch/nxvideo, culdcept-nx's), the H.265 decoder on the Switch's NVDEC: devkitPro's switch-ffmpeg 7.1
-# (built with averne's nvtegra backend) linked with the shim into one object whose only global symbols are nxv_*, so
-# FFmpeg 7.1's names never meet the SDK's FFmpeg (the XMA and WMA audio). Built when devkitPro's FFmpeg has nvtegra.
-# Without it the .hevc movies are not shown (src/sa2_hevc_movies.cpp).
+# Base port 259 (rr6-nx / sasrt-nx, 2026-11-21; culdcept-nx's nxvideo): the H.265 movies' decoder on the Switch's NVDEC,
+# tools/switch/nxvideo: devkitPro's switch-ffmpeg 7.1 (built with averne's nvtegra backend) linked with the shim into one
+# object whose only global symbols are nxv_*, so FFmpeg 7.1's names never meet the SDK's FFmpeg (the XMA audio). Made
+# into the static library renut_nxvideo, so only a port whose movie player calls nxv_* takes it into the NRO (the base
+# has none: each game's player is its own, as rr6-nx's SFD and sasrt-nx's USM). Built when devkitPro's FFmpeg has
+# nvtegra; RENUT_NXVIDEO=1 is then defined for the app. sa2-nx-ult: SA2's players call it (src/sa2_hevc_movies.cpp,
+# src/sa2_interviews.cpp; before port 259 SA2 built the same object itself, as SA2_NXVIDEO).
 if(REXGLUE_PLATFORM_SWITCH)
-    option(SA2_NXVIDEO "The H.265 movies' NVDEC decoder (tools/switch/nxvideo)" ON)
+    option(RENUT_NXVIDEO "The H.265 movies' NVDEC decoder (tools/switch/nxvideo)" ON)
     set(_nxv_pl "${DEVKITPRO}/portlibs/switch")
-    if(SA2_NXVIDEO AND EXISTS "${_nxv_pl}/include/libavutil/hwcontext_nvtegra.h")
+    if(RENUT_NXVIDEO AND EXISTS "${_nxv_pl}/include/libavutil/hwcontext_nvtegra.h")
         set(_nxv_src "${CMAKE_CURRENT_SOURCE_DIR}/../tools/switch/nxvideo")
         set(_nxv_out "${CMAKE_CURRENT_BINARY_DIR}/nxvideo")
         file(MAKE_DIRECTORY "${_nxv_out}")
@@ -1051,9 +1053,11 @@ if(REXGLUE_PLATFORM_SWITCH)
             COMMENT "nxvideo: FFmpeg 7.1 with nvtegra in one object, only nxv_* global"
             VERBATIM)
         set_source_files_properties("${_nxv_out}/nxvideo.o" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
-        target_sources(renut PRIVATE "${_nxv_out}/nxvideo.o")
-        target_include_directories(renut PRIVATE "${_nxv_src}")
-        target_compile_definitions(renut PRIVATE SA2_NXVIDEO=1)
+        add_library(renut_nxvideo STATIC "${_nxv_out}/nxvideo.o")
+        set_target_properties(renut_nxvideo PROPERTIES LINKER_LANGUAGE C)
+        target_include_directories(renut_nxvideo INTERFACE "${_nxv_src}")
+        target_link_libraries(renut PRIVATE renut_nxvideo)
+        target_compile_definitions(renut PRIVATE RENUT_NXVIDEO=1)
         message(STATUS "nxvideo: H.265 / NVDEC movies (devkitPro's switch-ffmpeg with nvtegra)")
     endif()
 endif()
