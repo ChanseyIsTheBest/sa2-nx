@@ -185,3 +185,11 @@ is perceptual: its full-band waveform SNR is 15-20 dB at any rate, so that numbe
   second, the rest passed over to keyframes). Files left out (emu_interview_absent1): back to the menu in 0.5 s. A
   route press lost in an emulator stall: input_script presses now start at the first poll that sees them (08ce9e9e).
   Not run: the console (NVDEC), the natural end of the 6-minute file (only skips so far).
+- 2026-11-24 (the console, the user: the game crashed at boot, twice): build 02c4b933's first boot packed the web
+  installer's game_root into game_root.nxpack (SA2's asset_pack_build, 1.0.6's; 3,550 NAME.lz4b entries kept as they
+  are), and the pack, mounted from then on, cannot serve NAME.lz4b: the game found almost none of its files
+  (rex_crash.log: abort in InvalidFunctionTrap, sub_82153410's call through the table at 0x838AD134). The emulator's
+  tomls set asset_pack_build = false, so no run here had made a pack. Fixed in a3f7d07c (no pack from such a folder,
+  a pack holding such files not used); checked on the PC (out/packtest) and in Ryujinx with the pack build on
+  (`out/emu_tomls/ult_packbuild.toml`, emu_packfix1: no pack, the folder from its index in 0.4 s, Opus music, H.265
+  movie, 0 errors). Package out/packages/2026-11-24_packfix, copied to the user's SD (MD5 checked).
