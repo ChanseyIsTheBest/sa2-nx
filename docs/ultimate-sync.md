@@ -52,7 +52,10 @@ Ports 236-263 and SA2 (2026-11-23):
   Switch build of 1088110f's tree): Ryujinx ran at about half the usual speed (two other ports compiling: the
   recording took 8 minutes, 4.5 before), so the two-player demo began 2,028 frames later and only 1,472 of its
   2,259 frames fell in the window; those blocks are 1.0.6's as in every run before (3, 22, 3, 26, 28, 4, 38, then 11
-  of the cut block). The rest of the demo was not recorded.
+  of the cut block). Run again with a 6,400-frame window (`out\emu_tomls\ult_attract_wide.toml`,
+  `emu_sync263_attract_wide`, build 0c71fcbc; the demo again about 1,965 frames late): the whole demo, 261 of 2,259
+  frames identical, block for block as in every run before (the last block varies between runs: 45-49). Packaged:
+  `out\packages\2026-11-23_sync263` (NRO, ELF, notes).
 
 Ports 223-234 and SA2 (2026-11-20):
 
