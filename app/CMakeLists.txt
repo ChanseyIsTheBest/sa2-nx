@@ -219,6 +219,7 @@ set(RENUT_SOURCES
     # control options (sa2-nx 1.0.5).
     src/sa2_keys.cpp
     src/sa2_controls.cpp
+    src/sa2_menu.cpp  # sa2-nx-ult (2026-11-24): 1.0.6's sa2.toml keys on the game menu (its game hook)
     # SA2's own hook around Renut (the window scissor's shadow, 1.0.6's src/me/sa2_me_hooks.cpp).
     src/sa2_renut_hooks.cpp
     # sa2-nx's lockstep recorder (sa2_video_s: the frame comparison that gates every change of the code generation).

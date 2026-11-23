@@ -39,24 +39,19 @@ REXCVAR_DEFINE_BOOL(sa2_action_buttons, false, "SA2/Controls",
                     "The light dash moves to Y, so B or X at a line of light-dash rings somersaults or starts a spin "
                     "dash as anywhere else; holding X starts Sonic's or Shadow's spin dash at once, and B keeps the "
                     "usual hold (from OpenSA2; the X part is the SA2 Mod Loader code \"Press B to Somersault\" by Hyper "
-                    "and MainMemory)")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+                    "and MainMemory)");
 REXCVAR_DEFINE_BOOL(sa2_analog_fix, true, "SA2/Controls",
                     "The stick reaches full speed at about two thirds of a push instead of before half, so half a push "
-                    "walks and a full push still runs (from OpenSA2)")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+                    "walks and a full push still runs (from OpenSA2)");
 REXCVAR_DEFINE_BOOL(sa2_deadzone, true, "SA2/Controls",
                     "A round deadzone for each pad's left stick, and full tilt a little before the stick's edge, the "
-                    "same in every direction; the game's own deadzone still applies after it (from OpenSA2)")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+                    "same in every direction; the game's own deadzone still applies after it (from OpenSA2)");
 REXCVAR_DEFINE_BOOL(sa2_camera_invert, false, "SA2/Controls",
                     "The camera turns the other way: the right stick's left and right swap, and so do LT and RT, also "
-                    "in the menus that read them (from OpenSA2)")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+                    "in the menus that read them (from OpenSA2)");
 REXCVAR_DEFINE_BOOL(sa2_hold_toggle, false, "SA2/Controls",
                     "B as a toggle: one press holds it and the next lets it go, for a mech's lock-on or the spin dash's "
-                    "charge; START also lets it go (from OpenSA2)")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+                    "charge; START also lets it go (from OpenSA2)");
 // A scripted test run has no line of light-dash rings at hand.
 REXCVAR_DEFINE_BOOL(sa2_diag_offer_light_dash, false, "SA2/Diagnostics",
                     "Tests (sa2_action_buttons): every empty action window of Sonic's offers the light dash")
@@ -179,8 +174,15 @@ void HoldToggle(uint8_t* base, uint32_t pad, uint32_t state) {
 
 REX_EXTERN(__imp__sub_8290BAB8);
 REX_HOOK_RAW(sub_8290BAB8) {
-  static const bool deadzone = REXCVAR_GET(sa2_deadzone), invert = REXCVAR_GET(sa2_camera_invert),
-                    toggle = REXCVAR_GET(sa2_hold_toggle);
+  // sa2-nx-ult (2026-11-24, the game menu's rows): read at each call, so a change applies at once; a change of the
+  // toggle lets every latched B go.
+  const bool deadzone = REXCVAR_GET(sa2_deadzone), invert = REXCVAR_GET(sa2_camera_invert),
+             toggle = REXCVAR_GET(sa2_hold_toggle);
+  static bool toggle_before = false;
+  if (toggle != toggle_before) {
+    std::fill(std::begin(g_latched), std::end(g_latched), false);
+    toggle_before = toggle;
+  }
   if (!(deadzone || invert || toggle)) {
     __imp__sub_8290BAB8(ctx, base);
     return;
@@ -220,7 +222,7 @@ inline float PastDeadzone(float v) { return v > kDeadzone ? v - kDeadzone : v < 
 // and clamp stay the game's. Players 0 and 1 only (the original zeroes the others).
 REX_EXTERN(__imp__sub_82156FD0);
 REX_HOOK_RAW(sub_82156FD0) {
-  static const bool on = REXCVAR_GET(sa2_analog_fix);
+  const bool on = REXCVAR_GET(sa2_analog_fix);  // sa2-nx-ult (2026-11-24): live (the game menu)
   if (!on) {
     __imp__sub_82156FD0(ctx, base);
     return;
@@ -251,7 +253,7 @@ REX_HOOK_RAW(sub_82156FD0) {
 // 0, as the body gives for an action its table does not list, so the caller goes on to the somersault.
 REX_EXTERN(__imp__sub_824B05C0);
 REX_HOOK_RAW(sub_824B05C0) {
-  static const bool on = REXCVAR_GET(sa2_action_buttons);
+  const bool on = REXCVAR_GET(sa2_action_buttons);  // sa2-nx-ult (2026-11-24): live (the game menu)
   if (!on) {
     __imp__sub_824B05C0(ctx, base);
     return;
@@ -306,7 +308,7 @@ REX_HOOK_RAW(sub_824B05C0) {
 // are left alone: they have no spin dash to start, and the hold is Metal Sonic's black shield.
 REX_EXTERN(__imp__sub_824B1180);
 REX_HOOK_RAW(sub_824B1180) {
-  static const bool on = REXCVAR_GET(sa2_action_buttons);
+  const bool on = REXCVAR_GET(sa2_action_buttons);  // sa2-nx-ult (2026-11-24): live (the game menu)
   if (!on) {
     __imp__sub_824B1180(ctx, base);
     return;

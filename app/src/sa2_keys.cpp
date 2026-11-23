@@ -130,13 +130,13 @@ void RenutSaveConfig() {}
 // 1.0.6's sa2_renut_msaa gave the game's single-sample targets 2, 4 or 8 samples (an option off by default). The base
 // has no such option: its msaa_level sets the samples of the game's own MSAA targets (1 = off), another thing.
 // sa2-nx-ult (2026-11-24, the user: "SA2 used to support MSAA before the rebase"): 1.0.6's MSAA is back, in the
-// renderer's BuildTarget (renut_engine/gpu/render/surfaces.cpp), and the game menu's MSAA row sets this key.
+// renderer's BuildTarget (renut_engine/gpu/render/surfaces.cpp), and the game menu's MSAA row sets this key; the
+// renderer takes it once a frame (the user: "without closing and restarting the game"), as msaa_level.
 REXCVAR_DEFINE_INT32(sa2_renut_msaa, 0, "SA2/Graphics",
                      "Multisample anti-aliasing of the game's single-sample render targets (sa2-nx 1.0.6's): 0 = off "
                      "(the game's own, default), 2 = 2x, 4 = 4x, 8 = 8x. Smoother edges; each step costs more GPU and "
-                     "CPU time and memory. Read at start")
-    .range(0, 8)
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+                     "CPU time and memory. Takes effect from the next frame")
+    .range(0, 8);
 REXCVAR_DEFINE_BOOL(sa2_renut_double_buffer, false, "SA2/Graphics",
                     "Double buffering (sa2-nx 1.0.6's key): two images instead of three, less input lag, more dropped "
                     "frames in busy scenes. Sets pacman_renut_double_buffer when true")

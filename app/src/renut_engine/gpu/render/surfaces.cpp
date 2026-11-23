@@ -39,6 +39,13 @@
 
 // sa2-nx-ult (2026-11-24): 1.0.6's MSAA of the game's single-sample targets (app/src/sa2_keys.cpp; BuildTarget below).
 REXCVAR_DECLARE(int32_t, sa2_renut_msaa);
+// A test of its change at run time (the game menu's, with no menu): this many seconds after the first latch, the
+// latch (LatchResolutionScaleLocked) takes sa2_renut_msaa_test_level in place of sa2_renut_msaa. 0 (the default): off.
+REXCVAR_DEFINE_INT32(sa2_renut_msaa_test_s, 0, "SA2/Graphics",
+                     "Test: seconds after the first frame at which MSAA becomes sa2_renut_msaa_test_level, as a change "
+                     "in the game menu would (0 = off)");
+REXCVAR_DEFINE_INT32(sa2_renut_msaa_test_level, 4, "SA2/Graphics",
+                     "Test: the MSAA level sa2_renut_msaa_test_s switches to (0, 2, 4, 8)");
 
 // renut-ultimate (2026-11-16, port 145; tw2de_nx's of 2026-10-22, ON at the user's word: "port the speed ups as on by default").
 // Port 174 (from rehatched-nx): see CapturedHeaderVa. Accuracy, so off by default; a game that re-points headers turns it
@@ -150,10 +157,23 @@ struct CachedFramebuffer {
 // part of an MSAA target's key, so a change makes those targets anew at their next use.
 uint32_t g_msaa_latched = 0;
 
+// sa2-nx-ult (2026-11-24, the user: MSAA "without closing and restarting the game"): sa2_renut_msaa (1.0.6's MSAA of
+// the game's single-sample targets) taken at each frame's latch as msaa_level is (LatchResolutionScaleLocked): 0, 2,
+// 4 or 8. Before the first latch, the key itself. Part of a single-sample target's key (the bits msaa_level uses for
+// the targets made with MSAA, which single-sample ones leave at 0), so a change makes the game's targets anew at their
+// next use, the old ones retired as idle targets are.
+uint32_t g_sa2_msaa_latched = 0;
+bool g_sa2_msaa_latched_once = false;
+std::chrono::steady_clock::time_point g_sa2_msaa_first_latch;  // sa2_renut_msaa_test_s's start
+uint32_t Sa2MsaaOf(int32_t n) { return n >= 8 ? 8u : n >= 4 ? 4u : n >= 2 ? 2u : 0u; }
+uint32_t Sa2Msaa() { return g_sa2_msaa_latched_once ? g_sa2_msaa_latched : Sa2MsaaOf(REXCVAR_GET(sa2_renut_msaa)); }
+
 uint64_t TargetKey(const d3d::SurfaceDesc &desc, bool depth, plume::RenderFormat format,
                    RenderScale scale) {
   const u32 info = desc.SurfaceInfo;
-  const uint64_t msaa = ((info >> 16) & 3) == 0 ? 0 : g_msaa_latched >= 4 ? 2 : g_msaa_latched >= 2 ? 1 : 0;
+  const uint32_t sa2 = ((info >> 16) & 3) == 0 ? Sa2Msaa() : 0;  // sa2-nx-ult: 1 (2x), 2 (4x), 3 (8x)
+  const uint64_t msaa = ((info >> 16) & 3) == 0 ? (sa2 >= 8 ? 3 : sa2 >= 4 ? 2 : sa2 >= 2 ? 1 : 0)
+                        : g_msaa_latched >= 4 ? 2 : g_msaa_latched >= 2 ? 1 : 0;
   return uint64_t(u32(desc.ColorInfo) & 0xFFF) | uint64_t(info & 0x3FFF) << 12 |
          uint64_t((info >> 16) & 3) << 26 | uint64_t(depth) << 28 |
          uint64_t(scale.code & 7) << 29 | uint64_t(u32(format) & 0xFFFFFF) << 32 | msaa << 56;
@@ -319,19 +339,14 @@ bool BuildTarget(HostSurface &surface, const d3d::SurfaceDesc &desc, uint32_t mi
   // every render target single-sample, so msaa_level (above) has nothing to act on; this gives the game's
   // single-sample targets 2, 4 or 8 samples on the host, and the game's resolves downsample them (the resolve paths
   // go by the host target's samples). Its 4x surfaces (Direct3D's fast Clear aliases) stay as above. After the
-  // lowering, so msaa_level never takes the raised count back; 0 (the default) changes nothing.
+  // lowering, so msaa_level never takes the raised count back; 0 (the default) changes nothing. The level is the one
+  // latched for this frame (Sa2Msaa, part of the target's key), so the game menu changes it at once.
   if (SampleCount(surface.info_word) == plume::RenderSampleCount::COUNT_1) {
-    static const plume::RenderSampleCounts forced = [] {
-      const int32_t n = REXCVAR_GET(sa2_renut_msaa);
-      const auto c = n >= 8   ? plume::RenderSampleCounts(plume::RenderSampleCount::COUNT_8)
-                     : n >= 4 ? plume::RenderSampleCounts(plume::RenderSampleCount::COUNT_4)
-                     : n >= 2 ? plume::RenderSampleCounts(plume::RenderSampleCount::COUNT_2)
-                              : plume::RenderSampleCounts(plume::RenderSampleCount::COUNT_1);
-      if (c != plume::RenderSampleCount::COUNT_1)
-        RGPU_INFO("[sa2] MSAA {}x on the game's single-sample render targets (sa2_renut_msaa)", u32(c));
-      return c;
-    }();
-    surface.samples = forced;
+    const uint32_t n = Sa2Msaa();
+    if (n >= 2)
+      surface.samples = n >= 8 ? plume::RenderSampleCount::COUNT_8
+                        : n >= 4 ? plume::RenderSampleCount::COUNT_4
+                                 : plume::RenderSampleCount::COUNT_2;
   }
   if (surface.depth) {
     surface.format = DepthTargetFormat(surface.format_word);  // banjo-nx (2026-10-19, banjo_deko3d_depth24)
@@ -585,6 +600,22 @@ void LatchResolutionScaleLocked() {
       RGPU_INFO("[renut] MSAA {}x from this frame (msaa_level; the MSAA targets made again)", level);
     g_msaa_latched = level;
     ++g_surface_epoch;
+  }
+  // sa2-nx-ult (2026-11-24): sa2_renut_msaa the same way (g_sa2_msaa_latched): the game's single-sample targets anew.
+  int32_t sa2_key = REXCVAR_GET(sa2_renut_msaa);
+  if (!g_sa2_msaa_latched_once) g_sa2_msaa_first_latch = std::chrono::steady_clock::now();
+  if (const int32_t test_s = REXCVAR_GET(sa2_renut_msaa_test_s);
+      test_s > 0 && std::chrono::steady_clock::now() - g_sa2_msaa_first_latch >= std::chrono::seconds(test_s))
+    sa2_key = REXCVAR_GET(sa2_renut_msaa_test_level);
+  if (const uint32_t sa2 = Sa2MsaaOf(sa2_key);
+      !g_sa2_msaa_latched_once || sa2 != g_sa2_msaa_latched) {
+    if (g_sa2_msaa_latched_once || sa2)
+      RGPU_INFO("[sa2] MSAA {} from this frame (sa2_renut_msaa; the game's single-sample targets made again)",
+                sa2 ? std::to_string(sa2) + "x" : std::string("off"));
+    const bool changed = g_sa2_msaa_latched_once && sa2 != g_sa2_msaa_latched;
+    g_sa2_msaa_latched = sa2;
+    g_sa2_msaa_latched_once = true;
+    if (changed) ++g_surface_epoch;
   }
   const std::string resolution = REXCVAR_GET(renut_resolution);
   // Codes of RenderScale.

@@ -58,8 +58,7 @@ REXCVAR_DEFINE_INT32(sa2_diag_swap_hold_every_s, 0, "SA2/Diagnostics",
 // (banjo_noncpu_enhancements), the same meaning and default.
 REXCVAR_DEFINE_BOOL(sa2_vsync_relaxed, true, "SA2",
                     "Relaxed vsync: a frame that misses 60 fps is shown as soon as it is ready (50-59 fps) instead of "
-                    "at the next refresh (a fall to 30)")
-    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+                    "at the next refresh (a fall to 30)");
 namespace {
 struct RelaxedVsync {
   bool active = false;
@@ -172,12 +171,9 @@ uint64_t g_display_previous_ns = 0;
 void PaceSwap(uint32_t device_va) {
   static const bool on = REXCVAR_GET(sa2_renut_vblank_pacing);
   if (!on || !device_va) return;
-  static const bool relaxed_resolved = [] {
-    g_vsync_relaxed.active =
-        ::banjo::EnhancementActive(::banjo::EnhancementGroup::kNonCpu, REXCVAR_GET(sa2_vsync_relaxed));
-    return true;
-  }();
-  (void)relaxed_resolved;
+  // sa2-nx-ult (2026-11-24, the game menu's row): taken at each frame, so a change applies from the next one.
+  g_vsync_relaxed.active =
+      ::banjo::EnhancementActive(::banjo::EnhancementGroup::kNonCpu, REXCVAR_GET(sa2_vsync_relaxed));
   const auto *interval_word = ::renut::gpu::GuestPtr<const be_u32>(device_va + kDeviceOffsetPresentationInterval);
   const uint32_t refreshes = RefreshesPerFrame(interval_word ? uint32_t(*interval_word) : 1);
   const auto now = Clock::now();

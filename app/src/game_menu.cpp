@@ -414,14 +414,15 @@ std::vector<Setting> MakeSettings(const std::string& file) {
   // add(T_SMAA, "banjo_renut_smaa", false, on_off(), 0, Tr(H_SMAA));
   // sa2-nx-ult (2026-11-24, the user: "MSAA doesn't appear to be working", "SA2 used to support MSAA before the
   // rebase"): SA2's MSAA row sets sa2-nx 1.0.6's sa2_renut_msaa (the game's single-sample targets multisampled:
-  // surfaces.cpp BuildTarget), read at start, so it takes effect at the next start. The base's msaa_level only lowers
-  // the samples of the targets a game makes with MSAA; SA2 makes none (its 4x fast Clear aliases stay at 4, its
-  // default), so that row changed nothing.
+  // surfaces.cpp BuildTarget). The renderer takes it once a frame, so it applies when the menu closes, as msaa_level's
+  // row does (the user: "without closing and restarting the game"). The base's msaa_level only lowers the samples of
+  // the targets a game makes with MSAA; SA2 makes none (its 4x fast Clear aliases stay at 4, its default), so that
+  // row changed nothing.
   // add(T_MSAA, "msaa_level", false, {C(Tr(C_OFF), "1", "1"), C("2x", "2", "2"), C("4x", "4", "4")}, 0, Tr(H_MSAA));
-  add(T_MSAA, "sa2_renut_msaa", true,
+  add(T_MSAA, "sa2_renut_msaa", false,
       {C(Tr(C_OFF), "0", "0"), C("2x", "2", "2"), C("4x", "4", "4"), C("8x", "8", "8")}, 0,
       "Smoother edges on the game's 3D image (2x, 4x or 8x samples). Each step costs GPU and CPU time and can lower the "
-      "frame rate. Takes effect at the next start.");
+      "frame rate. Applies when the menu closes.");
   // blur-nx (2026-11-18, the user: "make 4 core mode an option ... on by default and a warning that it is highly
   // reccomended to be left on").
   add(T_FOURCORE, "four_core_mode", true, on_off(), 0, Tr(H_FOURCORE));
@@ -443,7 +444,7 @@ std::vector<Setting> MakeSettings(const std::string& file) {
   for (Setting& x : s)  // the render targets are made anew for these: once, when the menu closes
     if (x.key == "banjo_renut_render_height_handheld" || x.key == "banjo_renut_render_height_docked" ||
         x.key == "banjo_renut_dynamic_resolution_handheld" || x.key == "banjo_renut_dynamic_resolution_docked" ||
-        x.key == "msaa_level")
+        x.key == "msaa_level" || x.key == "sa2_renut_msaa")  // sa2-nx-ult (2026-11-24): and SA2's MSAA
       x.apply_on_close = true;
   add(T_MENUFONT, "menu_font", false,
       {Q(Tr(C_SYSTEM), "System"), Q(Tr(C_PIXEL), "Pixel"), Q("Roboto", "Roboto"), Q("Karla", "Karla"),

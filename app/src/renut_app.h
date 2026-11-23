@@ -41,6 +41,9 @@ void Enable();  // blur-nx (2026-11-17, #220; renut-ultimate port 151): src/blur
 }
 #include "native/nfsmw_nativo_captura.h"
 #include "sa2_capture.h"  // sa2-nx-ult: SA2's lockstep recorder (sa2_video_s)
+namespace sa2::menu {
+void Install();  // sa2-nx-ult (2026-11-24): SA2's rows on the game menu (src/sa2_menu.cpp)
+}
 #if !REX_PLATFORM_SWITCH
 #include "profiler/nfsmw_perfil_pc.h"
 #endif
@@ -136,6 +139,7 @@ public:
         drawer->AddDialog(profiler_dialog_.get());
         // blur-nx (2026-11-18, the user's request): the game menu. Attached for good (its constructor adds it), it
         // asks for no ImGui frame while closed (WantsFrame), so the drawer builds none for it then.
+        sa2::menu::Install();  // sa2-nx-ult (2026-11-24): SA2's rows (1.0.6's sa2.toml keys; src/sa2_menu.cpp)
         game_menu_ = std::make_unique<blur::GameMenuDialog>(drawer, config_path(), [this] { return runtime(); },
                                                             [this] { return immediate_drawer(); });
 #if !REX_PLATFORM_SWITCH
