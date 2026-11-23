@@ -19,8 +19,11 @@
 #include <unordered_map>
 
 #include <rex/filesystem.h>
-#include <rex/filesystem/adx_opus.h>  // sa2-nx-ult (2026-11-21): NAME.adxo entries
-#include <rex/filesystem/sfd_hevc.h>  // sa2-nx-ult (2026-11-21): NAME.hevc entries
+#include <rex/filesystem/adx_opus.h>    // sa2-nx-ult (2026-11-21): NAME.adxo entries
+#include <rex/filesystem/lz4_blocks.h>  // sa2-nx-ult (2026-11-24): the stand-ins a pack cannot serve (below)
+#include <rex/filesystem/opus_pcm.h>
+#include <rex/filesystem/sfd_hevc.h>    // sa2-nx-ult (2026-11-21): NAME.hevc entries
+#include <rex/filesystem/xmo.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/string.h>
@@ -36,6 +39,15 @@ constexpr uint64_t kMaxPathsSize = 64ull << 20;
 constexpr size_t kCacheSize = 64 * 1024;       // asset_pack.c PACK_CACHE_SIZE
 constexpr size_t kChunk = 1 << 20;             // big reads go in 1 MB pieces, so other readers interleave
 constexpr uint64_t kFnvBasis = 1469598103934665603ULL;
+
+// sa2-nx-ult (2026-11-24): the web installer's stand-ins that a pack cannot serve: NAME.lz4b (and NAME.hevc.lz4b),
+// NAME.opcm, NAME.xmo, NAME.xmop (the host path device reads them; a pack only knows NAME.hevc and NAME.adxo). The
+// first boot used to pack such a folder file for file, and the game then found none of its files (the console's
+// crash of 2026-11-24 at boot: 3,550 .lz4b entries in game_root.nxpack). Since base port 264 the folder itself starts
+// fast from its VFS index, so a folder with any of them is never packed, and a pack holding any is not used.
+bool UnservedStandIn(std::string_view path) {
+  return HasLz4BlocksSuffix(path) || HasOpusPcmSuffix(path) || HasXmoSuffix(path) || HasXmopSuffix(path);
+}
 
 struct PackHeader {
   char magic[8];
@@ -344,6 +356,23 @@ bool PackDevice::Initialize() {
     REXFS_ERROR("[pack] {}: {}", rex::path_to_utf8(PackPath(folder_)), error);
     return false;
   }
+  // sa2-nx-ult (2026-11-24): a pack made from the web installer's folder (UnservedStandIn) is not used: the game
+  // folder is mounted instead (Runtime::SetupVfs).
+  {
+    size_t unserved = 0;
+    std::string first;
+    for (const DiskEntry& disk : index.entries) {
+      const std::string_view path(index.paths.data() + disk.path_offset, disk.path_length);
+      if (UnservedStandIn(path) && unserved++ == 0) first = std::string(path);
+    }
+    if (unserved) {
+      REXFS_WARN("[pack] {} holds compressed files a pack cannot serve ({} of them, the first {}: made by an earlier "
+                 "build from the web installer's game folder): not used, the game folder is read instead. The "
+                 ".nxpack and .nxidx can be deleted.",
+                 rex::path_to_utf8(PackPath(folder_)), unserved, first);
+      return false;
+    }
+  }
   storage_ = PackStorage::Open(PackPath(folder_));
   if (!storage_) {
     REXFS_ERROR("[pack] cannot open {}", rex::path_to_utf8(PackPath(folder_)));
@@ -461,6 +490,11 @@ bool PackDevice::Build(const std::filesystem::path& folder, std::string* error,
     item.size = it->file_size(ec);
     if (ec || !ValidRelative(item.path.c_str(), item.path.size())) {
       return *error = "the game folder cannot be enumerated (" + item.path + ")", false;
+    }
+    if (UnservedStandIn(item.path)) {  // sa2-nx-ult (2026-11-24): the web installer's folder is read as it is
+      return *error = "the game folder holds the web installer's compressed files (the first: " + item.path +
+                      "), which the folder serves with its VFS index",
+             false;
     }
     items.push_back(std::move(item));
   }
