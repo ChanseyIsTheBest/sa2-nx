@@ -48,7 +48,8 @@ uint32_t MinAnisotropy();
 // banjo-nx (2026-10-28, GPU block): banjo_renut_anisotropy_cap (0: the game's own).
 uint32_t AnisotropyCap();
 // banjo-nx (2026-10-28, GPU block): dynamic resolution's keys (render/surfaces.cpp).
-bool DynamicResolutionOn();
+bool DynamicResolutionOn();  // either mode's (rr6-nx 2026-11-22)
+bool DynamicModeOn(bool docked);  // rr6-nx (2026-11-22): banjo_renut_dynamic_resolution_handheld / _docked, as set now
 int32_t DynamicHeight(bool docked, bool high);  // the range's ends, as set (not rounded)
 double DynamicGpuMs();  // banjo-nx (2026-10-28): a decimal key (34.5)
 double DynamicUpSeconds();  // banjo-nx (2026-10-28): banjo_renut_dynamic_up_s (1 s)

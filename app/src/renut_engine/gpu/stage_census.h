@@ -45,10 +45,17 @@ enum Stage : uint32_t {
 // of the draw path (19 of them) with the key off, 1.7 % of N&B's render thread on the console (its title loop).
 extern std::atomic<int> g_on;  // -1: not read yet
 bool OnSlow();
+#if defined(RENUT_DIAG_CENSUS_OFF)
+// banjo-nx (2026-11-20, BANJO_SWITCH_DIAG_CENSUS OFF, the Switch's default): no census in this build; every Scope and
+// check compiles away (N&B's render thread in Showdown Town against 1.0.2: the checks with the key off cost ~0.1 us a
+// draw with the host batch census's). blur_renut_diag_stage_census does nothing here.
+constexpr bool On() { return false; }
+#else
 inline bool On() {
   const int on = g_on.load(std::memory_order_relaxed);
   return on >= 0 ? on != 0 : OnSlow();
 }
+#endif
 
 struct Acc {
   std::atomic<uint64_t> ticks{0};

@@ -139,12 +139,56 @@ namespace plume {
             dkCmdBufDestroy(cmd);
         for (auto &m : memory)
             device->destroyBlock(m.first);
+        for (auto &m : memoryCached)  // banjo-nx (2026-11-21)
+            device->destroyBlock(m.first);
         for (auto &t : transient)
             device->destroyBlock(t.first);
     }
 
+    // banjo-nx (2026-11-21, cachedCommands): deko3d's write position in the fed block (dk::detail::CmdBuf's m_cmdPos at
+    // +112, after m_cmdChunkStart at +96 and m_cmdStart at +104: libdeko3d's CmdBuf::addMemory stores the block's CPU
+    // address into all three). Checked at every block fed (Deko3DCmdPos equals the block's address right after
+    // dkCmdBufAddMemory); a mismatch turns the option off for the rest of the run.
+    static inline uint8_t *Deko3DCmdPos(DkCmdBuf cmd) {
+        uint8_t *p;
+        memcpy(&p, reinterpret_cast<const uint8_t *>(cmd) + 112, sizeof(p));
+        return p;
+    }
+    static bool g_cachedCommandsBad = false;
+
     void Deko3DCommandList::addMemory(size_t minimum) {
         const uint32_t want = alignUp(uint32_t(std::max<size_t>(minimum, CommandBlockSize)), DK_MEMBLOCK_ALIGNMENT);
+        if (cachedList) {
+            if (cachedChunk)
+                cachedWritten.push_back({cachedChunk, Deko3DCmdPos(cmd)});  // the block deko3d leaves, as written
+            while (memoryCachedUsed < memoryCached.size() && memoryCached[memoryCachedUsed].second < want)
+                memoryCachedUsed++;
+            if (memoryCachedUsed == memoryCached.size()) {
+                DkMemBlock block = device->makeBlock(want, DkMemBlockFlags_CpuCached | DkMemBlockFlags_GpuCached, "command memory (cached)");
+                // No line of it dirty from an earlier use of the memory (one written back later over the commands).
+                if (block)
+                    armDCacheFlush(dkMemBlockGetCpuAddr(block), want);
+                memoryCached.push_back({block, want});
+                GetDeko3DStats().commandBytes += want;
+            }
+            DkMemBlock block = memoryCached[memoryCachedUsed].first;
+            dkCmdBufAddMemory(cmd, block, 0, memoryCached[memoryCachedUsed].second);
+            memoryCachedUsed++;
+            cachedChunk = static_cast<uint8_t *>(dkMemBlockGetCpuAddr(block));
+            if (Deko3DCmdPos(cmd) == cachedChunk)
+                return;
+            // Not the layout this reads: uncached from here on (nothing was written into the cached block; a block fed
+            // with nothing pending in the one before replaces it).
+            g_cachedCommandsBad = true;
+            logf("cachedCommands: deko3d's command buffer layout is not the expected one; off");
+            for (const auto &[from, to] : cachedWritten) {  // (what earlier blocks of this list hold, to memory now)
+                if (to > from)
+                    armDCacheClean(from, size_t(to - from));
+            }
+            cachedWritten.clear();
+            cachedList = false;
+            cachedChunk = nullptr;
+        }
         while (memoryUsed < memory.size() && memory[memoryUsed].second < want)
             memoryUsed++;
         if (memoryUsed == memory.size()) {
@@ -188,6 +232,11 @@ namespace plume {
         copyRunFenced = false;  // port 161
         sampleMaskSet = 0xFFFFFFFFu;  // port 166
         memoryUsed = 0;
+        // banjo-nx (2026-11-21, cachedCommands): this list's kind of command memory, for all its blocks.
+        memoryCachedUsed = 0;
+        cachedList = Deko3DGetOptions().cachedCommands && !g_cachedCommandsBad;
+        cachedChunk = nullptr;
+        cachedWritten.clear();
         addMemory(0);
         // sasrt-nx (2026-11-08, Deko3DOptions::freshComputeConstants): InvalidateShaderCaches (0x369), Constant (bit 12).
         // sasrt-nx (2026-11-08): and the global-data cache (bit 4): the seeds read upload-ring addresses (CPU-written,
@@ -291,6 +340,17 @@ namespace plume {
             resolveBoundDepth(false);
         flushBarriers();
         list = dkCmdBufFinishList(cmd);
+        // banjo-nx (2026-11-21, cachedCommands): every word the list wrote, to memory before any submission reads it.
+        if (cachedList) {
+            if (cachedChunk)
+                cachedWritten.push_back({cachedChunk, Deko3DCmdPos(cmd)});
+            for (const auto &[from, to] : cachedWritten) {
+                if (to > from)
+                    armDCacheClean(from, size_t(to - from));
+            }
+            cachedWritten.clear();
+            cachedChunk = nullptr;
+        }
         open = false;
         if (Deko3DGetOptions().diagBarriers)
             bumpStat(GetDeko3DStats().diagListEnds);  // sasrt-nx (2026-11-08): the census
@@ -542,7 +602,10 @@ namespace plume {
         {
             // banjo-nx (2026-10-19): counted for the renderer's report (a load and a store: diagnostics).
             Deko3DStats &st = GetDeko3DStats();
-            auto bump = [](std::atomic<uint64_t> &c) { c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); };
+            auto bump = [](std::atomic<uint64_t> &c) {
+                if (g_deko3dCounts)  // banjo-nx (2026-11-20)
+                    c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+            };
             bump(mode == DkBarrier_Full ? st.barriersFull : mode == DkBarrier_Fragments ? st.barriersFragments : st.barriersPrimitives);
             if (invalidate & DkInvalidateFlags_Image)
                 bump(st.barriersImageInvalidate);
@@ -979,7 +1042,10 @@ namespace plume {
         }
         // banjo-nx (2026-10-19): a load and a store (a lost count is possible between two recording threads), not
         // an exclusive read-modify-write loop: the A57 has no LSE atomics.
-        auto bump = [](std::atomic<uint64_t> &c) { c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); };
+        auto bump = [](std::atomic<uint64_t> &c) {
+            if (g_deko3dCounts)  // banjo-nx (2026-11-20)
+                c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        };
         bump(GetDeko3DStats().pipelineBinds);
         // Shaders: rebound when any stage differs (absent stages are disabled by the bind).
         // banjo-nx (2026-10-28, per-draw night): only the stages that differ (deko3d binds each stage on its own: its

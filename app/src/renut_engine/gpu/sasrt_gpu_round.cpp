@@ -1,5 +1,6 @@
 // sasrt-nx (2026-11-08): the GPU round after the move to the ultimate base (sasrt_gpu_round.h, docs/gpu-round-1108.md).
 #include "renut_engine/gpu/sasrt_gpu_round.h"
+#include "banjo_switch_default.h"  // banjo-nx (port 251): BANJO_SWITCH_DEFAULT
 
 #include <fmt/format.h>
 #include <rex/cvar.h>
@@ -290,12 +291,17 @@ REXCVAR_DEFINE_BOOL(sasrt_gpu_convert_tail_no_texture_drop, true, "SASRT/GPU",
                     "frames ago, and every queue flush since dropped the texture and L2 caches (deko3d's postSubmitFlush). "
                     "The wait itself (all 3D work done, the stream in L2) stays. Same bytes read: same pixels")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// banjo-nx (2026-11-21) turns it off for N&B in its own settings: two in-run A/Bs of 122 in Showdown Town (console
+// c28, c34) had it on worse (render thread +0.6 % and +0.8 % a frame, fps -1.1 % and -0.8 %, GPU +0.3 %): the per-draw
+// mask costs more CPU than the attribute fetches it saves on the GPU there. The base keeps it on (port 251; its rule
+// for one port's finding: docs/off-by-default.md section 7).
 REXCVAR_DEFINE_BOOL(sasrt_gpu_vs_input_mask, true, "SASRT/GPU",
                     "deko3d renderer (third GPU round, item 32, A/B 122): a pipeline's vertex attributes that the bound "
                     "vertex shader variant never reads (its shader program header's input map, read from the DKSH at load: "
                     "the outputs a pixel shader does not read, constant 905, take their inputs out with them) are bound as "
                     "constants, which the vertex attribute fetch does not read from memory. The shader reads the same "
-                    "attributes as before: same pixels")
+                    "attributes as before: same pixels. banjo-nx turns it off for N&B (two A/Bs: on cost the render "
+                    "thread more than it saved the GPU there)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(sasrt_gpu_export_no_pixel_shader, true, "SASRT/GPU",
                     "deko3d renderer (third GPU round, item 33, A/B 123; with sasrt_gpu_export_raster_discard): an "
@@ -493,7 +499,9 @@ REXCVAR_DEFINE_BOOL(sasrt_gpu_export_no_point_gs, true, "SASRT/GPU",
                     "cost ~120 ns a point whatever their vertex shader did. The vertex shader runs once a point either way: "
                     "the same exports, and no pixel either way. Its vertex variant then gets constant 905 (no outputs)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(sasrt_gpu_handover_with_smaa, false, "SASRT/GPU",
+// banjo-nx (2026-11-22, console run c44, N&B with SMAA on): A/B 135 gave GPU -1.1 % a draw (9 of 9 pairs lower),
+// the render thread and fps flat, the town's picture right in 22 captures: on by default on the Switch.
+REXCVAR_DEFINE_BOOL(sasrt_gpu_handover_with_smaa, BANJO_SWITCH_DEFAULT(true, false), "SASRT/GPU",
                     "deko3d renderer (fourth GPU round, item 45, A/B 135): banjo's colour hand-over "
                     "(banjo_deko3d_color_handover: a whole resolve into a texture of its size and format left in the "
                     "target's image, not copied) was off whenever SMAA was on, so every resolve was drawn since the SMAA "
@@ -556,6 +564,8 @@ REXCVAR_DEFINE_BOOL(sasrt_rt_cached_export_seeds, true, "SASRT/RenderThread",
 
 #if defined(PLUME_DEKO3D)
 #include <plume_deko3d.h>
+
+#include "renut_engine/gpu/banjo_renut_record.h"  // banjo-nx (2026-11-21): StageActive
 #endif
 
 namespace sasrt::gpu_round {
@@ -573,10 +583,45 @@ void LatchNow() {
 #undef SASRT_GPU_ROUND_LATCH
   g_latched = l;
   g_latched_ready.store(true, std::memory_order_release);
+  RefreshEffective();
 }
+
+// banjo-nx (2026-11-20): On()'s answers (see the header): the latched key, and not this item's A/B "off" half.
+uint8_t g_effective[kCount] = {};  // constant-initialised to 0: not latched
+void RefreshEffective() {
+  const int ab = banjo::renut_gpu::g_ab_off.load(std::memory_order_relaxed);
+  for (int i = 0; i < kCount; ++i) {
+    const bool on = g_latched.on[i] && ab != kAbBase + i && !(ab == kAbRtGroup && i >= kRtRestoreCandidates);
+    g_effective[i] = on ? 2 : 1;
+  }
+}
+
+// banjo-nx (2026-11-21, the render thread to 33 ms; A/B 173): plume's Deko3DOptions::cachedCommands (see there).
+// Console, Showdown Town, in-run pairs (median, render thread a draw with it on): c36 +0.11 % (21 pairs), c39 +0.90 %
+// (16); GPU -1.0 % and -0.9 % a draw (34 of 37 pairs lower). The ranges' clean at each list's end is the render
+// thread's, and the render thread sets the frame rate in the town: off by default (a GPU-bound scene may want it).
+REXCVAR_DEFINE_BOOL(banjo_deko3d_cached_commands, false, "Banjo/Enhancements",
+                    "deko3d renderer (2026-11-21, A/B 173): command memory CPU-cached, each list's written ranges cleaned "
+                    "to memory at its end (uncached before: every command word a store to the bus). The same commands. "
+                    "Console c36/c39: GPU -1 % a draw, render thread +0.1/+0.9 % a draw (off: the town is render-bound)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// banjo-nx (2026-11-21, console run c43): with the core-3 command stage the list's end, and so the clean, is the
+// stage's: A/B 173 then gave render thread -1.2 % a draw (10 of 10 pairs lower), GPU -1.4 %, all threads' CPU -1.8 %.
+REXCVAR_DEFINE_BOOL(banjo_deko3d_cached_commands_with_stage, true, "Banjo/Enhancements",
+                    "deko3d renderer: command memory CPU-cached (banjo_deko3d_cached_commands) whenever the core-3 "
+                    "command stage plays the lists (banjo_deko3d_command_stage), its clean then off the render thread")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 void ApplyPlume() {
 #if defined(PLUME_DEKO3D)
+  {
+    static const bool cached = REXCVAR_GET(banjo_deko3d_cached_commands);
+    static const bool with_stage = REXCVAR_GET(banjo_deko3d_cached_commands_with_stage);
+    plume::g_deko3dOptions.cachedCommands =
+        (cached || (with_stage && banjo::renut_gpu::record::StageActive())) &&
+        banjo::renut_gpu::g_ab_off.load(std::memory_order_relaxed) != 173;  // banjo-nx (2026-11-21)
+  }
+  plume::g_deko3dCounts = banjo::renut_gpu::Latch().counts;  // banjo-nx (2026-11-20): plume's stats bumps
   plume::g_deko3dOptions.preciseDepthResolve = On(kPreciseDepth);
   plume::g_deko3dOptions.decompressMerge = On(kDecompressMerge);
   plume::g_deko3dOptions.readbackMerge = On(kReadbackMerge);

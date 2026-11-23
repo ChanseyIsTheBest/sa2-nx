@@ -395,11 +395,18 @@ std::vector<Setting> MakeSettings(const std::string& file) {
       {C("960x540", "540", "540"), C("1024x576", "576", "576"), C("1088x612", "612", "612"),
        C("1152x648", "648", "648"), C("1216x684", "684", "684"), C("1280x720", "720", "720")},
       5, Tr(H_HANDHELD));
+  // rr6-nx (2026-11-22, the user: "a separate toggle for handheld and docked dynamic resolution"): each mode's switch
+  // under its fixed resolution; the help says its range (banjo_renut_dynamic_*_low / _high, as set).
+  const auto lines = [](const char *key) { return std::atoi(rex::cvar::GetFlagByName(key).c_str()); };
+  add(T_DYN_HANDHELD, "banjo_renut_dynamic_resolution_handheld", false, on_off(), 1,
+      TrDD(H_DYN_HANDHELD, lines("banjo_renut_dynamic_handheld_low"), lines("banjo_renut_dynamic_handheld_high")));
   add(T_DOCKED, "banjo_renut_render_height_docked", false,
       {C("1280x720", "720", "720"), C("1408x792", "792", "792"), C("1536x864", "864", "864"),
        C("1600x900", "900", "900"), C("1664x936", "936", "936"), C("1728x972", "972", "972"),
        C("1792x1008", "1008", "1008"), C("1920x1080", "1080", "1080")},
       5, Tr(H_DOCKED));
+  add(T_DYN_DOCKED, "banjo_renut_dynamic_resolution_docked", false, on_off(), 0,
+      TrDD(H_DYN_DOCKED, lines("banjo_renut_dynamic_docked_low"), lines("banjo_renut_dynamic_docked_high")));
   add(T_RUMBLE, "input_rumble", false, on_off(), 0, Tr(H_RUMBLE), /*always_in_file=*/false);
   add(T_SMAA, "banjo_renut_smaa", false, on_off(), 0, Tr(H_SMAA));
   add(T_MSAA, "msaa_level", false, {C(Tr(C_OFF), "1", "1"), C("2x", "2", "2"), C("4x", "4", "4")}, 0, Tr(H_MSAA));
@@ -423,6 +430,7 @@ std::vector<Setting> MakeSettings(const std::string& file) {
       0, Tr(H_MENUCOLOR));
   for (Setting& x : s)  // the render targets are made anew for these: once, when the menu closes
     if (x.key == "banjo_renut_render_height_handheld" || x.key == "banjo_renut_render_height_docked" ||
+        x.key == "banjo_renut_dynamic_resolution_handheld" || x.key == "banjo_renut_dynamic_resolution_docked" ||
         x.key == "msaa_level")
       x.apply_on_close = true;
   add(T_MENUFONT, "menu_font", false,

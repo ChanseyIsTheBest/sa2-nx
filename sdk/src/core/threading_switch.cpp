@@ -613,6 +613,14 @@ unsigned RexSwitchAppCoreMask(void) {
   return g_process_mask.load(std::memory_order_relaxed) & ~g_strip_mask.load(std::memory_order_relaxed);
 }
 
+bool RexSwitchSetCurrentThreadCoresWithSystem(int preferred, unsigned mask) {
+  EnsureSystemCore();
+  mask &= g_process_mask.load(std::memory_order_relaxed);
+  if (mask == 0) return false;
+  if (preferred < 0 || (mask & (1u << preferred)) == 0) preferred = -1;
+  return R_SUCCEEDED(__real_svcSetThreadCoreMask(CUR_THREAD_HANDLE, preferred, mask));
+}
+
 bool RexSwitchMoveCurrentThreadToSystemCore(int priority) {
   const int core = RexSwitchSystemCore();
   if (core < 0) return false;

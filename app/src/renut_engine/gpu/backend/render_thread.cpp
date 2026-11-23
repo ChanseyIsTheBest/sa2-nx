@@ -59,6 +59,11 @@ REXCVAR_DEFINE_BOOL(banjo_renut_prefetch_next, true, "Banjo/Enhancements",
                     "Renut's render thread asks for the next draw's capture (written on the game thread's core) to be "
                     "brought into its cache while it does the draw before it")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// banjo-nx (2026-11-20, render-thread batch, experiment #58): see RunRing.
+REXCVAR_DEFINE_INT32(banjo_renut_ring_spin_us, 0, "Banjo/Renut",
+                     "Experiment: microseconds Renut's render thread looks for new work before it sleeps on an empty "
+                     "ring (0: sleeps at once)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(banjo_renut_wake_batch, 16, "Banjo/Enhancements",
                      "Renut's render thread, when it has caught up and sleeps, is woken by the game's draws only once "
                      "this many are queued (each wake is a kernel call on both threads; the fourth console run woke it "
@@ -278,11 +283,24 @@ void Execute(Item &item) {
 // consistent: no store-load reordering) is seen by that last look, and one that read it true takes g_mutex before it
 // notifies, so it cannot notify between the look and the wait.
 constexpr size_t kRingRun = 256;
+// banjo-nx (2026-11-20, render-thread batch, experiment #58): with the ring empty, the render thread looks again for up
+// to this many microseconds (a YIELD between looks) before it sleeps: a push in that time is taken without the kernel's
+// sleep and wake (svcWaitForAddress / svcSignalToAddress, tens of microseconds each way). 0: sleep at once, as before.
+// It spends the render thread's core while it looks; measure it (tools/ab_halves.py) before keeping it.
 void RunRing() {
   static const bool batch_clock = REXCVAR_GET(banjo_renut_batch_clock);
   static const bool prefetch = REXCVAR_GET(banjo_renut_prefetch_next);
+  static const int spin_us = REXCVAR_GET(banjo_renut_ring_spin_us);
   uint64_t pos = g_dequeue.load(std::memory_order_relaxed);
   for (;;) {
+    if (spin_us > 0 && !RingReady(pos)) {
+      const Clock::time_point until = Clock::now() + std::chrono::microseconds(spin_us);
+      while (!RingReady(pos) && Clock::now() < until) {
+#if defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
+      }
+    }
     if (!RingReady(pos)) {
       g_waiting.store(true, std::memory_order_seq_cst);
       bool stopping = false;

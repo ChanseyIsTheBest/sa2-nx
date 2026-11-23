@@ -24,6 +24,16 @@ option(BANJO_SWITCH_EARLY_RA "Leave GCC's AArch64 early register allocation pass
 # console profile's samples fall. -g does not change the generated code: an ELF built with this ON has every function
 # at the address of the same sources built with it OFF, so it names the samples of a run of the normal NRO.
 option(BANJO_SWITCH_RENDERER_LINES "Switch: line tables for the hot native renderer files (profiling aid)" OFF)
+# banjo-nx (2026-11-20, the render thread against renut-nx 1.0.2): full debug info (-g, with the inlined functions)
+# for Renut's renderer and plume, so a console profile's samples can be named by the source function they fall in
+# even where PGO and LTO inlined it (1.0.2's ELF had it; the ultimate build's had none). -g does not change the code.
+option(BANJO_SWITCH_RENUT_DEBUG_INFO "Switch: -g for Renut's renderer and plume (profiling aid)" OFF)
+# banjo-nx (2026-11-20): the renderer's diagnostic censuses (blur_renut_diag_stage_census, blur_renut_diag_batch_census)
+# compiled in. OFF (the Switch's default): their checks are constant false and every census block compiles away; the
+# keys do nothing. In Showdown Town the checks with the keys off cost N&B's render thread ~0.1 us a draw.
+option(BANJO_SWITCH_DIAG_CENSUS "Switch: compile in the renderer's diagnostic censuses" OFF)
+# (Set on the renderer's targets below, where they exist: a directory-wide definition recompiled the generated game
+# code, ~1,000 files, for a definition it never reads.)
 if(REXGLUE_PLATFORM_SWITCH AND NOT BANJO_SWITCH_EARLY_RA)
     add_compile_options(-mearly-ra=none)
     add_link_options(-mearly-ra=none)
@@ -1090,6 +1100,17 @@ endif()
 if(WIN32)
     target_compile_options(renut PRIVATE -gline-tables-only -gcodeview)
     target_link_options(renut PRIVATE "LINKER:/DEBUG:FULL")
+endif()
+
+if(REXGLUE_PLATFORM_SWITCH AND NOT BANJO_SWITCH_DIAG_CENSUS)  # banjo-nx (2026-11-20), see the option above
+    target_compile_definitions(banjo_renut_gpu PRIVATE RENUT_DIAG_CENSUS_OFF)
+    target_compile_definitions(renut PRIVATE RENUT_DIAG_CENSUS_OFF)
+endif()
+
+if(REXGLUE_PLATFORM_SWITCH AND BANJO_SWITCH_RENUT_DEBUG_INFO)
+    target_compile_options(banjo_renut_gpu PRIVATE -g)
+    target_compile_options(plume PRIVATE -g)
+    target_link_options(renut PRIVATE -g)  # LTO: the link writes the late debug info of the units compiled with -g
 endif()
 
 if(REXGLUE_PLATFORM_SWITCH AND BANJO_SWITCH_RENDERER_LINES)

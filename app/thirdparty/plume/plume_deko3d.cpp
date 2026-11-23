@@ -263,6 +263,7 @@ namespace plume {
 
 
     Deko3DOptions g_deko3dOptions;
+    bool g_deko3dCounts = true;  // banjo-nx (2026-11-20): see plume_deko3d.h
     // sasrt-nx (2026-11-11, port 82; its GPU list's row 2; UNTESTED): preciseStencilWrite's count.
     std::atomic<uint64_t> g_deko3dPreciseStencilSaved{0};
     void Deko3DSetOptions(const Deko3DOptions &options) { g_deko3dOptions = options; }
@@ -638,6 +639,7 @@ namespace plume {
     }
 
     Deko3DBuffer::~Deko3DBuffer() {
+        Deko3DBeforeDestroy();  // banjo-nx (2026-11-21, the core-3 command stage)
         if (block) {
             {
                 std::lock_guard<std::mutex> lock(device->bufferMutex);
@@ -777,6 +779,7 @@ namespace plume {
     }
 
     Deko3DTexture::~Deko3DTexture() {
+        Deko3DBeforeDestroy();  // banjo-nx (2026-11-21, the core-3 command stage)
         if (valid && ownsMemory) {
             g_deko3dStats.imageBytes -= alloc.size;
             device->retire(alloc, nullptr);
@@ -890,6 +893,8 @@ namespace plume {
         }
         if (images) {
             imageCount = images;
+            imageSizes.resize(images);  // banjo-nx (2026-11-21): sized once (see imageTextures)
+            imageTextures.resize(images, nullptr);
             imageBlock = device->makeBlock(alignUp(images * 32, DK_MEMBLOCK_ALIGNMENT), DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, "image descriptors");
             if (imageBlock)
                 memset(dkMemBlockGetCpuAddr(imageBlock), 0, images * 32);
@@ -904,6 +909,7 @@ namespace plume {
     }
 
     Deko3DDescriptorSet::~Deko3DDescriptorSet() {
+        Deko3DBeforeDestroy();  // banjo-nx (2026-11-21, the core-3 command stage)
         if (imageBlock)
             device->retire({}, imageBlock);
         if (samplerBlock)
@@ -940,6 +946,9 @@ namespace plume {
 
     // renut-ultimate (2026-11-10, port 59, from LostOdysseyRecomp ff013164; Deko3DOptions::relaxedDescriptorCounters): the
     // count and the epoch of a descriptor write. Relaxed, nothing waits for the uncached descriptor store to drain.
+    static Deko3DImageTrackHook g_deko3dImageTrackHook = nullptr;  // banjo-nx (2026-11-21): Deko3DSetImageTrackHook
+    void (*g_deko3dBeforeDestroyHook)() = nullptr;  // banjo-nx (2026-11-21): plume_deko3d.h
+
     static void noteDescriptorWrite(Deko3DDevice *device) {
         if (g_deko3dOptions.relaxedDescriptorCounters) {
             g_deko3dStats.descriptorWrites.fetch_add(1, std::memory_order_relaxed);
@@ -986,8 +995,6 @@ namespace plume {
             // size at the view's first level; the depth of a 3D image there, else the view's layers (all from its first
             // when it names no count). tools/deko3d_glsl_opt.py's txq verify (constant 908 = 2) checks it on the GPU.
             const uint32_t id = descriptorIndex - imageFirst;
-            if (imageSizes.size() <= id)
-                imageSizes.resize(id + 1);
             const uint32_t m = view.mipLevelOffset;
             const uint32_t w = std::max(1u, t->desc.width >> m), h = std::max(1u, t->desc.height >> m);
             const DkImageType type = view.type != DkImageType_None ? view.type : t->type;
@@ -997,17 +1004,38 @@ namespace plume {
             else
                 z = view.layerCount ? view.layerCount
                                     : (t->desc.arraySize > view.layerOffset ? t->desc.arraySize - view.layerOffset : 1u);
-            imageSizes[id] = {w, h, z};
-            if (imageTextures.size() <= id)  // sasrt-nx (2026-11-08, Deko3DOptions::trackedImageInvalidate)
-                imageTextures.resize(id + 1, nullptr);
-            imageTextures[id] = t;
+            // banjo-nx (2026-11-21, the core-3 command stage): the tables' update through the hook when it takes it.
+            const Deko3DImageTrack track{this, id, t, {w, h, z}, true};
+            if (!g_deko3dImageTrackHook || !g_deko3dImageTrackHook(track))
+                Deko3DApplyImageTrack(track);
         }
         if (t == nullptr || !t->valid) {  // sasrt-nx (2026-11-08): an emptied slot names no texture
-            const uint32_t id = descriptorIndex - imageFirst;
-            if (id < imageTextures.size())
-                imageTextures[id] = nullptr;
+            const Deko3DImageTrack track{this, descriptorIndex - imageFirst, nullptr, {0, 0, 0}, false};
+            if (!g_deko3dImageTrackHook || !g_deko3dImageTrackHook(track))
+                Deko3DApplyImageTrack(track);
         }
         noteDescriptorWrite(device);
+    }
+
+    // banjo-nx (2026-11-21, the core-3 command stage): plume_deko3d.h.
+    void Deko3DSetImageTrackHook(Deko3DImageTrackHook hook) { g_deko3dImageTrackHook = hook; }
+    void Deko3DApplyImageTrack(const Deko3DImageTrack &track) {
+        Deko3DDescriptorSet *set = track.set;
+        const uint32_t id = track.id;
+        if (!set)
+            return;
+        if (track.sized) {
+            if (set->imageSizes.size() <= id)  // (not with a set made with its images: sized then)
+                set->imageSizes.resize(id + 1);
+            set->imageSizes[id] = {track.size[0], track.size[1], track.size[2]};
+        }
+        if (track.texture) {
+            if (set->imageTextures.size() <= id)
+                set->imageTextures.resize(id + 1, nullptr);
+            set->imageTextures[id] = track.texture;
+        } else if (id < set->imageTextures.size()) {
+            set->imageTextures[id] = nullptr;
+        }
     }
 
     void Deko3DDescriptorSet::setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) {
@@ -1034,6 +1062,7 @@ namespace plume {
     }
 
     Deko3DQueryPool::~Deko3DQueryPool() {
+        Deko3DBeforeDestroy();  // banjo-nx (2026-11-21, the core-3 command stage)
         if (block)
             device->retire({}, block);
     }
@@ -1607,7 +1636,9 @@ namespace plume {
     void Deko3DDevice::spareWorker() {
         // The uam thread's place: off the render thread's core, below the game's threads (the priority the process
         // allows at or above the asked one, as compileWorker takes it).
-        if (g_deko3dOptions.compileCore >= 0)
+        if (g_deko3dOptions.placeCompileThread)  // sasrt-nx (2026-11-22): the compiles float (see the option)
+            g_deko3dOptions.placeCompileThread();
+        else if (g_deko3dOptions.compileCore >= 0)
             svcSetThreadCoreMask(CUR_THREAD_HANDLE, g_deko3dOptions.compileCore, 1u << g_deko3dOptions.compileCore);
         s32 asked = g_deko3dOptions.compilePriority, priority = -1;
         if (asked > 0) {
@@ -2070,7 +2101,9 @@ namespace plume {
             std::lock_guard<std::mutex> lock(compileMutex);  // compile() reads it under the lock
             compileThreadHandle = threadGetCurHandle();
         }
-        if (g_deko3dOptions.compileCore >= 0)
+        if (g_deko3dOptions.placeCompileThread)  // sasrt-nx (2026-11-22): the compiles float (see the option)
+            g_deko3dOptions.placeCompileThread();
+        else if (g_deko3dOptions.compileCore >= 0)
             svcSetThreadCoreMask(CUR_THREAD_HANDLE, g_deko3dOptions.compileCore, 1u << g_deko3dOptions.compileCore);
         // banjo-nx (2026-10-23): the priority the process may give (the console's profile showed this thread at 0x3B in
         // every report: 0x3E is below an application's lowest, the game threads' 0x3B, and the kernel refused it while
@@ -2133,8 +2166,12 @@ namespace plume {
                     // And while a drawing thread waits for a pipeline the prebuild builds (Deko3DHurryCompiles), the
                     // prebuild's compiles too.
                     const bool hurry = g_compileHurry.load(std::memory_order_relaxed) > 0;
+                    // 2026-11-20 (the city on the console): and an urgent compile (a fetch-specialised pipeline the
+                    // draws use the generic one for meanwhile): with the rest, Showdown Town's terrain pipelines came
+                    // 33-68 s late, the GPU at 51 ms a frame instead of 34 until then, and the prebuild's other
+                    // (cached) pipelines queued behind them.
                     pick = std::find_if(compileQueue.begin(), compileQueue.end(), [hurry](const CompileJob *j) {
-                        return (j->async && j->cached) || (!j->async && (j->drawWaits || hurry));
+                        return (j->async && j->cached) || (!j->async && (j->drawWaits || j->urgent || hurry));
                     });
                     if (pick != compileQueue.end())
                         break;
@@ -2333,6 +2370,7 @@ namespace plume {
         job.log = &log;
         // banjo-nx (2026-10-23): a blocking compile: a drawing thread (the game stops) or a background one (prebuild).
         job.drawWaits = !t_backgroundThread;
+        job.urgent = t_urgentVariants;  // banjo-nx (2026-11-20): no compile rest (see the uam loop)
         // banjo-nx (2026-10-18): the waiting thread's priority, lent to the uam thread while it waits (the render
         // thread must not wait behind the game's threads for a low-priority compile).
         s32 waiterPriority = 0;
@@ -2491,6 +2529,7 @@ namespace plume {
     Deko3DGraphicsPipeline::Deko3DGraphicsPipeline() { g_graphicsPipelines.fetch_add(1, std::memory_order_relaxed); }
 
     Deko3DGraphicsPipeline::~Deko3DGraphicsPipeline() {
+        Deko3DBeforeDestroy();  // banjo-nx (2026-11-21, the core-3 command stage)
         g_graphicsPipelines.fetch_sub(1, std::memory_order_relaxed);
         if (provisional.load(std::memory_order_relaxed))
             g_deko3dProvisionalPipelines.fetch_sub(1, std::memory_order_relaxed);

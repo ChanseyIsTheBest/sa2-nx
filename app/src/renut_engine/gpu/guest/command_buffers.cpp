@@ -197,6 +197,51 @@ REXCVAR_DEFINE_BOOL(banjo_renut_replay_record_prefetch, false, "Banjo/Enhancemen
                     "next op's shader and declaration records (at their own guest addresses) from its recorded words. "
                     "In-run A/B target 57 with this key on")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// banjo-nx (2026-11-21, the render thread to 33 ms): the console's in-run A/Bs (c36, Showdown Town, 21-22 pairs, the
+// render thread a draw with the item on against off): PrefetchShaderBehind +1.44 % (on slower in 19 of 21 pairs),
+// ApplyResources' copy and card prefetch +0.47 % (16 of 22). Both read a line to find the next (the record's entry and
+// declaration, the object's answers): a miss the render thread waits on, for lines the draw would wait on as long. Off.
+REXCVAR_DEFINE_BOOL(banjo_renut_replay_shader_behind, false, "Banjo/Enhancements",
+                    "OFF by default (console c36: +1.44 % render thread a draw with it on). Renut's renderer (2026-10-28): "
+                    "at a shader change, the replay prefetches the record's cache entry and declaration lines")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(banjo_renut_replay_copy_prefetch, false, "Banjo/Enhancements",
+                    "OFF by default (console c36: +0.47 % render thread a draw with it on). Renut's renderer (2026-10-28): "
+                    "ApplyResources prefetches the geometry objects' copies and store cards (off: the answers' lines)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Console c41 (18 pairs, the render thread a draw with it on): +0.31 % (14 of 18 higher): off. Five lines a buffer an op
+// cost more than the card loads they hid.
+REXCVAR_DEFINE_BOOL(banjo_renut_replay_card_prefetch, false, "Banjo/Enhancements",
+                    "OFF by default (console c41: +0.31 % render thread a draw with it on). Renut's renderer (2026-11-21, "
+                    "A/B 181): an op ahead, the replay prefetches the store cards its next draw's geometry proofs read "
+                    "first, from the recorded index and vertex buffer header words alone. Prefetches only")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Console c35/c40/c41 (A/B 56, the render thread a draw with it on): -0.03 % (mean), +0.36 %, +0.24 % (medians): off.
+REXCVAR_DEFINE_BOOL(banjo_renut_replay_object_prefetch, false, "Banjo/Enhancements",
+                    "OFF by default (console c40/c41: +0.36/+0.24 % render thread a draw with it on). Renut's renderer "
+                    "(2026-10-28, A/B 56): an op ahead, the replay prefetches the lines of the texture and geometry "
+                    "objects its next op's record names. Prefetches only")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DECLARE(bool, banjo_deko3d_command_stage_any_core);
+namespace banjo::renut_gpu::record {
+void FollowStageCores(int &applied);  // banjo-nx (2026-11-22): banjo_renut_record.h
+}  // (banjo_renut_record.cpp)
+// banjo-nx (2026-11-21, the user's batch 2: the cache-warming helper; A/B 185).
+REXCVAR_DEFINE_BOOL(banjo_renut_warm_helper, true, "Banjo/Enhancements",
+                    "Renut's renderer (2026-11-21): a thread on the system core (4-core mode) reads a few ops ahead of the "
+                    "replay and touches what their draws will read (the ops' state and records, the texture and geometry "
+                    "objects, the vertex copies and their store cards, the shader records and their entries and "
+                    "declarations), so the render thread finds those lines in the shared L2 instead of main memory. "
+                    "Reads only (the image is the same). In-run A/B 185 (its off half: the helper is given nothing)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(banjo_renut_warm_ahead, 24, "Banjo",
+                     "The cache-warming helper: ops it keeps warmed ahead of the replay")
+    .range(2, 256)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(banjo_renut_warm_sleep_us, 100, "Banjo",
+                     "The cache-warming helper: its sleep when it is that far ahead (or has nothing)")
+    .range(10, 5000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(banjo_renut_replay_stream, true, "Banjo/Enhancements",
                     "Renut's renderer (2026-10-27, the replay stream): recorded ops are 64-byte aligned and a draw's op "
                     "is two lines (its call without pointers, the UP data by offset, the shaders' words as recorded); "
@@ -2147,6 +2192,36 @@ void PrefetchResourceObjects(const u8 *record, const DrawResources &held) {
       PrefetchGeometryObject(o, true);
   }
 }
+// banjo-nx (2026-11-21, the render thread to 33 ms; A/B 181, banjo_renut_replay_card_prefetch): the next op's index and
+// vertex buffers' store cards and page serials, which the geometry proofs read at a buffer's first draw in a kick interval
+// (PagesClean's card loads: 1.5 % of the render thread in console run c40, not prefetched since 175 went off), worked
+// out from the record's own header words (the index buffer's Address, the vertex buffers' first Format word: their
+// CPU base) with no object read: A/B 175's prefetch read the object's answers first, a miss it waited on. A buffer the
+// replay holds already (the draw before's) is skipped; at most two vertex buffers. Prefetches only.
+void PrefetchRecordCards(const u8 *record, const DrawResources &held) {
+  ResourceHead head;
+  std::memcpy(&head, record, sizeof(head));
+  if ((head.flags & 1) && !(held.ib_valid && held.ib[1] == head.ib[1])) {
+    const u32 at = CardOffsetOfAddress(head.ib[1]);
+    if (at != UINT32_MAX)
+      PrefetchCardsAt(at);
+  }
+  const u8 *from = record + sizeof(head) + size_t(std::popcount(head.slots)) * sizeof(TextureObject *);
+  u32 done = 0;
+  for (u32 bits = head.vb_mask; bits && done < 2; bits &= bits - 1, from += 8) {
+    const u32 s = u32(std::countr_zero(bits));
+    u32 w0;
+    std::memcpy(&w0, from, 4);
+    if (((held.vb_mask >> s) & 1) && held.vb[s][0] == w0)
+      continue;
+    const u32 base = w0 & ~3u;
+    const u32 at = base >= 0x20000000u ? CardOffsetOfAddress(base) : UINT32_MAX;  // (GetStreamSource's CPU base)
+    if (at != UINT32_MAX) {
+      PrefetchCardsAt(at);
+      ++done;
+    }
+  }
+}
 // 'copies' (the stream on): the objects' lines came an op before (PrefetchResourceObjects): the copies their answers
 // name are fetched; else the answers' lines, as before.
 inline void ApplyResources(DrawResources &table, const u8 *record, bool draw, bool copies) {
@@ -2940,7 +3015,202 @@ void CensusPacket(const u8 *state, const OpCall &call, u32 fields) {
 // On the render thread. 'predication': the mask the buffer runs under
 // (SetPredication before RunCommandBuffer), which the draws' own masks narrow
 // (see SetReplayPredicationLocked).
-void Replay(const u8 *running, const BufferSet &buffers, u32 command_buffer_va, u32 depth,
+// banjo-nx (2026-11-20, N&B's render thread against renut-nx 1.0.2 in Showdown Town): one copy (noclone): LTO's
+// constant propagation made two 18 KB copies of it, and both ran every draw (the instruction cache; 1.0.2 had one).
+// banjo-nx (2026-11-21, the user's batch 2): the cache-warming helper (banjo_renut_warm_helper). Replay publishes the
+// buffer it plays (a sequence lock: the count is odd while the target is written) and its op index at each op; the
+// helper, on the system core, reads up to banjo_renut_warm_ahead ops ahead of it and touches what their draws read (the
+// prefetch helpers that cost the render thread when it ran them itself, A/B 174/175/56/181: their loads stall only the
+// helper here). The lines it brings land in the L2 the cores share. Reads and prefetches only, every pointer it follows
+// checked (arena offsets against the arena's size, geometry objects against their pool, shader records by their own
+// address word): a buffer freed under it is read as stale bytes, and the target's count tells it to stop.
+#if REX_PLATFORM_SWITCH
+extern "C" int RexSwitchSystemCore(void);
+extern "C" bool RexSwitchMoveCurrentThreadToSystemCore(int priority);
+#endif
+namespace warm {
+struct Target {
+  const Op *ops = nullptr;
+  size_t op_count = 0;
+  const u8 *arena = nullptr;
+  size_t arena_size = 0;
+};
+// banjo-nx (2026-11-21, the ARM audit): the render thread's line (the target under its sequence, the op index it stores
+// at every op) apart from the helper's counters, whose fetch_adds at each of its wakes took that line from the render
+// thread's core.
+alignas(64) std::atomic<uint32_t> g_seq{0};
+Target g_target;  // the render thread's, written under g_seq
+std::atomic<size_t> g_index{0};
+bool g_started = false;  // render thread
+alignas(64) std::atomic<uint64_t> g_ops{0}, g_wakes{0}, g_idle{0};
+
+bool On() {
+#if REX_PLATFORM_SWITCH
+  // (the emulator has no system core: banjo_deko3d_command_stage_any_core runs it anyway, for its tests)
+  static const bool on = REXCVAR_GET(banjo_renut_warm_helper) &&
+                         (RexSwitchSystemCore() >= 0 || REXCVAR_GET(banjo_deko3d_command_stage_any_core));
+  return on;
+#else
+  return false;
+#endif
+}
+
+void Publish(const Target &t) {
+  const uint32_t s = g_seq.load(std::memory_order_relaxed);
+  g_seq.store(s + 1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
+  g_target = t;
+  g_index.store(0, std::memory_order_relaxed);
+  g_seq.store(s + 2, std::memory_order_release);
+}
+
+bool Read(Target &t, uint32_t &seq) {
+  const uint32_t s0 = g_seq.load(std::memory_order_acquire);
+  if (s0 & 1)
+    return false;
+  t = g_target;
+  std::atomic_thread_fence(std::memory_order_acquire);
+  if (g_seq.load(std::memory_order_relaxed) != s0)
+    return false;
+  seq = s0;
+  return true;
+}
+
+void WarmOp(const Target &t, size_t j) {
+  const Op &op = t.ops[j];
+  const char *line = reinterpret_cast<const char *>(&op);
+  __builtin_prefetch(line);
+  __builtin_prefetch(line + 64);
+  const u8 *arena = t.arena;
+  const size_t size = t.arena_size;
+  if (op.state != kNone && op.state < size) {
+    const u32 bytes = std::min<u32>(u32(std::popcount(op.plain_dirty)) * kChunkBytes +
+                                        u32(std::popcount(op.vs_dirty) + std::popcount(op.ps_dirty)) * kConstantGroupBytes,
+                                    4096u);
+    for (u32 at = 0; at < bytes && op.state + at < size; at += 64)
+      __builtin_prefetch(arena + op.state + at);
+  }
+  if (op.extents != kNoExtents && op.extents < size)
+    __builtin_prefetch(arena + op.extents);
+  if (op.resources != kNoResources && size_t(op.resources) + sizeof(ResourceHead) <= size) {
+    ResourceHead head;
+    std::memcpy(&head, arena + op.resources, sizeof(head));
+    const u8 *from = arena + op.resources + sizeof(head);
+    const u8 *const end = arena + size;
+    for (u32 bits = head.slots; bits && from + sizeof(TextureObject *) <= end; bits &= bits - 1) {
+      TextureObject *obj;
+      std::memcpy(&obj, from, sizeof(obj));
+      from += sizeof(obj);
+      if (obj)
+        PrefetchTextureObject(obj);  // (prefetches only: no load through it)
+    }
+    from += size_t(std::popcount(head.vb_mask)) * 8;
+    if ((head.flags & 2) && from + 8 <= end) {
+      u32 object_mask;
+      std::memcpy(&object_mask, from, 4);
+      from += 8;
+      for (u32 bits = object_mask; bits && from + sizeof(GeometryObject *) <= end; bits &= bits - 1) {
+        GeometryObject *o;
+        std::memcpy(&o, from, sizeof(o));
+        from += sizeof(o);
+        if (GeometryObjectPooled(o)) {
+          PrefetchGeometryObject(o, false);
+          PrefetchGeometryCopies(o, false);  // (reads the pooled object; its copies and cards prefetched)
+        }
+      }
+    }
+    if ((head.flags & 4) && from + sizeof(GeometryObject *) <= end) {
+      GeometryObject *o;
+      std::memcpy(&o, from, sizeof(o));
+      if (GeometryObjectPooled(o)) {
+        PrefetchGeometryObject(o, true);
+        PrefetchGeometryCopies(o, true);
+      }
+    }
+  }
+  if (op.kind == OpKind::Draw) {
+    if (op.fields & kFieldShaders) {
+      PrefetchShaderRecordAt(op.call.vs_word);
+      PrefetchShaderRecordAt(op.call.ps_word);
+      PrefetchShaderBehind(op.call.vs_word);  // (checks the record's own address word before it reads further)
+      PrefetchShaderBehind(op.call.ps_word);
+    }
+    if (op.call.decl_word)
+      PrefetchShaderRecordAt(op.call.decl_word);
+  }
+}
+
+void Worker() {
+#if REX_PLATFORM_SWITCH
+  const bool moved = RexSwitchMoveCurrentThreadToSystemCore(0x2F);
+  RGPU_INFO("[renut] cache-warming helper (banjo_renut_warm_helper): on the system core {}{} at priority 0x2F",
+            RexSwitchSystemCore(), moved ? "" : " (NOT accepted)");
+#endif
+  const size_t ahead = size_t(REXCVAR_GET(banjo_renut_warm_ahead));
+  const auto nap = std::chrono::microseconds(REXCVAR_GET(banjo_renut_warm_sleep_us));
+  uint32_t seq_done = 0;
+  size_t warmed_to = 0;
+  int cores_applied = 1;  // (on core 3: moved above)
+  for (;;) {
+    banjo::renut_gpu::record::FollowStageCores(cores_applied);  // banjo-nx (2026-11-22, A/B 189)
+    Target t;
+    uint32_t seq = 0;
+    if (!Read(t, seq) || !t.ops || !t.op_count) {
+      g_idle.fetch_add(1, std::memory_order_relaxed);
+      std::this_thread::sleep_for(nap);
+      continue;
+    }
+    if (seq != seq_done) {
+      seq_done = seq;
+      warmed_to = 0;
+    }
+    const size_t at = g_index.load(std::memory_order_relaxed);
+    const size_t from = std::max(warmed_to, at + 1);
+    const size_t to = std::min(t.op_count, at + 1 + ahead);
+    if (from >= to) {
+      g_idle.fetch_add(1, std::memory_order_relaxed);
+      std::this_thread::sleep_for(nap);
+      continue;
+    }
+    g_wakes.fetch_add(1, std::memory_order_relaxed);
+    size_t j = from;
+    for (; j < to; ++j) {
+      if (g_seq.load(std::memory_order_relaxed) != seq)
+        break;  // the replay moved to another buffer (or left this one)
+      WarmOp(t, j);
+    }
+    g_ops.fetch_add(j - from, std::memory_order_relaxed);
+    warmed_to = j;
+  }
+}
+
+// Render thread: the helper started (once) and this buffer its target; Leave puts the outer one back.
+struct Scope {
+  bool active = false;
+  Target saved;
+  size_t saved_index = 0;
+  Scope(const HostCommandBuffer &buffer) {
+    if (!On() || banjo::renut_gpu::g_ab_off.load(std::memory_order_relaxed) == 185)
+      return;
+    if (!g_started) {
+      g_started = true;
+      banjo::renut_gpu::StartLongLivedThread(&Worker, 64u << 10);
+    }
+    active = true;
+    saved = g_target;
+    saved_index = g_index.load(std::memory_order_relaxed);
+    Publish(Target{buffer.ops.data(), buffer.ops.size(), buffer.arena.data(), buffer.arena.size()});
+  }
+  ~Scope() {
+    if (!active)
+      return;
+    Publish(saved);
+    g_index.store(saved_index, std::memory_order_relaxed);
+  }
+};
+}  // namespace warm
+
+[[gnu::noclone]] void Replay(const u8 *running, const BufferSet &buffers, u32 command_buffer_va, u32 depth,
             u32 predication) {
   if (depth >= kMaxRunDepth)
     return;
@@ -2950,6 +3220,7 @@ void Replay(const u8 *running, const BufferSet &buffers, u32 command_buffer_va, 
   // Only this thread touches a captured buffer: the game records into a new
   // one (BeginRecording).
   HostCommandBuffer &buffer = *it->second;
+  warm::Scope warm_scope(buffer);  // banjo-nx (2026-11-21, batch 2): the cache-warming helper's target
   // halo3-nx (2026-11-03, banjo_renut_replay_inherits): see BuildInheritRuns.
   static const bool inherits_on = REXCVAR_GET(banjo_renut_replay_inherits);
   if (inherits_on && !buffer.inherit_built)
@@ -3023,6 +3294,8 @@ void Replay(const u8 *running, const BufferSet &buffers, u32 command_buffer_va, 
                          banjo::renut_gpu::g_ab_off.load(std::memory_order_relaxed) != 40;
   size_t sort_cursor = 0;
   for (size_t op_index = 0; op_index < op_count; ++op_index) {
+    if (warm_scope.active)
+      warm::g_index.store(op_index, std::memory_order_relaxed);  // banjo-nx (2026-11-21): the helper's pace
     if (sort_runs && sort_cursor < buffer.sort_runs.size()) {
       while (sort_cursor < buffer.sort_runs.size() && buffer.sort_runs[sort_cursor].begin < op_index)
         ++sort_cursor;  // (a merged draw took a run's first op)
@@ -3147,7 +3420,7 @@ void Replay(const u8 *running, const BufferSet &buffers, u32 command_buffer_va, 
       }
       // (Without the shader stages, A/B 49: the next op's sets, as c2 did.)
       const size_t sets_at = stream_shaders && op_index + 2 < op_count ? op_index + 2 : op_index + 1;
-      if (sets_at < op_count) {
+      if (sets_at < op_count && prefetch_ab != 176) {  // banjo-nx (2026-11-21): A/B 176's off half, none
         const Op &with = ops[sets_at];
         if (with.kind == OpKind::Draw && (with.fields & kFieldShaders)) {
           PrefetchShaderLocked(with.call.vs_word, RecordKind::VertexShader);
@@ -3171,8 +3444,12 @@ void Replay(const u8 *running, const BufferSet &buffers, u32 command_buffer_va, 
           for (u32 at = 0; at < std::min(bytes, kStreamStateBytes); at += 64)
             __builtin_prefetch(s + at);
         }
-        if (next.resources != kNoResources && prefetch_ab != 56)
+        static const bool object_prefetch = REXCVAR_GET(banjo_renut_replay_object_prefetch);  // (2026-11-21: off)
+        if (object_prefetch && next.resources != kNoResources && prefetch_ab != 56)
           PrefetchResourceObjects(arena + next.resources, resources);
+        static const bool card_prefetch = REXCVAR_GET(banjo_renut_replay_card_prefetch);  // banjo-nx (2026-11-21)
+        if (card_prefetch && next.kind == OpKind::Draw && next.resources != kNoResources && prefetch_ab != 181)
+          PrefetchRecordCards(arena + next.resources, resources);
         // banjo-nx (2026-10-28, per-draw night): its shader records' lines, from its words (resources.h), and with a
         // declaration of the device's its record's (a record at its own guest address too: the hash, stream order,
         // used mask and first streams the geometry reads first, a miss at most declaration changes in the d4 profile).
@@ -3196,9 +3473,21 @@ void Replay(const u8 *running, const BufferSet &buffers, u32 command_buffer_va, 
     }
     // banjo-nx (2026-10-28, per-draw night): this op's records came an op ago: what its shader change reads behind
     // them (the cache entries, the bound declaration), while its state is applied.
-    if (stream && op.kind == OpKind::Draw && (op.fields & kFieldShaders)) {
-      PrefetchShaderBehind(op.call.vs_word);
-      PrefetchShaderBehind(op.call.ps_word);
+    // banjo-nx (2026-11-20, render-thread batch #16): a stage whose word is the last such op's (the other stage changed)
+    // is skipped: its record, cache entry and declaration were read by that op's draw (one record line read and up to
+    // five prefetches a stage; the c15 city profile's PrefetchShaderBehind 0.18 us a draw). Prefetches only.
+    // banjo-nx (2026-11-21, A/B 174's off half: none of it; prefetches only).
+    static const bool shader_behind = REXCVAR_GET(banjo_renut_replay_shader_behind);  // banjo-nx (2026-11-21): off
+    if (shader_behind && stream && op.kind == OpKind::Draw && (op.fields & kFieldShaders) &&
+        banjo::renut_gpu::g_ab_off_plain != 174) {
+      static u32 behind_vs = 0, behind_ps = 0;  // render thread
+      const bool all = banjo::renut_gpu::g_ab_off_plain == 171;  // A/B 171 (banjo-nx's 301; port 188)
+      if (all || op.call.vs_word != behind_vs)
+        PrefetchShaderBehind(op.call.vs_word);
+      if (all || op.call.ps_word != behind_ps)
+        PrefetchShaderBehind(op.call.ps_word);
+      behind_vs = op.call.vs_word;
+      behind_ps = op.call.ps_word;
     }
     const uint64_t op_start = kinds ? RenderTicks() : 0;
     ApplyState(state, buffer.arena.data() + op.state, op.plain_dirty, op.vs_dirty, op.ps_dirty, groups);
@@ -3245,7 +3534,11 @@ void Replay(const u8 *running, const BufferSet &buffers, u32 command_buffer_va, 
     else if (op.plain_dirty & ((uint64_t(1) << kFetchChunks) - 1))
       extents.mask &= ~SlotsOfFetchChunks(op.plain_dirty);  // (recorded with the key off: not known)
     if (op.resources != kNoResources) {
-      ApplyResources(resources, buffer.arena.data() + op.resources, op.kind == OpKind::Draw, stream && op_index > 0);
+      // banjo-nx (2026-11-21, A/B 175's off half: the answers' lines, not the copies' and cards; prefetches only).
+      // Off by default (banjo_renut_replay_copy_prefetch: console c36, +0.47 % a draw with it).
+      static const bool copy_prefetch = REXCVAR_GET(banjo_renut_replay_copy_prefetch);
+      ApplyResources(resources, buffer.arena.data() + op.resources, op.kind == OpKind::Draw,
+                     copy_prefetch && stream && op_index > 0 && banjo::renut_gpu::g_ab_off_plain != 175);
     } else {  // nothing recorded: a draw has no index words of its own; slots it changed (key off) are not known
       if (op.kind == OpKind::Draw) {
         resources.ib_valid = false;
@@ -3346,8 +3639,9 @@ void Replay(const u8 *running, const BufferSet &buffers, u32 command_buffer_va, 
       // banjo-nx (2026-10-27): OFF by default since the console run of 2026-10-27 (+2.15 ms a frame with it, A/B 29):
       // banjo_renut_replay_lookahead. (The op after the ones this draw took, when it took some.)
       const size_t next_index = op_index + 1 + merged;
-      if (next_index < op_count && ops[next_index].kind == OpKind::Draw && ops[next_index].state != kNone &&
-          ReplayLookAheadOn()) {
+      // (2026-11-21: the key first, so that with it off the next op's line is not read here.)
+      if (ReplayLookAheadOn() && next_index < op_count && ops[next_index].kind == OpKind::Draw &&
+          ops[next_index].state != kNone) {
         const Op &next = ops[next_index];
         const u8 *next_state = buffer.arena.data() + next.state;
         __builtin_prefetch(next_state);

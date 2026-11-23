@@ -21,6 +21,9 @@
 #pragma once
 
 #include <cstdint>
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#include <arm_neon.h>  // banjo-nx (2026-11-20): FromGuest
+#endif
 
 #include <rex/types.h>
 
@@ -83,8 +86,17 @@ struct TextureFetch {
   // banjo-nx (2026-10-27, render thread night): inline (it was a call at each slot's conversion on the draw paths).
   static TextureFetch FromGuest(const d3d::TextureFetchConstant &guest) {
     TextureFetch fetch;
+#if defined(__aarch64__) && defined(__ARM_NEON)
+    // banjo-nx (2026-11-20, render-thread batch #14): the six big-endian words in two loads, two byte reversals and
+    // two stores (six loads and six REVs before; the fast path converts every slot of a draw whose texture words
+    // changed). The same words.
+    const uint8_t *g = reinterpret_cast<const uint8_t *>(&guest);
+    vst1q_u32(fetch.dword, vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(g))));
+    vst1_u32(fetch.dword + 4, vreinterpret_u32_u8(vrev32_u8(vld1_u8(g + 16))));
+#else
     for (u32 i = 0; i < 6; ++i)
       fetch.dword[i] = guest.dword[i];
+#endif
     return fetch;
   }
   // The constant D3DDevice_SetTexture builds from a texture header: its CPU

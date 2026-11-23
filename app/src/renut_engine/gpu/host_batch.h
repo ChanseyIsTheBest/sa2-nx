@@ -97,7 +97,13 @@ enum Count : uint32_t {
   kCountCount
 };
 extern std::atomic<uint64_t> g_count[kCountCount];
+#if defined(RENUT_DIAG_CENSUS_OFF)
+// banjo-nx (2026-11-20, BANJO_SWITCH_DIAG_CENSUS OFF, the Switch's default): no census in this build (see
+// stage_census.h); blur_renut_diag_batch_census does nothing here.
+constexpr bool CensusOn() { return false; }
+#else
 bool CensusOn();
+#endif
 // blur_renut_host_batch_verify (off): #3, #13 and #32 checked against the old way, differences logged.
 bool VerifyOn();
 void VerifyDiffer(const char *what);

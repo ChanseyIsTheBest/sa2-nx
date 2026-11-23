@@ -28,6 +28,7 @@
 #endif
 #include "renut_engine/gpu/overlay/overlay_ui.h"
 #include "renut_engine/gpu/overlay/overlay_drawer.h"  // banjo-nx (2026-10-19): HasLatest
+#include "renut_engine/gpu/banjo_renut_record.h"  // banjo-nx (2026-11-21, item 5): the stage's present
 #include "renut_engine/gpu/banjo_renut_tuning.h"
 #include "renut_engine/gpu/backend/render_thread.h"
 #include "renut_engine/gpu/backend/video.h"
@@ -108,6 +109,7 @@ void RebuildSwapChain(VideoState &s) {
   if (s.list_open)
     detail::SubmitAndAdvance(s, nullptr, nullptr);
   detail::WaitAllSubmitted(s);
+  banjo::renut_gpu::record::Drain();  // banjo-nx (2026-11-21, item 5): the stage's presents on this swap chain made
   s.swap_framebuffers.clear();
   if (!s.swap_chain->resize() || !detail::BuildSwapChainTargets(s)) {
     if (s.swap_chain->getWidth() && s.swap_chain->getHeight())
@@ -621,8 +623,24 @@ bool DiagTextureImageLocked(PresentImage &out) {
   return true;
 }
 
+// banjo-nx (2026-11-21, item 5, banjo_deko3d_stage_submit): the present made by the command stage after its submit of
+// the frame (StagePresentCall, below the present fences it records), and the render thread's last such call: the next
+// acquire (a queue operation, as the stage's submits and presents are) waits for it, so the two threads never use the
+// queue at once (it comes a whole frame of recording later: no wait in practice).
+struct StagePresentArgs {
+  plume::RenderSwapChain *swap_chain;
+  uint32_t image_index, pad;
+  plume::RenderCommandSemaphore *wait;
+  std::atomic<bool> *resize_requested;
+  plume::RenderCommandFence *fence;  // the frame's (the present fence's copy)
+};
+void StagePresentCall(const void *a);
+uint64_t g_last_present_call = 0;
+bool g_present_staged = false;  // PresentLocked made the present a stage call (Video::Present: the fence is its)
+
 // Records the back-buffer pass and presents. Caller holds s.mutex.
 void PresentLocked(VideoState &s, const PresentImage *image) {
+  g_present_staged = false;
   // Logs, once, why the GPU stopped if an earlier submission faulted.
   ReportDeviceLost(s.device.get());
   PresentImage diag_image;
@@ -642,6 +660,9 @@ void PresentLocked(VideoState &s, const PresentImage *image) {
 
   plume::RenderCommandSemaphore *acquire = s.acquire_semaphores[s.frame].get();
   uint32_t image_index = 0;
+  // banjo-nx (2026-11-21, item 5): the stage's last present made first (the queue is one thread's at a time).
+  banjo::renut_gpu::record::WaitStageCall(g_last_present_call);
+  g_last_present_call = 0;
   auto acquire_image = [&] {
     render_thread::WaitScope wait;
     return s.swap_chain->acquireTexture(acquire, &image_index);
@@ -698,6 +719,16 @@ void PresentLocked(VideoState &s, const PresentImage *image) {
 
   plume::RenderCommandSemaphore *present_semaphore = s.present_semaphores[image_index].get();
   detail::SubmitAndAdvance(s, acquire, present_semaphore);
+  const uint32_t submitted = (s.frame + kFramesInFlight - 1) % kFramesInFlight;
+  if (detail::SubmitWasStaged(submitted)) {
+    // banjo-nx (2026-11-21, item 5): the stage presents after its submit; the render thread goes on.
+    StagePresentArgs args{s.swap_chain.get(), image_index, 0, present_semaphore, &s.resize_requested,
+                          s.fences[submitted].get()};
+    g_last_present_call = banjo::renut_gpu::record::StageCall(&StagePresentCall, &args, sizeof(args));
+    banjo::renut_gpu::record::Hand();
+    g_present_staged = true;
+    return;
+  }
   plume::RenderCommandSemaphore *waits[] = {present_semaphore};
   bool presented;
   {
@@ -739,6 +770,30 @@ struct PresentFence {
 std::mutex g_present_fence_mutex;
 PresentFence g_present_fences[kPresentFences];
 std::atomic<uint64_t> g_present_count{0};
+
+// The frame just submitted's fence, as Video::Present records it (the display thread's PresentDone).
+void NotePresentFence(plume::RenderCommandFence *fence) {
+  std::lock_guard fence_lock(g_present_fence_mutex);
+  const uint64_t index = g_present_count.load(std::memory_order_relaxed) + 1;
+  PresentFence &p = g_present_fences[index % kPresentFences];
+  p.index = index;
+#if defined(PLUME_DEKO3D)
+  p.fence = plume::Deko3DCopyFence(fence);
+#else
+  (void)fence;
+#endif
+  g_present_count.store(index, std::memory_order_release);
+}
+
+// banjo-nx (2026-11-21, item 5): on the stage's thread, after its submit of the frame.
+void StagePresentCall(const void *a) {
+  StagePresentArgs args;
+  std::memcpy(&args, a, sizeof(args));
+  plume::RenderCommandSemaphore *waits[] = {args.wait};
+  if (!args.swap_chain->present(args.image_index, waits, 1))
+    args.resize_requested->store(true, std::memory_order_release);
+  NotePresentFence(args.fence);
+}
 } // namespace
 
 uint64_t Video::PresentCount() {
@@ -795,17 +850,10 @@ void Video::Present(const PresentImage *image) {
   PresentLocked(s, image);
   s.last_guest_present_ms.store(NowMs(), std::memory_order_release);
   detail::LatencyTrimLocked(s);  // banjo-nx (2026-10-20, input latency, banjo_deko3d_latency_trim)
-  {
-    // The frame just submitted: the slot before the one SubmitAndAdvance moved to.
-    std::lock_guard fence_lock(g_present_fence_mutex);
-    const uint64_t index = g_present_count.load(std::memory_order_relaxed) + 1;
-    PresentFence &p = g_present_fences[index % kPresentFences];
-    p.index = index;
-#if defined(PLUME_DEKO3D)
-    p.fence = plume::Deko3DCopyFence(s.fences[(s.frame + kFramesInFlight - 1) % kFramesInFlight].get());
-#endif
-    g_present_count.store(index, std::memory_order_release);
-  }
+  // The frame just submitted: the slot before the one SubmitAndAdvance moved to. (The stage's present records it
+  // after its submit: banjo-nx 2026-11-21, item 5.)
+  if (!g_present_staged)
+    NotePresentFence(s.fences[(s.frame + kFramesInFlight - 1) % kFramesInFlight].get());
 }
 
 void Video::PresentOverlayOnly() {

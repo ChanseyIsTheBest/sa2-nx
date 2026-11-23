@@ -116,6 +116,13 @@
 // waiting for the ring cleaner's range in progress, the cleaner at 0x3B on the system core kept off it by other work
 // there). A clean (dc cvac, plume Deko3DBuffer::unmap) can be repeated and run on two cores at once: the render thread
 // cleans that range itself instead of waiting for the thread to finish it (RingCleaner::Wait).
+// banjo-nx (2026-11-21, the next batch's item 5): banjo_renut_record.h StageCall.
+REXCVAR_DEFINE_BOOL(banjo_deko3d_stage_submit, true, "Banjo/Enhancements",
+                    "deko3d command stage (banjo_deko3d_command_stage): the stage ends the frame's list, submits it "
+                    "(once the ring cleaner has its ranges) and presents, in stream order: the render thread hands the "
+                    "frame over and goes on, instead of waiting for the stage to play the frame's last commands. "
+                    "In-run A/B target 183 (its off half: the render thread drains, ends and submits as before)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(sasrt_ring_cleaner_take_over, true, "Banjo/Enhancements",
                     "From sasrt-nx: a submit that needs the range the ring cleaner thread is cleaning cleans it itself (a "
                     "cache clean by address, repeatable) instead of waiting for the thread, which runs at the lowest "
@@ -566,7 +573,15 @@ bool BuildSwapChainTargets(VideoState &s) {
   return count != 0;
 }
 
+namespace {
+// banjo-nx (2026-11-21, batch 2): WaitSlotLocked waited for the slot's submitted frame (DrainSlot's RetiredFreeScope).
+bool g_slot_played[kFramesInFlight] = {};
+}  // namespace
+
 void DrainSlot(VideoState &s, uint32_t slot) {
+  // banjo-nx (2026-11-21, batch 2, banjo_deko3d_stage_retired_free): see WaitSlotLocked.
+  const banjo::renut_gpu::record::RetiredFreeScope retired_free(g_slot_played[slot]);
+  g_slot_played[slot] = false;
   s.retired_framebuffers[slot].clear();
   s.retired_views[slot].clear();
   s.retired_textures[slot].clear();
@@ -764,6 +779,40 @@ bool UseRingCleaner() {
   return IsDeko3D() && banjo::renut_gpu::RingCleanerOn();
 }
 
+// banjo-nx (2026-11-21, item 5): the frame's end and submit made by the command stage (StageSubmitCall, in stream order),
+// when its list is the stage's and the ring cleaner takes the ranges (no latency trim: its fence copies follow the
+// render thread's submit). g_stage_submit[slot]: the StageCall of the slot's last such submit (WaitSlotLocked waits for
+// it before the slot's fence).
+uint64_t g_stage_submit[kFramesInFlight] = {};
+bool StageSubmitOn(VideoState &s) {
+#if defined(PLUME_DEKO3D)
+  static const bool on = REXCVAR_GET(banjo_deko3d_stage_submit);
+  return on && banjo::renut_gpu::record::IsProxy(s.command_list) && UseRingCleaner() &&
+         !banjo::renut_gpu::LatencyTrimOn() && banjo::renut_gpu::g_ab_off_plain != 183;
+#else
+  (void)s;
+  return false;
+#endif
+}
+struct StageSubmitArgs {
+  plume::RenderCommandQueue *queue;
+  const plume::RenderCommandList *lists[2];
+  uint32_t count;
+  plume::RenderCommandSemaphore *wait, *signal;
+  plume::RenderCommandFence *fence;
+  uint64_t ticket;  // the ring cleaner's, for the frame's ranges
+};
+void StageSubmitCall(const void *a) {
+  StageSubmitArgs args;
+  std::memcpy(&args, a, sizeof(args));
+  RingCleaner::Instance().Wait(args.ticket);
+  const_cast<plume::RenderCommandList *>(args.lists[args.count - 1])->end();
+  plume::RenderCommandSemaphore *waits[] = {args.wait};
+  plume::RenderCommandSemaphore *signals[] = {args.signal};
+  args.queue->executeCommandLists(args.lists, args.count, args.wait ? waits : nullptr, args.wait ? 1 : 0,
+                                  args.signal ? signals : nullptr, args.signal ? 1 : 0, args.fence);
+}
+
 // Every range written so far is clean (handed to the cleaner and waited for, the rest by Publish).
 void PublishAll(VideoState &s, uint32_t slot) {
   if (UseRingCleaner()) {
@@ -780,6 +829,9 @@ plume::RenderCommandList *SlotList(VideoState &s, uint32_t slot) {
 }
 
 } // namespace
+
+// banjo-nx (2026-11-21, item 5): video_internal.h.
+bool SubmitWasStaged(uint32_t slot) { return g_stage_submit[slot] != 0; }
 
 namespace {
 
@@ -948,6 +1000,14 @@ std::string LatencyTrimReport() {
 void WaitSlotLocked(VideoState &s, uint32_t slot) {
   if (!s.submitted[slot])
     return;
+  // banjo-nx (2026-11-21, batch 2): every command of the slot's frame is played once this returns (its staged submit
+  // waited for below, or the stage drained at its submit): its retired objects go at DrainSlot without a drain.
+  g_slot_played[slot] = true;
+  // banjo-nx (2026-11-21, item 5): a submit the command stage makes: made before its fence is waited for.
+  if (g_stage_submit[slot]) {
+    banjo::renut_gpu::record::WaitStageCall(g_stage_submit[slot]);
+    g_stage_submit[slot] = 0;
+  }
   NoteGpuDoneSeenLocked(slot, false);  // banjo-nx (2026-10-20): done already (seen now)
   {
     render_thread::WaitScope wait;
@@ -1009,7 +1069,34 @@ void SubmitAndWaitLocked(VideoState &s) {
 void SubmitAndAdvance(VideoState &s, plume::RenderCommandSemaphore *wait,
                       plume::RenderCommandSemaphore *signal) {
   const uint32_t cur = s.frame;
-  if (s.list_open) {
+  if (s.list_open && StageSubmitOn(s)) {
+    // banjo-nx (2026-11-21, item 5): the stage ends and submits the frame after its last commands; the render thread
+    // hands the ring's ranges to the cleaner (the stage waits for them) and goes on.
+    FinishRecordingLocked(s);
+    EndListTiming(s, true);
+    plume::RenderCommandList *current = SlotList(s, cur);
+    std::vector<UploadRing::Range> ranges;
+    s.uploads[cur].HandOff(ranges);
+    StageSubmitArgs args{};
+    args.queue = s.queue.get();
+    args.lists[0] = s.pending_list ? s.pending_list : current;
+    args.lists[1] = current;
+    args.count = s.pending_list ? 2 : 1;
+    args.wait = wait;
+    args.signal = signal;
+    args.fence = s.fences[cur].get();
+    args.ticket = RingCleaner::Instance().Enqueue(std::move(ranges));
+    s.pending_list = nullptr;
+    g_stage_submit[cur] = banjo::renut_gpu::record::StageCall(&StageSubmitCall, &args, sizeof(args));
+    banjo::renut_gpu::record::Hand();
+    s.list_open = false;
+    s.command_list = nullptr;
+    s.submitted[cur] = true;
+    g_slot_swap[cur] = g_presenting_swap;
+    g_gpu_done_noted[cur] = g_presenting_swap == 0;
+    s.last_frame_draws = s.frame_draws;  // port 164 (banjo_deko3d_progressive_submit)
+    s.frame_draws = 0;
+  } else if (s.list_open) {
     FinishRecordingLocked(s);
     EndListTiming(s, true);
     banjo::renut_gpu::record::Drain();  // banjo-nx (banjo_renut_record_worker)
@@ -1289,7 +1376,9 @@ void Video::KickLocked() {
   // The open list ends here when it holds enough draws; the frame goes on in a kick list of the slot.
   const bool eager = banjo::renut_gpu::EagerKicksOn();
   const bool progressive = !eager && banjo::renut_gpu::ProgressiveSubmitOn();  // port 164
-  if (!banjo::renut_gpu::KickSubmitOn() ||
+  // banjo-nx (2026-11-21, A/B 179's off half: no list ends at a kick, the frame goes at the present: the render thread's
+  // submits a frame against the input latency banjo_deko3d_kick_submit buys).
+  if (!banjo::renut_gpu::KickSubmitOn() || banjo::renut_gpu::g_ab_off_plain == 179 ||
       s.list_draws < (eager ? detail::kEagerKickDraws : progressive ? detail::PieceDraws(s) : detail::kKickSubmitDraws) ||
       s.kick_lists_used[cur] >= (eager || progressive ? VideoState::kKickLists : detail::kKickListsAFrame))
     return;

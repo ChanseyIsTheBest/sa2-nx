@@ -18,6 +18,8 @@ enum MenuText : int {
   X_START, X_BACK, X_LS, X_RS, R_RESET, R_PRESS, H_CONTROL, H_RESET,
   F_NOTE, F_KEYS, F_KEYS_SCROLL, F_NEXT,
   A_UNLOCKED_OF, A_UNLOCKED, A_NONE, A_NOT_LOADED,
+  // rr6-nx (2026-11-22): each mode's dynamic resolution switch (T_HANDHELD / T_DOCKED are the fixed resolutions now)
+  T_DYN_HANDHELD, T_DYN_DOCKED, H_DYN_HANDHELD, H_DYN_DOCKED,
   kMenuTextCount
 };
 
@@ -37,14 +39,16 @@ inline const char* const kMenuLanguageKeys[kMenuLanguages] = {
 inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
     {  // English
         "Settings", "Achievements", "P%d Controls",
-        "Language", "Framerate cap", "Handheld resolution", "Docked resolution", "Rumble", "SMAA", "MSAA",
+        "Language", "Framerate cap", "Fixed handheld resolution", "Fixed docked resolution", "Rumble", "SMAA", "MSAA",
         "4-core mode", "Xbox button layout", "Joy-Con sideways", "Joy-Con sideways stick", "Menu buttons",
         "Menu colour", "Menu font",
         "Background opacity",
         "The game's language. System follows the console's language; a language the game does not have shows English.",
         "30 fps keeps a steady pace. 60 fps lets the game go faster where it can (uneven on busy tracks). Off: no cap.",
-        "The size of the 3D image in handheld mode. Lower is faster; the HUD and text stay sharp.",
-        "The size of the 3D image on the TV (1728x972 by default). Lower is faster; the HUD and text are drawn at 1080p.",
+        "The size of the 3D image in handheld mode while handheld dynamic resolution is off. Lower is faster; the HUD "
+        "and text stay sharp.",
+        "The size of the 3D image on the TV while docked dynamic resolution is off. Lower is faster; the HUD and text "
+        "are drawn at 1080p.",
         "Controller vibration.",
         "Edge smoothing on the 3D image after the game's own picture (costs a little GPU time).",
         "The game's own edge smoothing: smoother edges, a lower frame rate (4x: about 9 % lower than Off).",
@@ -70,19 +74,26 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "next start",
         "%d of %d unlocked", "Unlocked", "No achievements found in the game's data.",
         "No achievements: the game's data is not loaded yet.",
+        "Handheld dynamic resolution",
+        "Docked dynamic resolution",
+        "On: the 3D image in handheld mode goes between %d and %d lines, lower while the GPU is busy. Off: the fixed "
+        "handheld resolution.",
+        "On: the 3D image on the TV goes between %d and %d lines, lower while the GPU is busy. Off: the fixed docked "
+        "resolution.",
     },
     {  // French
         "Paramètres", "Succès", "Commandes J%d",
-        "Langue", "Limite d'images/s", "Résolution portable", "Résolution TV", "Vibrations", "SMAA", "MSAA",
+        "Langue", "Limite d'images/s", "Résolution portable fixe", "Résolution TV fixe", "Vibrations", "SMAA", "MSAA",
         "Mode 4 cœurs", "Disposition Xbox", "Joy-Con à l'horizontale", "Stick Joy-Con à l'horizontale",
         "Boutons du menu", "Couleur du menu", "Police du menu",
         "Opacité du fond",
         "La langue du jeu. Système suit la langue de la console ; une langue absente du jeu s'affiche en anglais.",
         "30 i/s garde un rythme régulier. 60 i/s laisse le jeu aller plus vite quand il le peut (irrégulier sur les "
         "circuits chargés). Désactivé : aucune limite.",
-        "La taille de l'image 3D en mode portable. Plus bas est plus rapide ; l'interface et le texte restent nets.",
-        "La taille de l'image 3D sur la TV (1728x972 par défaut). Plus bas est plus rapide ; l'interface et le texte "
-        "sont en 1080p.",
+        "La taille de l'image 3D en mode portable quand la résolution portable dynamique est désactivée. Plus bas est "
+        "plus rapide ; l'interface et le texte restent nets.",
+        "La taille de l'image 3D sur la TV quand la résolution TV dynamique est désactivée. Plus bas est plus rapide "
+        "; l'interface et le texte sont en 1080p.",
         "Vibrations de la manette.",
         "Lissage des contours de l'image 3D après l'image du jeu (coûte un peu de temps GPU).",
         "Le lissage propre au jeu : contours plus lisses, fréquence d'images plus basse (4x : environ 9 % de moins "
@@ -111,10 +122,16 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "au prochain lancement",
         "%d sur %d débloqués", "Débloqué", "Aucun succès trouvé dans les données du jeu.",
         "Aucun succès : les données du jeu ne sont pas encore chargées.",
+        "Résolution portable dynamique",
+        "Résolution TV dynamique",
+        "Activé : l'image 3D en mode portable varie entre %d et %d lignes, plus bas quand le GPU est chargé. "
+        "Désactivé : la résolution portable fixe.",
+        "Activé : l'image 3D sur la TV varie entre %d et %d lignes, plus bas quand le GPU est chargé. Désactivé : la "
+        "résolution TV fixe.",
     },
     {  // German
         "Einstellungen", "Erfolge", "Steuerung S%d",
-        "Sprache", "Bildratenlimit", "Handheld-Auflösung", "TV-Auflösung", "Vibration", "SMAA", "MSAA",
+        "Sprache", "Bildratenlimit", "Feste Handheld-Auflösung", "Feste TV-Auflösung", "Vibration", "SMAA", "MSAA",
         "4-Kern-Modus", "Xbox-Tastenbelegung", "Joy-Con quer", "Joy-Con-Stick quer", "Menütasten", "Menüfarbe",
         "Menüschrift",
         "Hintergrund-Deckkraft",
@@ -122,9 +139,10 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "auf Englisch angezeigt.",
         "30 fps hält ein gleichmäßiges Tempo. 60 fps lässt das Spiel schneller laufen, wo es kann (ungleichmäßig auf "
         "vollen Strecken). Aus: keine Begrenzung.",
-        "Die Größe des 3D-Bildes im Handheld-Modus. Niedriger ist schneller; HUD und Text bleiben scharf.",
-        "Die Größe des 3D-Bildes am Fernseher (standardmäßig 1728x972). Niedriger ist schneller; HUD und Text werden "
-        "in 1080p gezeichnet.",
+        "Die Größe des 3D-Bildes im Handheld-Modus, wenn die dynamische Handheld-Auflösung aus ist. Niedriger ist "
+        "schneller; HUD und Text bleiben scharf.",
+        "Die Größe des 3D-Bildes am Fernseher, wenn die dynamische TV-Auflösung aus ist. Niedriger ist schneller; HUD "
+        "und Text werden in 1080p gezeichnet.",
         "Controller-Vibration.",
         "Kantenglättung des 3D-Bildes nach dem Bild des Spiels (kostet etwas GPU-Zeit).",
         "Die spieleigene Kantenglättung: glattere Kanten, niedrigere Bildrate (4x: etwa 9 % weniger als Aus).",
@@ -153,10 +171,16 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "beim nächsten Start",
         "%d von %d freigeschaltet", "Freigeschaltet", "Keine Erfolge in den Spieldaten gefunden.",
         "Keine Erfolge: Die Spieldaten sind noch nicht geladen.",
+        "Dynamische Handheld-Auflösung",
+        "Dynamische TV-Auflösung",
+        "An: das 3D-Bild im Handheld-Modus zwischen %d und %d Zeilen, niedriger, solange die GPU ausgelastet ist. "
+        "Aus: die feste Handheld-Auflösung.",
+        "An: das 3D-Bild am Fernseher zwischen %d und %d Zeilen, niedriger, solange die GPU ausgelastet ist. Aus: die "
+        "feste TV-Auflösung.",
     },
     {  // Italian
         "Impostazioni", "Obiettivi", "Comandi G%d",
-        "Lingua", "Limite fotogrammi", "Risoluzione portatile", "Risoluzione TV", "Vibrazione", "SMAA", "MSAA",
+        "Lingua", "Limite fotogrammi", "Risoluzione portatile fissa", "Risoluzione TV fissa", "Vibrazione", "SMAA", "MSAA",
         "Modalità 4 core", "Layout pulsanti Xbox", "Joy-Con orizzontale", "Levetta Joy-Con orizzontale",
         "Pulsanti menu", "Colore menu", "Carattere menu",
         "Opacità sfondo",
@@ -164,9 +188,10 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "inglese.",
         "30 fps mantiene un ritmo costante. 60 fps lascia il gioco andare più veloce dove può (irregolare sui circuiti "
         "affollati). No: nessun limite.",
-        "La dimensione dell'immagine 3D in modalità portatile. Più bassa è più veloce; HUD e testo restano nitidi.",
-        "La dimensione dell'immagine 3D sulla TV (1728x972 di base). Più bassa è più veloce; HUD e testo sono "
-        "disegnati a 1080p.",
+        "La dimensione dell'immagine 3D in modalità portatile quando la risoluzione portatile dinamica è disattivata. "
+        "Più bassa è più veloce; HUD e testo restano nitidi.",
+        "La dimensione dell'immagine 3D sulla TV quando la risoluzione TV dinamica è disattivata. Più bassa è più "
+        "veloce; HUD e testo sono disegnati a 1080p.",
         "Vibrazione del controller.",
         "Smussatura dei bordi dell'immagine 3D dopo l'immagine del gioco (costa un po' di tempo GPU).",
         "La smussatura propria del gioco: bordi più lisci, frame rate più basso (4x: circa il 9 % in meno di No).",
@@ -195,10 +220,16 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "al prossimo avvio",
         "%d di %d sbloccati", "Sbloccato", "Nessun obiettivo trovato nei dati del gioco.",
         "Nessun obiettivo: i dati del gioco non sono ancora caricati.",
+        "Risoluzione portatile dinamica",
+        "Risoluzione TV dinamica",
+        "Sì: l'immagine 3D in modalità portatile va da %d a %d linee, più bassa quando la GPU è impegnata. No: la "
+        "risoluzione portatile fissa.",
+        "Sì: l'immagine 3D sulla TV va da %d a %d linee, più bassa quando la GPU è impegnata. No: la risoluzione TV "
+        "fissa.",
     },
     {  // Spanish
         "Ajustes", "Logros", "Controles J%d",
-        "Idioma", "Límite de fotogramas", "Resolución portátil", "Resolución TV", "Vibración", "SMAA", "MSAA",
+        "Idioma", "Límite de fotogramas", "Resolución portátil fija", "Resolución TV fija", "Vibración", "SMAA", "MSAA",
         "Modo 4 núcleos", "Distribución Xbox", "Joy-Con en horizontal", "Stick del Joy-Con en horizontal",
         "Botones del menú", "Color del menú", "Fuente del menú",
         "Opacidad del fondo",
@@ -206,9 +237,10 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "inglés.",
         "30 fps mantiene un ritmo estable. 60 fps deja que el juego vaya más rápido donde puede (irregular en "
         "circuitos concurridos). No: sin límite.",
-        "El tamaño de la imagen 3D en modo portátil. Más bajo es más rápido; el HUD y el texto siguen nítidos.",
-        "El tamaño de la imagen 3D en la TV (1728x972 por defecto). Más bajo es más rápido; el HUD y el texto se "
-        "dibujan a 1080p.",
+        "El tamaño de la imagen 3D en modo portátil cuando la resolución portátil dinámica está desactivada. Más bajo "
+        "es más rápido; el HUD y el texto siguen nítidos.",
+        "El tamaño de la imagen 3D en la TV cuando la resolución TV dinámica está desactivada. Más bajo es más "
+        "rápido; el HUD y el texto se dibujan a 1080p.",
         "Vibración del mando.",
         "Suavizado de bordes de la imagen 3D después de la imagen del juego (cuesta algo de tiempo de GPU).",
         "El suavizado propio del juego: bordes más suaves, menos fotogramas por segundo (4x: un 9 % menos que No).",
@@ -236,19 +268,26 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "próximo inicio",
         "%d de %d desbloqueados", "Desbloqueado", "No se encontraron logros en los datos del juego.",
         "Sin logros: los datos del juego aún no están cargados.",
+        "Resolución portátil dinámica",
+        "Resolución TV dinámica",
+        "Sí: la imagen 3D en modo portátil va de %d a %d líneas, más baja mientras la GPU está ocupada. No: la "
+        "resolución portátil fija.",
+        "Sí: la imagen 3D en la TV va de %d a %d líneas, más baja mientras la GPU está ocupada. No: la resolución TV "
+        "fija.",
     },
     {  // Polish
         "Ustawienia", "Osiągnięcia", "Sterowanie G%d",
-        "Język", "Limit klatek", "Rozdzielczość przenośna", "Rozdzielczość TV", "Wibracje", "SMAA", "MSAA",
+        "Język", "Limit klatek", "Stała rozdzielczość przenośna", "Stała rozdzielczość TV", "Wibracje", "SMAA", "MSAA",
         "Tryb 4 rdzeni", "Układ przycisków Xbox", "Joy-Con poziomo", "Gałka Joy-Con poziomo", "Przyciski menu",
         "Kolor menu", "Czcionka menu",
         "Krycie tła",
         "Język gry. System podąża za językiem konsoli; język, którego gra nie ma, wyświetla się po angielsku.",
         "30 kl./s utrzymuje równe tempo. 60 kl./s pozwala grze działać szybciej, gdy może (nierówno na zatłoczonych "
         "trasach). Wył.: bez limitu.",
-        "Rozmiar obrazu 3D w trybie przenośnym. Niższy jest szybszy; HUD i tekst pozostają ostre.",
-        "Rozmiar obrazu 3D na telewizorze (domyślnie 1728x972). Niższy jest szybszy; HUD i tekst są rysowane w "
-        "1080p.",
+        "Rozmiar obrazu 3D w trybie przenośnym, gdy dynamiczna rozdzielczość przenośna jest wyłączona. Niższy jest "
+        "szybszy; HUD i tekst pozostają ostre.",
+        "Rozmiar obrazu 3D na telewizorze, gdy dynamiczna rozdzielczość TV jest wyłączona. Niższy jest szybszy; HUD i "
+        "tekst są rysowane w 1080p.",
         "Wibracje kontrolera.",
         "Wygładzanie krawędzi obrazu 3D po obrazie gry (kosztuje trochę czasu GPU).",
         "Własne wygładzanie gry: gładsze krawędzie, mniej klatek (4x: około 9 % mniej niż Wył.).",
@@ -276,19 +315,26 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "przy następnym uruchomieniu",
         "Odblokowano %d z %d", "Odblokowane", "Nie znaleziono osiągnięć w danych gry.",
         "Brak osiągnięć: dane gry nie są jeszcze wczytane.",
+        "Dynamiczna rozdzielczość przenośna",
+        "Dynamiczna rozdzielczość TV",
+        "Wł.: obraz 3D w trybie przenośnym od %d do %d linii, niższy, gdy GPU jest obciążone. Wył.: stała "
+        "rozdzielczość przenośna.",
+        "Wł.: obraz 3D na telewizorze od %d do %d linii, niższy, gdy GPU jest obciążone. Wył.: stała rozdzielczość "
+        "TV.",
     },
     {  // Russian
         "Настройки", "Достижения", "Управление И%d",
-        "Язык", "Ограничение кадров", "Разрешение (портативный)", "Разрешение (ТВ)", "Вибрация", "SMAA", "MSAA",
+        "Язык", "Ограничение кадров", "Фикс. разрешение (портативный)", "Фикс. разрешение (ТВ)", "Вибрация", "SMAA", "MSAA",
         "Режим 4 ядер", "Раскладка Xbox", "Joy-Con горизонтально", "Стик Joy-Con горизонтально", "Кнопки меню",
         "Цвет меню", "Шрифт меню",
         "Непрозрачность фона",
         "Язык игры. «Система» следует языку консоли; язык, которого нет в игре, отображается на английском.",
         "30 к/с держит ровный темп. 60 к/с позволяет игре идти быстрее, где получается (неровно на загруженных "
         "трассах). Выкл.: без ограничения.",
-        "Размер 3D-изображения в портативном режиме. Ниже — быстрее; интерфейс и текст остаются чёткими.",
-        "Размер 3D-изображения на телевизоре (по умолчанию 1728x972). Ниже — быстрее; интерфейс и текст рисуются в "
-        "1080p.",
+        "Размер 3D-изображения в портативном режиме, когда динамическое разрешение (портативный) выключено. Ниже — "
+        "быстрее; интерфейс и текст остаются чёткими.",
+        "Размер 3D-изображения на телевизоре, когда динамическое разрешение (ТВ) выключено. Ниже — быстрее; интерфейс "
+        "и текст рисуются в 1080p.",
         "Вибрация контроллера.",
         "Сглаживание краёв 3D-изображения после картинки игры (немного нагружает GPU).",
         "Собственное сглаживание игры: более гладкие края, ниже частота кадров (4x: примерно на 9 % ниже, чем "
@@ -316,19 +362,26 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "при следующем запуске",
         "Открыто %d из %d", "Открыто", "В данных игры не найдено достижений.",
         "Нет достижений: данные игры ещё не загружены.",
+        "Динамическое разрешение (портативный)",
+        "Динамическое разрешение (ТВ)",
+        "Вкл.: 3D-изображение в портативном режиме от %d до %d строк, ниже, пока GPU загружен. Выкл.: фиксированное "
+        "разрешение (портативный).",
+        "Вкл.: 3D-изображение на телевизоре от %d до %d строк, ниже, пока GPU загружен. Выкл.: фиксированное "
+        "разрешение (ТВ).",
     },
     {  // Portuguese
         "Configurações", "Conquistas", "Controles J%d",
-        "Idioma", "Limite de quadros", "Resolução portátil", "Resolução TV", "Vibração", "SMAA", "MSAA",
+        "Idioma", "Limite de quadros", "Resolução portátil fixa", "Resolução TV fixa", "Vibração", "SMAA", "MSAA",
         "Modo 4 núcleos", "Layout de botões Xbox", "Joy-Con na horizontal", "Analógico do Joy-Con na horizontal",
         "Botões do menu", "Cor do menu", "Fonte do menu",
         "Opacidade do fundo",
         "O idioma do jogo. Sistema segue o idioma do console; um idioma que o jogo não tem aparece em inglês.",
         "30 fps mantém um ritmo estável. 60 fps deixa o jogo ir mais rápido onde puder (irregular em pistas cheias). "
         "Não: sem limite.",
-        "O tamanho da imagem 3D no modo portátil. Menor é mais rápido; o HUD e o texto continuam nítidos.",
-        "O tamanho da imagem 3D na TV (1728x972 por padrão). Menor é mais rápido; o HUD e o texto são desenhados em "
-        "1080p.",
+        "O tamanho da imagem 3D no modo portátil quando a resolução portátil dinâmica está desligada. Menor é mais "
+        "rápido; o HUD e o texto continuam nítidos.",
+        "O tamanho da imagem 3D na TV quando a resolução TV dinâmica está desligada. Menor é mais rápido; o HUD e o "
+        "texto são desenhados em 1080p.",
         "Vibração do controle.",
         "Suavização de bordas da imagem 3D depois da imagem do jogo (custa um pouco de tempo da GPU).",
         "A suavização do próprio jogo: bordas mais suaves, menos quadros por segundo (4x: cerca de 9 % menos que "
@@ -358,17 +411,22 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "próximo início",
         "%d de %d desbloqueadas", "Desbloqueada", "Nenhuma conquista encontrada nos dados do jogo.",
         "Sem conquistas: os dados do jogo ainda não foram carregados.",
+        "Resolução portátil dinâmica",
+        "Resolução TV dinâmica",
+        "Sim: a imagem 3D no modo portátil vai de %d a %d linhas, menor enquanto a GPU está ocupada. Não: a resolução "
+        "portátil fixa.",
+        "Sim: a imagem 3D na TV vai de %d a %d linhas, menor enquanto a GPU está ocupada. Não: a resolução TV fixa.",
     },
     {  // Japanese
         "設定", "実績", "P%d 操作",
-        "言語", "フレームレート上限", "携帯モード解像度", "TVモード解像度", "振動", "SMAA", "MSAA", "4コアモード",
+        "言語", "フレームレート上限", "携帯モード固定解像度", "TVモード固定解像度", "振動", "SMAA", "MSAA", "4コアモード",
         "Xboxボタン配置", "Joy-Con横持ち", "Joy-Con横持ちスティック", "メニューボタン", "メニューの色",
         "メニューのフォント",
         "背景の不透明度",
         "ゲームの言語。「システム」は本体の言語に従います。ゲームにない言語は英語で表示されます。",
         "30fpsは安定したペースを保ちます。60fpsは可能な場面でより速く動きます（混雑したコースでは不安定）。オフ：上限なし。",
-        "携帯モードでの3D画像のサイズ。低いほど速くなります。HUDと文字は鮮明なままです。",
-        "TVでの3D画像のサイズ（標準は1728x972）。低いほど速くなります。HUDと文字は1080pで描画されます。",
+        "携帯モードの動的解像度がオフのときの、携帯モードでの3D画像のサイズ。低いほど速くなります。HUDと文字は鮮明なままです。",
+        "TVモードの動的解像度がオフのときの、TVでの3D画像のサイズ。低いほど速くなります。HUDと文字は1080pで描画されます。",
         "コントローラーの振動。",
         "ゲームの画像の後に3D画像のエッジを滑らかにします（GPU時間を少し使います）。",
         "ゲーム自身のアンチエイリアス：エッジが滑らかになり、フレームレートが下がります（4x：オフより約9%低下）。",
@@ -394,17 +452,21 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "次回起動時",
         "%d / %d 解除済み", "解除済み", "ゲームのデータに実績が見つかりません。",
         "実績なし：ゲームのデータがまだ読み込まれていません。",
+        "携帯モード動的解像度",
+        "TVモード動的解像度",
+        "オン：携帯モードの3D画像は%dから%dラインの間で変わり、GPUが忙しいときは低くなります。オフ：携帯モード固定解像度。",
+        "オン：TVの3D画像は%dから%dラインの間で変わり、GPUが忙しいときは低くなります。オフ：TVモード固定解像度。",
     },
     {  // Korean
         "설정", "도전 과제", "P%d 조작",
-        "언어", "프레임 제한", "휴대 모드 해상도", "TV 모드 해상도", "진동", "SMAA", "MSAA", "4코어 모드",
+        "언어", "프레임 제한", "휴대 모드 고정 해상도", "TV 모드 고정 해상도", "진동", "SMAA", "MSAA", "4코어 모드",
         "Xbox 버튼 배치", "Joy-Con 가로", "Joy-Con 가로 스틱", "메뉴 버튼", "메뉴 색상", "메뉴 글꼴",
         "배경 불투명도",
         "게임 언어. '시스템'은 본체 언어를 따릅니다. 게임에 없는 언어는 영어로 표시됩니다.",
         "30fps는 일정한 속도를 유지합니다. 60fps는 가능한 곳에서 더 빠르게 실행됩니다(혼잡한 코스에서는 고르지 않음). "
         "끔: 제한 없음.",
-        "휴대 모드의 3D 화면 크기. 낮을수록 빠릅니다. HUD와 글자는 선명하게 유지됩니다.",
-        "TV의 3D 화면 크기(기본 1728x972). 낮을수록 빠릅니다. HUD와 글자는 1080p로 그려집니다.",
+        "휴대 모드 동적 해상도가 꺼져 있을 때 휴대 모드의 3D 화면 크기. 낮을수록 빠릅니다. HUD와 글자는 선명하게 유지됩니다.",
+        "TV 모드 동적 해상도가 꺼져 있을 때 TV의 3D 화면 크기. 낮을수록 빠릅니다. HUD와 글자는 1080p로 그려집니다.",
         "컨트롤러 진동.",
         "게임 화면 이후 3D 화면의 가장자리를 부드럽게 합니다(GPU 시간을 조금 사용).",
         "게임 자체의 안티에일리어싱: 가장자리가 부드러워지고 프레임이 낮아집니다(4x: 끔보다 약 9% 낮음).",
@@ -430,16 +492,20 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "다음 실행 시",
         "%d / %d 달성", "달성", "게임 데이터에서 도전 과제를 찾을 수 없습니다.",
         "도전 과제 없음: 게임 데이터가 아직 로드되지 않았습니다.",
+        "휴대 모드 동적 해상도",
+        "TV 모드 동적 해상도",
+        "켬: 휴대 모드의 3D 화면이 %d~%d 라인 사이에서 바뀌며, GPU가 바쁠 때 낮아집니다. 끔: 휴대 모드 고정 해상도.",
+        "켬: TV의 3D 화면이 %d~%d 라인 사이에서 바뀌며, GPU가 바쁠 때 낮아집니다. 끔: TV 모드 고정 해상도.",
     },
     {  // Chinese (Simplified)
         "设置", "成就", "P%d 操作",
-        "语言", "帧率上限", "掌机模式分辨率", "电视模式分辨率", "震动", "SMAA", "MSAA", "四核模式", "Xbox 按键布局",
+        "语言", "帧率上限", "掌机模式固定分辨率", "电视模式固定分辨率", "震动", "SMAA", "MSAA", "四核模式", "Xbox 按键布局",
         "Joy-Con 横握", "Joy-Con 横握摇杆", "菜单按键", "菜单颜色", "菜单字体",
         "背景不透明度",
         "游戏语言。“系统”跟随主机语言；游戏没有的语言会显示为英语。",
         "30 帧保持稳定节奏。60 帧让游戏在能跑快时更快（拥挤的赛道上不均匀）。关：不限制。",
-        "掌机模式下 3D 画面的大小。越低越快；HUD 和文字保持清晰。",
-        "电视上 3D 画面的大小（默认 1728x972）。越低越快；HUD 和文字以 1080p 绘制。",
+        "掌机模式动态分辨率关闭时，掌机模式下 3D 画面的大小。越低越快；HUD 和文字保持清晰。",
+        "电视模式动态分辨率关闭时，电视上 3D 画面的大小。越低越快；HUD 和文字以 1080p 绘制。",
         "手柄震动。",
         "在游戏画面之后对 3D 画面做边缘平滑（占用少量 GPU 时间）。",
         "游戏自带的抗锯齿：边缘更平滑，帧率更低（4x：比关低约 9%）。",
@@ -463,16 +529,20 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "上/下：滚动   L/R：标签   +：关闭",
         "下次启动",
         "已解锁 %d / %d", "已解锁", "在游戏数据中未找到成就。", "无成就：游戏数据尚未加载。",
+        "掌机模式动态分辨率",
+        "电视模式动态分辨率",
+        "开：掌机模式下 3D 画面在 %d 到 %d 行之间变化，GPU 繁忙时降低。关：掌机模式固定分辨率。",
+        "开：电视上 3D 画面在 %d 到 %d 行之间变化，GPU 繁忙时降低。关：电视模式固定分辨率。",
     },
     {  // Chinese (Traditional)
         "設定", "成就", "P%d 操作",
-        "語言", "影格率上限", "掌上模式解析度", "電視模式解析度", "震動", "SMAA", "MSAA", "四核心模式",
+        "語言", "影格率上限", "掌上模式固定解析度", "電視模式固定解析度", "震動", "SMAA", "MSAA", "四核心模式",
         "Xbox 按鍵配置", "Joy-Con 橫握", "Joy-Con 橫握搖桿", "選單按鍵", "選單顏色", "選單字型",
         "背景不透明度",
         "遊戲語言。「系統」會跟隨主機語言；遊戲沒有的語言會以英文顯示。",
         "30 fps 保持穩定節奏。60 fps 讓遊戲在可以時跑得更快（擁擠的賽道上不平均）。關：不限制。",
-        "掌上模式下 3D 畫面的大小。越低越快；HUD 和文字保持清晰。",
-        "電視上 3D 畫面的大小（預設 1728x972）。越低越快；HUD 和文字以 1080p 繪製。",
+        "掌上模式動態解析度關閉時，掌上模式下 3D 畫面的大小。越低越快；HUD 和文字保持清晰。",
+        "電視模式動態解析度關閉時，電視上 3D 畫面的大小。越低越快；HUD 和文字以 1080p 繪製。",
         "控制器震動。",
         "在遊戲畫面之後對 3D 畫面進行邊緣平滑（佔用少量 GPU 時間）。",
         "遊戲本身的反鋸齒：邊緣更平滑，影格率較低（4x：比關低約 9%）。",
@@ -496,6 +566,10 @@ inline const char* const kMenuTextTable[kMenuLanguages][kMenuTextCount] = {
         "上/下：捲動   L/R：分頁   +：關閉",
         "下次啟動",
         "已解鎖 %d / %d", "已解鎖", "在遊戲資料中找不到成就。", "沒有成就：遊戲資料尚未載入。",
+        "掌上模式動態解析度",
+        "電視模式動態解析度",
+        "開：掌上模式下 3D 畫面在 %d 到 %d 行之間變化，GPU 繁忙時降低。關：掌上模式固定解析度。",
+        "開：電視上 3D 畫面在 %d 到 %d 行之間變化，GPU 繁忙時降低。關：電視模式固定解析度。",
     },
 };
 

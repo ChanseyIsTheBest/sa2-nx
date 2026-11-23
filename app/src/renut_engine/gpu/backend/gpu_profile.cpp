@@ -1,6 +1,7 @@
 /**
  * @file    gpu/backend/gpu_profile.cpp
  */
+#include "renut_engine/gpu/banjo_renut_record.h"  // banjo-nx (2026-11-21): the deko3d command stage
 #include "renut_engine/gpu/backend/gpu_profile.h"
 
 #include <algorithm>
@@ -84,8 +85,8 @@ void Write(VideoState &s, Slot &slot, uint32_t label) {
   s.command_list->writeTimestamp(slot.pool.get(), slot.count);
 #if defined(PLUME_DEKO3D)
   if (slot.frag_pool) {  // vivapinata-nx (2026-11-12, renut_gpu_profile_counters)
-    plume::Deko3DReportCounter(s.command_list, slot.frag_pool.get(), slot.count, 10);  // FragmentShaderInvocations
-    plume::Deko3DReportCounter(s.command_list, slot.zcull_pool.get(), slot.count * 4, 3);  // ZcullStats
+    banjo::renut_gpu::record::ReportCounter(s.command_list, slot.frag_pool.get(), slot.count, 10);  // FragmentShaderInvocations
+    banjo::renut_gpu::record::ReportCounter(s.command_list, slot.zcull_pool.get(), slot.count * 4, 3);  // ZcullStats
   }
 #endif
   slot.labels[slot.count] = label;

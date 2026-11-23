@@ -118,6 +118,14 @@ bool LookupTablesOn();  // banjo_renut_record_lookups (command_buffers.cpp Recor
 void PrefetchGeometryObject(const GeometryObject *o, bool index);
 void PrefetchTextureObject(const TextureObject *o);
 void PrefetchGeometryCopies(const GeometryObject *o, bool index);
+// banjo-nx (2026-11-21, A/B 181): the store cards and page serial PagesClean reads first for a range at this physical
+// offset (PrefetchCards' lines), and the offset PhysicalOf gives for AddressPtr(address) (UINT32_MAX: no cards there).
+// Replay takes them from a record's header words alone (PrefetchRecordCards). Prefetches only.
+void PrefetchCardsAt(u32 offset);
+// banjo-nx (2026-11-21, batch 2's cache-warming helper): whether 'o' is one of the geometry objects' pool (the helper on
+// another core reads an object only then: the pool is never freed).
+bool GeometryObjectPooled(const GeometryObject *o);
+u32 CardOffsetOfAddress(u32 address);
 // banjo-nx (2026-10-28, ARM audit): kWords 32-bit words equal, as 64-bit loads, XORs and ORs with one test at the end (a
 // memcmp of a constant size is a call or a compare and branch a piece).
 template <u32 kWords>

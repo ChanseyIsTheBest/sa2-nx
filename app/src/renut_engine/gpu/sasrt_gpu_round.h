@@ -101,17 +101,30 @@ void LatchNow();
 // each switch a draw passes (it kept the A57 from starting the draw's later loads early). The values come from the
 // configuration only: on deko3d they are latched before the device exists (InstallShaderCache's ApplyPlume), elsewhere
 // at the first use; a thread that finds the flag unset latches them itself.
+// banjo-nx (2026-11-20, N&B's render thread against renut-nx 1.0.2 in Showdown Town): each item's answer kept in one
+// byte (0 not latched yet, 1 off, 2 on: zero-initialised means unlatched), set by LatchNow and again by
+// RefreshEffective at each A/B switch (AbApply).
+// On() is that one load: before, every call read the latch flag and the A/B half (two atomics) and the latched key,
+// FastDrawLocked asks dozens of times a draw, and those loads were 0.13 us of the 9.2 us a draw (1 ms sampling).
+// banjo-nx (2026-11-21): plain bytes (relaxed atomics before: loads the compiler could not merge), written at the latch
+// and at each A/B switch (the render thread), as g_ab_off_plain.
+extern uint8_t g_effective[kCount];
+void RefreshEffective();  // the answers again from the latched keys and banjo::renut_gpu::g_ab_off
 [[gnu::always_inline]] inline bool On(Item i) {
-  if (!g_latched_ready.load(std::memory_order_relaxed)) [[unlikely]]
+  uint8_t v = g_effective[i];
+  if (v == 0) [[unlikely]] {
     LatchNow();
-  const int ab = banjo::renut_gpu::g_ab_off.load(std::memory_order_relaxed);
-  return g_latched.on[i] && ab != kAbBase + i && !(ab == kAbRtGroup && i >= kRtRestoreCandidates);
+    v = g_effective[i];
+  }
+  return v == 2;
 }
 
 // Counts for the 10 s line: a load and a store (no read-modify-write on the A57; a count lost between two threads is a
 // diagnostic's error, not the renderer's).
 extern std::atomic<uint64_t> g_counts[kCount][2];
 [[gnu::always_inline]] inline void Count(Item i, uint64_t n = 1, int which = 0) {
+  if (!banjo::renut_gpu::Latch().counts)  // banjo-nx (2026-11-20): off with the logs (banjo_renut_draw_counts)
+    return;
   std::atomic<uint64_t> &c = g_counts[i][which];
   c.store(c.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
 }

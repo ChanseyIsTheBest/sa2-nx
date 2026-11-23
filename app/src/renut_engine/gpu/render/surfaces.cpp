@@ -89,6 +89,9 @@ constexpr int kMaxDynamicSteps = 10;
 int32_t g_dynamic_steps[2][kMaxDynamicSteps] = {};
 int g_dynamic_count[2] = {0, 0};
 std::atomic<int> g_dynamic_step{0};
+// rr6-nx (2026-11-22): the in-use mode's step count while its switch is on, 0 while it is off (the latch's, for
+// NoteGpuFrameForDynamicResolution).
+std::atomic<int> g_dynamic_active{0};
 std::atomic<bool> g_dynamic_docked{false};
 // banjo-nx (2026-10-28, night_gpu5): the heights render_scale.h's settable codes 4 and 6 hold now ([0] code 4, [1] code
 // 6; the shaders read them from InternalHeightsWord), and the frame each was last the render scale. A height other than
@@ -608,9 +611,17 @@ void LatchResolutionScaleLocked() {
       // request: docked 720 to 1080): an end of 1080 is code 2 (1.5x, the docked display's own size: the HUD is drawn
       // into the scene without the upscale), as a fixed height of 1080 always was (render_scale below).
       bool dynamic[2] = {false, false};
-      if (DynamicResolutionOn()) {
+      // rr6-nx (2026-11-22, the user: "a separate toggle for handheld and docked dynamic resolution"): each mode's range
+      // is made whenever it has one; banjo_renut_dynamic_resolution_handheld / _docked turn it on or off for that mode,
+      // at every latch on deko3d (the game menu's rows), at start on the other back ends (their codes are fixed).
+      {
         for (int m = 0; m < 2; ++m) {
           const bool docked_mode = m == 1;
+          const bool on_now = DynamicModeOn(docked_mode);
+#if !defined(PLUME_DEKO3D)
+          if (!on_now)
+            continue;
+#endif
           const int32_t low = pick(DynamicHeight(docked_mode, false), docked_mode ? "dynamic docked low" : "dynamic handheld low");
           const int32_t high = pick(DynamicHeight(docked_mode, true), docked_mode ? "dynamic docked high" : "dynamic handheld high");
           // sasrt-nx (2026-11-09, the user's ranges: handheld 480-720, docked 540-1080; port 52): on deko3d a range need
@@ -621,12 +632,19 @@ void LatchResolutionScaleLocked() {
 #else
           const bool needs_720 = true;
 #endif
+          // rr6-nx (2026-11-09): low = high, no range: that mode keeps its fixed height (banjo_renut_render_height_*).
+          if (low == high) {
+            RGPU_INFO("[renut] dynamic resolution, {} mode: no range (low = high = {}): the fixed {} lines",
+                      docked_mode ? "docked" : "handheld", low, docked_mode ? dh : hh);
+            continue;
+          }
           if (low >= high || (needs_720 && low != 720 && high != 720)) {
             RGPU_WARN("[renut] dynamic resolution, {} mode: {} to {} lines is not a range with 720 at one end: the "
                       "fixed height", docked_mode ? "docked" : "handheld", low, high);
             continue;
           }
-          (docked_mode ? dh : hh) = low == 720 ? high : low;
+          if (on_now)
+            (docked_mode ? dh : hh) = low == 720 ? high : low;
           dynamic[m] = true;
           // banjo-nx (2026-10-28, night_gpu5, banjo_renut_dynamic_steps): the ends and the heights between them, evenly
           // spaced and rounded to a multiple of 36 (whole host pixels at 320x180 too). Deko3d only: the other back ends'
@@ -648,8 +666,9 @@ void LatchResolutionScaleLocked() {
           for (int i = 0; i < n; ++i)
             list += fmt::format("{}{}", i ? " " : "", g_dynamic_steps[m][i]);
           RGPU_INFO("[renut] dynamic resolution, {} mode: 3D at {} lines, by the GPU's time a frame against {} ms "
-                    "(banjo_renut_dynamic_resolution){}",
-                    docked_mode ? "docked" : "handheld", list, DynamicGpuMs(),
+                    "({} now: banjo_renut_dynamic_resolution_{}){}",
+                    docked_mode ? "docked" : "handheld", list, DynamicGpuMs(), on_now ? "on" : "off",
+                    docked_mode ? "docked" : "handheld",
                     DynamicTestSeconds() > 0 ? fmt::format("; test: a step every {} s", DynamicTestSeconds())
                                              : std::string());
         }
@@ -673,10 +692,23 @@ void LatchResolutionScaleLocked() {
     // mode starts it at its 720 end (night_gpu2 console run: docking at 900 made the docked set of targets with the heap
     // at its end; 720 is the smaller set, at the 1x code both modes use).
     const int mode = docked ? 1 : 0;
-    const int count = heights.dynamic[mode] ? g_dynamic_count[mode] : 0;
+#if defined(PLUME_DEKO3D)
+    const bool mode_on = heights.dynamic[mode] && DynamicModeOn(docked);  // rr6-nx (2026-11-22): the mode's switch, now
+#else
+    const bool mode_on = heights.dynamic[mode];
+#endif
+    const int count = mode_on ? g_dynamic_count[mode] : 0;
     static bool dynamic_started = false;
+    static bool was_on[2] = {false, false}, seen[2] = {false, false};
     const bool mode_changed = g_dynamic_docked.exchange(docked) != docked;
-    if ((mode_changed || !dynamic_started) && count) {
+    const bool switched_on = mode_on && !was_on[mode];
+    if (heights.dynamic[mode] && seen[mode] && mode_on != was_on[mode])
+      RGPU_INFO("[renut] dynamic resolution, {} mode: {}", docked ? "docked" : "handheld",
+                mode_on ? "on" : "off: the fixed resolution");
+    seen[mode] = true;
+    was_on[mode] = mode_on;
+    g_dynamic_active.store(count, std::memory_order_relaxed);
+    if ((mode_changed || !dynamic_started || switched_on) && count) {
       dynamic_started = true;
       // the 720 end, or (sasrt-nx, 2026-11-09; port 52) the step nearest below 720 for a range without it
       int start = 0;
@@ -890,7 +922,7 @@ REXCVAR_DEFINE_BOOL(sasrt_dynamic_up_memory, true, "SASRT/Graphics",
 
 void NoteGpuFrameForDynamicResolution(double gpu_ms) {
   const int mode = g_dynamic_docked ? 1 : 0;
-  const int count = g_dynamic_count[mode];
+  const int count = g_dynamic_active.load(std::memory_order_relaxed);  // rr6-nx (2026-11-22): 0 while its switch is off
   if (count < 2 || gpu_ms <= 0.0)
     return;
   // banjo-nx (2026-10-28): up after banjo_renut_dynamic_up_s in a row of fitting, 1 s by default (the user: "be

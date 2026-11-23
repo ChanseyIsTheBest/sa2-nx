@@ -20,7 +20,12 @@ extern "C" void RexSwitchPerfCount(unsigned id);
 #include "profiler/profiler.h"                      // the on-screen profiler's GPU, present and render thread rows
 #include "renut_engine/gpu/banjo_renut_tuning.h"  // the [renut] report and its in-run A/B
 
-namespace banjo::renderdoc { void GameFrame(); }  // me/banjo_renderdoc.cpp (banjo_renderdoc_game_s)
+// Port 258 (sasrt-nx's sync note, 2026-11-22): a weak empty one, so a port with its own RenderDoc file (no
+// me/banjo_renderdoc.cpp) links; the base's is me/banjo_renderdoc.cpp's.
+namespace banjo::renderdoc {
+void GameFrame();  // me/banjo_renderdoc.cpp (banjo_renderdoc_game_s)
+__attribute__((weak)) void GameFrame() {}
+}  // namespace banjo::renderdoc
 
 namespace renut::frame_stats {
 

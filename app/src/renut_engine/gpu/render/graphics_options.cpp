@@ -23,34 +23,49 @@ REXCVAR_DEFINE_STRING(renut_ambient_occlusion, "Half", "Nuts&Bolts/Graphics",
                       "or Full.")
     .allowed({"Half", "Full"});
 
+// rr6-nx (2026-11-22, the user: "make a separate toggle for handheld and docked dynamic resolution make sure handheld
+// drs is off by default and docked is on by default 972p to 1080p"): one switch for each mode
+// (banjo_renut_dynamic_resolution_handheld / _docked, the game menu's rows); this one, the switch for both before, still
+// sets both when a toml sets it and they are not set themselves (DynamicModeOn).
 REXCVAR_DEFINE_BOOL(banjo_renut_dynamic_resolution, false, "Nuts&Bolts/Graphics",
-                    "Dynamic resolution (2026-10-28, the user's request; not pixel-identical while it acts): the 3D "
-                    "image between banjo_renut_dynamic_handheld_low and _high in handheld mode, _docked_low and _high "
-                    "docked (in place of banjo_renut_render_height_handheld / _docked): the low height while the GPU's "
-                    "time a frame is above banjo_renut_dynamic_gpu_ms, the high one when it would fit again (at least "
-                    "5 s between changes). One end of each range is 720 lines (the 1x scale) on the PC's back ends; "
-                    "on deko3d any range, started at its step nearest below 720 (sasrt-nx, port 52)")
+                    "Dynamic resolution for both modes (2026-10-28, the user's request), the switch before "
+                    "banjo_renut_dynamic_resolution_handheld / _docked (2026-11-22): set in a toml, it sets both of "
+                    "them, unless the toml sets them too. Not set: they decide")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(banjo_renut_dynamic_resolution_handheld, false, "Nuts&Bolts/Graphics",
+                    "Dynamic resolution in handheld mode (not pixel-identical while it acts; off by default, the "
+                    "user's choice of 2026-11-22): the 3D image between banjo_renut_dynamic_handheld_low and _high (in "
+                    "place of banjo_renut_render_height_handheld, the fixed handheld resolution): lower while the "
+                    "GPU's time a frame is above banjo_renut_dynamic_gpu_ms, higher again when the next height would "
+                    "fit. On deko3d from the next frame (the game menu's row); on the PC's back ends read at start, and "
+                    "one end of the range must be 720 lines there");
+REXCVAR_DEFINE_BOOL(banjo_renut_dynamic_resolution_docked, true, "Nuts&Bolts/Graphics",
+                    "Dynamic resolution in docked mode (not pixel-identical while it acts; on by default, 972 to 1080 "
+                    "lines, the user's choice of 2026-11-22): the 3D image between banjo_renut_dynamic_docked_low and "
+                    "_high (in place of banjo_renut_render_height_docked, the fixed docked resolution), as "
+                    "banjo_renut_dynamic_resolution_handheld does in handheld mode");
 REXCVAR_DEFINE_INT32(banjo_renut_dynamic_handheld_low, 540, "Nuts&Bolts/Graphics",
-                     "banjo_renut_dynamic_resolution: the handheld range's low height (a multiple of 9)")
+                     "banjo_renut_dynamic_resolution_handheld: the handheld range's low height (a multiple of 9)")
     .range(360, 1080)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(banjo_renut_dynamic_handheld_high, 720, "Nuts&Bolts/Graphics",
-                     "banjo_renut_dynamic_resolution: the handheld range's high height")
+                     "banjo_renut_dynamic_resolution_handheld: the handheld range's high height")
     .range(360, 1080)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_INT32(banjo_renut_dynamic_docked_low, 720, "Nuts&Bolts/Graphics",
-                     "banjo_renut_dynamic_resolution: the docked range's low height")
+REXCVAR_DEFINE_INT32(banjo_renut_dynamic_docked_low, 972, "Nuts&Bolts/Graphics",
+                     "banjo_renut_dynamic_resolution_docked: the docked range's low height (972 = 1728x972 by default, "
+                     "the user's choice of 2026-11-22; 720 before)")
     .range(360, 1080)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(banjo_renut_dynamic_docked_high, 1080, "Nuts&Bolts/Graphics",
-                     "banjo_renut_dynamic_resolution: the docked range's high height (a multiple of 9; 1080 is the "
+                     "banjo_renut_dynamic_resolution_docked: the docked range's high height (a multiple of 9; 1080 is the "
                      "docked display's own size, 900 before night_gpu5)")
     .range(360, 1080)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(banjo_renut_dynamic_steps, 4, "Nuts&Bolts/Graphics",
                      "banjo_renut_dynamic_resolution (night_gpu5, the user's request): heights between each range's low "
-                     "and high, evenly spaced (multiples of 36: 576 612 648 684 handheld, 792 864 936 1008 docked); the "
+                     "and high, evenly spaced (multiples of 36: 576 612 648 684 handheld 540-720; 1008 1044 docked "
+                     "972-1080); the "
                      "GPU's time picks the highest that fits. 0: only the two ends")
     .range(0, 8)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -211,10 +226,27 @@ plume::RenderFormat SurfaceColorFormat(const d3d::SurfaceDesc &desc) {
   return ColorTargetFormat(GpuColorFormat((u32(desc.ColorInfo) >> 16) & 0xF));
 }
 
-bool DynamicResolutionOn() {
-  static const bool v = REXCVAR_GET(banjo_renut_dynamic_resolution);
-  return v;
+// rr6-nx (2026-11-22): banjo_renut_dynamic_resolution, set in a toml, sets both modes' keys that the toml does not set
+// (once, at the first call: the renderer's first latch).
+static void DynamicLegacyOnce() {
+  static bool done = false;
+  if (done)
+    return;
+  done = true;
+  if (rex::cvar::GetFlagSource("banjo_renut_dynamic_resolution") == rex::cvar::Source::kDefault)
+    return;
+  const char *on = REXCVAR_GET(banjo_renut_dynamic_resolution) ? "true" : "false";
+  for (const char *key : {"banjo_renut_dynamic_resolution_handheld", "banjo_renut_dynamic_resolution_docked"}) {
+    if (rex::cvar::GetFlagSource(key) == rex::cvar::Source::kDefault)
+      rex::cvar::SetFlagByName(key, on);
+  }
 }
+bool DynamicModeOn(bool docked) {
+  DynamicLegacyOnce();
+  return docked ? REXCVAR_GET(banjo_renut_dynamic_resolution_docked)
+                : REXCVAR_GET(banjo_renut_dynamic_resolution_handheld);
+}
+bool DynamicResolutionOn() { return DynamicModeOn(false) || DynamicModeOn(true); }
 int32_t DynamicHeight(bool docked, bool high) {
   static const int32_t v[4] = {int32_t(REXCVAR_GET(banjo_renut_dynamic_handheld_low)),
                                int32_t(REXCVAR_GET(banjo_renut_dynamic_handheld_high)),

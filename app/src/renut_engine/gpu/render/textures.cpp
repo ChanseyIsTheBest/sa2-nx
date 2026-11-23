@@ -6,6 +6,7 @@
 #include "renut_engine/gpu/host_batch.h"  // blur-nx (2026-11-18, the Renut host batch)
 
 #include <algorithm>
+#include <array>  // port 257
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -33,6 +34,10 @@
 #include "renut_engine/gpu/backend/video.h"
 
 namespace renut::gpu {
+
+// sasrt-nx (2026-11-21, sasrt_resolve_remake_carry; port 257): render/draw.cpp, a resolve destination's content drawn
+// into the texture made again for it.
+bool SasrtCarryResolveContentLocked(HostTexture *from, HostTexture *to);
 
 namespace {
 
@@ -79,6 +84,31 @@ std::unordered_map<u32, HostTexture *> g_depth_words;
 // textures are views of memory, and a game may resolve through one header and
 // sample the same memory through another.
 std::unordered_map<u32, HostTexture *> g_resolve_targets;
+// sasrt-nx (2026-11-20, sasrt_resolve_alias_previous; port 257): the resolve destinations a page's entry held before the
+// current one (two at most, newest first). SASRT's menus resolve an RGBA8 and an FP16 image of one size into the same
+// memory: with the RGBA8 one the page's entry, the FP16 read found another format and was made from guest memory the GPU
+// never wrote (a one-frame flash). Off in the base: banjo-nx saw no effect in N&B, and neither answer is the 360's.
+REXCVAR_DEFINE_BOOL(sasrt_resolve_alias_previous, false, "SASRT/Graphics",
+                    "A texture read of memory a resolve wrote, in another format than the page's latest resolve, takes "
+                    "an earlier resolve destination of that page with its own description (format, size, memory) instead "
+                    "of a texture made from guest memory the GPU never wrote (sasrt-nx's menus' one-frame flash, "
+                    "2026-11-20). Off by default outside sasrt-nx")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+std::unordered_map<u32, std::array<HostTexture *, 2>> g_resolve_targets_previous;
+// sasrt-nx (2026-11-21, sasrt_resolve_remake_carry; port 257): a resolve destination made again only for another scale
+// or size (a dynamic resolution step) lost its content (a new image, discarded), where the console's memory keeps it. A
+// destination with a part the game resolves only now and then lost that part: SASRT's 3-4 player far shadow cascades
+// (the bottom half of one 512x1024 image, resolved only at the race's start) read NaN, 3.4e38 or old depths and drew
+// flat dark. Now the old image is drawn (point sampled, scaled) into the new one, then retired. Console-verified in
+// sasrt-nx (run 337).
+REXCVAR_DEFINE_INT32(sasrt_resolve_remake_carry, 1, "SASRT/Graphics",
+                     "A resolve destination made again for another render scale or size keeps its content: the old "
+                     "image is drawn (scaled) into the new one before it is retired (sasrt-nx 2026-11-21: far shadow "
+                     "cascades resolved only at a race's start were lost at the dynamic resolution's steps). 1 depth "
+                     "destinations, 2 colour ones too, 0 off (the new image's content undefined, as before)")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+uint64_t g_resolve_carried = 0, g_resolve_carry_failed = 0;
 std::unordered_map<uint64_t, uint32_t> g_samplers;  // sampler key -> slot
 std::vector<std::unique_ptr<plume::RenderSampler>> g_sampler_objects;
 uint64_t g_frame = 1;
@@ -924,8 +954,20 @@ void Retire(HostTexture &t) {
     t.words.reset();
     std::erase_if(g_depth_words, [&t](const auto &entry) { return entry.second == &t; });
   }
-  if (t.render_target)
+  if (t.render_target) {
     std::erase_if(g_resolve_targets, [&t](const auto &entry) { return entry.second == &t; });
+    // sasrt-nx (2026-11-20, sasrt_resolve_alias_previous; port 257): no earlier destination left pointing at it.
+    for (auto it = g_resolve_targets_previous.begin(); it != g_resolve_targets_previous.end();) {
+      auto &p = it->second;
+      if (p[1] == &t)
+        p[1] = nullptr;
+      if (p[0] == &t) {
+        p[0] = p[1];
+        p[1] = nullptr;
+      }
+      it = p[0] ? std::next(it) : g_resolve_targets_previous.erase(it);
+    }
+  }
 }
 
 // Two descriptions of the same data: the same memory, format, endianness, size
@@ -980,6 +1022,24 @@ HostTexture *ResolvedAlias(u32 texture_va, const TextureFetch &fetch, const u32 
                   "texture (blur_renut_expand_alias)", texture_va, b, resolved->guest_va, resolved->width,
                   resolved->height, a);
       return resolved;
+    }
+  }
+  // sasrt-nx (2026-11-20, sasrt_resolve_alias_previous; port 257): an earlier destination of this page with the read's
+  // own description (the same memory, format, size and dimension), whose image holds that resolve's content.
+  if (!g_resolve_targets_previous.empty()) {
+    auto p = g_resolve_targets_previous.find(fetch.BasePage());
+    if (p != g_resolve_targets_previous.end()) {
+      for (HostTexture *earlier : p->second) {
+        if (earlier && earlier->texture && earlier->guest_va != texture_va && SameData(earlier->desc, desc)) {
+          static uint32_t logged = 0;
+          if (logged++ < 16)
+            RGPU_INFO("[renut] texture {:08X} (format {}) reads the earlier resolve destination {:08X} ({}x{}) of its "
+                      "page, not the latest {:08X} (format {}) (sasrt_resolve_alias_previous)", texture_va,
+                      u32(fetch.Format()), earlier->guest_va, earlier->width, earlier->height, resolved->guest_va,
+                      u32(resolved->guest_format));
+          return earlier;
+        }
+      }
     }
   }
   return nullptr;
@@ -1152,6 +1212,7 @@ HostTexture *ResolveTarget(u32 texture_va, plume::RenderFormat format, RenderSca
   static const bool probe_kept = REXCVAR_GET(sasrt_gpu_words_probe_kept);
   bool carry_words = false, carried_wanted = false;
   uint32_t carried_probe = 0;
+  std::unique_ptr<HostTexture> carry_from;  // sasrt-nx (2026-11-21, sasrt_resolve_remake_carry; port 257)
   {  // blur-nx (2026-11-17, audit #5): the reason a destination is made (ResolveRemakeReport)
     uint32_t why = 0;
     if (!slot)
@@ -1181,8 +1242,18 @@ HostTexture *ResolveTarget(u32 texture_va, plume::RenderFormat format, RenderSca
       carried_wanted = slot->words_wanted;
       carried_probe = slot->words_probe;
     }
-    Retire(*slot);
-    slot.reset();
+    // sasrt-nx (2026-11-21, sasrt_resolve_remake_carry; port 257): made again for its scale or size alone: its image is
+    // kept until the new one has its content.
+    static const int32_t carry_mode = REXCVAR_GET(sasrt_resolve_remake_carry);
+    if (carry_mode > 0 && (depth || carry_mode >= 2) && slot->render_target && slot->texture &&
+        slot->host_format == format && std::memcmp(slot->desc, desc, sizeof(desc)) == 0 && slot->resolves > 0 &&
+        slot->dimension == TextureDimension::Tex2D && !slot->stacked && slot->mip_levels == 1 &&
+        slot->extra_levels == 0)
+      carry_from = std::move(slot);
+    if (slot) {
+      Retire(*slot);
+      slot.reset();
+    }
   }
   if (!slot) {
     slot = std::make_unique<HostTexture>();
@@ -1193,6 +1264,8 @@ HostTexture *ResolveTarget(u32 texture_va, plume::RenderFormat format, RenderSca
       RGPU_ERROR("Resolve destination {:08X}: {}x{} target creation failed", texture_va,
                  slot->width, slot->height);
       Retire(*slot);
+      if (carry_from)  // sasrt-nx (2026-11-21; port 257)
+        Retire(*carry_from);
       return nullptr;
     }
     if (carry_words) {  // renut-ultimate (2026-11-13, sasrt-nx's R2)
@@ -1209,12 +1282,38 @@ HostTexture *ResolveTarget(u32 texture_va, plume::RenderFormat format, RenderSca
       TransitionTextureLocked(slot.get(), plume::RenderTextureLayout::COLOR_WRITE);
       cmd->discardTexture(slot->texture.get());
     }
+    // sasrt-nx (2026-11-21, sasrt_resolve_remake_carry; port 257): the old image's content into it, then the old one
+    // retired.
+    if (carry_from) {
+      const bool carried = SasrtCarryResolveContentLocked(carry_from.get(), slot.get());
+      ++(carried ? g_resolve_carried : g_resolve_carry_failed);
+      const uint64_t n = g_resolve_carried + g_resolve_carry_failed;
+      if (n <= 8 || (n & (n - 1)) == 0)
+        RGPU_INFO("[renut] resolve destination {:08X} ({}x{}, {}) made again at {}x{}: its content {} ({} carried, {} "
+                  "not, so far; sasrt_resolve_remake_carry)", texture_va, slot->width, slot->height,
+                  depth ? "depth" : "colour", slot->alloc_width, slot->alloc_height,
+                  carried ? "drawn into the new image" : "NOT carried", g_resolve_carried, g_resolve_carry_failed);
+      if (carried)
+        slot->resolves = carry_from->resolves;  // it holds what they wrote
+      Retire(*carry_from);
+      carry_from.reset();
+    }
   }
   slot->gpu_written = true;
   slot->uploaded = true;
   slot->used_frame = g_frame;
   HostTexture *&entry = g_resolve_targets[fetch.BasePage()];
   if (entry != slot.get()) {
+    static const bool keep_previous = REXCVAR_GET(sasrt_resolve_alias_previous);
+    if (keep_previous && entry) {  // sasrt-nx (2026-11-20, sasrt_resolve_alias_previous; port 257)
+      auto &p = g_resolve_targets_previous[fetch.BasePage()];
+      if (p[0] != entry) {
+        p[1] = p[0] == slot.get() ? p[1] : p[0];
+        p[0] = entry;
+      }
+      if (p[1] == slot.get() || p[1] == p[0])
+        p[1] = nullptr;
+    }
     entry = slot.get();
     ++g_texture_epoch;  // banjo-nx (2026-10-19, render-thread proposal 3): ResolvedAlias's answer changes
     BumpTexturePage(fetch.BasePage());  // banjo-nx (2026-10-27)

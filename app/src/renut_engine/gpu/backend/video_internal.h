@@ -37,6 +37,8 @@ void SubmitAndWaitLocked(VideoState &s);
 // Waits for a slot's submitted list, if it has one (its fence is waited only
 // once), ahead of the slot's reuse.
 void WaitSlotLocked(VideoState &s, uint32_t slot);
+// banjo-nx (2026-11-21, item 5): whether the slot's last submit was the command stage's (banjo_deko3d_stage_submit).
+bool SubmitWasStaged(uint32_t slot);
 
 // banjo-nx (2026-10-20, input latency, banjo_deko3d_latency_trim): after the frame's present, holds the render thread
 // until the GPU has finished all but the frame's last part (video.cpp); its 10 s report line (empty when off).

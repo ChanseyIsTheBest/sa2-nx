@@ -213,6 +213,12 @@ def stage_spec(prefix, spec, vs_text, ps_text, ps_present=True):
     return out
 
 
+def generic_drops(cid):
+    """port 253 (rr6-nx, 2026-11-22): the constants plume_deko3d's genericDrops leaves out of a stage's generic
+    variant (the bools, 900, 901, 903-906, 909, 920-923, 929): keep the two lists the same."""
+    return 1000 <= cid <= 1255 or cid in (900, 901, 903, 904, 905, 906, 909, 929) or 920 <= cid <= 923
+
+
 # 2026-10-18: alpha functions (constant 903 = function + 1) assumed for a list pipeline that records none (a version 3
 # list, or a record converted from one): 8 (no alpha test) and 7 (>=, the alpha-to-coverage test at 0.5), the two the
 # Ryujinx runs saw 161 of 164 times, and 5 (>, 103 of the 183 variants run 47 compiled during play); the console builds
@@ -599,7 +605,18 @@ def main():
                 continue
             sspec = stage_spec(prefix, spec, vs_shader[0] if vs_shader else None,
                                ps_shader[0] if ps_shader else None, not no_ps)
-            for sspec in round_vs_specs(prefix, config_specs(prefix, shader[1], sspec)):
+            sspecs = list(round_vs_specs(prefix, config_specs(prefix, shader[1], sspec)))
+            if a.generic:
+                # port 253 (rr6-nx, 2026-11-22, its synced build's console run cache1): with --generic, each pipeline's
+                # own generic variant too: its constants without the ones plume drops for it (genericDrops), what the
+                # prebuild builds the pipeline with while the full variant compiles in the background. 926, 950-973 and
+                # 977 are not dropped, so a list pipeline with them has a generic variant of its own, which the shader-
+                # wide generic below is not: without it the prebuild compiled it, blocking, and every specialised
+                # pipeline queued behind it (one took 354 s on core 3 in a race, 3 draws a frame on the generic pipeline
+                # meanwhile).
+                sspecs += [g for g in ({k: v for k, v in s.items() if not generic_drops(k)} for s in sspecs)
+                           if g not in sspecs]
+            for sspec in sspecs:
                 defines = variant_defines(shader[1], sspec)
                 if (prefix, h, defines) in seen:
                     continue
