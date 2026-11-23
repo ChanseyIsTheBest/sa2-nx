@@ -218,7 +218,10 @@ struct SurfaceMemo {
   uint64_t epoch = 0;
   HostSurface *surface = nullptr;
 };
-SurfaceMemo g_surface_memo[64];  // banjo-nx (2026-10-19, render-thread proposal 8): 64, indexed by a hash of the VA
+// banjo-nx (2026-10-19, render-thread proposal 8): 64, indexed by a hash of the VA. sasrt-nx (2026-11-20,
+// sasrt_rt3_surface_memo_256; the third render-thread round's #24): 256 (Sonic Transformed's four views' targets and
+// resolves, their EDRAM views and the stack headers conflicted in 64); the first 64 alone with the key off.
+SurfaceMemo g_surface_memo[256];
 uint64_t g_surface_epoch = 1;
 
 void FreeDepthViews(std::vector<DepthImage::View> &views) {
@@ -1103,6 +1106,26 @@ void ColorAliasesLocked(const HostSurface *surface, std::vector<HostSurface *> &
   out.clear();
   if (!surface || surface->depth)
     return;
+  // sasrt-nx (2026-11-20, sasrt_rt2_color_alias_memo): what the scans found, kept until the table changes (a target
+  // built or retired bumps g_sasrt_table_epoch; the scans read the keys, the textures and the depth flags alone).
+  const bool memo = sasrt::gpu_round::On(sasrt::gpu_round::kRt2ColorAliasMemo);
+  if (memo && surface->sasrt_alias_epoch == g_sasrt_table_epoch) {
+    out = surface->sasrt_aliases;
+    sasrt::gpu_round::Count(sasrt::gpu_round::kRt2ColorAliasMemo);
+    return;
+  }
+  struct Keep {
+    const HostSurface *surface;
+    std::vector<HostSurface *> &out;
+    bool on;
+    ~Keep() {
+      if (on) {
+        surface->sasrt_aliases = out;
+        surface->sasrt_alias_epoch = g_sasrt_table_epoch;
+        sasrt::gpu_round::Count(sasrt::gpu_round::kRt2ColorAliasMemo, 1, 1);
+      }
+    }
+  } keep{surface, out, memo};
   // TargetKey: the view in the low 32 bits, the host format above.
   constexpr uint64_t kViewMask = 0xFFFFFFFFull;
   uint64_t own = 0;
@@ -1448,7 +1471,9 @@ HostSurface *GetHostSurfaceLocked(u32 surface_va) {
   }
 
   const bool memo = banjo::renut_gpu::CpuMemosOn();
-  SurfaceMemo &m = g_surface_memo[(surface_va * 0x9E3779B1u) >> 26];
+  const u32 memo_hash = surface_va * 0x9E3779B1u;
+  SurfaceMemo &m = g_surface_memo[sasrt::gpu_round::On(sasrt::gpu_round::kRt3SurfaceMemo256) ? memo_hash >> 24
+                                                                                               : memo_hash >> 26];
   if (memo && m.epoch == g_surface_epoch && m.va == surface_va && m.size == desc->Size &&
       m.info == desc->SurfaceInfo && m.format == desc->Format && m.color_info == desc->ColorInfo) {
     // the same as the lookup's: the surface bound now

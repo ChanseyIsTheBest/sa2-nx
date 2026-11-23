@@ -988,6 +988,8 @@ bool SignsOnly(const u32 a[6], const u32 b[6]) {
   return all_signed(a[0]) == all_signed(b[0]) && banjo::renut_gpu::TextureKeepOnSignsOn();
 }
 
+HostTexture *DepthWordsSource(const TextureFetch &fetch);  // below (sasrt-nx 2026-11-22: ResolvedAlias asks it)
+
 // The resolve destination another header wrote this texture's memory through,
 // when it holds the same data (SameData). Only the GPU has what the resolve
 // wrote.
@@ -1026,7 +1028,12 @@ HostTexture *ResolvedAlias(u32 texture_va, const TextureFetch &fetch, const u32 
   }
   // sasrt-nx (2026-11-20, sasrt_resolve_alias_previous; port 257): an earlier destination of this page with the read's
   // own description (the same memory, format, size and dimension), whose image holds that resolve's content.
-  if (!g_resolve_targets_previous.empty()) {
+  // sasrt-nx (2026-11-22): not for a read of the latest destination's depth words (an 8_8_8_8 texture of a depth
+  // resolve's size, DepthWordsSource): those words are what the read wants, through the depth words path after this.
+  // An older RGBA8 resolve on the same page took such a read instead: SASRT's EDRAM depth restore copy (A393B1E0) drew
+  // that colour as depth, and below 1x (dynamic resolution) its race showed vertical stripes of sky and sea through
+  // the far scenery (console, 1 player, 2026-11-22; gone with this key off).
+  if (!g_resolve_targets_previous.empty() && !(resolved->words && DepthWordsSource(fetch) == resolved)) {
     auto p = g_resolve_targets_previous.find(fetch.BasePage());
     if (p != g_resolve_targets_previous.end()) {
       for (HostTexture *earlier : p->second) {

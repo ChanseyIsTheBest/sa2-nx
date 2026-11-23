@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -168,6 +169,12 @@ union PageEntry {
     uint32_t reserved : 14;
   };
 };
+
+// sasrt-nx (2026-11-20, sasrt_rt2_readable_memo): raised at the start and the end (base port 260) of every heap
+// operation that can take read access from a page (Decommit, Release, Protect, Reset, Restore, AllocFixed without
+// read access): an answer that a range was readable holds while it is unchanged (the renderer's vertex fills keep
+// such answers instead of walking the page table).
+extern std::atomic<uint64_t> g_page_access_generation;
 
 // Heap abstraction for page-based allocation.
 class BaseHeap {

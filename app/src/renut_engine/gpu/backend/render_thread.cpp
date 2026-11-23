@@ -4,6 +4,7 @@
 #include "renut_engine/gpu/backend/render_thread.h"
 #include "renut_engine/gpu/stage_census.h"  // blur-nx (2026-11-17, the Renut audit's census)
 #include "renut_engine/gpu/host_batch.h"  // blur-nx (2026-11-18, the Renut host batch)
+#include "renut_engine/gpu/sasrt_gpu_round.h"  // sasrt-nx (2026-11-20): the second render-thread round
 
 #include <algorithm>
 #include <atomic>
@@ -131,6 +132,12 @@ inline void PrefetchItem(const Item &item) {
     __builtin_prefetch(b + 64);
     __builtin_prefetch(b + 128);
     __builtin_prefetch(b + 192);
+    // sasrt-nx (2026-11-20, sasrt_rt2_ring_prefetch; the second render-thread round's #30): a narrowed delta averages
+    // ~360 bytes in Sonic Transformed's 4-player race (6-7 lines): two lines more.
+    if (sasrt::gpu_round::On(sasrt::gpu_round::kRt2RingPrefetch)) {
+      __builtin_prefetch(b + 256);
+      __builtin_prefetch(b + 320);
+    }
   }
 }
 

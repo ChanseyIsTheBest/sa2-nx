@@ -67,6 +67,9 @@ struct HostSurface {
   // pitch that could be its restore's source, as of the target table's epoch 'sasrt_candidates_epoch' (0: not found yet).
   std::vector<HostSurface *> sasrt_restore_candidates;
   uint64_t sasrt_candidates_epoch = 0;
+  // sasrt-nx (2026-11-20, sasrt_rt2_color_alias_memo): ColorAliasesLocked's answer as of the target table's epoch.
+  mutable uint64_t sasrt_alias_epoch = 0;
+  mutable std::vector<HostSurface *> sasrt_aliases;
   // halo3-nx (2026-11-03): when it was last bound to draw to, and what of another format's target over the same EDRAM view it
   // holds (SyncColorViewLocked).
   uint64_t bound_serial = 0;

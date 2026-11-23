@@ -10,7 +10,8 @@
 
 namespace sasrt::gpu_round {
 
-// X(name, key, what it does): the items in order; the A/B target of item i is 90 + i.
+// X(name, key, what it does): the items in order; the A/B target of item i is 90 + i, from kRt2DropThrottle on 190 and
+// up (AbTargetOf).
 #define SASRT_GPU_ROUND_ITEMS(X)                                                                                         \
   X(kInertDraws, sasrt_gpu_skip_inert_draws, "draws that write nothing skipped before their targets are bound")      \
   X(kPreciseDepth, sasrt_gpu_precise_depth_resolve, "depth decompressed only when written since its last decompression") \
@@ -72,7 +73,21 @@ namespace sasrt::gpu_round {
   X(kConvertVertexPass, sasrt_gpu_convert_vertex_pass, "exported stream conversions drawn as a vertex pass (flat: off)") \
   /* sasrt-nx's render-thread round (2026-11-09; port 54): A/B 144 and up, and 200 for the group (kAbRtGroup) */          \
   X(kRtRestoreCandidates, sasrt_rt_restore_candidates, "render thread: a depth target's EDRAM-restore source found among its own few candidate colour targets, kept until a target is built or retired, not by two scans of every target a draw") \
-  X(kRtCachedExportSeeds, sasrt_rt_cached_export_seeds, "render thread: the memexport windows' buffer CPU-cached, so the CPU writes the seeds at cache speed and cleans their lines (chosen at start: no in-run A/B)")
+  X(kRtCachedExportSeeds, sasrt_rt_cached_export_seeds, "render thread: the memexport windows' buffer CPU-cached, so the CPU writes the seeds at cache speed and cleans their lines (chosen at start: no in-run A/B)") \
+  /* sasrt-nx's render-thread rounds 2-4 (2026-11-20, their universal items; docs/render-thread-ideas-1120.md there): A/B 190 and up (200 skipped: kAbRtGroup), 241-243 for each round */ \
+  X(kRt2DropThrottle, sasrt_rt2_drop_throttle, "render thread: DropReplacedRanges' pass over the stream cache's limit every 4th frame, not every frame (memory only)") \
+  X(kRt2PagesTail, sasrt_rt2_pages_tail, "render thread: PagesClean's last 1-7 pages of a range in one masked NEON block when none of their cards is written") \
+  X(kRt2RingPrefetch, sasrt_rt2_ring_prefetch, "render thread: the next ring item's narrowed device delta prefetched to six lines, not four") \
+  X(kRt2ReadableMemo, sasrt_rt2_readable_memo, "render thread: the vertex fills' guest readability answers kept while no page has lost read access (no heap mutex, no page walk)") \
+  X(kRt2TextureMemoTwoWay, sasrt_rt2_texture_memo_two_way, "render thread: the texture slot memo two-way (2,048 sets of two), the way of an earlier frame replaced") \
+  X(kRt2RepeatRing, sasrt_rt2_repeat_ring, "render thread: WholeGeometryTry's repeat answer kept for the last four meshes of a kick, not one") \
+  X(kRt2HeldExportBitmap, sasrt_rt2_held_export_bitmap, "render thread: GetStreamSource looks up the kept exports only where a 64 KB granule bitmap says one may lie") \
+  X(kRt2ColorAliasMemo, sasrt_rt2_color_alias_memo, "render thread: ColorAliasesLocked's answer kept per surface until a target is made or retired") \
+  X(kRt3SurfaceMemo256, sasrt_rt3_surface_memo_256, "render thread: GetHostSurfaceLocked's memo 256 entries, not 64") \
+  X(kRt3DepthBiasFields, sasrt_rt3_depth_bias_fields, "render thread: the fast draw's depth bias not set again when its packets are unchanged since the draw before") \
+  X(kRt4PushRunsMerged, sasrt_rt4_push_runs_merged, "render thread: two runs of pushed constant groups with one or two groups between them pushed as one run (the gap's current device values too; never over a literal register)") \
+  X(kRt4StateIdCrc, sasrt_rt4_state_id_crc, "render thread: RenderStateIdLocked's table index by CRC32C of the words (14 crc32cx), not 27 dependent multiplies") \
+  X(kRt4ExportReadsFast, sasrt_rt4_export_reads_fast, "render thread: a draw whose only memexport reads are host-layout vertex streams found on the GPU stays on the fast path (the streams converted there as the full path does)")
 
 enum Item : int {
 #define SASRT_GPU_ROUND_ENUM(name, key, what) name,
@@ -86,8 +101,23 @@ constexpr int kAbBase = 90;
 // kRtRestoreCandidates on) at once: the round's total, best with banjo_renut_ab_s 30 (4 s halves cannot resolve 1-3 ms
 // of render thread).
 constexpr int kAbRtGroup = 200;
-static_assert(kCount <= 64, "plume's Deko3DStats::sasrtRound has 64 counts");
-static_assert(kAbBase + kCount <= 256, "banjo_renut_ab_targets takes targets up to 255");
+// sasrt-nx's render-thread rounds 2-4 (2026-11-20; the base, 2026-11-22): their items' A/B targets are 190 and up in the
+// list's order, 200 skipped (kAbRtGroup above); 241, 242 and 243 switch each round's items at once (its total; with
+// banjo_renut_ab_s 30: a round is 1-3 % of the render thread).
+constexpr Item kRt2First = kRt2DropThrottle, kRt3First = kRt3SurfaceMemo256, kRt4First = kRt4PushRunsMerged;
+constexpr int kAbRt2Base = 190;
+constexpr int kAbRt2Group = 241, kAbRt3Group = 242, kAbRt4Group = 243;
+constexpr int AbTargetOf(int i) {
+  if (i < kRt2First)
+    return kAbBase + i;
+  const int n = kAbRt2Base + (i - kRt2First);
+  return n >= kAbRtGroup ? n + 1 : n;
+}
+// plume counts its own items (Deko3DStats::sasrtRound, 64 counts; Report adds them to the items below 64); the
+// render-thread rounds' items are counted here alone.
+static_assert(kRt2First <= 64, "plume's Deko3DStats::sasrtRound has 64 counts");
+static_assert(kAbBase + kRt2First <= kAbRt2Base, "the first items' targets end before the rounds' begin");
+static_assert(AbTargetOf(kCount - 1) < 211, "the rounds' targets end before blur-nx's 211");
 
 struct Latched {
   bool on[kCount] = {};

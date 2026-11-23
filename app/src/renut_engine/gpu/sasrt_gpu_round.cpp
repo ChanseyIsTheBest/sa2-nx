@@ -271,8 +271,11 @@ REXCVAR_DEFINE_BOOL(sasrt_gpu_export_raster_discard, true, "SASRT/GPU",
 
 // sasrt-nx (2026-11-08): the third GPU round (docs/gpu-round-1108.md "Round 3"; the user: "Try to aim for 20 more pixel
 // identical gpu optimisations"). A/B 120 and up.
-REXCVAR_DEFINE_BOOL(sasrt_gpu_seed_cpu_direct, true, "SASRT/GPU",
-                    "deko3d renderer (third GPU round, item 30, A/B 120; with sasrt_gpu_fetch_copy_compute): a memexport "
+// Port 263 (2026-11-23, the user: "please make this false sasrt_gpu_seed_cpu_direct also banjo was getting vertex
+// explosions from it"): OFF by default; a game's own toml may turn it on.
+REXCVAR_DEFINE_BOOL(sasrt_gpu_seed_cpu_direct, false, "SASRT/GPU",
+                    "deko3d renderer (third GPU round, item 30, A/B 120; with sasrt_gpu_fetch_copy_compute; OFF by default "
+                    "since port 263: banjo-nx saw vertex explosions with it on): a memexport "
                     "draw's fresh windows get their seed (guest memory's bytes there) written by the CPU straight into the "
                     "slot's export buffer as the draw is recorded, not copied into the upload ring and then by a compute "
                     "dispatch: no dispatch, and no wait between it and the export draw. The buffer is the GPU's and the "
@@ -561,6 +564,98 @@ REXCVAR_DEFINE_BOOL(sasrt_rt_cached_export_seeds, true, "SASRT/RenderThread",
                     "every line a seed touches is wholly its own: the GPU sees the same bytes. The CPU never reads the "
                     "buffer (readbacks go through a GPU copy). For games with memory exports")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// sasrt-nx's render-thread rounds 2-4 (2026-11-20; docs/render-thread-ideas-1120.md and
+// docs/handoff/rt_rounds_1120 there): their universal items, each pixel-identical with its own key, on by default.
+// Measured on Sonic Transformed's console (4 players standing still, after a PGO cycle): rounds 2-4 together -12 % of
+// the render thread a frame. Their A/B targets: sasrt_gpu_round.h AbTargetOf; 241-243 each round at once.
+REXCVAR_DEFINE_BOOL(sasrt_rt2_drop_throttle, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 56, A/B 190): "
+                    "DropReplacedRanges' pass while the stream cache is over its limit runs every 4th frame, not every "
+                    "frame (kameo-nx's rule for 3 fps; Sonic Transformed's 4-player race sat at 135.7 MB of 128 and "
+                    "walked both caches every frame, and a whole entry among the drops staled every mesh object). "
+                    "Memory only: what a draw reads does not change")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt2_pages_tail, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 57, A/B 191): PagesClean's "
+                    "last 1-7 pages of a range (most vertex ranges are that short) tested in one masked NEON block "
+                    "when none of their four views' cards is written, as the 8- and 16-page blocks do; else page by "
+                    "page as before (AArch64). The same answer")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt2_ring_prefetch, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 58, A/B 192): The render "
+                    "thread prefetches the next ring item's narrowed device delta to six lines, not four (it averages "
+                    "~360 bytes in Sonic Transformed's 4-player race). Prefetches only")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt2_readable_memo, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 59, A/B 193): The vertex "
+                    "fills' check that their guest bytes are committed (dishonored_renut_vertex_readable_check: each a "
+                    "heap's recursive mutex, which the game's allocations hold too, and a page-table walk) keeps the "
+                    "ranges it found readable, 64 of them, while no page anywhere has lost read access since "
+                    "(rex::memory::g_page_access_generation, raised when a decommit, release, protect, reset, restore "
+                    "or commit without read access starts and when it returns)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt2_texture_memo_two_way, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 60, A/B 194): "
+                    "FillTextures' texture slot memo (4,096 entries by texture address and fetch words) as 2,048 sets "
+                    "of two ways: a texture's entry kept while another hashes to its set, the way bound in an earlier "
+                    "frame replaced (Sonic Transformed's four-player race missed ~1,950 binds a second to another "
+                    "entry, each a whole BindTextureLocked). Every hit checks the entry's words as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt2_repeat_ring, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 61, A/B 195): "
+                    "WholeGeometryTry's repeat answer (blur_renut_whole_repeat: a draw whose streams, index buffer, "
+                    "shader and layout are an earlier draw's of the same kick takes its copies without the probes) "
+                    "kept for the last four such answers, not the last one: draws that take turns between a few "
+                    "meshes. Each answer is checked as before")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt2_held_export_bitmap, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 62, A/B 196): "
+                    "GetStreamSource looks in the kept exports' map (sasrt_renut_exports_held; about 257 a frame in "
+                    "Sonic Transformed's 4-player race, a std::map walk per stream) only when a 64 KB granule bitmap "
+                    "of the kept exports' ranges says one may lie at the stream's address. For games with memory "
+                    "exports")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt2_color_alias_memo, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's second render-thread round, 2026-11-20; item 63, A/B 197): "
+                    "ColorAliasesLocked (two scans of every target per colour resolve, about 118 a frame in Sonic "
+                    "Transformed's 4-player race) answers from a per-surface list kept until a target is made or "
+                    "retired (the target table's epoch, g_sasrt_table_epoch)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt3_surface_memo_256, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's third render-thread round, 2026-11-20; item 64, A/B 198): "
+                    "GetHostSurfaceLocked's memo (a surface's target by its address, header words and the surface "
+                    "epoch) has 256 entries, not 64: Sonic Transformed's four views' targets, resolves, EDRAM views "
+                    "and stack headers conflicted in 64")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt3_depth_bias_fields, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's third render-thread round, 2026-11-20; item 65, A/B 199): A fast draw "
+                    "does not call SetDrawDepthBias when the bias set is still bound and none of the packets it reads "
+                    "(the view packets' mode control, the point packet's bias words, the destination packet's depth "
+                    "info) changed since the draw before in the chain (banjo-nx keeps it in N&B, its A/B 302)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt4_push_runs_merged, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's fourth render-thread round, 2026-11-20; item 66, A/B 201): "
+                    "PushFloatConstants pushes two runs of constant groups that one or two groups separate as one run, "
+                    "the groups between them with the device's current values (they become valid); never across a "
+                    "group with a literal register of this shader or of the buffer: one dkCmdBufPushConstants call "
+                    "instead of two")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt4_state_id_crc, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's fourth render-thread round, 2026-11-20; item 67, A/B 202): "
+                    "RenderStateIdLocked (the render-state number by content) finds its table slot by a CRC32C of the "
+                    "20 render-state words and the targets' words (the A57's crc32cx, 8 bytes an instruction) instead "
+                    "of 27 dependent multiplies; a hit compares the words as before. AArch64 with the CRC extension "
+                    "(the Switch) only")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(sasrt_rt4_export_reads_fast, true, "SASRT/RenderThread",
+                    "Render thread (sasrt-nx's fourth render-thread round, 2026-11-20; item 68, A/B 203): A draw whose "
+                    "only reads of pending memexport results are vertex streams the host layout reads from windows "
+                    "FindExportedStream finds on the GPU stays on the fast path: ConvertExportedStreamsLocked converts "
+                    "them there (as DrawStateLocked does) and BindStreams binds the converted streams; whole-buffer "
+                    "geometry and fetch, index and texture reads of exports take the full path as before (Sonic "
+                    "Transformed's 4-player race: 93 'export read' draws a frame to the full path; banjo-nx's N&B city "
+                    "~6,300 a 10 s, with banjo-nx's two fixes). For games with memory exports")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 #if defined(PLUME_DEKO3D)
 #include <plume_deko3d.h>
@@ -591,7 +686,12 @@ uint8_t g_effective[kCount] = {};  // constant-initialised to 0: not latched
 void RefreshEffective() {
   const int ab = banjo::renut_gpu::g_ab_off.load(std::memory_order_relaxed);
   for (int i = 0; i < kCount; ++i) {
-    const bool on = g_latched.on[i] && ab != kAbBase + i && !(ab == kAbRtGroup && i >= kRtRestoreCandidates);
+    // sasrt-nx (2026-11-22, the base port of the render-thread rounds 2-4): each item's own target (AbTargetOf), and
+    // 241-243 for each round's items at once. kAbRtGroup (port 54's round) stays that round's two items alone.
+    const bool on = g_latched.on[i] && ab != AbTargetOf(i) &&
+                    !(ab == kAbRtGroup && i >= kRtRestoreCandidates && i < kRt2First) &&
+                    !(ab == kAbRt2Group && i >= kRt2First && i < kRt3First) &&
+                    !(ab == kAbRt3Group && i >= kRt3First && i < kRt4First) && !(ab == kAbRt4Group && i >= kRt4First);
     g_effective[i] = on ? 2 : 1;
   }
 }
@@ -654,8 +754,17 @@ const char *AbName(int target) {
   };
   if (target == kAbRtGroup)  // sasrt-nx (2026-11-09; port 54)
     return "the render-thread round's items, all at once (sasrt_rt_*, A/B 200)";
-  const int i = target - kAbBase;
-  return i >= 0 && i < kCount ? kNames[i] : nullptr;
+  // sasrt-nx (2026-11-22): the render-thread rounds 2-4, each round at once.
+  if (target == kAbRt2Group)
+    return "the second render-thread round's items, all at once (sasrt_rt2_*, A/B 241)";
+  if (target == kAbRt3Group)
+    return "the third render-thread round's items, all at once (sasrt_rt3_*, A/B 242)";
+  if (target == kAbRt4Group)
+    return "the fourth render-thread round's items, all at once (sasrt_rt4_*, A/B 243)";
+  for (int i = 0; i < kCount; ++i)
+    if (AbTargetOf(i) == target)
+      return kNames[i];
+  return nullptr;
 }
 
 std::string Report() {

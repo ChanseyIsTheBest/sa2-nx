@@ -239,6 +239,15 @@ extern "C" void RexSwitchApmApply(void) {
                  "checking there is no way to guarantee the memory stays where it is\n");
     return;
   }
+  // Port 262 (from the Cave ports, 2026-11-23): clocks that read 0 (an emulator's stubbed pcv: Ryujinx answers every
+  // GetClockRate with 0) cannot be checked either, and each candidate below would poll them for 1.5 s for nothing. In
+  // Ryujinx those ~30 clkrst sessions (not the 4.5 s: a sleep as long in their place did not) left every SDK overlay
+  // drawn later, the game menu's among them, invisible on screen. Nothing is changed.
+  if (gpu0 == 0 || emc0 == 0) {
+    std::fprintf(stderr, "[apm] the clocks read 0 (GPU %u Hz, memory %u Hz; an emulator?): NOTHING is changed\n",
+                 unsigned(gpu0), unsigned(emc0));
+    return;
+  }
   std::fprintf(stderr, "[apm] starting point: config 0x%08X, GPU %.1f MHz, memory %.1f MHz\n",
                has_original ? config_original : 0u, double(gpu0) / 1e6, double(emc0) / 1e6);
 

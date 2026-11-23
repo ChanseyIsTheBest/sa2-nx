@@ -1159,6 +1159,27 @@ BaseHeap::BaseHeap() : membase_(nullptr), heap_base_(0), heap_size_(0), page_siz
 
 BaseHeap::~BaseHeap() = default;
 
+std::atomic<uint64_t> g_page_access_generation{1};  // sasrt-nx (2026-11-20, sasrt_rt2_readable_memo): xmemory.h
+namespace {
+// sasrt-nx (2026-11-22, the base port of sasrt_rt2_readable_memo): g_page_access_generation raised when an operation
+// that can take read access starts and again when it returns, its page changes made: a readable answer a query found
+// while the operation ran (before its changes, under the heap mutex) carries a value from before the second raise, so
+// it goes with it (raised only at the start, such an answer could carry the new value and outlive the change).
+struct PageAccessChange {
+  bool on;
+  explicit PageAccessChange(bool raise = true) : on(raise) {
+    if (on)
+      g_page_access_generation.fetch_add(1, std::memory_order_acq_rel);
+  }
+  ~PageAccessChange() {
+    if (on)
+      g_page_access_generation.fetch_add(1, std::memory_order_acq_rel);
+  }
+  PageAccessChange(const PageAccessChange &) = delete;
+  PageAccessChange &operator=(const PageAccessChange &) = delete;
+};
+}  // namespace
+
 std::unique_lock<std::recursive_mutex> BaseHeap::AcquireHostPageReconcileLock() const {
   if (page_size_ >= memory_->system_page_size_) {
     return {};
@@ -1417,6 +1438,7 @@ bool BaseHeap::Save(stream::ByteStream* stream) {
 }
 
 bool BaseHeap::Restore(stream::ByteStream* stream) {
+  const PageAccessChange page_access_change;  // sasrt-nx (2026-11-20, sasrt_rt2_readable_memo)
   REXSYS_DEBUG("Heap {:08X}-{:08X}", heap_base_, heap_base_ + (heap_size_ - 1));
 
   const uint32_t host_page_size = memory_->system_page_size_;
@@ -1494,6 +1516,7 @@ bool BaseHeap::Restore(stream::ByteStream* stream) {
 }
 
 void BaseHeap::Reset() {
+  const PageAccessChange page_access_change;  // sasrt-nx (2026-11-20, sasrt_rt2_readable_memo)
   // TODO(DrChat): protect pages.
   std::memset(page_table_.data(), 0, sizeof(PageEntry) * page_table_.size());
   // TODO(Triang3l): Remove access callbacks from pages if this is a physical
@@ -1539,6 +1562,9 @@ bool BaseHeap::AllocSystemHeap(uint32_t size, uint32_t alignment, uint32_t alloc
 
 bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignment,
                           uint32_t allocation_type, uint32_t protect) {
+  // sasrt-nx (2026-11-20, sasrt_rt2_readable_memo): a commit over pages already committed sets their protection (it
+  // can take read access away): the readable answers go when the new one has no read.
+  const PageAccessChange page_access_change(!(protect & memory::kMemoryProtectRead));
   alignment = rex::round_up(alignment, page_size_);
   if (base_address % alignment != 0) {
     if (base_address % page_size_ != 0) {
@@ -1828,6 +1854,7 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
 }
 
 bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
+  const PageAccessChange page_access_change;  // sasrt-nx (2026-11-20, sasrt_rt2_readable_memo)
   uint32_t page_count = get_page_count(size, page_size_, page_size_shift_);
   uint32_t start_page_number = (address - heap_base_) >> page_size_shift_;
   uint32_t end_page_number = start_page_number + page_count - 1;
@@ -1864,6 +1891,7 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
 }
 
 bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
+  const PageAccessChange page_access_change;  // sasrt-nx (2026-11-20, sasrt_rt2_readable_memo)
   // Global critical region before heap_mutex_ - see
   // AcquireHostPageReconcileLock for why the order matters.
   auto global_lock = AcquireHostPageReconcileLock();
@@ -1926,6 +1954,7 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
 }
 
 bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32_t* old_protect) {
+  const PageAccessChange page_access_change;  // sasrt-nx (2026-11-20, sasrt_rt2_readable_memo)
   if (!size) {
     REXSYS_ERROR("BaseHeap::Protect failed due to zero size");
     return false;
