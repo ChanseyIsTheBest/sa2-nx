@@ -38,8 +38,11 @@
  *   header  : "RXVFSIDX" | u32 version | u32 0 | u64 entry count | u64 body size | u64 FNV-1a(body)
  *   body    : str host path | dir(root)
  *   dir     : u8 children complete | u32 child count | child * count
- *   child   : u8 type (0 file, 1 dir) | str name | u64 size | u64 create | u64 access | u64 write
- *             | dir (only when type == 1)
+ *   child   : u8 type (0 file, 1 dir) | str name | u64 size | u8 kinds | [u64 guest size | str guest name]
+ *             | u64 create | u64 access | u64 write | dir (only when type == 1)
+ *             (version 4: size is a file's size on the SD, as the listing has it; kinds is HostPathEntry's
+ *             kIndex* flags of a stand-in, .lz4b / .hevc / .opcm / .xmo / .xmop (sa2-nx-ult: and .adxo, 32), and only a stand-in carries
+ *             the size and the name the guest sees)
  *   str     : u32 length | bytes
  */
 
@@ -136,7 +139,12 @@ namespace {
 constexpr char kMagic[8] = {'R', 'X', 'V', 'F', 'S', 'I', 'D', 'X'};
 // 2: rr6-nx (2026-11-21), children in host_path_device.cpp's AnswerRank order (an index of 1 may hold NAME.lz4b
 // before NAME.hevc); sasrt-nx (2026-11-21): and NAME.xmo / NAME.xmop (base port 259).
-constexpr uint32_t kVersion = 2;
+// 4: port 264 (culdcept-nx's two-size index of 2026-11-20, for every kind of port 259): a file's size on the SD and a
+// stand-in's decision. Versions 1-2 kept the size the guest sees, which for a stand-in never matched the SD's
+// listing, so a game folder with any stand-in failed validation and every start did the full scan (Culdcept: 22.8 s
+// on the console, 237 ms from the index). Not 3: futari-nx's own index of 2026-11-22 is a version 3 of another
+// layout (culdcept-nx's and nights-nx's are a 2 of another layout).
+constexpr uint32_t kVersion = 4;
 constexpr size_t kHeader = 8 + 4 + 4 + 8 + 8 + 8;
 // Sanity limits for parsing a damaged file: nothing in a game folder comes close.
 constexpr uint32_t kMaxName = 4096;
@@ -229,7 +237,13 @@ void SerializeDirectory(Writer& w, HostPathEntry* dir, uint64_t* count) {
     // The name exactly as the host listing returned it (host_path's last component), which is
     // what PopulateEntry fed to HostPathEntry::Create.
     w.String(rex::path_to_utf8(child->host_path().filename()));
-    w.Pod<uint64_t>(uint64_t(child->size()));
+    w.Pod<uint64_t>(is_dir ? uint64_t(child->size()) : child->disk_size());
+    const uint8_t kinds = is_dir ? 0 : child->index_kinds();
+    w.Pod<uint8_t>(kinds);
+    if (kinds) {
+      w.Pod<uint64_t>(uint64_t(child->size()));
+      w.String(child->name());
+    }
     w.Pod<uint64_t>(child->create_timestamp());
     w.Pod<uint64_t>(child->access_timestamp());
     w.Pod<uint64_t>(child->write_timestamp());
@@ -324,8 +338,12 @@ bool BuildDirectory(Context& ctx, Reader& r, HostPathEntry* dir, int depth,
     FileInfo info;
     std::string name;
     uint64_t size = 0, ct = 0, at = 0, wt = 0;
-    if (!r.Pod(&type) || type > 1 || !r.String(&name, kMaxName) || name.empty() ||
-        !r.Pod(&size) || !r.Pod(&ct) || !r.Pod(&at) || !r.Pod(&wt)) {
+    HostPathEntry::IndexHint hint;
+    if (!r.Pod(&type) || type > 1 || !r.String(&name, kMaxName) || name.empty() || !r.Pod(&size) ||
+        !r.Pod(&hint.kinds) || hint.kinds > HostPathEntry::kIndexKindsAll ||  // sa2-nx-ult: 63 (with .adxo's 32)
+        (hint.kinds && (type != 0 || !r.Pod(&hint.size) || !r.String(&hint.guest_name, kMaxName) ||
+                        hint.guest_name.empty())) ||
+        !r.Pod(&ct) || !r.Pod(&at) || !r.Pod(&wt)) {
       ctx.reason = "corrupt data";
       return false;
     }
@@ -336,7 +354,7 @@ bool BuildDirectory(Context& ctx, Reader& r, HostPathEntry* dir, int depth,
     info.create_timestamp = ct;
     info.access_timestamp = at;
     info.write_timestamp = wt;
-    auto* child = HostPathEntry::Create(ctx.device, dir, dir->host_path() / info.name, info);
+    auto* child = HostPathEntry::Create(ctx.device, dir, dir->host_path() / info.name, info, &hint);
     dir->AddChildIndex(child);
     ++ctx.inputs;
     if (type) {
@@ -382,7 +400,7 @@ bool ValidateDirectory(HostPathEntry* dir, uint64_t* directories, std::string* r
     auto* child = static_cast<HostPathEntry*>(h.get());
     const bool is_dir = (child->attributes() & kFileAttributeDirectory) != 0;
     b.emplace_back(rex::path_to_utf8(child->host_path().filename()), is_dir,
-                   is_dir ? 0 : uint64_t(child->size()));
+                   is_dir ? 0 : child->disk_size());  // the SD's size, a stand-in's own (port 264)
   }
   std::sort(a.begin(), a.end());
   std::sort(b.begin(), b.end());
