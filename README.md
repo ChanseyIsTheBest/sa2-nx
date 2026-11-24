@@ -19,10 +19,11 @@ DLC (`58411202/00000002/SonicAdventure2Battle`) is optional.
    Xbox 360 (with the Battle DLC if you have it) and press **Create sa2-nx.zip**. It all runs in your browser: the
    movies are re-encoded to H.265 and the music to Opus, the other files are compressed, and everything goes into one
    file, `game_root.nxpack` (with its index `game_root.nxidx`): about 1.2 GB instead of 2.4 GB.
-3. Extract `sa2-nx.zip` into `sdmc:/switch/`.
+3. Extract `sa2-nx.zip` to the root of the SD card: it makes `sdmc:/switch/sa2-nx/`.
 4. Start it with a game override (hold **R** while starting an installed title) or a forwarder.
 
-To update from 1.0.6 or earlier, make a new zip with the installer and extract it over your folder: 1.0.7 needs its
+To update from 1.0.6 or earlier, make a new zip with the installer and extract it to the root of the SD card, over your
+folder: 1.0.7 needs its
 `deko3d_glsl.bin` and its game files. Your saves and `sa2.toml` stay. A `game_root` folder left from an older install is
 not read any more and can be deleted.
 

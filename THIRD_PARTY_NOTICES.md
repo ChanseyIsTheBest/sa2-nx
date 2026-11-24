@@ -15,6 +15,7 @@ folder it is in (see below).
 | [NFSMW Recompiled](https://github.com/madelrandel-blip/NFSMW-Recompiled) by madelrandel-blip | The recompilation project the ports above started from | GPL-3.0 |
 | [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) by Tom Clay, with portions from [Xenia](https://xenia.jp) (Ben Vanik and the Xenia contributors) | `sdk/` | BSD-3-Clause (`sdk/LICENSE`) |
 | [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) by hedge-dev and contributors, with the changes of the ports above and this one | `shaders/`, `app/thirdparty/reblue-XenosRecomp` | MIT |
+| [OpenSA2](https://github.com/kittycache9/OpenSA2) by kittycache, with the SA2 Mod Loader code "Press B to Somersault" by Hyper and MainMemory | `app/src/sa2_controls.cpp`: the control options `sa2_action_buttons`, `sa2_analog_fix`, `sa2_deadzone`, `sa2_camera_invert` and `sa2_hold_toggle`, ported from OpenSA2's tweaks for the PC game to this port's Xbox 360 game | GPL-3.0-only |
 
 The Horizon (Switch) layer added to `sdk/` is under the SDK's BSD-3-Clause license, and the changes in `shaders/` and
 `app/thirdparty/reblue-XenosRecomp` under XenosRecomp's MIT license, so they can be reused by other ports. The rest of
@@ -53,6 +54,7 @@ Libraries used by the SDK, the NRO and the code generator, in `sdk/thirdparty`, 
 | [LZ4](https://github.com/lz4/lz4) 1.10.0 by Yann Collet (`lib/lz4.c`: the decoder of the game files the installer packs with LZ4; from rr6-nx, through culdcept-nx) | BSD-2-Clause |
 | [ZXC](https://github.com/hellobertrand/zxc) 0.15.0 by Bertrand Lebonnois (the decoder of the game files the installer packs with ZXC; from rr6-nx, through culdcept-nx), with [rapidhash](https://github.com/Nicoshev/rapidhash) by Nicolas De Carli | BSD-3-Clause; MIT |
 | [FFmpeg](https://ffmpeg.org) 7.1 as devkitPro's `switch-ffmpeg` builds it, with averne's nvtegra backend (in `tools/switch/nxvideo`, culdcept-nx's, linked into the Switch build: the H.265 movies' decoder on the Switch's NVDEC, and its software decoder) | GPL (built with `--enable-gpl`); LGPL-2.1-or-later sources |
+| [libopus](https://opus-codec.org) 1.3 as devkitPro's `switch-libopus` builds it (linked into the Switch build: the decoder of the installer's Opus music, `NAME.adxo`) | BSD-3-Clause |
 | [SIMDe](https://github.com/simd-everywhere/simde) | MIT |
 | [toml++](https://github.com/marzer/tomlplusplus) | MIT |
 | [o1heap](https://github.com/pavel-kirienko/o1heap) | MIT |
