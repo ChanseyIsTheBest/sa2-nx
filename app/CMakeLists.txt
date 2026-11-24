@@ -1096,7 +1096,7 @@ if(REXGLUE_PLATFORM_SWITCH)
     rexglue_switch_add_nro(renut
         NAME "${RENUT_GAME_NAME}"  # port 193: set once, above
         AUTHOR "ChanseyIsTheBest"
-        VERSION "1.0.7"
+        VERSION "1.0.8"
         ${RENUT_ICON_ARG})
 endif()
 

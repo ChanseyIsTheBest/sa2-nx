@@ -2,7 +2,7 @@
 
 <h1 align=center>Sonic Adventure 2: Nintendo Switch port</h1>
 
-<p align=center><b>sa2-nx 1.0.7</b> · <a href="https://chanseyisthebest.github.io/sa2-nx-installer/">web installer</a> · <a href="https://github.com/ChanseyIsTheBest/sa2-nx/releases/tag/v1.0.7">release</a></p>
+<p align=center><b>sa2-nx 1.0.8</b> · <a href="https://chanseyisthebest.github.io/sa2-nx-installer/">web installer</a> · <a href="https://github.com/ChanseyIsTheBest/sa2-nx/releases/tag/v1.0.8">release</a></p>
 
 An unofficial native port of the Xbox 360 (Xbox Live Arcade) version of **Sonic Adventure 2** (2012), made by static
 recompilation with [ReXGlue](https://github.com/rexglue/rexglue-sdk) and drawn natively with deko3d. No emulator.
@@ -22,10 +22,10 @@ DLC (`58411202/00000002/SonicAdventure2Battle`) is optional.
 3. Extract `sa2-nx.zip` to the root of the SD card: it makes `sdmc:/switch/sa2-nx/`.
 4. Start it with a game override (hold **R** while starting an installed title) or a forwarder.
 
-To update from 1.0.6 or earlier, make a new zip with the installer and extract it to the root of the SD card, over your
-folder: 1.0.7 needs its
-`deko3d_glsl.bin` and its game files. Your saves and `sa2.toml` stay. A `game_root` folder left from an older install is
-not read any more and can be deleted.
+To update from 1.0.7, replace `sa2.nro` in `sdmc:/switch/sa2-nx/` with the release's (or make a new zip); nothing else
+changes. To update from 1.0.6 or earlier, make a new zip with the installer and extract it to the root of the SD card,
+over your folder: since 1.0.7 the game needs its `deko3d_glsl.bin` and its game files. Your saves and `sa2.toml` stay.
+A `game_root` folder left from an older install is not read any more and can be deleted.
 
 Features:
 
