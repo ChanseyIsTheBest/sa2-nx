@@ -16037,15 +16037,27 @@ void DepthHandOverBeforeBindLocked(HostSurface *surface, const plume::RenderRect
     if (d->handed_from == surface)
       holders.push_back(d);
   // The last resolve's destination takes the image; any other is drawn.
-  for (size_t i = holders.size(); i-- > 0;) {
-    HostTexture &d = *holders[i];
-    if (take && surface->generation == d.handed_generation && surface->writes == d.handed_writes &&
-        TakeImageLocked(d, *surface)) {
-      take = false;
-      continue;
+  // sa2-nx-ult (2026-11-24, the user: character shadows missing or not updating, a regression from 1.0.6): the others
+  // are drawn FIRST, from the image as their resolves read it, and only then does the last one take it. The taker used
+  // to go first: TakeImageLocked swaps the target's image (and with it its generation) for the destination's old one,
+  // so every other destination's MaterialiseLocked found the target changed and lost its resolve (the hand-over's
+  // "lost" count), keeping an old frame's content. SA2 resolves each 512x512 shadow pass to two destinations before its
+  // whole clear: one was lost every frame (the attract demo in Ryujinx: 600 in 10 s). sa2-nx 1.0.6's own hand-over gave
+  // the image to every current destination. The same pixels as the resolves drawn; the taker still takes no copy.
+  HostTexture *taker = nullptr;
+  if (take) {
+    for (size_t i = holders.size(); i-- > 0;) {
+      if (surface->generation == holders[i]->handed_generation && surface->writes == holders[i]->handed_writes) {
+        taker = holders[i];
+        break;
+      }
     }
-    MaterialiseLocked(d, false);
   }
+  for (HostTexture *d : holders)
+    if (d != taker)
+      MaterialiseLocked(*d, false);
+  if (taker && !TakeImageLocked(*taker, *surface))
+    MaterialiseLocked(*taker, false);
 }
 
 // banjo-nx (2026-10-18, banjo_deko3d_draw_resolves): a single-sampled colour resolve drawn into the destination

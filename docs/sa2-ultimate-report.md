@@ -32,6 +32,25 @@ nothing. Both NROs run in Ryujinx as ARM code that its JIT turns into x86, so an
 does not reproduce exactly could show for one build's code only; the console run tells whether it is there at all.
 Otherwise the next step is a comparison of guest memory of the two NROs at a frame that differs.
 
+**1.0.8 (2026-11-24): the characters' shadows.** After 1.0.7 the user saw the characters' shadows missing or not
+updating on the console, with MSAA on or off, in single player and in the attract sequence's two-player demo. The cause
+was the base's colour hand-over (`banjo_deko3d_color_handover`, kameo-nx's, deko3d only), which this paragraph's
+"differences" did not single out: the PC never runs it, so the PC's frame comparison (the gate, identical to 1.0.6)
+could not see it, and in the emulator its pictures were taken for the grind sparks above.
+- SA2 resolves each 512x512 shadow pass into two destinations, then clears the target whole. At that clear
+  `DepthHandOverBeforeBindLocked` (render/draw.cpp) let the last destination take the target's image first.
+  `TakeImageLocked` swaps the image and with it the target's generation, so the other destination's
+  `MaterialiseLocked` found the target changed and lost its resolve. Its texture kept an old frame's content: a shadow
+  frozen or missing. The 10 s `colour hand-over` line of the 1.0.7 release in Ryujinx: 1,200 resolves left in the image,
+  600 taken at a clear, **600 lost** (one a frame).
+- 1.0.6's own hand-over (`sa2_renut_colour_handover`) gave the image to every destination that still held it.
+- The fix: the other destinations are drawn first, from the image as their resolves read it; then the last one takes
+  it. The same pixels as drawn resolves; the last destination still takes no copy. The PC is unchanged (no hand-over).
+- Checks: the 1.0.7 release in Ryujinx had none of its two-player demo's 350 frames in 1.0.6's (its title's 250 all
+  identical; `out\emu_runs\emu_shadow_107`; frame 7122: Shadow on the stairs without a shadow). The fixed build on
+  the console: the user, "all fixed". Released as 1.0.8: that NRO with its NACP version set to 1.0.8 (one byte).
+  Sent to the base: `out\handoffs\colour-handover-two-destinations.patch`.
+
 ## The base's later ports (2026-11-20)
 
 The base took 45 more ports (191-235) during the night and the morning. They came in with `tools/ult_port_sync.py`
