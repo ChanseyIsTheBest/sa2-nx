@@ -46,10 +46,16 @@ could not see it, and in the emulator its pictures were taken for the grind spar
 - 1.0.6's own hand-over (`sa2_renut_colour_handover`) gave the image to every destination that still held it.
 - The fix: the other destinations are drawn first, from the image as their resolves read it; then the last one takes
   it. The same pixels as drawn resolves; the last destination still takes no copy. The PC is unchanged (no hand-over).
-- Checks: the 1.0.7 release in Ryujinx had none of its two-player demo's 350 frames in 1.0.6's (its title's 250 all
-  identical; `out\emu_runs\emu_shadow_107`; frame 7122: Shadow on the stairs without a shadow). The fixed build on
-  the console: the user, "all fixed". Released as 1.0.8: that NRO with its NACP version set to 1.0.8 (one byte).
-  Sent to the base: `out\handoffs\colour-handover-two-destinations.patch`.
+- Checks: the fixed build on the console: the user, "all fixed". In Ryujinx (the two-player demo, frames 6400-8800
+  every 4th: `out\emu_runs\emu_shadow_107` for the 1.0.7 release, `emu_shadow_fix1` for the fix, the same PGO + LTO
+  build otherwise): the colour hand-over's "lost" went from 600 to 0 in every 10 s line (about 470 "drawn after all"
+  instead). The two runs' demos started about 350 frames apart; paired by picture, their frames differ only in the
+  blinking "Press START" and in the shadows: at 1.0.7's frame 7362 no shadow under Sonic on the grass, the fix's
+  matching frame (7713) draws it (`emu_shadow_fix1\shadow_7362_before_after.png`). Not explained by this fix: in
+  Ryujinx neither release build has any two-player demo frame identical to 1.0.6's (1.0.7: 0 of 350, the fix: 0 of
+  435; the title's frames all identical), where the everyday builds of the rebase had about 13 %: open.
+  Released as 1.0.8: the console-tested NRO with its NACP version set to 1.0.8 (one byte). Sent to the base:
+  `out\handoffs\colour-handover-two-destinations.patch`.
 
 ## The base's later ports (2026-11-20)
 
